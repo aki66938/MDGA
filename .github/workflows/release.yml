@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*.*.*.*"
+      - "v*.*.*"
 
 jobs:
   build-windows:
@@ -39,16 +39,14 @@ jobs:
         id: version
         shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME}"           # e.g. v0.0.1.0
-          SEMVER="${TAG#v}"                  # 0.0.1.0
-          TAURI_VER="${SEMVER%.*}"           # 0.0.1  (drop patch segment)
+          TAG="${GITHUB_REF_NAME}"           # e.g. v0.0.1
+          SEMVER="${TAG#v}"                  # 0.0.1  (三位，直接写入 tauri.conf.json)
           echo "semver=$SEMVER" >> $GITHUB_OUTPUT
-          echo "tauri_ver=$TAURI_VER" >> $GITHUB_OUTPUT
 
       - name: Patch tauri.conf.json version
         shell: bash
         run: |
-          sed -i "s/\"version\": \".*\"/\"version\": \"${{ steps.version.outputs.tauri_ver }}\"/" \
+          sed -i "s/\"version\": \".*\"/\"version\": \"${{ steps.version.outputs.semver }}\"/" \
             apps/desktop/src-tauri/tauri.conf.json
 
       - name: Build Tauri app
@@ -64,9 +62,8 @@ jobs:
 
             Windows 桌面安装包，下载 `.msi`（推荐）或 `.exe` 安装即可。
 
-            **使用前提**：在 Windows 系统环境变量中配置 `DEEPSEEK_API_KEY`。
+            **使用前提**：在 Windows 系统环境变量中配置 `DEEPSEEK_API_KEY`，应用启动后自动识别。
 
-            ---
-            查看完整更新记录：[doc/history.md](https://github.com/aki66938/MDGA/blob/main/doc/history.md)
+            完整更新记录见 [doc/history.md](https://github.com/aki66938/MDGA/blob/main/doc/history.md)
           releaseDraft: false
           prerelease: false
