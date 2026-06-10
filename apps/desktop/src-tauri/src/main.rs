@@ -154,7 +154,8 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
     update
         .download_and_install(
             |downloaded, total| {
-                let pct = total.map(|t| downloaded * 100 / t).unwrap_or(0);
+                // downloaded: usize, total: Option<u64>，统一转 u64 再计算百分比
+                let pct = total.map(|t| downloaded as u64 * 100 / t).unwrap_or(0);
                 let _ = app_clone.emit("update-progress", pct);
             },
             || {
@@ -164,7 +165,7 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    tauri::process::restart(&app.env());
+    app.restart();
 }
 
 // ── 入口 ──────────────────────────────────────────────────────────────────
