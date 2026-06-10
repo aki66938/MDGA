@@ -37,7 +37,7 @@ textarea {
 .sidebar {
   display: flex;
   flex-direction: column;
-  gap: 28px;
+  gap: 8px;
   height: 100vh;
   overflow: hidden;
   border-right: 1px solid #e4e5e7;
@@ -393,6 +393,76 @@ h1 {
   color: #69717d;
   font-size: 14px;
   line-height: 1.6;
+}
+
+/* ── 会话列表 ── */
+
+.conv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.conv-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  color: #1f2328;
+  font-size: 13px;
+  line-height: 1.4;
+  user-select: none;
+  transition: background 0.1s;
+}
+
+.conv-item:hover {
+  background: #f0f1f3;
+}
+
+.conv-item--active {
+  background: #eef1f5;
+  font-weight: 500;
+}
+
+.conv-item__title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv-item__delete {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  color: #b0b5bc;
+  font-size: 14px;
+  cursor: pointer;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.1s;
+  padding: 0;
+  line-height: 1;
+}
+
+.conv-item:hover .conv-item__delete {
+  opacity: 1;
+}
+
+.conv-item__delete:hover {
+  background: #e0e2e5;
+  color: #69717d;
 }
 
 /* ── 更新提示横幅（固定在侧边栏底部） ── */
