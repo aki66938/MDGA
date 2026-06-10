@@ -4,6 +4,8 @@
 
 基于 Tauri 2 + Rust + React 构建，本地优先，无云账号，无数据上传。API Key 只从系统环境变量读取，不在应用内保存。
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 ---
 
 ## 下载安装
@@ -36,12 +38,28 @@ API Key 可在 [DeepSeek 开放平台](https://platform.deepseek.com) 获取。
 - 每次回复展示 Token 用量与估算费用（含缓存命中）
 - Assistant 回复 Markdown 渲染（代码块、列表、表格等）
 - 本地运行，无云同步，无账号体系
+- 新版本发布时应用内自动提示更新
 
 ---
 
 ## 版本记录
 
 查看 [doc/history.md](doc/history.md) 了解完整版本迭代记录。
+
+---
+
+## 二次开发
+
+本项目基于 [MIT License](LICENSE) 开源，允许自由 fork 和二次开发。
+
+```
+git clone https://github.com/aki66938/MDGA.git
+cd MDGA
+npm install
+cd apps/desktop && npx tauri dev
+```
+
+**环境依赖**：Node.js 20+、Rust stable、Visual Studio Build Tools（含 C++ 工作负载）
 
 ---
 
