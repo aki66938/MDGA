@@ -1,0 +1,11 @@
+[package]
+name = "mdga-token-accounting"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+mdga-shared = { path = "../shared" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

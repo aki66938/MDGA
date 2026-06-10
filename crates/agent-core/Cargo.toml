@@ -1,0 +1,10 @@
+[package]
+name = "mdga-agent-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+mdga-shared = { path = "../shared" }
+serde.workspace = true
+thiserror.workspace = true

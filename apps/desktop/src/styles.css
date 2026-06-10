@@ -1,0 +1,423 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  margin: 0;
+}
+
+:root {
+  color: #1f2328;
+  background: #f7f7f8;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+/* ── 整体布局 ── */
+
+.app-shell {
+  display: grid;
+  height: 100vh;
+  overflow: hidden;
+  grid-template-columns: 260px minmax(0, 1fr);
+}
+
+/* ── 侧边栏 ── */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  height: 100vh;
+  overflow: hidden;
+  border-right: 1px solid #e4e5e7;
+  background: linear-gradient(180deg, #fff7f7 0%, #f2f8ff 100%);
+  padding: 18px;
+}
+
+.new-chat,
+.nav-item,
+.composer button {
+  border: 1px solid #d8dadd;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #1f2328;
+  cursor: pointer;
+}
+
+.new-chat {
+  padding: 10px 12px;
+  text-align: left;
+}
+
+.nav-label {
+  margin: 0 0 8px;
+  color: #747982;
+  font-size: 13px;
+}
+
+.nav-item {
+  width: 100%;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.nav-item.active {
+  border-color: #b9c3d5;
+  background: #f5f8fc;
+}
+
+/* ── 工作区：flex 列，撑满视窗高度，内部不溢出 ── */
+
+.workspace {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100vh;
+  overflow: hidden;
+  padding: 32px 48px 24px;
+  gap: 0;
+}
+
+/* ── 顶栏 ── */
+
+.topbar {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #e4e5e7;
+}
+
+.eyebrow {
+  margin: 0 0 6px;
+  color: #747982;
+  font-size: 13px;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 0;
+  font-size: 28px;
+}
+
+.status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.status-strip span {
+  border: 1px solid #d8dadd;
+  border-radius: 999px;
+  background: #ffffff;
+  padding: 7px 11px;
+  color: #4f5661;
+  font-size: 13px;
+}
+
+/* ── 空状态 ── */
+
+.hero-panel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 32px;
+  width: 100%;
+  overflow: hidden;
+}
+
+.hero-panel h2 {
+  text-align: center;
+  font-size: 26px;
+  font-weight: 600;
+}
+
+/* ── 消息列表：唯一的滚动容器 ── */
+
+.message-list {
+  flex: 1;
+  min-height: 0;          /* 关键：让 flex item 可以收缩到小于内容高度 */
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 24px 0;
+  width: min(760px, 100%);
+  align-self: center;
+}
+
+/* 每条消息的行容器，user 右对齐，assistant 左对齐 */
+.message-row {
+  display: flex;
+  flex-direction: column;
+}
+
+.message-row:has(.message--user) {
+  align-items: flex-end;
+}
+
+.message-row:has(.message--assistant) {
+  align-items: flex-start;
+}
+
+.message {
+  max-width: 80%;
+  line-height: 1.6;
+}
+
+.message p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+/* 用户消息：右侧深色气泡 */
+.message--user {
+  align-self: flex-end;
+  background: #1f2328;
+  color: #ffffff;
+  border-radius: 12px;
+  padding: 12px 16px;
+}
+
+/* assistant 消息：无背景，内容直接融入页面 */
+.message--assistant {
+  width: 100%;
+  color: #1f2328;
+}
+
+.message--assistant p {
+  margin-bottom: 0;
+}
+
+/* Markdown 内容样式 */
+.message--assistant > * {
+  margin-top: 0;
+  margin-bottom: 12px;
+}
+
+.message--assistant > *:last-child {
+  margin-bottom: 0;
+}
+
+.message--assistant h1,
+.message--assistant h2,
+.message--assistant h3,
+.message--assistant h4 {
+  margin-top: 20px;
+  margin-bottom: 8px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.message--assistant h1 { font-size: 20px; }
+.message--assistant h2 { font-size: 17px; }
+.message--assistant h3 { font-size: 15px; }
+
+.message--assistant ul,
+.message--assistant ol {
+  padding-left: 20px;
+  margin-bottom: 12px;
+}
+
+.message--assistant li {
+  margin-bottom: 4px;
+  line-height: 1.7;
+}
+
+.message--assistant p {
+  margin: 0 0 12px;
+  line-height: 1.7;
+  white-space: normal;
+}
+
+.message--assistant p:last-child {
+  margin-bottom: 0;
+}
+
+.message--assistant code {
+  background: #f0f1f3;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 13px;
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+}
+
+.message--assistant pre {
+  background: #f0f1f3;
+  border-radius: 8px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  margin-bottom: 12px;
+}
+
+.message--assistant pre code {
+  background: none;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.message--assistant blockquote {
+  border-left: 3px solid #d0d3d8;
+  margin: 0 0 12px;
+  padding: 4px 0 4px 14px;
+  color: #69717d;
+}
+
+.message--assistant table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-bottom: 12px;
+  font-size: 14px;
+}
+
+.message--assistant th,
+.message--assistant td {
+  border: 1px solid #e0e2e5;
+  padding: 7px 12px;
+  text-align: left;
+}
+
+.message--assistant th {
+  background: #f5f6f7;
+  font-weight: 600;
+}
+
+.message--assistant hr {
+  border: none;
+  border-top: 1px solid #e0e2e5;
+  margin: 16px 0;
+}
+
+/* token 统计行：独立在 assistant 内容下方，不属于气泡 */
+.usage-badge {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 10px;
+  font-size: 11px;
+  color: #b0b5bc;
+  line-height: 1;
+}
+
+.usage-sep {
+  color: #d4d7db;
+}
+
+.usage-cache {
+  color: #5bcba0;
+}
+
+.usage-cost {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 输入框：固定在底部，不参与滚动 ── */
+
+.composer {
+  display: grid;
+  flex-shrink: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  border: 1px solid #d8dadd;
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 14px;
+  width: min(760px, 100%);
+  align-self: center;
+  margin-top: 12px;
+}
+
+.composer textarea {
+  min-height: 68px;
+  resize: none;
+  border: 0;
+  outline: 0;
+}
+
+.composer button {
+  align-self: end;
+  padding: 9px 14px;
+}
+
+.composer button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── MVP 卡片 ── */
+
+.mvp-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  width: min(760px, 100%);
+}
+
+.mvp-grid article {
+  border: 1px solid #e0e2e5;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 16px;
+}
+
+.mvp-grid h3 {
+  margin-bottom: 8px;
+  font-size: 16px;
+}
+
+.mvp-grid p {
+  margin-bottom: 0;
+  color: #69717d;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+/* ── 响应式 ── */
+
+@media (max-width: 760px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    height: auto;
+    border-right: 0;
+    border-bottom: 1px solid #e4e5e7;
+  }
+
+  .workspace {
+    padding: 24px 24px 16px;
+  }
+
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .mvp-grid {
+    grid-template-columns: 1fr;
+  }
+}

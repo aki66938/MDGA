@@ -1,0 +1,33 @@
+# ── Rust ──
+target/
+Cargo.lock
+
+# ── Node ──
+node_modules/
+dist/
+.turbo/
+
+# ── Tauri ──
+apps/desktop/src-tauri/target/
+apps/desktop/dist/
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ──
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+
+# ── Env ──
+.env
+.env.*
+
+# ── Dev collaboration rules (local only, never upload) ──
+.dev-rules.md
+
+# ── Claude Code local settings ──
+.claude/
