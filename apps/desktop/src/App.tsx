@@ -29,6 +29,12 @@ type Message = {
   usage?: UsageSummary;
 };
 
+type UpdateState =
+  | { status: "idle" }
+  | { status: "available"; version: string }
+  | { status: "downloading"; progress: number }
+  | { status: "error"; message: string };
+
 const permissionMode: PermissionMode = "restricted";
 
 export function App() {
@@ -36,8 +42,10 @@ export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  // 检测 API Key
   useEffect(() => {
     invoke<string>("get_deepseek_api_key_status")
       .then((raw) => {
@@ -50,9 +58,39 @@ export function App() {
       .catch(() => setApiKeyStatus({ state: "missing" }));
   }, []);
 
+  // 启动后延迟 3 秒检查更新，不阻塞主流程
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      invoke<string | null>("check_update")
+        .then((version) => {
+          if (version) setUpdate({ status: "available", version });
+        })
+        .catch(() => {}); // 静默失败，不打扰用户
+    }, 3000);
+
+    // 监听下载进度事件
+    const unlistenProgress = listen<number>("update-progress", (e) => {
+      setUpdate({ status: "downloading", progress: e.payload });
+    });
+
+    return () => {
+      clearTimeout(timer);
+      unlistenProgress.then((fn) => fn());
+    };
+  }, []);
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  async function handleInstallUpdate() {
+    setUpdate({ status: "downloading", progress: 0 });
+    try {
+      await invoke("install_update");
+    } catch (err) {
+      setUpdate({ status: "error", message: String(err) });
+    }
+  }
 
   async function handleSend() {
     const text = input.trim();
@@ -123,6 +161,57 @@ export function App() {
           <p className="nav-label">项目</p>
           <button className="nav-item active" type="button">MDGA</button>
         </nav>
+
+        {/* 更新提示区域，固定在侧边栏底部 */}
+        {update.status === "available" && (
+          <div className="update-banner">
+            <p className="update-banner__title">发现新版本</p>
+            <p className="update-banner__version">v{update.version}</p>
+            <div className="update-banner__actions">
+              <button
+                className="update-banner__btn update-banner__btn--primary"
+                type="button"
+                onClick={handleInstallUpdate}
+              >
+                立即更新
+              </button>
+              <button
+                className="update-banner__btn"
+                type="button"
+                onClick={() => setUpdate({ status: "idle" })}
+              >
+                稍后
+              </button>
+            </div>
+          </div>
+        )}
+
+        {update.status === "downloading" && (
+          <div className="update-banner">
+            <p className="update-banner__title">正在下载更新…</p>
+            <div className="update-banner__progress-bar">
+              <div
+                className="update-banner__progress-fill"
+                style={{ width: `${update.progress}%` }}
+              />
+            </div>
+            <p className="update-banner__version">{update.progress}%</p>
+          </div>
+        )}
+
+        {update.status === "error" && (
+          <div className="update-banner update-banner--error">
+            <p className="update-banner__title">更新失败</p>
+            <p className="update-banner__version">{update.message}</p>
+            <button
+              className="update-banner__btn"
+              type="button"
+              onClick={() => setUpdate({ status: "idle" })}
+            >
+              关闭
+            </button>
+          </div>
+        )}
       </aside>
 
       <section className="workspace" aria-label="MDGA workspace">
@@ -196,7 +285,6 @@ export function App() {
 
 function UsageBadge({ usage }: { usage: UsageSummary }) {
   const cost = usage.estimatedCostUsd;
-  // 费用格式：小于 0.0001 显示 <$0.0001，否则最多保留 6 位有效小数
   const costStr =
     cost < 0.0001 && cost > 0
       ? "<$0.0001"

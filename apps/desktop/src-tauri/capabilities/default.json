@@ -4,6 +4,7 @@
   "description": "Default capabilities for MDGA desktop",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "updater:default"
   ]
 }

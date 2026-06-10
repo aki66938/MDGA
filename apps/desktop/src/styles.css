@@ -395,6 +395,79 @@ h1 {
   line-height: 1.6;
 }
 
+/* ── 更新提示横幅（固定在侧边栏底部） ── */
+
+.sidebar {
+  position: relative;
+}
+
+.update-banner {
+  margin-top: auto;
+  border: 1px solid #d8dadd;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.update-banner--error {
+  border-color: #f5c0c0;
+  background: #fff8f8;
+}
+
+.update-banner__title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #1f2328;
+}
+
+.update-banner__version {
+  margin: 0;
+  font-size: 12px;
+  color: #747982;
+}
+
+.update-banner__actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.update-banner__btn {
+  flex: 1;
+  border: 1px solid #d8dadd;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1f2328;
+  cursor: pointer;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.update-banner__btn--primary {
+  background: #1f2328;
+  color: #ffffff;
+  border-color: #1f2328;
+}
+
+.update-banner__progress-bar {
+  height: 4px;
+  background: #e0e2e5;
+  border-radius: 99px;
+  overflow: hidden;
+  margin-top: 2px;
+}
+
+.update-banner__progress-fill {
+  height: 100%;
+  background: #1f2328;
+  border-radius: 99px;
+  transition: width 0.2s ease;
+}
+
 /* ── 响应式 ── */
 
 @media (max-width: 760px) {
