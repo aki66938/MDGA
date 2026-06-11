@@ -464,13 +464,132 @@ Plan11 是当前 MVP 下一步的核心计划。没有 Plan11，workspace 只能
 
 ## 10. 近期实现建议
 
-下一步优先实现：
+`0.0.8` 已完成第一条 `create_file` 工具闭环。接下来不应立即跳到 MCP / Skills / 命令执行，而应继续补齐本地文件操作底座，让 DeepSeek 在 workspace 内具备基础开发协作能力。
 
-1. `create_file` built-in tool。
-2. DeepSeek tool call loop。
-3. workspace path guard。
-4. Activity Event 基础展示。
+### 10.1 下一阶段实施顺序
 
-第一版成功标准：
+#### Step 1 - 完整文件工具组
 
-> 用户在绑定 `C:\Users\AIT\Desktop\MDGA` 的会话中要求创建 `test.txt`，MDGA 后端真实创建 `C:\Users\AIT\Desktop\MDGA\test.txt`，前端显示工具执行成功，assistant 基于工具结果回复。
+优先级最高。目标是让模型在意识到需要查看、修改、删除、列举文件时，能够自行调用工具，而不是要求用户手动操作。
+
+工具：
+
+- `list_dir`
+- `read_file`
+- `write_file`
+- `delete_file`
+
+约束：
+
+- 全部工具只接受 workspace-relative path。
+- 全部工具复用同一套 path guard。
+- `write_file` 默认覆盖文本文件，但必须返回 `previousExists`、`bytesWritten`。
+- `delete_file` 只能删除文件，暂不允许删除目录。
+- `read_file` 需要限制文件大小，第一版建议 256 KiB。
+- 二进制或不可 UTF-8 解码文件返回明确错误。
+
+验收：
+
+- 用户要求“读取 README 并总结”，模型调用 `read_file`。
+- 用户要求“把 test.txt 改成 123456”，模型调用 `write_file`，本地文件真实变化。
+- 用户要求“删除 test.txt”，模型调用 `delete_file`，本地文件真实消失。
+- 用户要求“看看当前目录有什么”，模型调用 `list_dir`。
+
+#### Step 2 - 工具事件可视化
+
+目标是把 Agent 工作过程从纯文本中分离出来，形成类似 Codex / Claude Code 的折叠过程面板。
+
+事件：
+
+- `tool_requested`
+- `tool_started`
+- `tool_succeeded`
+- `tool_failed`
+
+前端要求：
+
+- 默认折叠。
+- 灰度弱化。
+- 显示工具名、目标路径、结果摘要。
+- 失败时可展开查看错误。
+
+验收：
+
+- 创建、读取、修改、删除文件时，UI 中能看到真实工具事件。
+- assistant 最终回复不再伪造执行过程。
+
+#### Step 3 - Diff / Patch 底座
+
+目标是让代码修改可审阅，而不是只做整文件覆盖。
+
+工具：
+
+- `read_file`
+- `write_file`
+- `apply_patch`
+- `show_diff`
+
+约束：
+
+- `apply_patch` 第一版只支持单文件文本 patch。
+- patch 应返回 before/after 摘要。
+- 后续进入审阅面板和可撤销机制。
+
+验收：
+
+- 用户要求修改某个源码文件时，Agent 能先读文件，再生成 patch，再应用 patch。
+- UI 能展示文件 diff。
+
+#### Step 4 - 命令执行与测试闭环
+
+目标是让 Agent 能自主运行低风险测试和检查命令。
+
+工具：
+
+- `run_command`
+
+约束：
+
+- cwd 固定为 conversation workspace。
+- 第一版只允许低风险命令，例如 `npm test`、`npm run build`、`cargo test`、`cargo check`、`git status`、`dir`。
+- 超时默认 120 秒。
+- 输出截断并保留完整日志摘要。
+- 高风险命令进入审批或拒绝。
+
+验收：
+
+- Agent 修改代码后可自行运行测试。
+- 测试失败时可读取错误并继续修复。
+- 测试通过后才能声明完成。
+
+#### Step 5 - Permission Manager 与 Sandbox 深化
+
+目标是让工具能力从“能执行”升级为“可控地执行”。
+
+能力：
+
+- Restricted / Ask Every Time / Workspace Auto / Full Access。
+- 越界路径审批。
+- 高风险工具审批。
+- Activity Event 持久化。
+- `.mdgaignore` 或 `.gitignore` 读取策略。
+
+验收：
+
+- Workspace Auto 下，workspace 内读写自动执行。
+- 越界请求触发确认或拒绝。
+- Full Access 下仍有明显状态提示和审计日志。
+
+### 10.2 当前下一轮开发目标
+
+下一轮最小可交付版本建议为 `0.0.9`：
+
+> 在 `0.0.8 create_file` 的基础上，补齐 `list_dir`、`read_file`、`write_file`、`delete_file` 四个 Built-in File Tools，并接入 DeepSeek Tool Calls，使用户能让 DeepSeek 自主读取、修改、删除 workspace 内的文本文件。
+
+开发原则：
+
+- 继续 TDD：每个工具先写红测，再实现。
+- 不引入 MCP / Skills，先补 Built-in Tools。
+- 不实现 `run_command`，避免风险面过早扩大。
+- 不做复杂 UI，先保证真实本地行为跑通。
+- 完成源码变更并经 dev 验证后，必须更新 history、推送 main、推送三段式 release tag。
