@@ -16,3 +16,4 @@
 | 0.0.4 | 增加当前会话累计 token 与估算费用展示，历史会话加载后可基于已保存 usage 自动聚合<br>统一单次回复与会话累计费用格式，便于用户观察消耗水平并与账单对照<br>补充前端测试覆盖持久化 usage 聚合展示 | Codex |
 | 0.0.5 | 增加当前工作区绑定：用户可输入本地目录路径并保存为 Agent 授权工作区<br>工作区信息写入 SQLite，应用重启后可恢复显示<br>后端保存前校验路径存在且为目录，为后续权限与文件任务边界打基础 | Codex |
 | 0.0.6 | 重构工作区绑定为新对话 session 级选择：首屏通过系统目录选择器选择工作区，普通对话正文不再显示路径输入表单<br>conversation 表新增 workspace snapshot 与 mode 字段，发送首条消息时将所选目录绑定到整轮会话<br>接入 Tauri dialog 插件与权限配置，新增前端测试、storage 测试并通过全量 Rust / 前端验证 | Codex |
+| 0.0.7 | 打通 workspace 认知闭环：发送消息时前端传入 conversationId，后端从 SQLite 读取该会话 workspace snapshot<br>调用 DeepSeek 前自动注入 system workspace context，使模型能够回答当前会话绑定的工作区路径<br>补充单会话 workspace 查询、system message 注入与前端发送参数测试 | Codex |

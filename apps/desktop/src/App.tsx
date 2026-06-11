@@ -278,7 +278,7 @@ export function App() {
     });
 
     try {
-      await invoke("send_message", { messages: outgoing, model });
+      await invoke("send_message", { conversationId: finalConvId, messages: outgoing, model });
     } catch (err) {
       setMessages((prev) => {
         const updated = [...prev];

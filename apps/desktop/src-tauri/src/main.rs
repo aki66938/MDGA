@@ -2,7 +2,7 @@ use mdga_deepseek_client::{chat_stream, detect_api_key_status, ChatMessage};
 use mdga_shared::ApiKeyStatus;
 use mdga_storage::{
     clear_active_workspace, create_conversation, delete_conversation, get_active_workspace,
-    create_conversation_with_workspace, get_messages, init_db, list_conversations,
+    create_conversation_with_workspace, get_conversation, get_messages, init_db, list_conversations,
     save_active_workspace, save_message, update_title, Conversation, StoredMessage, Workspace,
 };
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
@@ -30,11 +30,24 @@ fn get_deepseek_api_key_status() -> ApiKeyStatus {
 #[tauri::command]
 async fn send_message(
     app: AppHandle,
+    state: State<'_, AppState>,
+    conversation_id: String,
     messages: Vec<ChatMessage>,
     model: String,
 ) -> Result<(), String> {
     let api_key = std::env::var("DEEPSEEK_API_KEY")
         .map_err(|_| "DEEPSEEK_API_KEY 未配置".to_string())?;
+    let conversation = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        get_conversation(&db, &conversation_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "会话不存在".to_string())?
+    };
+    let messages = messages_with_workspace_context(
+        messages,
+        conversation.workspace_path.as_deref(),
+        conversation.workspace_name.as_deref(),
+    );
 
     let raw_usage = chat_stream(
         &api_key,
@@ -248,6 +261,56 @@ fn workspace_name_from_path(path: &str) -> String {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(path)
         .to_string()
+}
+
+fn messages_with_workspace_context(
+    messages: Vec<ChatMessage>,
+    workspace_path: Option<&str>,
+    workspace_name: Option<&str>,
+) -> Vec<ChatMessage> {
+    // 把后端可信的 session 工作区快照注入模型上下文，使 DeepSeek 能回答当前工作区问题。
+    let Some(path) = workspace_path.filter(|path| !path.trim().is_empty()) else {
+        return messages;
+    };
+    let name = workspace_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("未命名工作区");
+    let mut injected = Vec::with_capacity(messages.len() + 1);
+    injected.push(ChatMessage {
+        role: "system".to_string(),
+        content: format!(
+            "你正在 MDGA 桌面端中运行。本轮会话绑定的工作区名称是 {name}，工作区路径是 {path}。\
+除非用户明确授权越界，否则你应假定所有本地文件任务都发生在该工作区内。\
+当用户询问你当前所在的工作区或工作目录时，应直接回答这个路径；不要声称自己没有工作区。"
+        ),
+    });
+    injected.extend(messages);
+    injected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepends_workspace_context_to_deepseek_messages() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "你是否清楚现在所在的工作区路径是什么".to_string(),
+        }];
+
+        let injected = messages_with_workspace_context(
+            messages,
+            Some("C:\\Users\\AIT\\Desktop\\MDGA"),
+            Some("MDGA"),
+        );
+
+        assert_eq!(injected[0].role, "system");
+        assert!(injected[0].content.contains("C:\\Users\\AIT\\Desktop\\MDGA"));
+        assert!(injected[0].content.contains("MDGA"));
+        assert!(injected[0].content.contains("除非用户明确授权越界"));
+        assert_eq!(injected[1].role, "user");
+    }
 }
 
 // ── 入口 ──────────────────────────────────────────────────────────────────

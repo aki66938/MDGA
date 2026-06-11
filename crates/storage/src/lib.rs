@@ -188,6 +188,33 @@ pub fn list_conversations(conn: &Connection) -> SqlResult<Vec<Conversation>> {
     rows.collect()
 }
 
+/// 按 ID 查询单个会话。
+///
+/// 输入数据库连接和会话 ID；输出完整 Conversation 或 None，供发送链路读取 session 级工作区快照。
+pub fn get_conversation(conn: &Connection, conv_id: &str) -> SqlResult<Option<Conversation>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, workspace_path, workspace_name, mode, created_at, updated_at
+         FROM conversations
+         WHERE id = ?1
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query([conv_id])?;
+
+    if let Some(row) = rows.next()? {
+        Ok(Some(Conversation {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            workspace_path: row.get(2)?,
+            workspace_name: row.get(3)?,
+            mode: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
 /// 更新会话标题，同时刷新 updated_at。
 pub fn update_title(conn: &Connection, conv_id: &str, title: &str) -> SqlResult<()> {
     conn.execute(
@@ -368,6 +395,28 @@ mod tests {
         assert_eq!(conv.workspace_name.as_deref(), Some("MDGA"));
         assert_eq!(conv.mode, "local_workspace");
         assert_eq!(stored[0].workspace_path.as_deref(), Some("C:\\Users\\AIT\\Desktop\\MDGA"));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn gets_conversation_by_id_with_workspace_snapshot() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        let conv = create_conversation_with_workspace(
+            &conn,
+            Some("C:\\Users\\AIT\\Desktop\\MDGA"),
+            Some("MDGA"),
+        )
+        .expect("conversation should save workspace snapshot");
+        let stored = get_conversation(&conn, &conv.id)
+            .expect("query should succeed")
+            .expect("conversation should exist");
+
+        assert_eq!(stored.id, conv.id);
+        assert_eq!(stored.workspace_path.as_deref(), Some("C:\\Users\\AIT\\Desktop\\MDGA"));
+        assert_eq!(stored.workspace_name.as_deref(), Some("MDGA"));
 
         let _ = std::fs::remove_file(db_path);
     }

@@ -144,5 +144,9 @@ describe("desktop MVP shell", () => {
       "new_conversation_with_workspace",
       { workspacePath: "C:\\Users\\AIT\\Desktop\\MDGA" }
     ));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
+      "send_message",
+      expect.objectContaining({ conversationId: "conv-1" })
+    ));
   });
 });
