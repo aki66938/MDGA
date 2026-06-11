@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -19,6 +20,9 @@ import "./styles.css";
 type Conversation = {
   id: string;
   title: string;
+  workspacePath?: string | null;
+  workspaceName?: string | null;
+  mode: "chat_only" | "local_workspace";
   createdAt: number;
   updatedAt: number;
 };
@@ -50,13 +54,9 @@ type StoredMessage = {
   createdAt: number;
 };
 
-type WorkspaceBinding = {
-  id: string;
+type DraftWorkspace = {
   name: string;
   path: string;
-  createdAt: number;
-  updatedAt: number;
-  active: boolean;
 };
 
 type UpdateState =
@@ -77,8 +77,7 @@ export function App() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [model, setModel] = useState<DeepSeekModelId>(DEFAULT_DEEPSEEK_MODEL_ID);
-  const [workspace, setWorkspace] = useState<WorkspaceBinding | null>(null);
-  const [workspacePath, setWorkspacePath] = useState("");
+  const [draftWorkspace, setDraftWorkspace] = useState<DraftWorkspace | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -102,16 +101,6 @@ export function App() {
   // 启动时加载会话列表
   useEffect(() => {
     loadConversations();
-  }, []);
-
-  // 启动时加载当前授权工作区
-  useEffect(() => {
-    invoke<WorkspaceBinding | null>("get_workspace")
-      .then((loaded) => {
-        setWorkspace(loaded);
-        setWorkspacePath(loaded?.path ?? "");
-      })
-      .catch(() => setWorkspace(null));
   }, []);
 
   // activeConvId 切换时加载对应消息
@@ -160,17 +149,18 @@ export function App() {
 
   async function handleNewConversation() {
     if (sending) return;
-    const conv = await invoke<Conversation>("new_conversation").catch(() => null);
-    if (!conv) return;
-    setConversations((prev) => [conv, ...prev]);
-    setActiveConvId(conv.id);
+    setActiveConvId(null);
     setMessages([]);
     setInput("");
+    setDraftWorkspace(null);
+    setWorkspaceError(null);
   }
 
   async function handleSelectConversation(id: string) {
     if (id === activeConvId || sending) return;
     setActiveConvId(id);
+    setDraftWorkspace(null);
+    setWorkspaceError(null);
   }
 
   async function handleDeleteConversation(e: React.MouseEvent, id: string) {
@@ -183,28 +173,18 @@ export function App() {
     }
   }
 
-  async function handleSaveWorkspace() {
-    const path = workspacePath.trim();
-    if (!path) {
-      setWorkspaceError("请输入工作区路径");
-      return;
-    }
-
+  async function handleSelectWorkspace() {
     try {
-      const next = await invoke<WorkspaceBinding>("set_workspace_path", { path });
-      setWorkspace(next);
-      setWorkspacePath(next.path);
+      const selected = await open({ directory: true, multiple: false });
+      if (!selected || Array.isArray(selected)) return;
+      setDraftWorkspace({
+        path: selected,
+        name: basenameFromPath(selected),
+      });
       setWorkspaceError(null);
     } catch (err) {
       setWorkspaceError(String(err));
     }
-  }
-
-  async function handleClearWorkspace() {
-    await invoke("clear_workspace").catch(() => {});
-    setWorkspace(null);
-    setWorkspacePath("");
-    setWorkspaceError(null);
   }
 
   // ── 发送消息 ────────────────────────────────────────────────────────────
@@ -216,11 +196,17 @@ export function App() {
     // 没有活跃会话时自动创建
     let convId = activeConvId;
     if (!convId) {
-      const conv = await invoke<Conversation>("new_conversation").catch(() => null);
+      const conv = await invoke<Conversation>("new_conversation_with_workspace", {
+        workspacePath: draftWorkspace?.path ?? null,
+      }).catch((err) => {
+        setWorkspaceError(String(err));
+        return null;
+      });
       if (!conv) return;
       convId = conv.id;
       setConversations((prev) => [conv, ...prev]);
       setActiveConvId(conv.id);
+      setWorkspaceError(null);
     }
 
     // 持久化用户消息
@@ -323,6 +309,7 @@ export function App() {
   }
 
   const hasMessages = messages.length > 0;
+  const activeConversation = conversations.find((conv) => conv.id === activeConvId);
   const conversationUsage = aggregateUsage(messages);
 
   // ── UI ──────────────────────────────────────────────────────────────────
@@ -423,6 +410,11 @@ export function App() {
           <div className="status-strip" aria-label="MVP status">
             <span>{getApiKeyStatusLabel(apiKeyStatus)}</span>
             <span>{getPermissionModeLabel(permissionMode)}</span>
+            {activeConversation?.workspaceName && (
+              <span title={activeConversation.workspacePath ?? undefined}>
+                {activeConversation.workspaceName}
+              </span>
+            )}
             <select
               className="model-select"
               value={model}
@@ -439,37 +431,6 @@ export function App() {
             </select>
           </div>
         </header>
-
-        <section className="workspace-binding" aria-label="Workspace binding">
-          <div className="workspace-binding__current">
-            <span className="workspace-binding__label">当前工作区</span>
-            {workspace ? (
-              <>
-                <strong>{workspace.name}</strong>
-                <span title={workspace.path}>{workspace.path}</span>
-              </>
-            ) : (
-              <span>尚未绑定本地目录</span>
-            )}
-          </div>
-          <div className="workspace-binding__form">
-            <input
-              aria-label="工作区路径"
-              value={workspacePath}
-              onChange={(e) => setWorkspacePath(e.target.value)}
-              placeholder="输入本地目录路径，例如 C:\\Users\\AIT\\Desktop\\MDGA"
-            />
-            <button type="button" onClick={handleSaveWorkspace}>
-              绑定工作区
-            </button>
-            {workspace && (
-              <button type="button" className="workspace-binding__clear" onClick={handleClearWorkspace}>
-                清除
-              </button>
-            )}
-          </div>
-          {workspaceError && <p className="workspace-binding__error">{workspaceError}</p>}
-        </section>
 
         {hasMessages ? (
           <section className="message-list" aria-label="Conversation">
@@ -494,6 +455,20 @@ export function App() {
         ) : (
           <section className="hero-panel" aria-label="New conversation">
             <h2>我们应该在 MDGA 中做些什么？</h2>
+            <section className="workspace-picker" aria-label="New conversation workspace">
+              <button type="button" onClick={handleSelectWorkspace}>
+                选择工作区
+              </button>
+              {draftWorkspace ? (
+                <div className="workspace-picker__selected">
+                  <strong>{draftWorkspace.name}</strong>
+                  <span title={draftWorkspace.path}>{draftWorkspace.path}</span>
+                </div>
+              ) : (
+                <p>未绑定工作区，仅聊天模式</p>
+              )}
+              {workspaceError && <p className="workspace-picker__error">{workspaceError}</p>}
+            </section>
             <section className="mvp-grid" aria-label="MVP status cards">
               <article>
                 <h3>DeepSeek 连接</h3>
@@ -577,6 +552,13 @@ function formatUsd(cost: number): string {
   // 统一格式化美元费用，避免单次 usage 与会话累计展示出现差异。
   if (cost < 0.0001 && cost > 0) return "<$0.0001";
   return `$${cost.toFixed(6).replace(/\.?0+$/, "")}`;
+}
+
+function basenameFromPath(path: string): string {
+  // 从系统目录选择器返回的绝对路径中提取展示名，兼容 Windows 与 Unix 分隔符。
+  const normalized = path.replace(/[\\/]+$/, "");
+  const parts = normalized.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
 }
 
 function ConversationUsageSummary({ usage }: { usage: UsageSummary }) {

@@ -196,13 +196,13 @@ MVP 可先做基础 `canonicalize` 与 `starts_with` 检查；完整防逃逸逻
 
 第一阶段验收：
 
-- 新对话首屏存在 `选择工作区` 按钮。
-- 点击后打开系统目录选择器。
-- 选中目录后，新对话首屏显示 workspace basename。
-- 发送第一条消息后，conversation 绑定该 workspace。
+- 新对话首屏存在 `选择工作区` 按钮。✅ 已在 `0.0.6` 实现。
+- 点击后打开系统目录选择器。✅ 已在 `0.0.6` 通过 Tauri dialog 实现。
+- 选中目录后，新对话首屏显示 workspace basename。✅ 已在 `0.0.6` 实现。
+- 发送第一条消息后，conversation 绑定该 workspace。✅ 已在 `0.0.6` 通过 conversation workspace snapshot 实现。
 - 切换历史会话时能恢复该 conversation 的 workspace 信息。
-- 普通对话正文不显示工作区路径输入框。
-- 未选择工作区也可以开始纯聊天会话。
+- 普通对话正文不显示工作区路径输入框。✅ 已在 `0.0.6` 实现。
+- 未选择工作区也可以开始纯聊天会话。✅ 已在 `0.0.6` 以 `chat_only` mode 支持。
 
 第二阶段验收：
 
@@ -214,22 +214,22 @@ MVP 可先做基础 `canonicalize` 与 `starts_with` 检查；完整防逃逸逻
 
 ## 9. 对当前实现的修正方向
 
-当前 `0.0.5` 已实现：
+`0.0.5` 曾实现：
 
 - `workspaces` 表。
 - 手动输入路径绑定。
 - 后端校验路径存在且为目录。
 - UI 在普通页面显示当前工作区绑定表单。
 
-需要修正：
+`0.0.6` 已完成第一阶段修正：
 
 - 去掉普通对话正文里的路径输入绑定表单。
 - 引入系统目录选择器。
 - 把工作区从“全局 active workspace”改成“conversation 创建时绑定 workspace snapshot”。
-- 让历史会话恢复自身 workspace，而不是读取全局 active workspace。
+- 会话列表读取 conversation 自身的 workspace snapshot，不再依赖全局 active workspace 展示。
 
 当前实现保留价值：
 
-- storage 与 Tauri command 的路径校验思路可复用。
-- `Workspace` DTO 可作为后续 `ConversationWorkspace` 的基础。
-- 现有测试可改写为“新 session 选择目录后绑定 conversation”。
+- storage 与 Tauri command 的路径校验思路已复用到 `new_conversation_with_workspace`。
+- `Workspace` DTO 与全局 active workspace API 暂时保留为历史兼容代码，后续接入项目列表时再清理或迁移。
+- 测试已改写为“新 session 选择目录后绑定 conversation”。

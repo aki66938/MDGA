@@ -5,6 +5,7 @@ import { App } from "./App";
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
   listen: vi.fn(),
+  open: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -15,6 +16,10 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: mocks.listen
 }));
 
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: mocks.open
+}));
+
 describe("desktop MVP shell", () => {
   afterEach(() => {
     cleanup();
@@ -23,11 +28,11 @@ describe("desktop MVP shell", () => {
   beforeEach(() => {
     Element.prototype.scrollIntoView = vi.fn();
     mocks.listen.mockResolvedValue(() => undefined);
+    mocks.open.mockReset();
     mocks.invoke.mockImplementation((command: string) => {
       if (command === "get_deepseek_api_key_status") return Promise.resolve("Missing");
       if (command === "check_update") return Promise.resolve(null);
       if (command === "get_conversations") return Promise.resolve([]);
-      if (command === "get_workspace") return Promise.resolve(null);
       return Promise.resolve([]);
     });
   });
@@ -99,35 +104,45 @@ describe("desktop MVP shell", () => {
     });
   });
 
-  it("shows and saves the current workspace path", async () => {
+  it("selects a workspace on the new conversation screen and binds it to the created conversation", async () => {
+    mocks.open.mockResolvedValue("C:\\Users\\AIT\\Desktop\\MDGA");
     mocks.invoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "get_deepseek_api_key_status") return Promise.resolve("Configured");
       if (command === "check_update") return Promise.resolve(null);
       if (command === "get_conversations") return Promise.resolve([]);
-      if (command === "get_workspace") return Promise.resolve(null);
-      if (command === "set_workspace_path") {
+      if (command === "new_conversation_with_workspace") {
+        expect(args?.workspacePath).toBe("C:\\Users\\AIT\\Desktop\\MDGA");
         return Promise.resolve({
-          id: "workspace-1",
-          name: "MDGA",
-          path: args?.path,
+          id: "conv-1",
+          title: "新对话",
+          workspacePath: args?.workspacePath,
+          workspaceName: "MDGA",
+          mode: "local_workspace",
           createdAt: 1,
           updatedAt: 1,
-          active: true,
         });
       }
+      if (command === "persist_message") return Promise.resolve(undefined);
+      if (command === "rename_conversation") return Promise.resolve(undefined);
+      if (command === "send_message") return Promise.resolve(undefined);
       return Promise.resolve([]);
     });
 
     render(<App />);
 
-    const input = await screen.findByLabelText("工作区路径");
-    fireEvent.change(input, { target: { value: "C:\\Users\\AIT\\Desktop\\MDGA" } });
-    fireEvent.click(screen.getByRole("button", { name: "绑定工作区" }));
+    fireEvent.click(await screen.findByRole("button", { name: "选择工作区" }));
 
     await waitFor(() => {
-      const binding = screen.getByLabelText("Workspace binding");
-      expect(within(binding).getByText("MDGA")).toBeTruthy();
-      expect(within(binding).getByText("C:\\Users\\AIT\\Desktop\\MDGA")).toBeTruthy();
+      const selector = screen.getByLabelText("New conversation workspace");
+      expect(within(selector).getByText("MDGA")).toBeTruthy();
     });
+
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "帮我分析这个项目" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
+      "new_conversation_with_workspace",
+      { workspacePath: "C:\\Users\\AIT\\Desktop\\MDGA" }
+    ));
   });
 });

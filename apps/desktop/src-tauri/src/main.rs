@@ -2,8 +2,8 @@ use mdga_deepseek_client::{chat_stream, detect_api_key_status, ChatMessage};
 use mdga_shared::ApiKeyStatus;
 use mdga_storage::{
     clear_active_workspace, create_conversation, delete_conversation, get_active_workspace,
-    get_messages, init_db, list_conversations, save_active_workspace, save_message, update_title,
-    Conversation, StoredMessage, Workspace,
+    create_conversation_with_workspace, get_messages, init_db, list_conversations,
+    save_active_workspace, save_message, update_title, Conversation, StoredMessage, Workspace,
 };
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use std::sync::Mutex;
@@ -63,6 +63,35 @@ async fn send_message(
 fn new_conversation(state: State<AppState>) -> Result<Conversation, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     create_conversation(&db).map_err(|e| e.to_string())
+}
+
+/// 创建新会话，并将会话绑定到创建时选择的工作区快照。
+///
+/// 输入可选工作区路径；路径存在时校验目录并写入 conversation snapshot，未传路径时创建纯聊天会话。
+#[tauri::command]
+fn new_conversation_with_workspace(
+    state: State<AppState>,
+    workspace_path: Option<String>,
+) -> Result<Conversation, String> {
+    let workspace = match workspace_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(path) => {
+            let path_buf = std::path::PathBuf::from(path);
+            if !path_buf.is_dir() {
+                return Err("工作区路径不存在或不是目录".to_string());
+            }
+            let name = workspace_name_from_path(path);
+            Some((path.to_string(), name))
+        }
+        None => None,
+    };
+
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    create_conversation_with_workspace(
+        &db,
+        workspace.as_ref().map(|(path, _)| path.as_str()),
+        workspace.as_ref().map(|(_, name)| name.as_str()),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// 返回所有会话列表，按最近更新时间倒序。
@@ -212,10 +241,20 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
     app.restart();
 }
 
+fn workspace_name_from_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
 // ── 入口 ──────────────────────────────────────────────────────────────────
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
@@ -230,6 +269,7 @@ fn main() {
             get_deepseek_api_key_status,
             send_message,
             new_conversation,
+            new_conversation_with_workspace,
             get_conversations,
             load_messages,
             persist_message,

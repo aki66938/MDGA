@@ -12,6 +12,9 @@ use uuid::Uuid;
 pub struct Conversation {
     pub id: String,
     pub title: String,
+    pub workspace_path: Option<String>,
+    pub workspace_name: Option<String>,
+    pub mode: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -87,6 +90,9 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             ON workspaces (active, updated_at);
         ",
     )?;
+    add_column_if_missing(&conn, "conversations", "workspace_path", "TEXT")?;
+    add_column_if_missing(&conn, "conversations", "workspace_name", "TEXT")?;
+    add_column_if_missing(&conn, "conversations", "mode", "TEXT NOT NULL DEFAULT 'chat_only'")?;
     Ok(conn)
 }
 
@@ -100,21 +106,62 @@ pub fn now_ts() -> i64 {
         .as_secs() as i64
 }
 
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> SqlResult<()> {
+    // SQLite 不支持 ADD COLUMN IF NOT EXISTS，需先检查 schema，避免重复迁移失败。
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(());
+        }
+    }
+
+    conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
+    Ok(())
+}
+
 // ── Conversation CRUD ─────────────────────────────────────────────────────
 
 /// 创建新会话，初始标题为"新对话"。
 ///
 /// 输入数据库连接；插入一条 conversations 记录并返回完整结构体。
 pub fn create_conversation(conn: &Connection) -> SqlResult<Conversation> {
+    create_conversation_with_workspace(conn, None, None)
+}
+
+/// 创建新会话，并可绑定创建时选择的工作区快照。
+///
+/// 输入数据库连接、可选工作区路径和名称；输出完整 Conversation。路径存在时 mode 为
+/// `local_workspace`，否则为 `chat_only`，用于后续权限和 Agent cwd 判定。
+pub fn create_conversation_with_workspace(
+    conn: &Connection,
+    workspace_path: Option<&str>,
+    workspace_name: Option<&str>,
+) -> SqlResult<Conversation> {
     let id = Uuid::new_v4().to_string();
     let now = now_ts();
+    let mode = if workspace_path.is_some() {
+        "local_workspace"
+    } else {
+        "chat_only"
+    };
     conn.execute(
-        "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
-        params![id, "新对话", now],
+        "INSERT INTO conversations
+         (id, title, workspace_path, workspace_name, mode, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        params![id, "新对话", workspace_path, workspace_name, mode, now],
     )?;
     Ok(Conversation {
         id,
         title: "新对话".to_string(),
+        workspace_path: workspace_path.map(str::to_string),
+        workspace_name: workspace_name.map(str::to_string),
+        mode: mode.to_string(),
         created_at: now,
         updated_at: now,
     })
@@ -123,7 +170,7 @@ pub fn create_conversation(conn: &Connection) -> SqlResult<Conversation> {
 /// 查询所有会话，按最近更新时间倒序排列。
 pub fn list_conversations(conn: &Connection) -> SqlResult<Vec<Conversation>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, created_at, updated_at
+        "SELECT id, title, workspace_path, workspace_name, mode, created_at, updated_at
          FROM conversations
          ORDER BY updated_at DESC",
     )?;
@@ -131,8 +178,11 @@ pub fn list_conversations(conn: &Connection) -> SqlResult<Vec<Conversation>> {
         Ok(Conversation {
             id: row.get(0)?,
             title: row.get(1)?,
-            created_at: row.get(2)?,
-            updated_at: row.get(3)?,
+            workspace_path: row.get(2)?,
+            workspace_name: row.get(3)?,
+            mode: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
         })
     })?;
     rows.collect()
@@ -297,6 +347,27 @@ mod tests {
 
         clear_active_workspace(&conn).expect("workspace should clear");
         assert!(get_active_workspace(&conn).expect("query should succeed").is_none());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn creates_conversation_with_workspace_snapshot() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        let conv = create_conversation_with_workspace(
+            &conn,
+            Some("C:\\Users\\AIT\\Desktop\\MDGA"),
+            Some("MDGA"),
+        )
+        .expect("conversation should save workspace snapshot");
+        let stored = list_conversations(&conn).expect("conversation should list");
+
+        assert_eq!(conv.workspace_path.as_deref(), Some("C:\\Users\\AIT\\Desktop\\MDGA"));
+        assert_eq!(conv.workspace_name.as_deref(), Some("MDGA"));
+        assert_eq!(conv.mode, "local_workspace");
+        assert_eq!(stored[0].workspace_path.as_deref(), Some("C:\\Users\\AIT\\Desktop\\MDGA"));
 
         let _ = std::fs::remove_file(db_path);
     }

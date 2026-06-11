@@ -449,7 +449,7 @@ MVP 推荐首个 Agent 场景：
 
 > 注：当前 assistant 单次 usage 已随消息写入 SQLite；前端在加载历史消息后基于 `usageJson` 聚合当前会话累计 token 与估算费用。token 统计行已从 assistant 气泡中独立，作为页面级弱化文字显示在回复内容下方。
 
-### Phase 5 - Project / Workspace MVP 🚧 设计修正中（session 级工作区绑定）
+### Phase 5 - Project / Workspace MVP 🚧 第一阶段已实现（session 级工作区绑定）
 
 目标：
 
@@ -461,12 +461,16 @@ MVP 推荐首个 Agent 场景：
 验收：
 
 - 用户可以选择项目目录。
-- 用户可以手动输入本地目录路径并绑定为当前活动工作区。✅
-- 应用重启后可以从 SQLite 读取当前活动工作区。✅
+- 新对话首屏可以通过系统目录选择器选择工作区。✅
+- 发送首条消息时，conversation 会保存创建时的 workspace snapshot。✅
+- 未选择工作区时可以创建 `chat_only` 纯聊天会话。✅
+- 普通对话正文不再显示工作区路径输入表单。✅
+- 用户可以手动输入本地目录路径并绑定为当前活动工作区。⚠️ `0.0.5` 技术切片，已被 session 级选择取代。
+- 应用重启后可以从 SQLite 读取当前活动工作区。⚠️ `0.0.5` 技术切片，后续应迁移为最近项目 / 最近工作区。
 - 新对话可以绑定项目。
 - 工作区不可访问时给出降级提示。
 
-> 修正：工作区选择应发生在新对话 / 新 session 首屏，通过系统目录选择器完成；普通对话正文不应显示工作区绑定表单。单次选择后，整轮对话默认局限于该工作区内。当前 `0.0.5` 的全局 active workspace 与手动路径输入仅作为 storage / 校验技术切片，后续需按 `Spec01-Workspace-Session-Binding.md` 重构为 conversation 级 workspace snapshot。
+> 修正：工作区选择应发生在新对话 / 新 session 首屏，通过系统目录选择器完成；普通对话正文不应显示工作区绑定表单。单次选择后，整轮对话默认局限于该工作区内。`0.0.6` 已完成第一阶段：conversation 级 workspace snapshot、Tauri 系统目录选择器、首屏选择 UI 与基础测试。下一步需要将 Agent 文件工具和命令执行默认 cwd 接到该 conversation workspace，并实现越界审批。
 
 ### Phase 6 - Permission Manager MVP
 
