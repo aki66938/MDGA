@@ -13,6 +13,7 @@
   "dependencies": {
     "@mdga/ui": "0.1.0",
     "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1"
   }

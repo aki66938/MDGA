@@ -13,16 +13,41 @@ pub struct PricingSnapshot {
     pub output_per_1m: f64,
 }
 
-/// 当前内置的 DeepSeek V3 价格快照（2025-06 版）。
+/// 当前内置的 DeepSeek V4 Flash 价格快照（2026-06 版）。
 ///
 /// 来源：https://api-docs.deepseek.com/quick_start/pricing
 /// 价格单位：美元 / 百万 token。
-pub fn deepseek_v3_pricing() -> PricingSnapshot {
+pub fn deepseek_v4_flash_pricing() -> PricingSnapshot {
     PricingSnapshot {
-        version: "deepseek-v3-2025-06".to_string(),
-        input_cache_hit_per_1m: 0.0014,
+        version: "deepseek-v4-flash-2026-06".to_string(),
+        input_cache_hit_per_1m: 0.0028,
         input_cache_miss_per_1m: 0.14,
         output_per_1m: 0.28,
+    }
+}
+
+/// 当前内置的 DeepSeek V4 Pro 价格快照（2026-06 版）。
+///
+/// 输入为空，输出 V4 Pro 的价格快照；本方法不联网更新价格，价格更新需新增版本。
+pub fn deepseek_v4_pro_pricing() -> PricingSnapshot {
+    PricingSnapshot {
+        version: "deepseek-v4-pro-2026-06".to_string(),
+        input_cache_hit_per_1m: 0.003625,
+        input_cache_miss_per_1m: 0.435,
+        output_per_1m: 0.87,
+    }
+}
+
+/// 根据 DeepSeek 模型 ID 选择对应价格快照。
+///
+/// 输入模型 ID，输出当前内置价格快照；废弃兼容别名按官方说明映射到 V4 Flash。
+pub fn deepseek_pricing_for_model(model: &str) -> PricingSnapshot {
+    match model {
+        "deepseek-v4-pro" => deepseek_v4_pro_pricing(),
+        "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner" => {
+            deepseek_v4_flash_pricing()
+        }
+        _ => deepseek_v4_flash_pricing(),
     }
 }
 

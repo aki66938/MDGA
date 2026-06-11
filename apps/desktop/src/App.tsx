@@ -4,9 +4,12 @@ import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  DEEPSEEK_MODELS,
+  DEFAULT_DEEPSEEK_MODEL_ID,
   getApiKeyStatusLabel,
   getPermissionModeLabel,
   type ApiKeyStatus,
+  type DeepSeekModelId,
   type PermissionMode,
 } from "@mdga/ui";
 import "./styles.css";
@@ -64,6 +67,7 @@ export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [model, setModel] = useState<DeepSeekModelId>(DEFAULT_DEEPSEEK_MODEL_ID);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // 流式积累的 assistant 内容，用于 chat-done 时持久化
@@ -242,7 +246,7 @@ export function App() {
     });
 
     try {
-      await invoke("send_message", { messages: outgoing });
+      await invoke("send_message", { messages: outgoing, model });
     } catch (err) {
       setMessages((prev) => {
         const updated = [...prev];
@@ -372,6 +376,20 @@ export function App() {
           <div className="status-strip" aria-label="MVP status">
             <span>{getApiKeyStatusLabel(apiKeyStatus)}</span>
             <span>{getPermissionModeLabel(permissionMode)}</span>
+            <select
+              className="model-select"
+              value={model}
+              onChange={(e) => setModel(e.target.value as DeepSeekModelId)}
+              disabled={sending}
+              aria-label="模型选择"
+              title={DEEPSEEK_MODELS.find((item) => item.id === model)?.description}
+            >
+              {DEEPSEEK_MODELS.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
           </div>
         </header>
 

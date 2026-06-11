@@ -134,6 +134,27 @@ h1 {
   font-size: 13px;
 }
 
+.model-select {
+  border: 1px solid #d8dadd;
+  border-radius: 999px;
+  background: #ffffff;
+  padding: 7px 11px;
+  color: #4f5661;
+  font-size: 13px;
+  cursor: pointer;
+  outline: none;
+  appearance: none;
+  padding-right: 24px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23747982' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+
+.model-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* ── 空状态 ── */
 
 .hero-panel {

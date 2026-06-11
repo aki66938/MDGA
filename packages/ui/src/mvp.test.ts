@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   calculateEstimatedCost,
+  DEEPSEEK_MODELS,
+  DEFAULT_DEEPSEEK_MODEL_ID,
   formatActivitySummary,
   getApiKeyStatusLabel,
+  getDeepSeekModelById,
   getPermissionModeLabel
 } from "./index";
 
@@ -39,5 +42,18 @@ describe("MVP protocol helpers", () => {
     });
 
     expect(cost).toBeCloseTo(1.1228);
+  });
+
+  it("uses the current DeepSeek V4 model catalog and excludes deprecated aliases", () => {
+    const modelIds: string[] = DEEPSEEK_MODELS.map((model) => model.id);
+
+    expect(DEFAULT_DEEPSEEK_MODEL_ID).toBe("deepseek-v4-flash");
+    expect(modelIds).toEqual([
+      "deepseek-v4-flash",
+      "deepseek-v4-pro"
+    ]);
+    expect(modelIds.includes("deepseek-chat")).toBe(false);
+    expect(modelIds.includes("deepseek-reasoner")).toBe(false);
+    expect(getDeepSeekModelById("deepseek-v4-pro")?.label).toBe("DeepSeek V4 Pro");
   });
 });

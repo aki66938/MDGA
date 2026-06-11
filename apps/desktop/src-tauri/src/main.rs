@@ -4,7 +4,7 @@ use mdga_storage::{
     create_conversation, delete_conversation, get_messages, init_db, list_conversations,
     save_message, update_title, Conversation, StoredMessage,
 };
-use mdga_token_accounting::{compute_cost_summary, deepseek_v3_pricing};
+use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
@@ -27,14 +27,18 @@ fn get_deepseek_api_key_status() -> ApiKeyStatus {
 /// 通过 "chat-chunk" 事件逐块推送内容；流结束后发送 "chat-usage" 事件；
 /// 最后发送 "chat-done"。错误时返回字符串供前端展示。
 #[tauri::command]
-async fn send_message(app: AppHandle, messages: Vec<ChatMessage>) -> Result<(), String> {
+async fn send_message(
+    app: AppHandle,
+    messages: Vec<ChatMessage>,
+    model: String,
+) -> Result<(), String> {
     let api_key = std::env::var("DEEPSEEK_API_KEY")
         .map_err(|_| "DEEPSEEK_API_KEY 未配置".to_string())?;
 
     let raw_usage = chat_stream(
         &api_key,
         messages,
-        "deepseek-chat",
+        &model,
         |chunk| {
             let _ = app.emit("chat-chunk", chunk);
         },
@@ -43,7 +47,7 @@ async fn send_message(app: AppHandle, messages: Vec<ChatMessage>) -> Result<(), 
     .map_err(|e| e.to_string())?;
 
     if let Some(raw) = raw_usage {
-        let summary = compute_cost_summary(&raw, &deepseek_v3_pricing());
+        let summary = compute_cost_summary(&raw, &deepseek_pricing_for_model(&model));
         let _ = app.emit("chat-usage", summary);
     }
 

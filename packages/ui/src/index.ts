@@ -5,6 +5,29 @@ export type ApiKeyStatus =
 
 export type PermissionMode = "restricted" | "ask_every_time" | "workspace_auto" | "full_access";
 
+export type DeepSeekModelId = "deepseek-v4-flash" | "deepseek-v4-pro";
+
+export type DeepSeekModelOption = {
+  id: DeepSeekModelId;
+  label: string;
+  description: string;
+};
+
+export const DEFAULT_DEEPSEEK_MODEL_ID: DeepSeekModelId = "deepseek-v4-flash";
+
+export const DEEPSEEK_MODELS: DeepSeekModelOption[] = [
+  {
+    id: "deepseek-v4-flash",
+    label: "DeepSeek V4 Flash",
+    description: "默认模型，适合日常聊天、文档处理和低成本任务"
+  },
+  {
+    id: "deepseek-v4-pro",
+    label: "DeepSeek V4 Pro",
+    description: "更强模型，适合复杂推理、长任务和 Agent 场景"
+  }
+];
+
 export type ActivitySummaryInput = {
   type: "command.completed" | "file.changed" | "tool.completed";
   count: number;
@@ -45,6 +68,10 @@ export function getPermissionModeLabel(mode: PermissionMode): string {
     case "full_access":
       return "完全访问";
   }
+}
+
+export function getDeepSeekModelById(id: string): DeepSeekModelOption | undefined {
+  return DEEPSEEK_MODELS.find((model) => model.id === id);
 }
 
 export function formatActivitySummary(input: ActivitySummaryInput): string {
