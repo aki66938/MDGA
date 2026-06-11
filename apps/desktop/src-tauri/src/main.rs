@@ -1,4 +1,4 @@
-use mdga_deepseek_client::{chat_stream, detect_api_key_status, ChatMessage};
+use mdga_deepseek_client::{chat_completion, chat_stream, detect_api_key_status, ChatMessage};
 use mdga_shared::ApiKeyStatus;
 use mdga_storage::{
     clear_active_workspace, create_conversation, delete_conversation, get_active_workspace,
@@ -6,6 +6,7 @@ use mdga_storage::{
     save_active_workspace, save_message, update_title, Conversation, StoredMessage, Workspace,
 };
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
+use mdga_tool_runtime::{create_file, CreateFileRequest};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
@@ -49,16 +50,15 @@ async fn send_message(
         conversation.workspace_name.as_deref(),
     );
 
-    let raw_usage = chat_stream(
-        &api_key,
-        messages,
-        &model,
-        |chunk| {
+    let raw_usage = if let Some(workspace_path) = conversation.workspace_path.as_deref() {
+        chat_with_builtin_tools(&api_key, messages, &model, workspace_path, &app).await?
+    } else {
+        chat_stream(&api_key, messages, &model, |chunk| {
             let _ = app.emit("chat-chunk", chunk);
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    };
 
     if let Some(raw) = raw_usage {
         let summary = compute_cost_summary(&raw, &deepseek_pricing_for_model(&model));
@@ -281,11 +281,132 @@ fn messages_with_workspace_context(
         content: format!(
             "你正在 MDGA 桌面端中运行。本轮会话绑定的工作区名称是 {name}，工作区路径是 {path}。\
 除非用户明确授权越界，否则你应假定所有本地文件任务都发生在该工作区内。\
-当用户询问你当前所在的工作区或工作目录时，应直接回答这个路径；不要声称自己没有工作区。"
+当用户询问你当前所在的工作区或工作目录时，应直接回答这个路径；不要声称自己没有工作区。\
+当用户要求创建文件时，必须调用 create_file 工具完成真实本地写入；不要只给出代码示例，\
+也不要在没有工具结果时声称文件已创建。"
         ),
     });
     injected.extend(messages);
     injected
+}
+
+async fn chat_with_builtin_tools(
+    api_key: &str,
+    messages: Vec<ChatMessage>,
+    model: &str,
+    workspace_path: &str,
+    app: &AppHandle,
+) -> Result<Option<mdga_shared::RawUsage>, String> {
+    let mut wire_messages = chat_messages_to_wire(messages);
+    let first = chat_completion(
+        api_key,
+        wire_messages.clone(),
+        model,
+        Some(vec![create_file_tool_schema()]),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut usage = first.usage;
+
+    if first.tool_calls.is_empty() {
+        if let Some(content) = first.content {
+            let _ = app.emit("chat-chunk", content);
+        }
+        return Ok(usage);
+    }
+
+    wire_messages.push(first.assistant_message);
+    for call in first.tool_calls {
+        let result = match call.function.name.as_str() {
+            "create_file" => execute_create_file_tool_call(workspace_path, &call.function.arguments),
+            other => Err(format!("未知工具: {other}")),
+        };
+        let output = match result {
+            Ok(value) => serde_json::json!({ "ok": true, "result": value }),
+            Err(message) => serde_json::json!({ "ok": false, "error": message }),
+        };
+        let _ = app.emit("tool-event", output.clone());
+        wire_messages.push(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": output.to_string()
+        }));
+    }
+
+    let final_result = chat_completion(api_key, wire_messages, model, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(content) = final_result.content {
+        let _ = app.emit("chat-chunk", content);
+    }
+    usage = merge_usage(usage, final_result.usage);
+    Ok(usage)
+}
+
+fn chat_messages_to_wire(messages: Vec<ChatMessage>) -> Vec<serde_json::Value> {
+    messages
+        .into_iter()
+        .map(|message| {
+            serde_json::json!({
+                "role": message.role,
+                "content": message.content,
+            })
+        })
+        .collect()
+}
+
+fn create_file_tool_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "create_file",
+            "description": "Create a text file inside the current MDGA conversation workspace. Use this when the user asks to create a file. The path must be relative to the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative file path inside the current workspace, for example test.txt or docs/note.md."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Text content to write. Use an empty string when the user asks for an empty file."
+                    }
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn execute_create_file_tool_call(
+    workspace_path: &str,
+    arguments: &str,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::from_str::<CreateFileRequest>(arguments)
+        .map_err(|err| format!("工具参数解析失败: {err}"))?;
+    let result = create_file(workspace_path, request).map_err(|err| err.to_string())?;
+    serde_json::to_value(result).map_err(|err| err.to_string())
+}
+
+fn merge_usage(
+    first: Option<mdga_shared::RawUsage>,
+    second: Option<mdga_shared::RawUsage>,
+) -> Option<mdga_shared::RawUsage> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(usage), None) | (None, Some(usage)) => Some(usage),
+        (Some(a), Some(b)) => Some(mdga_shared::RawUsage {
+            prompt_tokens: a.prompt_tokens + b.prompt_tokens,
+            completion_tokens: a.completion_tokens + b.completion_tokens,
+            total_tokens: a.total_tokens + b.total_tokens,
+            prompt_cache_hit_tokens: a.prompt_cache_hit_tokens + b.prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens: a.prompt_cache_miss_tokens + b.prompt_cache_miss_tokens,
+            reasoning_tokens: a.reasoning_tokens + b.reasoning_tokens,
+            raw_json: serde_json::json!([a.raw_json, b.raw_json]).to_string(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -309,7 +430,31 @@ mod tests {
         assert!(injected[0].content.contains("C:\\Users\\AIT\\Desktop\\MDGA"));
         assert!(injected[0].content.contains("MDGA"));
         assert!(injected[0].content.contains("除非用户明确授权越界"));
+        assert!(injected[0].content.contains("必须调用 create_file 工具"));
         assert_eq!(injected[1].role, "user");
+    }
+
+    #[test]
+    fn executes_create_file_tool_call_inside_workspace() {
+        let workspace = std::env::temp_dir().join(format!(
+            "mdga-desktop-tool-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should be available")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+        let output = execute_create_file_tool_call(
+            workspace.to_str().expect("workspace should be utf8"),
+            r#"{"path":"test.txt","content":""}"#,
+        )
+        .expect("tool call should execute");
+
+        assert_eq!(output["relativePath"], "test.txt");
+        assert!(workspace.join("test.txt").is_file());
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }
 

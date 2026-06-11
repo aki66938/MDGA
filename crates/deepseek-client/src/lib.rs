@@ -30,6 +30,28 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ToolFunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolFunctionCall,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatCompletionResult {
+    pub content: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub assistant_message: serde_json::Value,
+    pub usage: Option<RawUsage>,
+}
+
 /// 检测当前进程是否能读取 DeepSeek API Key。
 ///
 /// 输入环境变量读取闭包，输出脱敏后的 API Key 状态；
@@ -151,6 +173,45 @@ where
     Ok(captured_usage)
 }
 
+/// 向 DeepSeek API 发起一次非流式聊天请求，可携带 tool schema。
+///
+/// 输入 API Key、消息 JSON、模型名和可选工具列表；输出 assistant 内容、tool calls 和 usage。
+/// 本方法不执行工具，只负责解析模型意图。
+pub async fn chat_completion(
+    api_key: &str,
+    messages: Vec<serde_json::Value>,
+    model: &str,
+    tools: Option<Vec<serde_json::Value>>,
+) -> Result<ChatCompletionResult, DeepSeekError> {
+    let client = Client::new();
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": false
+    });
+
+    if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
+        body["tools"] = serde_json::Value::Array(tools);
+        body["tool_choice"] = serde_json::json!("auto");
+    }
+
+    let response = client
+        .post("https://api.deepseek.com/chat/completions")
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(classify_api_error(status, &body));
+    }
+
+    let value = response.json::<serde_json::Value>().await?;
+    parse_chat_completion_response(&value)
+}
+
 /// 将服务端 usage JSON 解析为 RawUsage。
 ///
 /// 输入 usage 字段的 serde_json::Value 和原始 JSON 字符串，输出标准化结构；
@@ -176,5 +237,76 @@ fn parse_raw_usage(usage: &serde_json::Value, raw_data: &str) -> RawUsage {
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
         raw_json: raw_data.to_string(),
+    }
+}
+
+fn parse_chat_completion_response(
+    value: &serde_json::Value,
+) -> Result<ChatCompletionResult, DeepSeekError> {
+    let assistant_message = value
+        .pointer("/choices/0/message")
+        .cloned()
+        .ok_or_else(|| DeepSeekError::BadRequest("响应缺少 choices[0].message".to_string()))?;
+    let content = assistant_message
+        .get("content")
+        .and_then(|content| content.as_str())
+        .map(str::to_string);
+    let tool_calls = assistant_message
+        .get("tool_calls")
+        .cloned()
+        .map(serde_json::from_value::<Vec<ToolCall>>)
+        .transpose()
+        .map_err(|err| DeepSeekError::BadRequest(err.to_string()))?
+        .unwrap_or_default();
+    let usage = value
+        .get("usage")
+        .filter(|usage| !usage.is_null())
+        .map(|usage| parse_raw_usage(usage, &value.to_string()));
+
+    Ok(ChatCompletionResult {
+        content,
+        tool_calls,
+        assistant_message,
+        usage,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_tool_call_completion_response() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "create_file",
+                            "arguments": "{\"path\":\"test.txt\",\"content\":\"\"}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_cache_hit_tokens": 0,
+                "prompt_cache_miss_tokens": 10
+            }
+        });
+
+        let parsed = parse_chat_completion_response(&raw).expect("response should parse");
+
+        assert_eq!(parsed.content, None);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_1");
+        assert_eq!(parsed.tool_calls[0].function.name, "create_file");
+        assert_eq!(parsed.usage.expect("usage should parse").total_tokens, 15);
     }
 }

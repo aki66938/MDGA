@@ -337,7 +337,7 @@ activity_events
 
 ## 8. 开发阶段
 
-### Phase 1 - Built-in File Tools MVP
+### Phase 1 - Built-in File Tools MVP ✅ 首个工具闭环已实现
 
 目标：
 
@@ -345,16 +345,16 @@ activity_events
 
 任务：
 
-- 新增 `crates/tool-runtime` 文件工具实现。
+- 新增 `crates/tool-runtime` 文件工具实现。✅ `0.0.8` 已实现 `create_file`。
 - 新增 workspace path guard。
-- 后端 `send_message` 支持 DeepSeek tool calls。
+- 后端 `send_message` 支持 DeepSeek tool calls。✅ `0.0.8` 已接入非流式 tool-call 决策与结果回传。
 - 前端显示基础工具事件。
-- 测试覆盖 workspace 内创建、越界拒绝、工具结果回传。
+- 测试覆盖 workspace 内创建、越界拒绝、工具结果回传。✅ 已覆盖 create_file、绝对路径拒绝、`..` 越界拒绝和桌面后端桥接。
 
 验收：
 
-- 用户请求“在当前工作区创建 test.txt”后，本地确实出现文件。
-- 如果模型请求 `../test.txt`，后端拒绝。
+- 用户请求“在当前工作区创建 test.txt”后，本地确实出现文件。✅ 后端工具闭环已具备，待 dev 版真实 API 手测。
+- 如果模型请求 `../test.txt`，后端拒绝。✅
 - UI 显示真实执行结果。
 
 ### Phase 2 - Read / Write / List 完整文件工具
@@ -474,4 +474,3 @@ Plan11 是当前 MVP 下一步的核心计划。没有 Plan11，workspace 只能
 第一版成功标准：
 
 > 用户在绑定 `C:\Users\AIT\Desktop\MDGA` 的会话中要求创建 `test.txt`，MDGA 后端真实创建 `C:\Users\AIT\Desktop\MDGA\test.txt`，前端显示工具执行成功，assistant 基于工具结果回复。
-
