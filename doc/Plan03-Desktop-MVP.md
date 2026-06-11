@@ -432,7 +432,7 @@ MVP 推荐首个 Agent 场景：
 - 用户可以创建、切换、重命名会话。✅（新建、切换、删除已实现；手动重命名待 UI 补充）
 - 会话可以无项目存在。✅
 
-### Phase 4 - Token Accounting MVP ✅ 已实现（展示层）
+### Phase 4 - Token Accounting MVP ✅ 已实现（持久化展示层）
 
 目标：
 
@@ -445,8 +445,9 @@ MVP 推荐首个 Agent 场景：
 - 完成一次聊天后可以看到 token usage。✅
 - 如果返回 cache hit / miss，可以分别展示。✅
 - 如果 usage 缺失，明确标注估算或未知。✅
+- 当前会话可基于 SQLite 历史 usage 聚合显示累计 token 与费用。✅
 
-> 注：当前 usage 数据仅存于内存（React state），SQLite 持久化在 Phase 3 存储实现后接入。token 统计行已从 assistant 气泡中独立，作为页面级弱化文字显示在回复内容下方。
+> 注：当前 assistant 单次 usage 已随消息写入 SQLite；前端在加载历史消息后基于 `usageJson` 聚合当前会话累计 token 与估算费用。token 统计行已从 assistant 气泡中独立，作为页面级弱化文字显示在回复内容下方。
 
 ### Phase 5 - Project / Workspace MVP
 

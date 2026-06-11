@@ -355,6 +355,25 @@ h1 {
   font-variant-numeric: tabular-nums;
 }
 
+/* 会话级 token 汇总：贴近输入区，作为账本入口而不是主内容卡片 */
+.conversation-usage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  width: min(760px, 100%);
+  align-self: center;
+  margin-top: 8px;
+  color: #8b929c;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.conversation-usage__label {
+  color: #4f5661;
+  font-weight: 500;
+}
+
 /* ── 输入框：固定在底部，不参与滚动 ── */
 
 .composer {

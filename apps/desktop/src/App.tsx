@@ -277,6 +277,7 @@ export function App() {
   }
 
   const hasMessages = messages.length > 0;
+  const conversationUsage = aggregateUsage(messages);
 
   // ── UI ──────────────────────────────────────────────────────────────────
 
@@ -433,6 +434,10 @@ export function App() {
           </section>
         )}
 
+        {conversationUsage && (
+          <ConversationUsageSummary usage={conversationUsage} />
+        )}
+
         <div className="composer">
           <textarea
             aria-label="Message"
@@ -454,14 +459,81 @@ export function App() {
   );
 }
 
+function aggregateUsage(messages: Message[]): UsageSummary | null {
+  // 汇总当前会话中所有 assistant usage，输出给会话级账本展示。
+  const usages = messages
+    .map((message) => message.usage)
+    .filter((usage): usage is UsageSummary => Boolean(usage));
+
+  if (usages.length === 0) return null;
+
+  const pricingVersions = new Set(usages.map((usage) => usage.pricingVersion));
+  const usageSources = new Set(usages.map((usage) => usage.usageSource));
+
+  return usages.reduce<UsageSummary>(
+    (total, usage) => ({
+      promptTokens: total.promptTokens + usage.promptTokens,
+      completionTokens: total.completionTokens + usage.completionTokens,
+      totalTokens: total.totalTokens + usage.totalTokens,
+      cacheHitTokens: total.cacheHitTokens + usage.cacheHitTokens,
+      cacheMissTokens: total.cacheMissTokens + usage.cacheMissTokens,
+      reasoningTokens: total.reasoningTokens + usage.reasoningTokens,
+      estimatedCostUsd: total.estimatedCostUsd + usage.estimatedCostUsd,
+      usageSource: usageSources.size === 1 ? usage.usageSource : "mixed",
+      pricingVersion: pricingVersions.size === 1 ? usage.pricingVersion : "mixed",
+    }),
+    {
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      cacheHitTokens: 0,
+      cacheMissTokens: 0,
+      reasoningTokens: 0,
+      estimatedCostUsd: 0,
+      usageSource: "",
+      pricingVersion: "",
+    }
+  );
+}
+
+function formatUsd(cost: number): string {
+  // 统一格式化美元费用，避免单次 usage 与会话累计展示出现差异。
+  if (cost < 0.0001 && cost > 0) return "<$0.0001";
+  return `$${cost.toFixed(6).replace(/\.?0+$/, "")}`;
+}
+
+function ConversationUsageSummary({ usage }: { usage: UsageSummary }) {
+  // 展示当前会话累计 token 与估算费用，作为 MVP 账本入口。
+  return (
+    <div className="conversation-usage" aria-label="Conversation token summary">
+      <span className="conversation-usage__label">会话累计</span>
+      <span>{usage.totalTokens.toLocaleString()} tokens</span>
+      <span className="usage-sep">·</span>
+      <span>{usage.promptTokens.toLocaleString()} in</span>
+      <span className="usage-sep">/</span>
+      <span>{usage.completionTokens.toLocaleString()} out</span>
+      {usage.reasoningTokens > 0 && (
+        <>
+          <span className="usage-sep">·</span>
+          <span>{usage.reasoningTokens.toLocaleString()} reasoning</span>
+        </>
+      )}
+      {usage.cacheHitTokens > 0 && (
+        <>
+          <span className="usage-sep">·</span>
+          <span className="usage-cache">{usage.cacheHitTokens.toLocaleString()} cached</span>
+        </>
+      )}
+      <span className="usage-sep">·</span>
+      <span className="usage-cost">{formatUsd(usage.estimatedCostUsd)}</span>
+    </div>
+  );
+}
+
 // ── UsageBadge ────────────────────────────────────────────────────────────
 
 function UsageBadge({ usage }: { usage: UsageSummary }) {
-  const cost = usage.estimatedCostUsd;
-  const costStr =
-    cost < 0.0001 && cost > 0
-      ? "<$0.0001"
-      : `$${cost.toFixed(6).replace(/\.?0+$/, "")}`;
+  const costStr = formatUsd(usage.estimatedCostUsd);
   const isEstimate = usage.usageSource !== "deepseek_usage";
 
   return (
