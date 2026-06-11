@@ -1,8 +1,9 @@
 use mdga_deepseek_client::{chat_stream, detect_api_key_status, ChatMessage};
 use mdga_shared::ApiKeyStatus;
 use mdga_storage::{
-    create_conversation, delete_conversation, get_messages, init_db, list_conversations,
-    save_message, update_title, Conversation, StoredMessage,
+    clear_active_workspace, create_conversation, delete_conversation, get_active_workspace,
+    get_messages, init_db, list_conversations, save_active_workspace, save_message, update_title,
+    Conversation, StoredMessage, Workspace,
 };
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use std::sync::Mutex;
@@ -127,6 +128,45 @@ fn remove_conversation(
     delete_conversation(&db, &conversation_id).map_err(|e| e.to_string())
 }
 
+// ── 工作区管理 ─────────────────────────────────────────────────────────────
+
+/// 返回当前用户授权的活动工作区。
+///
+/// 输入应用状态；输出当前 Workspace 或 None，用于前端展示 Agent 可操作目录边界。
+#[tauri::command]
+fn get_workspace(state: State<AppState>) -> Result<Option<Workspace>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    get_active_workspace(&db).map_err(|e| e.to_string())
+}
+
+/// 保存当前用户授权的工作区路径。
+///
+/// 输入本地目录路径；后端校验路径存在且为目录，写入 SQLite 后返回 Workspace。
+#[tauri::command]
+fn set_workspace_path(state: State<AppState>, path: String) -> Result<Workspace, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("工作区路径不能为空".to_string());
+    }
+
+    let path_buf = std::path::PathBuf::from(trimmed);
+    if !path_buf.is_dir() {
+        return Err("工作区路径不存在或不是目录".to_string());
+    }
+
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    save_active_workspace(&db, trimmed).map_err(|e| e.to_string())
+}
+
+/// 清除当前工作区授权。
+///
+/// 输入应用状态；删除当前活动工作区记录，后续 Agent 文件能力应视为未授权。
+#[tauri::command]
+fn clear_workspace(state: State<AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    clear_active_workspace(&db).map_err(|e| e.to_string())
+}
+
 // ── 自动更新 ──────────────────────────────────────────────────────────────
 
 /// 检查 GitHub Releases 是否有新版本。
@@ -195,6 +235,9 @@ fn main() {
             persist_message,
             rename_conversation,
             remove_conversation,
+            get_workspace,
+            set_workspace_path,
+            clear_workspace,
             check_update,
             install_update,
         ])

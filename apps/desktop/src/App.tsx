@@ -50,6 +50,15 @@ type StoredMessage = {
   createdAt: number;
 };
 
+type WorkspaceBinding = {
+  id: string;
+  name: string;
+  path: string;
+  createdAt: number;
+  updatedAt: number;
+  active: boolean;
+};
+
 type UpdateState =
   | { status: "idle" }
   | { status: "available"; version: string }
@@ -68,6 +77,9 @@ export function App() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [model, setModel] = useState<DeepSeekModelId>(DEFAULT_DEEPSEEK_MODEL_ID);
+  const [workspace, setWorkspace] = useState<WorkspaceBinding | null>(null);
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // 流式积累的 assistant 内容，用于 chat-done 时持久化
@@ -90,6 +102,16 @@ export function App() {
   // 启动时加载会话列表
   useEffect(() => {
     loadConversations();
+  }, []);
+
+  // 启动时加载当前授权工作区
+  useEffect(() => {
+    invoke<WorkspaceBinding | null>("get_workspace")
+      .then((loaded) => {
+        setWorkspace(loaded);
+        setWorkspacePath(loaded?.path ?? "");
+      })
+      .catch(() => setWorkspace(null));
   }, []);
 
   // activeConvId 切换时加载对应消息
@@ -159,6 +181,30 @@ export function App() {
       setActiveConvId(null);
       setMessages([]);
     }
+  }
+
+  async function handleSaveWorkspace() {
+    const path = workspacePath.trim();
+    if (!path) {
+      setWorkspaceError("请输入工作区路径");
+      return;
+    }
+
+    try {
+      const next = await invoke<WorkspaceBinding>("set_workspace_path", { path });
+      setWorkspace(next);
+      setWorkspacePath(next.path);
+      setWorkspaceError(null);
+    } catch (err) {
+      setWorkspaceError(String(err));
+    }
+  }
+
+  async function handleClearWorkspace() {
+    await invoke("clear_workspace").catch(() => {});
+    setWorkspace(null);
+    setWorkspacePath("");
+    setWorkspaceError(null);
   }
 
   // ── 发送消息 ────────────────────────────────────────────────────────────
@@ -393,6 +439,37 @@ export function App() {
             </select>
           </div>
         </header>
+
+        <section className="workspace-binding" aria-label="Workspace binding">
+          <div className="workspace-binding__current">
+            <span className="workspace-binding__label">当前工作区</span>
+            {workspace ? (
+              <>
+                <strong>{workspace.name}</strong>
+                <span title={workspace.path}>{workspace.path}</span>
+              </>
+            ) : (
+              <span>尚未绑定本地目录</span>
+            )}
+          </div>
+          <div className="workspace-binding__form">
+            <input
+              aria-label="工作区路径"
+              value={workspacePath}
+              onChange={(e) => setWorkspacePath(e.target.value)}
+              placeholder="输入本地目录路径，例如 C:\\Users\\AIT\\Desktop\\MDGA"
+            />
+            <button type="button" onClick={handleSaveWorkspace}>
+              绑定工作区
+            </button>
+            {workspace && (
+              <button type="button" className="workspace-binding__clear" onClick={handleClearWorkspace}>
+                清除
+              </button>
+            )}
+          </div>
+          {workspaceError && <p className="workspace-binding__error">{workspaceError}</p>}
+        </section>
 
         {hasMessages ? (
           <section className="message-list" aria-label="Conversation">

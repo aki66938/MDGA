@@ -27,6 +27,7 @@ describe("desktop MVP shell", () => {
       if (command === "get_deepseek_api_key_status") return Promise.resolve("Missing");
       if (command === "check_update") return Promise.resolve(null);
       if (command === "get_conversations") return Promise.resolve([]);
+      if (command === "get_workspace") return Promise.resolve(null);
       return Promise.resolve([]);
     });
   });
@@ -95,6 +96,38 @@ describe("desktop MVP shell", () => {
       expect(within(summary).getByText("会话累计")).toBeTruthy();
       expect(within(summary).getByText("200 tokens")).toBeTruthy();
       expect(within(summary).getByText("$0.00012")).toBeTruthy();
+    });
+  });
+
+  it("shows and saves the current workspace path", async () => {
+    mocks.invoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "get_deepseek_api_key_status") return Promise.resolve("Configured");
+      if (command === "check_update") return Promise.resolve(null);
+      if (command === "get_conversations") return Promise.resolve([]);
+      if (command === "get_workspace") return Promise.resolve(null);
+      if (command === "set_workspace_path") {
+        return Promise.resolve({
+          id: "workspace-1",
+          name: "MDGA",
+          path: args?.path,
+          createdAt: 1,
+          updatedAt: 1,
+          active: true,
+        });
+      }
+      return Promise.resolve([]);
+    });
+
+    render(<App />);
+
+    const input = await screen.findByLabelText("工作区路径");
+    fireEvent.change(input, { target: { value: "C:\\Users\\AIT\\Desktop\\MDGA" } });
+    fireEvent.click(screen.getByRole("button", { name: "绑定工作区" }));
+
+    await waitFor(() => {
+      const binding = screen.getByLabelText("Workspace binding");
+      expect(within(binding).getByText("MDGA")).toBeTruthy();
+      expect(within(binding).getByText("C:\\Users\\AIT\\Desktop\\MDGA")).toBeTruthy();
     });
   });
 });

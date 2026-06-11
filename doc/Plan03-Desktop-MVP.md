@@ -449,7 +449,7 @@ MVP 推荐首个 Agent 场景：
 
 > 注：当前 assistant 单次 usage 已随消息写入 SQLite；前端在加载历史消息后基于 `usageJson` 聚合当前会话累计 token 与估算费用。token 统计行已从 assistant 气泡中独立，作为页面级弱化文字显示在回复内容下方。
 
-### Phase 5 - Project / Workspace MVP
+### Phase 5 - Project / Workspace MVP 🚧 部分实现（活动工作区绑定）
 
 目标：
 
@@ -461,8 +461,12 @@ MVP 推荐首个 Agent 场景：
 验收：
 
 - 用户可以选择项目目录。
+- 用户可以手动输入本地目录路径并绑定为当前活动工作区。✅
+- 应用重启后可以从 SQLite 读取当前活动工作区。✅
 - 新对话可以绑定项目。
 - 工作区不可访问时给出降级提示。
+
+> 注：当前实现先打通单个活动工作区边界，采用 `workspaces` 表保存用户授权目录，后端保存前校验路径存在且为目录。项目列表、系统目录选择器、会话到项目的绑定关系仍待后续补充。
 
 ### Phase 6 - Permission Manager MVP
 

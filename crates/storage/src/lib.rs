@@ -30,6 +30,18 @@ pub struct StoredMessage {
     pub created_at: i64,
 }
 
+/// 工作区记录，对应用户授权给 Agent 的本地目录。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Workspace {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub active: bool,
+}
+
 // ── 初始化 ────────────────────────────────────────────────────────────────
 
 /// 打开或创建 SQLite 数据库，执行 schema 迁移。
@@ -61,6 +73,18 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_messages_conv
             ON messages (conversation_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id         TEXT PRIMARY KEY,
+            name       TEXT NOT NULL,
+            path       TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            active     INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_workspaces_active
+            ON workspaces (active, updated_at);
         ",
     )?;
     Ok(conn)
@@ -175,4 +199,105 @@ pub fn get_messages(conn: &Connection, conv_id: &str) -> SqlResult<Vec<StoredMes
         })
     })?;
     rows.collect()
+}
+
+// ── Workspace CRUD ────────────────────────────────────────────────────────
+
+/// 保存当前活动工作区。
+///
+/// 输入数据库连接和用户授权目录路径；输出新的 Workspace 记录。MVP 阶段只保留一个活动工作区，
+/// 写入新工作区前会清除旧记录，后续项目列表能力成熟后再扩展为多工作区。
+pub fn save_active_workspace(conn: &Connection, path: &str) -> SqlResult<Workspace> {
+    let id = Uuid::new_v4().to_string();
+    let now = now_ts();
+    let name = workspace_name_from_path(path);
+
+    conn.execute("DELETE FROM workspaces", [])?;
+    conn.execute(
+        "INSERT INTO workspaces (id, name, path, created_at, updated_at, active)
+         VALUES (?1, ?2, ?3, ?4, ?4, 1)",
+        params![id, name, path, now],
+    )?;
+
+    Ok(Workspace {
+        id,
+        name,
+        path: path.to_string(),
+        created_at: now,
+        updated_at: now,
+        active: true,
+    })
+}
+
+/// 读取当前活动工作区。
+///
+/// 输入数据库连接；如果用户已绑定工作区，返回 Workspace，否则返回 None。
+pub fn get_active_workspace(conn: &Connection) -> SqlResult<Option<Workspace>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, path, created_at, updated_at, active
+         FROM workspaces
+         WHERE active = 1
+         ORDER BY updated_at DESC
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query([])?;
+
+    if let Some(row) = rows.next()? {
+        Ok(Some(Workspace {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            path: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+            active: row.get::<_, i64>(5)? == 1,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// 清除当前活动工作区绑定。
+///
+/// 输入数据库连接；删除 MVP 阶段的工作区记录，用于用户撤销当前授权目录。
+pub fn clear_active_workspace(conn: &Connection) -> SqlResult<()> {
+    conn.execute("DELETE FROM workspaces WHERE active = 1", [])?;
+    Ok(())
+}
+
+fn workspace_name_from_path(path: &str) -> String {
+    // 从路径末尾提取目录名，提取失败时退回完整路径，避免 UI 出现空标题。
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saves_and_replaces_active_workspace() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        let first = save_active_workspace(&conn, "C:\\Users\\AIT\\Desktop\\MDGA")
+            .expect("workspace should save");
+        assert_eq!(first.name, "MDGA");
+        assert_eq!(first.path, "C:\\Users\\AIT\\Desktop\\MDGA");
+
+        let second = save_active_workspace(&conn, "C:\\Users\\AIT\\Desktop\\Other")
+            .expect("workspace should replace");
+        let loaded = get_active_workspace(&conn).expect("workspace should load");
+
+        assert_eq!(loaded.map(|workspace| workspace.path), Some(second.path));
+        assert_ne!(first.id, second.id);
+
+        clear_active_workspace(&conn).expect("workspace should clear");
+        assert!(get_active_workspace(&conn).expect("query should succeed").is_none());
+
+        let _ = std::fs::remove_file(db_path);
+    }
 }

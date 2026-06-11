@@ -155,6 +155,76 @@ h1 {
   cursor: not-allowed;
 }
 
+/* ── 工作区绑定 ── */
+
+.workspace-binding {
+  display: grid;
+  flex-shrink: 0;
+  gap: 8px;
+  width: min(760px, 100%);
+  align-self: center;
+  border-bottom: 1px solid #eceef0;
+  padding: 12px 0;
+}
+
+.workspace-binding__current,
+.workspace-binding__form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: #69717d;
+  font-size: 13px;
+}
+
+.workspace-binding__label {
+  color: #4f5661;
+  font-weight: 500;
+}
+
+.workspace-binding__current strong {
+  color: #1f2328;
+}
+
+.workspace-binding__current span:last-child {
+  overflow: hidden;
+  max-width: 100%;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-binding__form input {
+  flex: 1;
+  min-width: 260px;
+  border: 1px solid #d8dadd;
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: #1f2328;
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.workspace-binding__form button {
+  border: 1px solid #d8dadd;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #1f2328;
+  cursor: pointer;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.workspace-binding__clear {
+  color: #69717d !important;
+}
+
+.workspace-binding__error {
+  margin: 0;
+  color: #bd3a3a;
+  font-size: 12px;
+}
+
 /* ── 空状态 ── */
 
 .hero-panel {
