@@ -73,6 +73,7 @@ type StoredMessage = {
   role: string;
   content: string;
   usageJson: string | null;
+  partsJson: string | null;
   createdAt: number;
 };
 
@@ -118,7 +119,8 @@ export function App() {
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const streamingTextRef = useRef(""); // 只累积纯文字内容，用于 chat-done 持久化
+  const streamingTextRef = useRef(""); // 只累积纯文字内容，用于 chat-done 持久化（供模型上下文）
+  const streamingPartsRef = useRef<MessagePart[]>([]); // 跟踪当前 assistant 的完整 parts，用于持久化交错的工具卡片
   const streamingUsageRef = useRef<UsageSummary | null>(null);
 
   useEffect(() => {
@@ -177,11 +179,17 @@ export function App() {
 
   function storedToMessage(s: StoredMessage): Message {
     const usage = s.usageJson ? JSON.parse(s.usageJson) as UsageSummary : undefined;
-    return {
-      role: s.role as "user" | "assistant",
-      parts: [{ type: "text", content: s.content }],
-      usage,
-    };
+    // 优先用持久化的结构化 parts 还原文字+工具卡片交错；缺失时回退为单个 text part。
+    let parts: MessagePart[] = [{ type: "text", content: s.content }];
+    if (s.partsJson) {
+      try {
+        const parsed = JSON.parse(s.partsJson) as MessagePart[];
+        if (Array.isArray(parsed) && parsed.length > 0) parts = parsed;
+      } catch {
+        // 解析失败保留纯文字回退
+      }
+    }
+    return { role: s.role as "user" | "assistant", parts, usage };
   }
 
   /** 从工具输入参数提取展示目标（path / from / command）*/
@@ -284,6 +292,7 @@ export function App() {
     setInput("");
     setSending(true);
     streamingTextRef.current = "";
+    streamingPartsRef.current = [];
     streamingUsageRef.current = null;
 
     // ── 流式事件监听 ────────────────────────────────────────────────────
@@ -303,6 +312,7 @@ export function App() {
           parts.push({ type: "text", content: e.payload });
         }
         updated[lastIdx] = { ...last, parts };
+        streamingPartsRef.current = parts;
         return updated;
       });
     });
@@ -343,6 +353,7 @@ export function App() {
           }
         }
         updated[lastIdx] = { ...last, parts };
+        streamingPartsRef.current = parts;
         return updated;
       });
     });
@@ -369,12 +380,15 @@ export function App() {
       const usageJson = streamingUsageRef.current
         ? JSON.stringify(streamingUsageRef.current)
         : null;
-      // 持久化时只存纯文字内容，工具卡片是运行时状态不落库
+      // content 存纯文字（供模型上下文）；partsJson 存文字+工具卡片交错结构（供重启后还原展示）
+      const finalParts = streamingPartsRef.current;
+      const partsJson = finalParts.length > 0 ? JSON.stringify(finalParts) : null;
       await invoke("persist_message", {
         conversationId: finalConvId,
         role: "assistant",
         content: streamingTextRef.current,
         usageJson,
+        partsJson,
       }).catch(() => {});
 
       const list = await invoke<Conversation[]>("get_conversations").catch(() => []);

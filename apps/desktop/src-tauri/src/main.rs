@@ -192,6 +192,7 @@ fn persist_message(
     role: String,
     content: String,
     usage_json: Option<String>,
+    parts_json: Option<String>,
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     save_message(
@@ -200,6 +201,7 @@ fn persist_message(
         &role,
         &content,
         usage_json.as_deref(),
+        parts_json.as_deref(),
     )
     .map_err(|e| e.to_string())
 }

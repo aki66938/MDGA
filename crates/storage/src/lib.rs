@@ -30,6 +30,9 @@ pub struct StoredMessage {
     pub role: String,
     pub content: String,
     pub usage_json: Option<String>,
+    /// 序列化后的消息 parts（文字块 + 工具卡片交错），用于重启后还原内联工具执行记录。
+    /// 为 None 表示旧数据或纯文字消息，前端回退为单个 text part。content 仍保留纯文字供模型上下文。
+    pub parts_json: Option<String>,
     pub created_at: i64,
 }
 
@@ -125,6 +128,7 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     add_column_if_missing(&conn, "conversations", "workspace_path", "TEXT")?;
     add_column_if_missing(&conn, "conversations", "workspace_name", "TEXT")?;
     add_column_if_missing(&conn, "conversations", "mode", "TEXT NOT NULL DEFAULT 'chat_only'")?;
+    add_column_if_missing(&conn, "messages", "parts_json", "TEXT")?;
     Ok(conn)
 }
 
@@ -274,13 +278,14 @@ pub fn save_message(
     role: &str,
     content: &str,
     usage_json: Option<&str>,
+    parts_json: Option<&str>,
 ) -> SqlResult<()> {
     let id = Uuid::new_v4().to_string();
     let now = now_ts();
     conn.execute(
-        "INSERT INTO messages (id, conversation_id, role, content, usage_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, conv_id, role, content, usage_json, now],
+        "INSERT INTO messages (id, conversation_id, role, content, usage_json, parts_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, conv_id, role, content, usage_json, parts_json, now],
     )?;
     conn.execute(
         "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
@@ -292,7 +297,7 @@ pub fn save_message(
 /// 查询会话的所有消息，按时间正序排列。
 pub fn get_messages(conn: &Connection, conv_id: &str) -> SqlResult<Vec<StoredMessage>> {
     let mut stmt = conn.prepare(
-        "SELECT id, conversation_id, role, content, usage_json, created_at
+        "SELECT id, conversation_id, role, content, usage_json, parts_json, created_at
          FROM messages
          WHERE conversation_id = ?1
          ORDER BY created_at ASC",
@@ -304,7 +309,8 @@ pub fn get_messages(conn: &Connection, conv_id: &str) -> SqlResult<Vec<StoredMes
             role: row.get(2)?,
             content: row.get(3)?,
             usage_json: row.get(4)?,
-            created_at: row.get(5)?,
+            parts_json: row.get(5)?,
+            created_at: row.get(6)?,
         })
     })?;
     rows.collect()
