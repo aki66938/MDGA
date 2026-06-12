@@ -356,6 +356,12 @@ export function App() {
     }
   }
 
+  async function handleStop() {
+    // 请求后端中断正在运行的 Agent 工具循环，已执行的工具结果保留。
+    if (!activeConvId) return;
+    await invoke("cancel_agent", { conversationId: activeConvId }).catch(() => {});
+  }
+
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -576,13 +582,23 @@ export function App() {
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
           />
-          <button
-            type="button"
-            onClick={handleSend}
-            disabled={!input.trim() || sending}
-          >
-            {sending ? "…" : "发送"}
-          </button>
+          {sending ? (
+            <button
+              type="button"
+              className="composer__stop"
+              onClick={handleStop}
+            >
+              停止
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleSend}
+              disabled={!input.trim()}
+            >
+              发送
+            </button>
+          )}
         </div>
       </section>
     </main>

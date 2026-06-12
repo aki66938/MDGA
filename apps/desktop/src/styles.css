@@ -459,6 +459,16 @@ h1 {
   cursor: not-allowed;
 }
 
+/* 停止按钮：发送中显示，红色弱化提示可中断 Agent */
+.composer button.composer__stop {
+  border-color: #e5484d;
+  color: #e5484d;
+}
+
+.composer button.composer__stop:hover {
+  background: #fdeced;
+}
+
 /* ── MVP 卡片 ── */
 
 .mvp-grid {

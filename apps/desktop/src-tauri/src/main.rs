@@ -21,9 +21,12 @@ use mdga_tool_runtime::{
     ReadFileRequest, RunCommandRequest, SearchTextRequest, StatPathRequest, WriteFileRequest,
 };
 
-/// Agent 工具循环单次会话内允许的最大工具轮数。写死为 5，平衡真实性与 token 成本。
-const MAX_TOOL_ROUNDS: usize = 5;
-use std::sync::Mutex;
+/// Agent 工具循环单次会话内允许的最大工具轮数。作为防失控的硬上限兜底；
+/// 真正的终止由「模型不再调用工具」自然触发，提高到 20 让多步开发任务不被过早截断。
+const MAX_TOOL_ROUNDS: usize = 20;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
 
@@ -31,6 +34,9 @@ use tauri_plugin_updater::UpdaterExt;
 
 struct AppState {
     db: Mutex<rusqlite::Connection>,
+    /// 正在运行的 Agent 会话取消标志，按 conversation_id 索引。用户点击停止时置 true，
+    /// 工具循环在轮次之间和工具执行前检查并安全收尾。
+    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 // ── DeepSeek ──────────────────────────────────────────────────────────────
@@ -68,7 +74,14 @@ async fn send_message(
     );
     let permission = permission_mode_from_str(&permission_mode);
 
-    let raw_usage = if let Some(workspace_path) = conversation.workspace_path.as_deref() {
+    // 注册本轮会话的取消令牌，供 cancel_agent 命令置位、工具循环检查。
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    {
+        let mut cancels = state.cancels.lock().map_err(|e| e.to_string())?;
+        cancels.insert(conversation_id.clone(), cancel_token.clone());
+    }
+
+    let result = if let Some(workspace_path) = conversation.workspace_path.as_deref() {
         chat_with_builtin_tools(
             &api_key,
             messages,
@@ -77,15 +90,25 @@ async fn send_message(
             permission,
             &conversation_id,
             &app,
+            cancel_token.clone(),
         )
-        .await?
+        .await
     } else {
         chat_stream(&api_key, messages, &model, |chunk| {
             let _ = app.emit("chat-chunk", chunk);
         })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
     };
+
+    // 无论成功或失败都要清理取消令牌，避免下一轮误判为已取消。
+    {
+        if let Ok(mut cancels) = state.cancels.lock() {
+            cancels.remove(&conversation_id);
+        }
+    }
+
+    let raw_usage = result?;
 
     if let Some(raw) = raw_usage {
         let summary = compute_cost_summary(&raw, &deepseek_pricing_for_model(&model));
@@ -205,6 +228,19 @@ fn get_conversation_events(
 ) -> Result<Vec<ActivityEventRecord>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     get_activity_events(&db, &conversation_id).map_err(|e| e.to_string())
+}
+
+/// 请求中断指定会话正在运行的 Agent 工具循环。
+///
+/// 置位该会话的取消标志；循环在下一个检查点安全收尾，已执行的工具结果保留。
+/// 若该会话当前没有运行中的 Agent，则为无操作。
+#[tauri::command]
+fn cancel_agent(state: State<AppState>, conversation_id: String) -> Result<(), String> {
+    let cancels = state.cancels.lock().map_err(|e| e.to_string())?;
+    if let Some(token) = cancels.get(&conversation_id) {
+        token.store(true, Ordering::SeqCst);
+    }
+    Ok(())
 }
 
 // ── 工作区管理 ─────────────────────────────────────────────────────────────
@@ -386,6 +422,7 @@ fn record_tool_event(
 
 /// Agent 工具循环：最多 MAX_TOOL_ROUNDS 轮，每轮带工具问模型、执行返回的工具、把结果回灌，
 /// 直到模型不再调用工具或达到轮数上限。所有工具执行前都经 SessionSecurityContext 裁决。
+#[allow(clippy::too_many_arguments)]
 async fn chat_with_builtin_tools(
     api_key: &str,
     messages: Vec<ChatMessage>,
@@ -394,6 +431,7 @@ async fn chat_with_builtin_tools(
     permission_mode: PermissionMode,
     conversation_id: &str,
     app: &AppHandle,
+    cancel: Arc<AtomicBool>,
 ) -> Result<Option<mdga_shared::RawUsage>, String> {
     let security_context = session_security_context(
         workspace_path.to_string(),
@@ -404,7 +442,15 @@ async fn chat_with_builtin_tools(
     let mut wire_messages = chat_messages_to_wire(messages);
     let mut usage: Option<mdga_shared::RawUsage> = None;
 
-    for _round in 0..MAX_TOOL_ROUNDS {
+    for round in 0..MAX_TOOL_ROUNDS {
+        // 轮次之间检查取消：用户点击停止后安全收尾，保留已执行的工具结果。
+        if cancel.load(Ordering::SeqCst) {
+            let _ = app.emit("chat-chunk", "\n\n（已中断）".to_string());
+            return Ok(usage);
+        }
+        // 推送轮次进度，让前端展示「第 N 轮」而非黑盒等待。
+        let _ = app.emit("agent-round", round + 1);
+
         let completion = chat_completion(
             api_key,
             wire_messages.clone(),
@@ -415,14 +461,17 @@ async fn chat_with_builtin_tools(
         .map_err(|e| e.to_string())?;
         usage = merge_usage(usage, completion.usage.clone());
 
-        let tool_calls = if completion.tool_calls.is_empty() {
+        // 区分结构化 tool_calls 与从正文兜底解析出的 DSML 调用：
+        // 前者的 content 是模型的真实叙述（可展示），后者的 content 是 DSML 标记（不可展示）。
+        let had_structured_calls = !completion.tool_calls.is_empty();
+        let tool_calls = if had_structured_calls {
+            completion.tool_calls.clone()
+        } else {
             completion
                 .content
                 .as_deref()
                 .map(recover_tool_calls_from_content)
                 .unwrap_or_default()
-        } else {
-            completion.tool_calls.clone()
         };
 
         // 模型不再调用工具：发出最终回复并结束循环。
@@ -433,12 +482,27 @@ async fn chat_with_builtin_tools(
             return Ok(usage);
         }
 
+        // 多轮过程流式可见：把模型调用工具前的叙述实时推送，让用户看到「为什么这么做」。
+        if had_structured_calls {
+            if let Some(content) = completion.content.as_deref() {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    let _ = app.emit("chat-chunk", format!("{trimmed}\n\n"));
+                }
+            }
+        }
+
         wire_messages.push(assistant_message_for_tool_calls(
             completion.assistant_message,
             &tool_calls,
         ));
 
         for call in tool_calls {
+            // 工具执行前检查取消：避免停止后仍继续执行剩余工具。
+            if cancel.load(Ordering::SeqCst) {
+                let _ = app.emit("chat-chunk", "\n\n（已中断）".to_string());
+                return Ok(usage);
+            }
             let tool_name = call.function.name.clone();
             let arguments = call.function.arguments.clone();
             record_tool_event(
@@ -964,7 +1028,10 @@ fn main() {
             std::fs::create_dir_all(&data_dir)?;
             let db = init_db(&data_dir.join("mdga.db"))
                 .map_err(|e| format!("无法初始化数据库: {e}"))?;
-            app.manage(AppState { db: Mutex::new(db) });
+            app.manage(AppState {
+                db: Mutex::new(db),
+                cancels: Mutex::new(HashMap::new()),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -978,6 +1045,7 @@ fn main() {
             rename_conversation,
             remove_conversation,
             get_conversation_events,
+            cancel_agent,
             get_workspace,
             set_workspace_path,
             clear_workspace,
