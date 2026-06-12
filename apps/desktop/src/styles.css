@@ -557,6 +557,84 @@ h1 {
   color: #69717d;
 }
 
+/* ── Agent 工作过程面板 ── */
+
+.activity-panel {
+  width: min(760px, 100%);
+  align-self: center;
+  margin-bottom: 10px;
+}
+
+.activity-panel__summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 4px 0;
+  color: #9aa0a8;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.activity-panel__caret {
+  font-size: 10px;
+}
+
+.activity-panel__failed {
+  color: #d9534f;
+}
+
+.activity-panel__list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 8px 12px;
+  border: 1px solid #ebedef;
+  border-radius: 8px;
+  background: #fafbfc;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.activity-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #69717d;
+  font-variant-numeric: tabular-nums;
+}
+
+.activity-row__tool {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  color: #4f5661;
+}
+
+.activity-row__target {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #9aa0a8;
+}
+
+.activity-row--succeeded .activity-row__status {
+  color: #1d9e75;
+}
+
+.activity-row--failed .activity-row__status {
+  color: #d9534f;
+}
+
+.activity-row__error {
+  color: #d9534f;
+  flex-basis: 100%;
+  padding-left: 4px;
+}
+
 /* ── 更新提示横幅（固定在侧边栏底部） ── */
 
 .sidebar {

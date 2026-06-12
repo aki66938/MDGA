@@ -1,12 +1,28 @@
-use mdga_deepseek_client::{chat_completion, chat_stream, detect_api_key_status, ChatMessage};
-use mdga_shared::ApiKeyStatus;
+use mdga_deepseek_client::{
+    chat_completion, chat_stream, detect_api_key_status, parse_dsml_tool_calls, ChatMessage,
+    ToolCall,
+};
+use mdga_sandbox_runtime::{
+    ensure_tool_allowed, session_security_context, NetworkMode, SessionSecurityContext,
+    ToolCapability,
+};
+use mdga_shared::{ApiKeyStatus, PermissionMode};
 use mdga_storage::{
     clear_active_workspace, create_conversation, delete_conversation, get_active_workspace,
-    create_conversation_with_workspace, get_conversation, get_messages, init_db, list_conversations,
-    save_active_workspace, save_message, update_title, Conversation, StoredMessage, Workspace,
+    create_conversation_with_workspace, get_activity_events, get_conversation, get_messages,
+    init_db, list_conversations, record_activity_event, save_active_workspace, save_message,
+    update_title, ActivityEventRecord, Conversation, StoredMessage, Workspace,
 };
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
-use mdga_tool_runtime::{create_file, CreateFileRequest};
+use mdga_tool_runtime::{
+    create_file, delete_dir, delete_file, edit_file, list_dir, make_dir, move_path, read_file,
+    run_command, search_text, stat_path, write_file, CreateFileRequest, DeleteDirRequest,
+    DeleteFileRequest, EditFileRequest, ListDirRequest, MakeDirRequest, MovePathRequest,
+    ReadFileRequest, RunCommandRequest, SearchTextRequest, StatPathRequest, WriteFileRequest,
+};
+
+/// Agent 工具循环单次会话内允许的最大工具轮数。写死为 5，平衡真实性与 token 成本。
+const MAX_TOOL_ROUNDS: usize = 5;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
@@ -35,6 +51,7 @@ async fn send_message(
     conversation_id: String,
     messages: Vec<ChatMessage>,
     model: String,
+    permission_mode: String,
 ) -> Result<(), String> {
     let api_key = std::env::var("DEEPSEEK_API_KEY")
         .map_err(|_| "DEEPSEEK_API_KEY 未配置".to_string())?;
@@ -49,9 +66,19 @@ async fn send_message(
         conversation.workspace_path.as_deref(),
         conversation.workspace_name.as_deref(),
     );
+    let permission = permission_mode_from_str(&permission_mode);
 
     let raw_usage = if let Some(workspace_path) = conversation.workspace_path.as_deref() {
-        chat_with_builtin_tools(&api_key, messages, &model, workspace_path, &app).await?
+        chat_with_builtin_tools(
+            &api_key,
+            messages,
+            &model,
+            workspace_path,
+            permission,
+            &conversation_id,
+            &app,
+        )
+        .await?
     } else {
         chat_stream(&api_key, messages, &model, |chunk| {
             let _ = app.emit("chat-chunk", chunk);
@@ -170,6 +197,16 @@ fn remove_conversation(
     delete_conversation(&db, &conversation_id).map_err(|e| e.to_string())
 }
 
+/// 返回指定会话的所有工具 Activity Event，按时间正序，供前端展示历史过程面板。
+#[tauri::command]
+fn get_conversation_events(
+    state: State<AppState>,
+    conversation_id: String,
+) -> Result<Vec<ActivityEventRecord>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    get_activity_events(&db, &conversation_id).map_err(|e| e.to_string())
+}
+
 // ── 工作区管理 ─────────────────────────────────────────────────────────────
 
 /// 返回当前用户授权的活动工作区。
@@ -282,65 +319,207 @@ fn messages_with_workspace_context(
             "你正在 MDGA 桌面端中运行。本轮会话绑定的工作区名称是 {name}，工作区路径是 {path}。\
 除非用户明确授权越界，否则你应假定所有本地文件任务都发生在该工作区内。\
 当用户询问你当前所在的工作区或工作目录时，应直接回答这个路径；不要声称自己没有工作区。\
-当用户要求创建文件时，必须调用 create_file 工具完成真实本地写入；不要只给出代码示例，\
-也不要在没有工具结果时声称文件已创建。"
+当用户要求列目录、读取文件、创建文件、修改文件或删除文件时，必须分别调用 list_dir、read_file、\
+create_file、write_file 或 delete_file 工具完成真实本地操作；不要只给出代码示例，\
+不要建议用户手动操作，也不要在没有工具结果时声称文件已处理。"
         ),
+    });
+    injected.push(ChatMessage {
+        role: "system".to_string(),
+        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 仅在 Full Access 权限下可用，用于列目录、git status、构建或测试等低风险命令。每一步都要基于真实工具结果继续，工具失败时如实说明原因。".to_string(),
     });
     injected.extend(messages);
     injected
 }
 
+/// 将前端权限模式字符串映射为后端枚举，未知值回退到最安全的 Restricted。
+fn permission_mode_from_str(value: &str) -> PermissionMode {
+    match value {
+        "ask_every_time" => PermissionMode::AskEveryTime,
+        "workspace_auto" => PermissionMode::WorkspaceAuto,
+        "full_access" => PermissionMode::FullAccess,
+        _ => PermissionMode::Restricted,
+    }
+}
+
+/// 记录一条工具 Activity Event，并同时推送给前端用于过程展示。
+///
+/// 输入会话 ID、工具名、状态、输入参数、可选输出/错误和工作区快照；
+/// 写入失败不阻塞主流程，只忽略错误，保证一次工具失败不会拖垮整条对话。
+#[allow(clippy::too_many_arguments)]
+fn record_tool_event(
+    app: &AppHandle,
+    conversation_id: &str,
+    event_type: &str,
+    tool_name: &str,
+    status: &str,
+    input_json: &str,
+    output_json: Option<&str>,
+    error_message: Option<&str>,
+    workspace_path: &str,
+) {
+    let state = app.state::<AppState>();
+    if let Ok(db) = state.db.lock() {
+        let _ = record_activity_event(
+            &db,
+            conversation_id,
+            event_type,
+            Some(tool_name),
+            status,
+            Some(input_json),
+            output_json,
+            error_message,
+            Some(workspace_path),
+        );
+    }
+    let _ = app.emit(
+        "tool-event",
+        serde_json::json!({
+            "toolName": tool_name,
+            "status": status,
+            "inputJson": input_json,
+            "outputJson": output_json,
+            "errorMessage": error_message,
+        }),
+    );
+}
+
+/// Agent 工具循环：最多 MAX_TOOL_ROUNDS 轮，每轮带工具问模型、执行返回的工具、把结果回灌，
+/// 直到模型不再调用工具或达到轮数上限。所有工具执行前都经 SessionSecurityContext 裁决。
 async fn chat_with_builtin_tools(
     api_key: &str,
     messages: Vec<ChatMessage>,
     model: &str,
     workspace_path: &str,
+    permission_mode: PermissionMode,
+    conversation_id: &str,
     app: &AppHandle,
 ) -> Result<Option<mdga_shared::RawUsage>, String> {
-    let mut wire_messages = chat_messages_to_wire(messages);
-    let first = chat_completion(
-        api_key,
-        wire_messages.clone(),
-        model,
-        Some(vec![create_file_tool_schema()]),
+    let security_context = session_security_context(
+        workspace_path.to_string(),
+        permission_mode,
+        NetworkMode::Disabled,
     )
-    .await
     .map_err(|e| e.to_string())?;
-    let mut usage = first.usage;
+    let mut wire_messages = chat_messages_to_wire(messages);
+    let mut usage: Option<mdga_shared::RawUsage> = None;
 
-    if first.tool_calls.is_empty() {
-        if let Some(content) = first.content {
-            let _ = app.emit("chat-chunk", content);
+    for _round in 0..MAX_TOOL_ROUNDS {
+        let completion = chat_completion(
+            api_key,
+            wire_messages.clone(),
+            model,
+            Some(all_builtin_tool_schemas()),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        usage = merge_usage(usage, completion.usage.clone());
+
+        let tool_calls = if completion.tool_calls.is_empty() {
+            completion
+                .content
+                .as_deref()
+                .map(recover_tool_calls_from_content)
+                .unwrap_or_default()
+        } else {
+            completion.tool_calls.clone()
+        };
+
+        // 模型不再调用工具：发出最终回复并结束循环。
+        if tool_calls.is_empty() {
+            if let Some(content) = completion.content {
+                let _ = app.emit("chat-chunk", content);
+            }
+            return Ok(usage);
         }
-        return Ok(usage);
+
+        wire_messages.push(assistant_message_for_tool_calls(
+            completion.assistant_message,
+            &tool_calls,
+        ));
+
+        for call in tool_calls {
+            let tool_name = call.function.name.clone();
+            let arguments = call.function.arguments.clone();
+            record_tool_event(
+                app,
+                conversation_id,
+                "tool_started",
+                &tool_name,
+                "running",
+                &arguments,
+                None,
+                None,
+                workspace_path,
+            );
+
+            let result =
+                execute_builtin_tool_call(&security_context, &tool_name, &arguments);
+            let (output, status, error) = match &result {
+                Ok(value) => (
+                    serde_json::json!({ "ok": true, "result": value }),
+                    "succeeded",
+                    None,
+                ),
+                Err(message) => (
+                    serde_json::json!({ "ok": false, "error": message }),
+                    "failed",
+                    Some(message.clone()),
+                ),
+            };
+            let output_str = output.to_string();
+            record_tool_event(
+                app,
+                conversation_id,
+                if status == "succeeded" { "tool_succeeded" } else { "tool_failed" },
+                &tool_name,
+                status,
+                &arguments,
+                Some(&output_str),
+                error.as_deref(),
+                workspace_path,
+            );
+
+            wire_messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": output_str
+            }));
+        }
     }
 
-    wire_messages.push(first.assistant_message);
-    for call in first.tool_calls {
-        let result = match call.function.name.as_str() {
-            "create_file" => execute_create_file_tool_call(workspace_path, &call.function.arguments),
-            other => Err(format!("未知工具: {other}")),
-        };
-        let output = match result {
-            Ok(value) => serde_json::json!({ "ok": true, "result": value }),
-            Err(message) => serde_json::json!({ "ok": false, "error": message }),
-        };
-        let _ = app.emit("tool-event", output.clone());
-        wire_messages.push(serde_json::json!({
-            "role": "tool",
-            "tool_call_id": call.id,
-            "content": output.to_string()
-        }));
-    }
-
+    // 达到最大轮数仍未收敛：做一次不带工具的收尾，强制模型给最终答复。
     let final_result = chat_completion(api_key, wire_messages, model, None)
         .await
         .map_err(|e| e.to_string())?;
+    usage = merge_usage(usage, final_result.usage);
     if let Some(content) = final_result.content {
         let _ = app.emit("chat-chunk", content);
     }
-    usage = merge_usage(usage, final_result.usage);
     Ok(usage)
+}
+
+fn recover_tool_calls_from_content(content: &str) -> Vec<ToolCall> {
+    parse_dsml_tool_calls(content)
+}
+
+fn assistant_message_for_tool_calls(
+    assistant_message: serde_json::Value,
+    tool_calls: &[ToolCall],
+) -> serde_json::Value {
+    if assistant_message
+        .get("tool_calls")
+        .and_then(|calls| calls.as_array())
+        .is_some()
+    {
+        return assistant_message;
+    }
+
+    serde_json::json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": tool_calls
+    })
 }
 
 fn chat_messages_to_wire(messages: Vec<ChatMessage>) -> Vec<serde_json::Value> {
@@ -355,29 +534,238 @@ fn chat_messages_to_wire(messages: Vec<ChatMessage>) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn create_file_tool_schema() -> serde_json::Value {
+fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
+    vec![
+        file_tool_schema(
+            "create_file",
+            "Create a new text file inside the current MDGA conversation workspace. Use this when the user asks to create a file. The path must be relative to the workspace.",
+            &["path", "content"],
+        ),
+        file_tool_schema(
+            "write_file",
+            "Write or overwrite a full UTF-8 text file inside the current MDGA conversation workspace. Use this only when the user asks to replace the whole file.",
+            &["path", "content"],
+        ),
+        file_tool_schema(
+            "edit_file",
+            "Edit an existing UTF-8 text file by replacing oldText with newText. Prefer this for code or text modifications.",
+            &["path", "oldText", "newText"],
+        ),
+        file_tool_schema(
+            "read_file",
+            "Read a UTF-8 text file inside the current MDGA conversation workspace. Use this when the user asks to inspect or summarize file contents.",
+            &["path"],
+        ),
+        file_tool_schema(
+            "delete_file",
+            "Delete a single file inside the current MDGA conversation workspace. Use this when the user asks to remove a file.",
+            &["path"],
+        ),
+        file_tool_schema(
+            "list_dir",
+            "List entries in a directory inside the current MDGA conversation workspace. Use this when the user asks what files or folders exist.",
+            &["path"],
+        ),
+        file_tool_schema(
+            "make_dir",
+            "Create a directory inside the current MDGA conversation workspace.",
+            &["path"],
+        ),
+        file_tool_schema(
+            "stat_path",
+            "Return whether a relative workspace path exists and whether it is a file or directory.",
+            &["path"],
+        ),
+        file_tool_schema(
+            "search_text",
+            "Search UTF-8 text files recursively inside a workspace directory.",
+            &["path", "query"],
+        ),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "move_path",
+                "description": "Move or rename a file or directory inside the current MDGA conversation workspace. Use this for moving/renaming instead of create+delete.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string", "description": "Existing relative source path inside the workspace." },
+                        "to": { "type": "string", "description": "New relative destination path inside the workspace. Must not already exist." }
+                    },
+                    "required": ["from", "to"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "delete_dir",
+                "description": "Delete a directory inside the current MDGA conversation workspace. Set recursive=true to delete a non-empty directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative directory path inside the workspace. Cannot be the workspace root." },
+                        "recursive": { "type": "boolean", "description": "Delete recursively including contents. Required true for non-empty directories. Defaults to false." }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": "Run a single PowerShell command in the workspace directory. Use for low-risk checks like listing files, git status, building or running tests. Only available under Full Access permission mode.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "The PowerShell command line to execute." },
+                        "timeoutSecs": { "type": "integer", "description": "Optional timeout in seconds, default 120, max 600." }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+    ]
+}
+
+fn file_tool_schema(name: &str, description: &str, required: &[&str]) -> serde_json::Value {
+    let mut properties = serde_json::json!({
+        "path": {
+            "type": "string",
+            "description": "Relative path inside the current workspace. Use . for workspace root."
+        }
+    });
+    if required.contains(&"content") {
+        properties["content"] = serde_json::json!({
+            "type": "string",
+            "description": "UTF-8 text content to write. Use an empty string when the user asks for an empty file."
+        });
+    }
+    if required.contains(&"oldText") {
+        properties["oldText"] = serde_json::json!({
+            "type": "string",
+            "description": "Exact existing text to replace. It should be unique unless replaceAll is true."
+        });
+    }
+    if required.contains(&"newText") {
+        properties["newText"] = serde_json::json!({
+            "type": "string",
+            "description": "Replacement text."
+        });
+        properties["replaceAll"] = serde_json::json!({
+            "type": "boolean",
+            "description": "Replace every match. Defaults to false."
+        });
+    }
+    if required.contains(&"query") {
+        properties["query"] = serde_json::json!({
+            "type": "string",
+            "description": "Text to search for."
+        });
+        properties["maxResults"] = serde_json::json!({
+            "type": "integer",
+            "description": "Maximum number of matches to return, up to 50."
+        });
+    }
+
     serde_json::json!({
         "type": "function",
         "function": {
-            "name": "create_file",
-            "description": "Create a text file inside the current MDGA conversation workspace. Use this when the user asks to create a file. The path must be relative to the workspace.",
+            "name": name,
+            "description": description,
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative file path inside the current workspace, for example test.txt or docs/note.md."
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Text content to write. Use an empty string when the user asks for an empty file."
-                    }
-                },
-                "required": ["path", "content"],
+                "properties": properties,
+                "required": required,
                 "additionalProperties": false
             }
         }
     })
+}
+
+fn execute_builtin_tool_call(
+    security_context: &SessionSecurityContext,
+    tool_name: &str,
+    arguments: &str,
+) -> Result<serde_json::Value, String> {
+    let capability = tool_capability_for_name(tool_name)?;
+    ensure_tool_allowed(security_context, capability).map_err(|err| err.to_string())?;
+    let workspace_path = security_context.workspace_root.as_str();
+
+    match tool_name {
+        "create_file" => execute_create_file_tool_call(workspace_path, arguments),
+        "write_file" => {
+            let request = serde_json::from_str::<WriteFileRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(write_file(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "edit_file" => {
+            let request = serde_json::from_str::<EditFileRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(edit_file(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "read_file" => {
+            let request = serde_json::from_str::<ReadFileRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(read_file(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "delete_file" => {
+            let request = serde_json::from_str::<DeleteFileRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(delete_file(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "list_dir" => {
+            let request = serde_json::from_str::<ListDirRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(list_dir(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "make_dir" => {
+            let request = serde_json::from_str::<MakeDirRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(make_dir(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "stat_path" => {
+            let request = serde_json::from_str::<StatPathRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(stat_path(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "search_text" => {
+            let request = serde_json::from_str::<SearchTextRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(search_text(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "move_path" => {
+            let request = serde_json::from_str::<MovePathRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(move_path(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "delete_dir" => {
+            let request = serde_json::from_str::<DeleteDirRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(delete_dir(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "run_command" => {
+            let request = serde_json::from_str::<RunCommandRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(run_command(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        other => Err(format!("未知工具: {other}")),
+    }
 }
 
 fn execute_create_file_tool_call(
@@ -388,6 +776,18 @@ fn execute_create_file_tool_call(
         .map_err(|err| format!("工具参数解析失败: {err}"))?;
     let result = create_file(workspace_path, request).map_err(|err| err.to_string())?;
     serde_json::to_value(result).map_err(|err| err.to_string())
+}
+
+fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability, String> {
+    match tool_name {
+        "list_dir" | "read_file" | "stat_path" | "search_text" => Ok(ToolCapability::FileRead),
+        "create_file" | "write_file" | "edit_file" | "make_dir" | "move_path" => {
+            Ok(ToolCapability::FileWrite)
+        }
+        "delete_file" | "delete_dir" => Ok(ToolCapability::FileDelete),
+        "run_command" => Ok(ToolCapability::CommandRun),
+        other => Err(format!("未知工具: {other}")),
+    }
 }
 
 fn merge_usage(
@@ -430,8 +830,15 @@ mod tests {
         assert!(injected[0].content.contains("C:\\Users\\AIT\\Desktop\\MDGA"));
         assert!(injected[0].content.contains("MDGA"));
         assert!(injected[0].content.contains("除非用户明确授权越界"));
-        assert!(injected[0].content.contains("必须调用 create_file 工具"));
-        assert_eq!(injected[1].role, "user");
+        assert!(injected[0].content.contains("必须分别调用"));
+        assert!(injected[0].content.contains("read_file"));
+        assert!(injected[0].content.contains("write_file"));
+        assert!(injected[0].content.contains("delete_file"));
+        assert!(injected[0].content.contains("list_dir"));
+        assert_eq!(injected[1].role, "system");
+        assert!(injected[1].content.contains("edit_file"));
+        assert!(injected[1].content.contains("search_text"));
+        assert_eq!(injected[2].role, "user");
     }
 
     #[test]
@@ -455,6 +862,93 @@ mod tests {
         assert!(workspace.join("test.txt").is_file());
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn executes_write_read_delete_and_list_tool_calls_inside_workspace() {
+        let workspace = std::env::temp_dir().join(format!(
+            "mdga-desktop-tool-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should be available")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+        let workspace_path = workspace.to_str().expect("workspace should be utf8");
+        let security_context = session_security_context(
+            workspace_path.to_string(),
+            PermissionMode::WorkspaceAuto,
+            NetworkMode::Disabled,
+        )
+        .expect("security context should build");
+        execute_builtin_tool_call(
+            &security_context,
+            "write_file",
+            r#"{"path":"note.txt","content":"123456"}"#,
+        )
+        .expect("write tool should execute");
+        let read_output = execute_builtin_tool_call(
+            &security_context,
+            "read_file",
+            r#"{"path":"note.txt"}"#,
+        )
+        .expect("read tool should execute");
+        let list_output = execute_builtin_tool_call(
+            &security_context,
+            "list_dir",
+            r#"{"path":"."}"#,
+        )
+        .expect("list tool should execute");
+        execute_builtin_tool_call(
+            &security_context,
+            "edit_file",
+            r#"{"path":"note.txt","oldText":"123456","newText":"abcdef"}"#,
+        )
+        .expect("edit tool should execute");
+        execute_builtin_tool_call(
+            &security_context,
+            "make_dir",
+            r#"{"path":"src"}"#,
+        )
+        .expect("mkdir tool should execute");
+        let stat_output = execute_builtin_tool_call(
+            &security_context,
+            "stat_path",
+            r#"{"path":"src"}"#,
+        )
+        .expect("stat tool should execute");
+        let search_output = execute_builtin_tool_call(
+            &security_context,
+            "search_text",
+            r#"{"path":".","query":"abcdef","maxResults":10}"#,
+        )
+        .expect("search tool should execute");
+        execute_builtin_tool_call(
+            &security_context,
+            "delete_file",
+            r#"{"path":"note.txt"}"#,
+        )
+        .expect("delete tool should execute");
+
+        assert_eq!(read_output["content"], "123456");
+        assert_eq!(list_output["entries"][0]["name"], "note.txt");
+        assert_eq!(stat_output["kind"], "directory");
+        assert_eq!(search_output["matches"][0]["path"], "note.txt");
+        assert!(!workspace.join("note.txt").exists());
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn recovers_deepseek_dsml_tool_calls_from_text_content() {
+        let content = r#"<｜DSML｜tool_calls><｜DSML｜invoke name="write_file"><｜DSML｜parameter name="path" string="true">\helloworld.txt</｜DSML｜parameter><｜DSML｜parameter name="content" string="true">123456</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"#;
+
+        let calls = recover_tool_calls_from_content(content);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        assert_eq!(calls[0].function.arguments, r#"{"content":"123456","path":"helloworld.txt"}"#);
     }
 }
 
@@ -483,6 +977,7 @@ fn main() {
             persist_message,
             rename_conversation,
             remove_conversation,
+            get_conversation_events,
             get_workspace,
             set_workspace_path,
             clear_workspace,

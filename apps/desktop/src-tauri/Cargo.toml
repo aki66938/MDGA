@@ -6,6 +6,7 @@ version.workspace = true
 
 [dependencies]
 mdga-deepseek-client = { path = "../../../crates/deepseek-client" }
+mdga-sandbox-runtime = { path = "../../../crates/sandbox-runtime" }
 mdga-shared = { path = "../../../crates/shared" }
 mdga-storage = { path = "../../../crates/storage" }
 mdga-token-accounting = { path = "../../../crates/token-accounting" }

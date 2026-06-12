@@ -65,7 +65,34 @@ type UpdateState =
   | { status: "downloading"; progress: number }
   | { status: "error"; message: string };
 
-const permissionMode: PermissionMode = "restricted";
+type ToolEvent = {
+  toolName: string;
+  status: string;
+  inputJson?: string | null;
+  outputJson?: string | null;
+  errorMessage?: string | null;
+};
+
+type ActivityEventRecord = {
+  id: string;
+  conversationId: string;
+  eventType: string;
+  toolName: string | null;
+  status: string;
+  inputJson: string | null;
+  outputJson: string | null;
+  errorMessage: string | null;
+  workspacePath: string | null;
+  createdAt: number;
+};
+
+// 后端权限模式枚举值，需与 Rust permission_mode_from_str 对齐
+const PERMISSION_MODES: PermissionMode[] = [
+  "restricted",
+  "ask_every_time",
+  "workspace_auto",
+  "full_access",
+];
 
 // ── App ───────────────────────────────────────────────────────────────────
 
@@ -77,8 +104,10 @@ export function App() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [model, setModel] = useState<DeepSeekModelId>(DEFAULT_DEEPSEEK_MODEL_ID);
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>("workspace_auto");
   const [draftWorkspace, setDraftWorkspace] = useState<DraftWorkspace | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // 流式积累的 assistant 内容，用于 chat-done 时持久化
@@ -103,13 +132,28 @@ export function App() {
     loadConversations();
   }, []);
 
-  // activeConvId 切换时加载对应消息
+  // activeConvId 切换时加载对应消息和工具事件历史
   useEffect(() => {
-    if (!activeConvId) { setMessages([]); return; }
+    if (!activeConvId) { setMessages([]); setToolEvents([]); return; }
     invoke<StoredMessage[]>("load_messages", { conversationId: activeConvId })
       .then((stored) => setMessages(stored.map(storedToMessage)))
       .catch(() => setMessages([]));
+    invoke<ActivityEventRecord[]>("get_conversation_events", { conversationId: activeConvId })
+      .then((events) => setToolEvents(events.filter(isTerminalEvent).map(recordToToolEvent)))
+      .catch(() => setToolEvents([]));
   }, [activeConvId]);
+
+  // 持续监听工具事件，把完成的工具动作追加到过程面板
+  useEffect(() => {
+    const unlisten = listen<ToolEvent>("tool-event", (e) => {
+      if (e.payload.status === "succeeded" || e.payload.status === "failed") {
+        setToolEvents((prev) => [...prev, e.payload]);
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
 
   // 自动滚动到底部
   useEffect(() => {
@@ -139,6 +183,20 @@ export function App() {
     return { role: s.role as "user" | "assistant", content: s.content, usage };
   }
 
+  function isTerminalEvent(e: ActivityEventRecord): boolean {
+    return e.status === "succeeded" || e.status === "failed";
+  }
+
+  function recordToToolEvent(e: ActivityEventRecord): ToolEvent {
+    return {
+      toolName: e.toolName ?? "unknown",
+      status: e.status,
+      inputJson: e.inputJson,
+      outputJson: e.outputJson,
+      errorMessage: e.errorMessage,
+    };
+  }
+
   async function loadConversations() {
     const list = await invoke<Conversation[]>("get_conversations").catch(() => []);
     setConversations(list);
@@ -151,6 +209,7 @@ export function App() {
     if (sending) return;
     setActiveConvId(null);
     setMessages([]);
+    setToolEvents([]);
     setInput("");
     setDraftWorkspace(null);
     setWorkspaceError(null);
@@ -278,7 +337,12 @@ export function App() {
     });
 
     try {
-      await invoke("send_message", { conversationId: finalConvId, messages: outgoing, model });
+      await invoke("send_message", {
+        conversationId: finalConvId,
+        messages: outgoing,
+        model,
+        permissionMode,
+      });
     } catch (err) {
       setMessages((prev) => {
         const updated = [...prev];
@@ -409,7 +473,19 @@ export function App() {
           </div>
           <div className="status-strip" aria-label="MVP status">
             <span>{getApiKeyStatusLabel(apiKeyStatus)}</span>
-            <span>{getPermissionModeLabel(permissionMode)}</span>
+            <select
+              className="model-select"
+              value={permissionMode}
+              onChange={(e) => setPermissionMode(e.target.value as PermissionMode)}
+              disabled={sending}
+              aria-label="权限模式"
+            >
+              {PERMISSION_MODES.map((mode) => (
+                <option key={mode} value={mode}>
+                  {getPermissionModeLabel(mode)}
+                </option>
+              ))}
+            </select>
             {activeConversation?.workspaceName && (
               <span title={activeConversation.workspacePath ?? undefined}>
                 {activeConversation.workspaceName}
@@ -485,6 +561,8 @@ export function App() {
             </section>
           </section>
         )}
+
+        {toolEvents.length > 0 && <ActivityPanel events={toolEvents} />}
 
         {conversationUsage && (
           <ConversationUsageSummary usage={conversationUsage} />
@@ -585,6 +663,56 @@ function ConversationUsageSummary({ usage }: { usage: UsageSummary }) {
       )}
       <span className="usage-sep">·</span>
       <span className="usage-cost">{formatUsd(usage.estimatedCostUsd)}</span>
+    </div>
+  );
+}
+
+// ── ActivityPanel ─────────────────────────────────────────────────────────
+
+function toolEventTarget(event: ToolEvent): string {
+  // 从工具输入参数里提取展示用的目标（path / from / command），失败时返回空串。
+  if (!event.inputJson) return "";
+  try {
+    const input = JSON.parse(event.inputJson) as Record<string, unknown>;
+    const target = input.path ?? input.from ?? input.command ?? "";
+    return typeof target === "string" ? target : "";
+  } catch {
+    return "";
+  }
+}
+
+function ActivityPanel({ events }: { events: ToolEvent[] }) {
+  // 折叠的 Agent 工作过程面板，默认收起，灰度弱化，展示真实工具动作而非模型文本。
+  const [expanded, setExpanded] = useState(false);
+  const failed = events.filter((e) => e.status === "failed").length;
+
+  return (
+    <div className="activity-panel" aria-label="Agent 工作过程">
+      <button
+        className="activity-panel__summary"
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="activity-panel__caret">{expanded ? "▾" : "▸"}</span>
+        已执行 {events.length} 个工具动作
+        {failed > 0 && <span className="activity-panel__failed"> · {failed} 个失败</span>}
+      </button>
+      {expanded && (
+        <ul className="activity-panel__list">
+          {events.map((event, i) => (
+            <li key={i} className={`activity-row activity-row--${event.status}`}>
+              <span className="activity-row__tool">{event.toolName}</span>
+              <span className="activity-row__target">{toolEventTarget(event)}</span>
+              <span className="activity-row__status">
+                {event.status === "succeeded" ? "✓" : "✗"}
+              </span>
+              {event.status === "failed" && event.errorMessage && (
+                <span className="activity-row__error">{event.errorMessage}</span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

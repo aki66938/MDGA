@@ -45,6 +45,22 @@ pub struct Workspace {
     pub active: bool,
 }
 
+/// Activity Event 记录，对应一次工具调用的请求、裁决和执行结果，用于审计与前端过程展示。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEventRecord {
+    pub id: String,
+    pub conversation_id: String,
+    pub event_type: String,
+    pub tool_name: Option<String>,
+    pub status: String,
+    pub input_json: Option<String>,
+    pub output_json: Option<String>,
+    pub error_message: Option<String>,
+    pub workspace_path: Option<String>,
+    pub created_at: i64,
+}
+
 // ── 初始化 ────────────────────────────────────────────────────────────────
 
 /// 打开或创建 SQLite 数据库，执行 schema 迁移。
@@ -88,6 +104,22 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_workspaces_active
             ON workspaces (active, updated_at);
+
+        CREATE TABLE IF NOT EXISTS activity_events (
+            id              TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            event_type      TEXT NOT NULL,
+            tool_name       TEXT,
+            status          TEXT NOT NULL,
+            input_json      TEXT,
+            output_json     TEXT,
+            error_message   TEXT,
+            workspace_path  TEXT,
+            created_at      INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_activity_conv
+            ON activity_events (conversation_id, created_at);
         ",
     )?;
     add_column_if_missing(&conn, "conversations", "workspace_path", "TEXT")?;
@@ -349,6 +381,87 @@ fn workspace_name_from_path(path: &str) -> String {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(path)
         .to_string()
+}
+
+// ── Activity Event ────────────────────────────────────────────────────────
+
+/// 记录一条 Activity Event。
+///
+/// 输入会话 ID、事件类型、状态及可选的工具名、输入/输出 JSON、错误信息和工作区快照；
+/// 写入 activity_events 表用于审计与前端折叠过程展示。本方法不做权限判断。
+#[allow(clippy::too_many_arguments)]
+pub fn record_activity_event(
+    conn: &Connection,
+    conversation_id: &str,
+    event_type: &str,
+    tool_name: Option<&str>,
+    status: &str,
+    input_json: Option<&str>,
+    output_json: Option<&str>,
+    error_message: Option<&str>,
+    workspace_path: Option<&str>,
+) -> SqlResult<ActivityEventRecord> {
+    let id = Uuid::new_v4().to_string();
+    let now = now_ts();
+    conn.execute(
+        "INSERT INTO activity_events
+         (id, conversation_id, event_type, tool_name, status, input_json,
+          output_json, error_message, workspace_path, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            id,
+            conversation_id,
+            event_type,
+            tool_name,
+            status,
+            input_json,
+            output_json,
+            error_message,
+            workspace_path,
+            now
+        ],
+    )?;
+    Ok(ActivityEventRecord {
+        id,
+        conversation_id: conversation_id.to_string(),
+        event_type: event_type.to_string(),
+        tool_name: tool_name.map(str::to_string),
+        status: status.to_string(),
+        input_json: input_json.map(str::to_string),
+        output_json: output_json.map(str::to_string),
+        error_message: error_message.map(str::to_string),
+        workspace_path: workspace_path.map(str::to_string),
+        created_at: now,
+    })
+}
+
+/// 查询会话的所有 Activity Event，按时间正序。
+pub fn get_activity_events(
+    conn: &Connection,
+    conv_id: &str,
+) -> SqlResult<Vec<ActivityEventRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, conversation_id, event_type, tool_name, status, input_json,
+                output_json, error_message, workspace_path, created_at
+         FROM activity_events
+         WHERE conversation_id = ?1
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([conv_id], |row| {
+        Ok(ActivityEventRecord {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            event_type: row.get(2)?,
+            tool_name: row.get(3)?,
+            status: row.get(4)?,
+            input_json: row.get(5)?,
+            output_json: row.get(6)?,
+            error_message: row.get(7)?,
+            workspace_path: row.get(8)?,
+            created_at: row.get(9)?,
+        })
+    })?;
+    rows.collect()
 }
 
 #[cfg(test)]

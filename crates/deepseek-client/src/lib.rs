@@ -271,6 +271,99 @@ fn parse_chat_completion_response(
     })
 }
 
+/// 从 DeepSeek 泄漏到正文的 DSML 工具标记中恢复 tool calls。
+///
+/// 输入 assistant 文本内容，输出可交给 Host 执行的 ToolCall 列表。DeepSeek 有时不会返回
+/// OpenAI-compatible `tool_calls` 字段，而是把 DSML 标记直接输出到正文。不同模型版本会用
+/// 不同数量的全角竖线（`｜DSML｜` 或 `｜｜DSML｜｜`），因此先归一化掉所有竖线再解析，
+/// 让解析对竖线数量保持容忍。
+///
+/// 注意：归一化会移除正文中所有全角竖线 U+FF5C；DSML 兜底路径下文件路径/内容极少包含该字符，
+/// 这是可接受的取舍。原生 tool_calls 路径不受影响。
+pub fn parse_dsml_tool_calls(raw_content: &str) -> Vec<ToolCall> {
+    let content = strip_dsml_bars(raw_content);
+    let content = content.as_str();
+    let mut calls = Vec::new();
+    let mut cursor = 0;
+    let invoke_marker = "<DSMLinvoke name=\"";
+    let invoke_end = "</DSMLinvoke>";
+
+    while let Some(offset) = content[cursor..].find(invoke_marker) {
+        let start = cursor + offset + invoke_marker.len();
+        let Some(name_end_offset) = content[start..].find('"') else {
+            break;
+        };
+        let name = &content[start..start + name_end_offset];
+        let Some(open_end_offset) = content[start + name_end_offset..].find('>') else {
+            break;
+        };
+        let body_start = start + name_end_offset + open_end_offset + 1;
+        let Some(body_end_offset) = content[body_start..].find(invoke_end) else {
+            break;
+        };
+        let body_end = body_start + body_end_offset;
+        let params = parse_dsml_parameters(&content[body_start..body_end]);
+        let Ok(arguments) = serde_json::to_string(&params) else {
+            cursor = body_end + invoke_end.len();
+            continue;
+        };
+
+        calls.push(ToolCall {
+            id: format!("dsml_call_{}", calls.len()),
+            kind: "function".to_string(),
+            function: ToolFunctionCall {
+                name: name.to_string(),
+                arguments,
+            },
+        });
+        cursor = body_end + invoke_end.len();
+    }
+
+    calls
+}
+
+/// 移除全角竖线 U+FF5C，使 `<｜DSML｜...>` 与 `<｜｜DSML｜｜...>` 归一化为 `<DSML...>`。
+fn strip_dsml_bars(content: &str) -> String {
+    content.replace('\u{FF5C}', "")
+}
+
+fn parse_dsml_parameters(body: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut params = serde_json::Map::new();
+    let mut cursor = 0;
+    let param_marker = "<DSMLparameter name=\"";
+    let param_end = "</DSMLparameter>";
+
+    while let Some(offset) = body[cursor..].find(param_marker) {
+        let start = cursor + offset + param_marker.len();
+        let Some(name_end_offset) = body[start..].find('"') else {
+            break;
+        };
+        let name = &body[start..start + name_end_offset];
+        let Some(open_end_offset) = body[start + name_end_offset..].find('>') else {
+            break;
+        };
+        let value_start = start + name_end_offset + open_end_offset + 1;
+        let Some(value_end_offset) = body[value_start..].find(param_end) else {
+            break;
+        };
+        let value_end = value_start + value_end_offset;
+        let value = normalize_dsml_parameter(name, &body[value_start..value_end]);
+        params.insert(name.to_string(), serde_json::Value::String(value));
+        cursor = value_end + param_end.len();
+    }
+
+    params
+}
+
+fn normalize_dsml_parameter(name: &str, value: &str) -> String {
+    let trimmed = value.trim();
+    if name == "path" {
+        trimmed.trim_start_matches(['\\', '/']).to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +401,44 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].id, "call_1");
         assert_eq!(parsed.tool_calls[0].function.name, "create_file");
         assert_eq!(parsed.usage.expect("usage should parse").total_tokens, 15);
+    }
+
+    #[test]
+    fn parses_single_bar_dsml_tool_call_from_content() {
+        let content = r#"我会修改文件。
+<｜DSML｜tool_calls><｜DSML｜invoke name="write_file"><｜DSML｜parameter name="path" string="true">\helloworld.txt</｜DSML｜parameter><｜DSML｜parameter name="content" string="true">123456</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"#;
+
+        let calls = parse_dsml_tool_calls(content);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        assert_eq!(calls[0].function.arguments, r#"{"content":"123456","path":"helloworld.txt"}"#);
+    }
+
+    #[test]
+    fn parses_double_bar_dsml_tool_call_from_content() {
+        // 真实 DeepSeek 输出使用双竖线，旧解析器（硬编码单竖线）在此会漏掉，导致工具调用泄漏成正文。
+        let content = "好的。\n<｜｜DSML｜｜tool_calls> <｜｜DSML｜｜invoke name=\"edit_file\"> <｜｜DSML｜｜parameter name=\"path\" string=\"true\">helloworld.txt</｜｜DSML｜｜parameter> <｜｜DSML｜｜parameter name=\"oldText\" string=\"true\">helloworld</｜｜DSML｜｜parameter> <｜｜DSML｜｜parameter name=\"newText\" string=\"true\">123456</｜｜DSML｜｜parameter> </｜｜DSML｜｜invoke> </｜｜DSML｜｜tool_calls>";
+
+        let calls = parse_dsml_tool_calls(content);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "edit_file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("arguments should be json");
+        assert_eq!(parsed["path"], "helloworld.txt");
+        assert_eq!(parsed["oldText"], "helloworld");
+        assert_eq!(parsed["newText"], "123456");
+    }
+
+    #[test]
+    fn parses_multiple_dsml_tool_calls_from_content() {
+        let content = "<｜｜DSML｜｜invoke name=\"read_file\"><｜｜DSML｜｜parameter name=\"path\" string=\"true\">a.txt</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke><｜｜DSML｜｜invoke name=\"delete_file\"><｜｜DSML｜｜parameter name=\"path\" string=\"true\">b.txt</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>";
+
+        let calls = parse_dsml_tool_calls(content);
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[1].function.name, "delete_file");
     }
 }

@@ -18,3 +18,4 @@
 | 0.0.6 | 重构工作区绑定为新对话 session 级选择：首屏通过系统目录选择器选择工作区，普通对话正文不再显示路径输入表单<br>conversation 表新增 workspace snapshot 与 mode 字段，发送首条消息时将所选目录绑定到整轮会话<br>接入 Tauri dialog 插件与权限配置，新增前端测试、storage 测试并通过全量 Rust / 前端验证 | Codex |
 | 0.0.7 | 打通 workspace 认知闭环：发送消息时前端传入 conversationId，后端从 SQLite 读取该会话 workspace snapshot<br>调用 DeepSeek 前自动注入 system workspace context，使模型能够回答当前会话绑定的工作区路径<br>补充单会话 workspace 查询、system message 注入与前端发送参数测试 | Codex |
 | 0.0.8 | 打通首个真实本地工具闭环：DeepSeek 可通过 Tool Calls 请求 `create_file`，MDGA 后端在会话工作区内真实创建文件<br>新增 workspace path guard，拒绝绝对路径和 `..` 越界写入，目标文件存在时拒绝覆盖<br>补充 DeepSeek tool-call 解析、Rust tool-runtime 与桌面后端桥接测试 | Codex |
+| 0.0.9 | 实现完整 Agent Tool Runtime：模型可自主调用工具并多轮推理，最多 5 轮工具循环<br>新增文件移动（move_path）、目录删除（delete_dir）、本地命令执行（run_command）工具<br>修复 DSML 双竖线解析 Bug，确保模型内嵌工具调用格式能被正确识别和执行<br>新增权限模式选择器（Restricted / AskEveryTime / WorkspaceAuto / FullAccess），run_command 仅 FullAccess 可用<br>工具执行记录持久化到 SQLite，前端工具事件面板实时展示每步执行结果 | Claude Code |

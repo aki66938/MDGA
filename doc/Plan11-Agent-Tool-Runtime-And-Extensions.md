@@ -357,7 +357,7 @@ activity_events
 - 如果模型请求 `../test.txt`，后端拒绝。✅
 - UI 显示真实执行结果。
 
-### Phase 2 - Read / Write / List 完整文件工具
+### Phase 2 - Read / Write / List 完整文件工具 ✅ 代码已实现（0.0.9，待 dev 验证）
 
 目标：
 
@@ -365,18 +365,21 @@ activity_events
 
 任务：
 
-- `list_dir` 返回名称、类型、大小、mtime。
-- `read_file` 支持大小限制和文本编码错误处理。
-- `write_file` 支持新建或覆盖策略。
-- UI 折叠展示文件工具事件。
+- `list_dir` 返回名称、类型、大小。✅
+- `read_file` 支持大小限制和文本编码错误处理。✅
+- `write_file` 支持新建或覆盖策略。✅
+- 新增 `move_path`（移动/重命名）、`delete_dir`（删目录）。✅
+- 容忍式 DSML 兜底解析（单/双竖线均可），修复工具调用泄漏成正文。✅
+- 真正的多轮 Agent loop（最大 5 轮）。✅
+- UI 折叠展示文件工具事件。✅
 
 验收：
 
-- Agent 能读取当前工作区 README 或 doc 文件并总结。
-- Agent 能创建/更新 workspace 内 Markdown。
-- 大文件和二进制文件有明确错误。
+- Agent 能读取当前工作区 README 或 doc 文件并总结。⏳ 待 dev 手测
+- Agent 能创建/更新/移动/删除 workspace 内文件。⏳ 待 dev 手测
+- 大文件和二进制文件有明确错误。✅
 
-### Phase 3 - Permission Manager 接入
+### Phase 3 - Permission Manager 接入 ✅ 代码已实现（0.0.9，待 dev 验证）
 
 目标：
 
@@ -384,18 +387,20 @@ activity_events
 
 任务：
 
-- 定义 tool risk level。
-- workspace 内低风险读写在 Workspace Auto 下自动通过。
-- 覆盖写入、越界、绝对路径进入审批或拒绝。
-- 持久化审批事件。
+- 前端权限模式选择器，透传到后端 SessionSecurityContext。✅
+- workspace 内低风险读写在 Workspace Auto 下自动通过。✅
+- `run_command` 仅 Full Access 允许；其余模式给出明确提示而非崩溃。✅
+- 持久化 Activity Event（activity_events 表）。✅
 
 验收：
 
-- Restricted 下写文件需要用户确认或被拒绝。
-- Workspace Auto 下 workspace 内创建文件自动执行。
-- Full Access 下仍记录审计事件。
+- Restricted 下写文件被拒绝。⏳ 待 dev 手测
+- Workspace Auto 下 workspace 内创建文件自动执行。⏳ 待 dev 手测
+- Full Access 下仍记录审计事件。✅（事件落库）
 
-### Phase 4 - Command Tool
+> 注：审批弹窗 UI（Ask Every Time 的真实交互）留到 0.1.x；当前 AskEveryTime 降级为"待审批"提示，不崩溃。
+
+### Phase 4 - Command Tool ✅ 基础已实现（0.0.9，待 dev 验证）
 
 目标：
 
@@ -403,15 +408,15 @@ activity_events
 
 任务：
 
-- 命令 cwd 默认 conversation workspace。
-- 限制超时、输出大小、环境变量传递。
-- 支持长进程终止。
-- 高风险命令进入审批。
+- 命令 cwd 默认 conversation workspace。✅
+- 限制超时（默认 120s，上限 600s）、输出大小（64 KiB 截断）。✅
+- 超时杀进程并标记 timed_out。✅
+- 仅 Full Access 权限可用。✅
 
 验收：
 
-- 可以运行 `dir`、`git status`、测试命令。
-- 删除、网络、安装依赖等动作进入审批。
+- 可以运行 `dir`、`git status`、测试命令。⏳ 待 dev 手测
+- 高风险命令的审批分级留到后续版本细化。
 
 ### Phase 5 - MCP Adapter
 
