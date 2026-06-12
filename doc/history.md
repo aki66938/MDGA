@@ -20,3 +20,4 @@
 | 0.0.8 | 打通首个真实本地工具闭环：DeepSeek 可通过 Tool Calls 请求 `create_file`，MDGA 后端在会话工作区内真实创建文件<br>新增 workspace path guard，拒绝绝对路径和 `..` 越界写入，目标文件存在时拒绝覆盖<br>补充 DeepSeek tool-call 解析、Rust tool-runtime 与桌面后端桥接测试 | Codex |
 | 0.0.9 | 实现完整 Agent Tool Runtime：模型可自主调用工具并多轮推理，最多 5 轮工具循环<br>新增文件移动（move_path）、目录删除（delete_dir）、本地命令执行（run_command）工具<br>修复 DSML 双竖线解析 Bug，确保模型内嵌工具调用格式能被正确识别和执行<br>新增权限模式选择器（Restricted / AskEveryTime / WorkspaceAuto / FullAccess），run_command 仅 FullAccess 可用<br>工具执行记录持久化到 SQLite，前端工具事件面板实时展示每步执行结果 | Claude Code |
 | 0.0.10 | Agent Loop 控制力强化：工具循环轮数上限从 5 提升到 20，复杂多步任务不再被过早截断<br>多轮过程流式可见：模型调用工具前的叙述内容实时推送，不再黑盒等待<br>新增中断能力：发送中显示「停止」按钮，用户可随时中止 Agent 任务，已执行结果保留 | Claude Code |
+| 0.0.11 | 工具执行过程内联渲染：AI 的工具调用直接插入对话流，与叙述文字交错显示，告别底部扎堆面板<br>工具卡片实时展示执行状态：运行中显示动画、完成显示绿色 ✓、失败显示红色 ✗ 与错误原因<br>用户视角下 AI「思考到哪一步、调用了什么工具」一目了然，体验连贯不黑盒 | Claude Code |

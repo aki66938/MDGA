@@ -567,82 +567,59 @@ h1 {
   color: #69717d;
 }
 
-/* ── Agent 工作过程面板 ── */
+/* ── 内联工具执行行（在对话流中与叙述文字交错渲染） ── */
 
-.activity-panel {
-  width: min(760px, 100%);
-  align-self: center;
-  margin-bottom: 10px;
-}
-
-.activity-panel__summary {
+.tool-inline {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 6px;
-  width: 100%;
-  border: none;
-  background: none;
-  padding: 4px 0;
-  color: #9aa0a8;
-  font-size: 12px;
-  cursor: pointer;
-  text-align: left;
+  padding: 2px 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: #8b929b;
 }
 
-.activity-panel__caret {
-  font-size: 10px;
+.tool-inline__icon {
+  font-size: 11px;
+  flex-shrink: 0;
+  width: 14px;
 }
 
-.activity-panel__failed {
-  color: #d9534f;
-}
-
-.activity-panel__list {
-  list-style: none;
-  margin: 6px 0 0;
-  padding: 8px 12px;
-  border: 1px solid #ebedef;
-  border-radius: 8px;
-  background: #fafbfc;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.activity-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: #69717d;
-  font-variant-numeric: tabular-nums;
-}
-
-.activity-row__tool {
+.tool-inline__name {
   font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
-  color: #4f5661;
+  font-size: 12px;
+  color: #9aa0a8;
+  flex-shrink: 0;
 }
 
-.activity-row__target {
-  flex: 1;
+.tool-inline__target {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  color: #b0b5bc;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #9aa0a8;
+  max-width: 380px;
 }
 
-.activity-row--succeeded .activity-row__status {
-  color: #1d9e75;
+.tool-inline__dots {
+  color: #b0b5bc;
+  animation: tool-blink 1.2s step-end infinite;
 }
 
-.activity-row--failed .activity-row__status {
-  color: #d9534f;
+@keyframes tool-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.2; }
 }
 
-.activity-row__error {
-  color: #d9534f;
-  flex-basis: 100%;
-  padding-left: 4px;
+.tool-inline--succeeded .tool-inline__icon { color: #2da44e; }
+.tool-inline--failed    .tool-inline__icon { color: #d1242f; }
+.tool-inline--running   .tool-inline__icon { color: #9aa0a8; }
+
+.tool-inline__error {
+  font-size: 11.5px;
+  color: #d1242f;
+  margin-left: 4px;
 }
 
 /* ── 更新提示横幅（固定在侧边栏底部） ── */

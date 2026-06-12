@@ -17,14 +17,25 @@ import "./styles.css";
 
 // ── 类型定义 ──────────────────────────────────────────────────────────────
 
-type Conversation = {
-  id: string;
-  title: string;
-  workspacePath?: string | null;
-  workspaceName?: string | null;
-  mode: "chat_only" | "local_workspace";
-  createdAt: number;
-  updatedAt: number;
+/** 消息中的文字块，直接 Markdown 渲染 */
+type TextPart = { type: "text"; content: string };
+
+/** 消息中的工具执行卡片，内联展示于叙述文字之间 */
+type ToolPart = {
+  type: "tool";
+  toolName: string;
+  target: string;
+  status: "running" | "succeeded" | "failed";
+  error?: string;
+};
+
+type MessagePart = TextPart | ToolPart;
+
+type Message = {
+  role: "user" | "assistant";
+  /** 所有内容都用 parts 表示，文字与工具卡片交错排列 */
+  parts: MessagePart[];
+  usage?: UsageSummary;
 };
 
 type UsageSummary = {
@@ -39,10 +50,14 @@ type UsageSummary = {
   pricingVersion: string;
 };
 
-type Message = {
-  role: "user" | "assistant";
-  content: string;
-  usage?: UsageSummary;
+type Conversation = {
+  id: string;
+  title: string;
+  workspacePath?: string | null;
+  workspaceName?: string | null;
+  mode: "chat_only" | "local_workspace";
+  createdAt: number;
+  updatedAt: number;
 };
 
 type StoredMessage = {
@@ -52,6 +67,14 @@ type StoredMessage = {
   content: string;
   usageJson: string | null;
   createdAt: number;
+};
+
+type ToolEvent = {
+  toolName: string;
+  status: string;
+  inputJson?: string | null;
+  outputJson?: string | null;
+  errorMessage?: string | null;
 };
 
 type DraftWorkspace = {
@@ -65,28 +88,6 @@ type UpdateState =
   | { status: "downloading"; progress: number }
   | { status: "error"; message: string };
 
-type ToolEvent = {
-  toolName: string;
-  status: string;
-  inputJson?: string | null;
-  outputJson?: string | null;
-  errorMessage?: string | null;
-};
-
-type ActivityEventRecord = {
-  id: string;
-  conversationId: string;
-  eventType: string;
-  toolName: string | null;
-  status: string;
-  inputJson: string | null;
-  outputJson: string | null;
-  errorMessage: string | null;
-  workspacePath: string | null;
-  createdAt: number;
-};
-
-// 后端权限模式枚举值，需与 Rust permission_mode_from_str 对齐
 const PERMISSION_MODES: PermissionMode[] = [
   "restricted",
   "ask_every_time",
@@ -107,14 +108,11 @@ export function App() {
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("workspace_auto");
   const [draftWorkspace, setDraftWorkspace] = useState<DraftWorkspace | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
-  const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  // 流式积累的 assistant 内容，用于 chat-done 时持久化
-  const streamingContentRef = useRef("");
+  const streamingTextRef = useRef(""); // 只累积纯文字内容，用于 chat-done 持久化
   const streamingUsageRef = useRef<UsageSummary | null>(null);
 
-  // 检测 API Key
   useEffect(() => {
     invoke<string>("get_deepseek_api_key_status")
       .then((raw) => {
@@ -127,40 +125,21 @@ export function App() {
       .catch(() => setApiKeyStatus({ state: "missing" }));
   }, []);
 
-  // 启动时加载会话列表
   useEffect(() => {
     loadConversations();
   }, []);
 
-  // activeConvId 切换时加载对应消息和工具事件历史
   useEffect(() => {
-    if (!activeConvId) { setMessages([]); setToolEvents([]); return; }
+    if (!activeConvId) { setMessages([]); return; }
     invoke<StoredMessage[]>("load_messages", { conversationId: activeConvId })
       .then((stored) => setMessages(stored.map(storedToMessage)))
       .catch(() => setMessages([]));
-    invoke<ActivityEventRecord[]>("get_conversation_events", { conversationId: activeConvId })
-      .then((events) => setToolEvents(events.filter(isTerminalEvent).map(recordToToolEvent)))
-      .catch(() => setToolEvents([]));
   }, [activeConvId]);
 
-  // 持续监听工具事件，把完成的工具动作追加到过程面板
-  useEffect(() => {
-    const unlisten = listen<ToolEvent>("tool-event", (e) => {
-      if (e.payload.status === "succeeded" || e.payload.status === "failed") {
-        setToolEvents((prev) => [...prev, e.payload]);
-      }
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, []);
-
-  // 自动滚动到底部
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // 启动后延迟检查更新
   useEffect(() => {
     const timer = setTimeout(() => {
       invoke<string | null>("check_update")
@@ -180,21 +159,23 @@ export function App() {
 
   function storedToMessage(s: StoredMessage): Message {
     const usage = s.usageJson ? JSON.parse(s.usageJson) as UsageSummary : undefined;
-    return { role: s.role as "user" | "assistant", content: s.content, usage };
-  }
-
-  function isTerminalEvent(e: ActivityEventRecord): boolean {
-    return e.status === "succeeded" || e.status === "failed";
-  }
-
-  function recordToToolEvent(e: ActivityEventRecord): ToolEvent {
     return {
-      toolName: e.toolName ?? "unknown",
-      status: e.status,
-      inputJson: e.inputJson,
-      outputJson: e.outputJson,
-      errorMessage: e.errorMessage,
+      role: s.role as "user" | "assistant",
+      parts: [{ type: "text", content: s.content }],
+      usage,
     };
+  }
+
+  /** 从工具输入参数提取展示目标（path / from / command）*/
+  function extractTarget(inputJson: string | null | undefined): string {
+    if (!inputJson) return "";
+    try {
+      const parsed = JSON.parse(inputJson) as Record<string, unknown>;
+      const target = parsed.path ?? parsed.from ?? parsed.command ?? "";
+      return typeof target === "string" ? target : "";
+    } catch {
+      return "";
+    }
   }
 
   async function loadConversations() {
@@ -209,7 +190,6 @@ export function App() {
     if (sending) return;
     setActiveConvId(null);
     setMessages([]);
-    setToolEvents([]);
     setInput("");
     setDraftWorkspace(null);
     setWorkspaceError(null);
@@ -236,10 +216,7 @@ export function App() {
     try {
       const selected = await open({ directory: true, multiple: false });
       if (!selected || Array.isArray(selected)) return;
-      setDraftWorkspace({
-        path: selected,
-        name: basenameFromPath(selected),
-      });
+      setDraftWorkspace({ path: selected, name: basenameFromPath(selected) });
       setWorkspaceError(null);
     } catch (err) {
       setWorkspaceError(String(err));
@@ -252,7 +229,6 @@ export function App() {
     const text = input.trim();
     if (!text || sending) return;
 
-    // 没有活跃会话时自动创建
     let convId = activeConvId;
     if (!convId) {
       const conv = await invoke<Conversation>("new_conversation_with_workspace", {
@@ -268,7 +244,6 @@ export function App() {
       setWorkspaceError(null);
     }
 
-    // 持久化用户消息
     await invoke("persist_message", {
       conversationId: convId,
       role: "user",
@@ -276,7 +251,6 @@ export function App() {
       usageJson: null,
     }).catch(() => {});
 
-    // 如果还是"新对话"，用首条消息前 20 字作为标题
     const currentConv = conversations.find((c) => c.id === convId);
     if (!currentConv || currentConv.title === "新对话") {
       const title = text.slice(0, 20);
@@ -286,19 +260,62 @@ export function App() {
       );
     }
 
-    const outgoing: Message[] = [...messages, { role: "user", content: text }];
-    setMessages([...outgoing, { role: "assistant", content: "" }]);
+    // 构建发给后端的纯文字消息（parts 中只取 text 块）
+    const outgoing: Message[] = [...messages, { role: "user", parts: [{ type: "text", content: text }] }];
+    setMessages([...outgoing, { role: "assistant", parts: [] }]);
     setInput("");
     setSending(true);
-    streamingContentRef.current = "";
+    streamingTextRef.current = "";
     streamingUsageRef.current = null;
 
+    // ── 流式事件监听 ────────────────────────────────────────────────────
+
+    // chat-chunk：追加文字到当前 assistant 消息的最后一个 text part
     const unlistenChunk = await listen<string>("chat-chunk", (e) => {
-      streamingContentRef.current += e.payload;
+      streamingTextRef.current += e.payload;
       setMessages((prev) => {
         const updated = [...prev];
-        const last = updated[updated.length - 1];
-        updated[updated.length - 1] = { ...last, content: last.content + e.payload };
+        const lastIdx = updated.length - 1;
+        const last = updated[lastIdx];
+        const parts = [...last.parts];
+        const tail = parts[parts.length - 1];
+        if (tail?.type === "text") {
+          parts[parts.length - 1] = { type: "text", content: tail.content + e.payload };
+        } else {
+          parts.push({ type: "text", content: e.payload });
+        }
+        updated[lastIdx] = { ...last, parts };
+        return updated;
+      });
+    });
+
+    // tool-event：running 时插入新卡片，succeeded/failed 时更新最近匹配的 running 卡片
+    const unlistenTool = await listen<ToolEvent>("tool-event", (e) => {
+      const { toolName, status, inputJson, errorMessage } = e.payload;
+      const target = extractTarget(inputJson);
+      setMessages((prev) => {
+        const updated = [...prev];
+        const lastIdx = updated.length - 1;
+        const last = updated[lastIdx];
+        if (last.role !== "assistant") return prev;
+        const parts = [...last.parts];
+        if (status === "running") {
+          parts.push({ type: "tool", toolName, target, status: "running" });
+        } else {
+          // 从后往前找同名的最近 running 卡片并更新状态
+          for (let i = parts.length - 1; i >= 0; i--) {
+            const p = parts[i];
+            if (p.type === "tool" && p.toolName === toolName && p.status === "running") {
+              parts[i] = {
+                ...p,
+                status: status as "succeeded" | "failed",
+                error: errorMessage ?? undefined,
+              };
+              break;
+            }
+          }
+        }
+        updated[lastIdx] = { ...last, parts };
         return updated;
       });
     });
@@ -317,21 +334,21 @@ export function App() {
     const unlistenDone = await listen("chat-done", async () => {
       setSending(false);
       unlistenChunk();
+      unlistenTool();
       unlistenUsage();
       unlistenDone();
 
-      // 持久化 assistant 消息
       const usageJson = streamingUsageRef.current
         ? JSON.stringify(streamingUsageRef.current)
         : null;
+      // 持久化时只存纯文字内容，工具卡片是运行时状态不落库
       await invoke("persist_message", {
         conversationId: finalConvId,
         role: "assistant",
-        content: streamingContentRef.current,
+        content: streamingTextRef.current,
         usageJson,
       }).catch(() => {});
 
-      // 刷新会话列表（更新 updatedAt 排序）
       const list = await invoke<Conversation[]>("get_conversations").catch(() => []);
       setConversations(list);
     });
@@ -339,25 +356,31 @@ export function App() {
     try {
       await invoke("send_message", {
         conversationId: finalConvId,
-        messages: outgoing,
+        messages: outgoing.map((m) => ({
+          role: m.role,
+          content: m.parts.filter((p) => p.type === "text").map((p) => (p as TextPart).content).join(""),
+        })),
         model,
         permissionMode,
       });
     } catch (err) {
       setMessages((prev) => {
         const updated = [...prev];
-        updated[updated.length - 1] = { role: "assistant", content: `错误：${err}` };
+        updated[updated.length - 1] = {
+          role: "assistant",
+          parts: [{ type: "text", content: `错误：${err}` }],
+        };
         return updated;
       });
       setSending(false);
       unlistenChunk();
+      unlistenTool();
       unlistenUsage();
       unlistenDone();
     }
   }
 
   async function handleStop() {
-    // 请求后端中断正在运行的 Agent 工具循环，已执行的工具结果保留。
     if (!activeConvId) return;
     await invoke("cancel_agent", { conversationId: activeConvId }).catch(() => {});
   }
@@ -418,24 +441,15 @@ export function App() {
           </nav>
         )}
 
-        {/* 更新提示区域 */}
         {update.status === "available" && (
           <div className="update-banner">
             <p className="update-banner__title">发现新版本</p>
             <p className="update-banner__version">v{update.version}</p>
             <div className="update-banner__actions">
-              <button
-                className="update-banner__btn update-banner__btn--primary"
-                type="button"
-                onClick={handleInstallUpdate}
-              >
+              <button className="update-banner__btn update-banner__btn--primary" type="button" onClick={handleInstallUpdate}>
                 立即更新
               </button>
-              <button
-                className="update-banner__btn"
-                type="button"
-                onClick={() => setUpdate({ status: "idle" })}
-              >
+              <button className="update-banner__btn" type="button" onClick={() => setUpdate({ status: "idle" })}>
                 稍后
               </button>
             </div>
@@ -446,10 +460,7 @@ export function App() {
           <div className="update-banner">
             <p className="update-banner__title">正在下载更新…</p>
             <div className="update-banner__progress-bar">
-              <div
-                className="update-banner__progress-fill"
-                style={{ width: `${update.progress}%` }}
-              />
+              <div className="update-banner__progress-fill" style={{ width: `${update.progress}%` }} />
             </div>
             <p className="update-banner__version">{update.progress}%</p>
           </div>
@@ -459,11 +470,7 @@ export function App() {
           <div className="update-banner update-banner--error">
             <p className="update-banner__title">更新失败</p>
             <p className="update-banner__version">{update.message}</p>
-            <button
-              className="update-banner__btn"
-              type="button"
-              onClick={() => setUpdate({ status: "idle" })}
-            >
+            <button className="update-banner__btn" type="button" onClick={() => setUpdate({ status: "idle" })}>
               关闭
             </button>
           </div>
@@ -477,7 +484,7 @@ export function App() {
             <p className="eyebrow">Make DeepSeek Great Again</p>
             <h1>MDGA</h1>
           </div>
-          <div className="status-strip" aria-label="MVP status">
+          <div className="status-strip" aria-label="status">
             <span>{getApiKeyStatusLabel(apiKeyStatus)}</span>
             <select
               className="model-select"
@@ -487,9 +494,7 @@ export function App() {
               aria-label="权限模式"
             >
               {PERMISSION_MODES.map((mode) => (
-                <option key={mode} value={mode}>
-                  {getPermissionModeLabel(mode)}
-                </option>
+                <option key={mode} value={mode}>{getPermissionModeLabel(mode)}</option>
               ))}
             </select>
             {activeConversation?.workspaceName && (
@@ -506,9 +511,7 @@ export function App() {
               title={DEEPSEEK_MODELS.find((item) => item.id === model)?.description}
             >
               {DEEPSEEK_MODELS.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.label}
-                </option>
+                <option key={item.id} value={item.id}>{item.label}</option>
               ))}
             </select>
           </div>
@@ -519,13 +522,7 @@ export function App() {
             {messages.map((msg, i) => (
               <div key={i} className="message-row">
                 <div className={`message message--${msg.role}`}>
-                  {msg.role === "user" ? (
-                    <p>{msg.content}</p>
-                  ) : (
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                      {msg.content}
-                    </ReactMarkdown>
-                  )}
+                  <MessageContent msg={msg} />
                 </div>
                 {msg.role === "assistant" && msg.usage && (
                   <UsageBadge usage={msg.usage} />
@@ -568,8 +565,6 @@ export function App() {
           </section>
         )}
 
-        {toolEvents.length > 0 && <ActivityPanel events={toolEvents} />}
-
         {conversationUsage && (
           <ConversationUsageSummary usage={conversationUsage} />
         )}
@@ -583,19 +578,11 @@ export function App() {
             onKeyDown={handleKeyDown}
           />
           {sending ? (
-            <button
-              type="button"
-              className="composer__stop"
-              onClick={handleStop}
-            >
+            <button type="button" className="composer__stop" onClick={handleStop}>
               停止
             </button>
           ) : (
-            <button
-              type="button"
-              onClick={handleSend}
-              disabled={!input.trim()}
-            >
+            <button type="button" onClick={handleSend} disabled={!input.trim()}>
               发送
             </button>
           )}
@@ -605,129 +592,44 @@ export function App() {
   );
 }
 
-function aggregateUsage(messages: Message[]): UsageSummary | null {
-  // 汇总当前会话中所有 assistant usage，输出给会话级账本展示。
-  const usages = messages
-    .map((message) => message.usage)
-    .filter((usage): usage is UsageSummary => Boolean(usage));
+// ── MessageContent ──────────────────────────────────────────────────────────
 
-  if (usages.length === 0) return null;
-
-  const pricingVersions = new Set(usages.map((usage) => usage.pricingVersion));
-  const usageSources = new Set(usages.map((usage) => usage.usageSource));
-
-  return usages.reduce<UsageSummary>(
-    (total, usage) => ({
-      promptTokens: total.promptTokens + usage.promptTokens,
-      completionTokens: total.completionTokens + usage.completionTokens,
-      totalTokens: total.totalTokens + usage.totalTokens,
-      cacheHitTokens: total.cacheHitTokens + usage.cacheHitTokens,
-      cacheMissTokens: total.cacheMissTokens + usage.cacheMissTokens,
-      reasoningTokens: total.reasoningTokens + usage.reasoningTokens,
-      estimatedCostUsd: total.estimatedCostUsd + usage.estimatedCostUsd,
-      usageSource: usageSources.size === 1 ? usage.usageSource : "mixed",
-      pricingVersion: pricingVersions.size === 1 ? usage.pricingVersion : "mixed",
-    }),
-    {
-      promptTokens: 0,
-      completionTokens: 0,
-      totalTokens: 0,
-      cacheHitTokens: 0,
-      cacheMissTokens: 0,
-      reasoningTokens: 0,
-      estimatedCostUsd: 0,
-      usageSource: "",
-      pricingVersion: "",
-    }
+function MessageContent({ msg }: { msg: Message }) {
+  return (
+    <>
+      {msg.parts.map((part, i) => {
+        if (part.type === "text") {
+          return msg.role === "user" ? (
+            <p key={i}>{part.content}</p>
+          ) : (
+            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]}>
+              {part.content}
+            </ReactMarkdown>
+          );
+        }
+        if (part.type === "tool") {
+          return <ToolInlineRow key={i} part={part} />;
+        }
+        return null;
+      })}
+    </>
   );
 }
 
-function formatUsd(cost: number): string {
-  // 统一格式化美元费用，避免单次 usage 与会话累计展示出现差异。
-  if (cost < 0.0001 && cost > 0) return "<$0.0001";
-  return `$${cost.toFixed(6).replace(/\.?0+$/, "")}`;
-}
+// ── ToolInlineRow ───────────────────────────────────────────────────────────
 
-function basenameFromPath(path: string): string {
-  // 从系统目录选择器返回的绝对路径中提取展示名，兼容 Windows 与 Unix 分隔符。
-  const normalized = path.replace(/[\\/]+$/, "");
-  const parts = normalized.split(/[\\/]/);
-  return parts[parts.length - 1] || path;
-}
-
-function ConversationUsageSummary({ usage }: { usage: UsageSummary }) {
-  // 展示当前会话累计 token 与估算费用，作为 MVP 账本入口。
+function ToolInlineRow({ part }: { part: ToolPart }) {
+  const { toolName, target, status, error } = part;
   return (
-    <div className="conversation-usage" aria-label="Conversation token summary">
-      <span className="conversation-usage__label">会话累计</span>
-      <span>{usage.totalTokens.toLocaleString()} tokens</span>
-      <span className="usage-sep">·</span>
-      <span>{usage.promptTokens.toLocaleString()} in</span>
-      <span className="usage-sep">/</span>
-      <span>{usage.completionTokens.toLocaleString()} out</span>
-      {usage.reasoningTokens > 0 && (
-        <>
-          <span className="usage-sep">·</span>
-          <span>{usage.reasoningTokens.toLocaleString()} reasoning</span>
-        </>
-      )}
-      {usage.cacheHitTokens > 0 && (
-        <>
-          <span className="usage-sep">·</span>
-          <span className="usage-cache">{usage.cacheHitTokens.toLocaleString()} cached</span>
-        </>
-      )}
-      <span className="usage-sep">·</span>
-      <span className="usage-cost">{formatUsd(usage.estimatedCostUsd)}</span>
-    </div>
-  );
-}
-
-// ── ActivityPanel ─────────────────────────────────────────────────────────
-
-function toolEventTarget(event: ToolEvent): string {
-  // 从工具输入参数里提取展示用的目标（path / from / command），失败时返回空串。
-  if (!event.inputJson) return "";
-  try {
-    const input = JSON.parse(event.inputJson) as Record<string, unknown>;
-    const target = input.path ?? input.from ?? input.command ?? "";
-    return typeof target === "string" ? target : "";
-  } catch {
-    return "";
-  }
-}
-
-function ActivityPanel({ events }: { events: ToolEvent[] }) {
-  // 折叠的 Agent 工作过程面板，默认收起，灰度弱化，展示真实工具动作而非模型文本。
-  const [expanded, setExpanded] = useState(false);
-  const failed = events.filter((e) => e.status === "failed").length;
-
-  return (
-    <div className="activity-panel" aria-label="Agent 工作过程">
-      <button
-        className="activity-panel__summary"
-        type="button"
-        onClick={() => setExpanded((v) => !v)}
-      >
-        <span className="activity-panel__caret">{expanded ? "▾" : "▸"}</span>
-        已执行 {events.length} 个工具动作
-        {failed > 0 && <span className="activity-panel__failed"> · {failed} 个失败</span>}
-      </button>
-      {expanded && (
-        <ul className="activity-panel__list">
-          {events.map((event, i) => (
-            <li key={i} className={`activity-row activity-row--${event.status}`}>
-              <span className="activity-row__tool">{event.toolName}</span>
-              <span className="activity-row__target">{toolEventTarget(event)}</span>
-              <span className="activity-row__status">
-                {event.status === "succeeded" ? "✓" : "✗"}
-              </span>
-              {event.status === "failed" && event.errorMessage && (
-                <span className="activity-row__error">{event.errorMessage}</span>
-              )}
-            </li>
-          ))}
-        </ul>
+    <div className={`tool-inline tool-inline--${status}`} aria-label={`${toolName} ${status}`}>
+      <span className="tool-inline__icon" aria-hidden="true">
+        {status === "running" ? "⚙" : status === "succeeded" ? "✓" : "✗"}
+      </span>
+      <span className="tool-inline__name">{toolName}</span>
+      {target && <span className="tool-inline__target">{target}</span>}
+      {status === "running" && <span className="tool-inline__dots" aria-hidden="true">…</span>}
+      {status === "failed" && error && (
+        <span className="tool-inline__error">{error}</span>
       )}
     </div>
   );
@@ -754,9 +656,77 @@ function UsageBadge({ usage }: { usage: UsageSummary }) {
       )}
       <span className="usage-sep">·</span>
       <span className="usage-cost">
-        {costStr}
-        {isEstimate && " (估算)"}
+        {costStr}{isEstimate && " (估算)"}
       </span>
     </div>
   );
+}
+
+// ── ConversationUsageSummary ───────────────────────────────────────────────
+
+function ConversationUsageSummary({ usage }: { usage: UsageSummary }) {
+  return (
+    <div className="conversation-usage" aria-label="Conversation token summary">
+      <span className="conversation-usage__label">会话累计</span>
+      <span>{usage.totalTokens.toLocaleString()} tokens</span>
+      <span className="usage-sep">·</span>
+      <span>{usage.promptTokens.toLocaleString()} in</span>
+      <span className="usage-sep">/</span>
+      <span>{usage.completionTokens.toLocaleString()} out</span>
+      {usage.reasoningTokens > 0 && (
+        <>
+          <span className="usage-sep">·</span>
+          <span>{usage.reasoningTokens.toLocaleString()} reasoning</span>
+        </>
+      )}
+      {usage.cacheHitTokens > 0 && (
+        <>
+          <span className="usage-sep">·</span>
+          <span className="usage-cache">{usage.cacheHitTokens.toLocaleString()} cached</span>
+        </>
+      )}
+      <span className="usage-sep">·</span>
+      <span className="usage-cost">{formatUsd(usage.estimatedCostUsd)}</span>
+    </div>
+  );
+}
+
+// ── 工具函数 ──────────────────────────────────────────────────────────────
+
+function aggregateUsage(messages: Message[]): UsageSummary | null {
+  const usages = messages
+    .map((m) => m.usage)
+    .filter((u): u is UsageSummary => Boolean(u));
+  if (usages.length === 0) return null;
+  const pricingVersions = new Set(usages.map((u) => u.pricingVersion));
+  const usageSources = new Set(usages.map((u) => u.usageSource));
+  return usages.reduce<UsageSummary>(
+    (total, u) => ({
+      promptTokens: total.promptTokens + u.promptTokens,
+      completionTokens: total.completionTokens + u.completionTokens,
+      totalTokens: total.totalTokens + u.totalTokens,
+      cacheHitTokens: total.cacheHitTokens + u.cacheHitTokens,
+      cacheMissTokens: total.cacheMissTokens + u.cacheMissTokens,
+      reasoningTokens: total.reasoningTokens + u.reasoningTokens,
+      estimatedCostUsd: total.estimatedCostUsd + u.estimatedCostUsd,
+      usageSource: usageSources.size === 1 ? u.usageSource : "mixed",
+      pricingVersion: pricingVersions.size === 1 ? u.pricingVersion : "mixed",
+    }),
+    {
+      promptTokens: 0, completionTokens: 0, totalTokens: 0,
+      cacheHitTokens: 0, cacheMissTokens: 0, reasoningTokens: 0,
+      estimatedCostUsd: 0, usageSource: "", pricingVersion: "",
+    }
+  );
+}
+
+function formatUsd(cost: number): string {
+  if (cost < 0.0001 && cost > 0) return "<$0.0001";
+  return `$${cost.toFixed(6).replace(/\.?0+$/, "")}`;
+}
+
+function basenameFromPath(path: string): string {
+  const normalized = path.replace(/[\\/]+$/, "");
+  const parts = normalized.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
 }
