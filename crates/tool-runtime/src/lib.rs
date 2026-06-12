@@ -819,6 +819,87 @@ fn normalize_relative_path(path: &Path) -> String {
     }
 }
 
+// ── Workspace Map（项目结构摘要） ──────────────────────────────────────────
+
+/// 生成 repo map 时忽略的噪声目录（构建产物、依赖、缓存等）。
+const MAP_IGNORE_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "venv",
+    "__pycache__",
+    "coverage",
+];
+const MAP_MAX_ENTRIES: usize = 200;
+const MAP_MAX_DEPTH: usize = 3;
+
+/// 生成工作区结构摘要（紧凑目录树），用于在会话开局注入模型上下文。
+///
+/// 输入工作区根目录；输出多行目录树字符串，目录在前、按名称排序。忽略 `.git`、隐藏目录、
+/// `node_modules`、`target` 等噪声目录，限制深度（{MAP_MAX_DEPTH}）与条目数（{MAP_MAX_ENTRIES}），
+/// 超限时追加省略提示，避免上下文膨胀。只读取目录条目名，不读取文件内容。
+pub fn workspace_map(workspace_root: &str) -> String {
+    let root = Path::new(workspace_root);
+    if !root.is_dir() {
+        return String::new();
+    }
+    let mut lines = Vec::new();
+    let mut count = 0usize;
+    let mut truncated = false;
+    walk_workspace_map(root, 0, &mut lines, &mut count, &mut truncated);
+    if truncated {
+        lines.push("…（结构过大，已省略部分条目）".to_string());
+    }
+    lines.join("\n")
+}
+
+fn walk_workspace_map(
+    dir: &Path,
+    depth: usize,
+    lines: &mut Vec<String>,
+    count: &mut usize,
+    truncated: &mut bool,
+) {
+    if depth >= MAP_MAX_DEPTH || *truncated {
+        return;
+    }
+    let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(read_dir) => read_dir.flatten().collect(),
+        Err(_) => return,
+    };
+    // 目录在前，再按名称（小写）排序，输出稳定可读。
+    entries.sort_by_key(|entry| {
+        let is_dir = entry.path().is_dir();
+        (!is_dir, entry.file_name().to_string_lossy().to_lowercase())
+    });
+
+    for entry in entries {
+        if *count >= MAP_MAX_ENTRIES {
+            *truncated = true;
+            return;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let is_dir = path.is_dir();
+        // 跳过噪声目录与隐藏目录（.git/.idea 等）；隐藏文件（.gitignore 等）保留。
+        if is_dir && (name.starts_with('.') || MAP_IGNORE_DIRS.contains(&name.as_str())) {
+            continue;
+        }
+        let indent = "  ".repeat(depth);
+        if is_dir {
+            lines.push(format!("{indent}{name}/"));
+        } else {
+            lines.push(format!("{indent}{name}"));
+        }
+        *count += 1;
+        if is_dir {
+            walk_workspace_map(&path, depth + 1, lines, count, truncated);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,6 +913,34 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mdga-tool-runtime-{nonce}"));
         std::fs::create_dir_all(&path).expect("workspace should be created");
         path
+    }
+
+    #[test]
+    fn workspace_map_lists_tree_and_skips_noise_dirs() {
+        let workspace = temp_workspace();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/main.rs"), "fn main(){}").unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[package]").unwrap();
+        // 噪声目录应被忽略
+        std::fs::create_dir_all(workspace.join("target/debug")).unwrap();
+        std::fs::write(workspace.join("target/debug/app.exe"), "bin").unwrap();
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
+        std::fs::write(workspace.join(".git/config"), "x").unwrap();
+
+        let map = workspace_map(workspace.to_str().unwrap());
+
+        assert!(map.contains("src/"));
+        assert!(map.contains("main.rs"));
+        assert!(map.contains("Cargo.toml"));
+        assert!(!map.contains("target"));
+        assert!(!map.contains(".git"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn workspace_map_returns_empty_for_missing_dir() {
+        assert_eq!(workspace_map("C:\\definitely\\not\\here\\mdga"), "");
     }
 
     #[test]

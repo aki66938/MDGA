@@ -24,6 +24,19 @@ pub enum DeepSeekError {
     Http(#[from] reqwest::Error),
 }
 
+impl DeepSeekError {
+    /// 判断该错误是否为瞬时、可重试的错误。
+    ///
+    /// 网络收发失败、服务端 5xx、限流 429 属于可重试；认证失败、余额不足、参数错误、
+    /// 上下文超限属于确定性错误，重试无意义。用于让长任务的 Agent 循环容忍偶发网络抖动。
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            DeepSeekError::Http(_) | DeepSeekError::ServerError | DeepSeekError::RateLimited
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -442,6 +455,16 @@ mod tests {
         assert_eq!(parsed["path"], "helloworld.txt");
         assert_eq!(parsed["oldText"], "helloworld");
         assert_eq!(parsed["newText"], "123456");
+    }
+
+    #[test]
+    fn classifies_retryable_errors() {
+        assert!(DeepSeekError::ServerError.is_retryable());
+        assert!(DeepSeekError::RateLimited.is_retryable());
+        assert!(!DeepSeekError::Unauthorized.is_retryable());
+        assert!(!DeepSeekError::InsufficientBalance.is_retryable());
+        assert!(!DeepSeekError::ContextLengthExceeded.is_retryable());
+        assert!(!DeepSeekError::BadRequest("x".to_string()).is_retryable());
     }
 
     #[test]

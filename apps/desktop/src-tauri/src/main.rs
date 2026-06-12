@@ -74,10 +74,17 @@ async fn send_message(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "会话不存在".to_string())?
     };
+    // 工作区已绑定时生成 repo map，注入项目结构摘要供模型开局认知。
+    let repo_map = conversation
+        .workspace_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(mdga_tool_runtime::workspace_map);
     let messages = messages_with_workspace_context(
         messages,
         conversation.workspace_path.as_deref(),
         conversation.workspace_name.as_deref(),
+        repo_map.as_deref(),
     );
     let permission = permission_mode_from_str(&permission_mode);
 
@@ -366,6 +373,7 @@ fn messages_with_workspace_context(
     messages: Vec<ChatMessage>,
     workspace_path: Option<&str>,
     workspace_name: Option<&str>,
+    repo_map: Option<&str>,
 ) -> Vec<ChatMessage> {
     // 把后端可信的 session 工作区快照注入模型上下文，使 DeepSeek 能回答当前工作区问题。
     let Some(path) = workspace_path.filter(|path| !path.trim().is_empty()) else {
@@ -388,8 +396,18 @@ create_file、write_file 或 delete_file 工具完成真实本地操作；不要
     });
     injected.push(ChatMessage {
         role: "system".to_string(),
-        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。".to_string(),
+        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。若某次工具调用失败，请阅读返回的 error，判断是参数、路径还是环境问题，调整后重试或换用其他工具，不要原样重复同一次失败调用。".to_string(),
     });
+    // repo map：开局注入工作区结构摘要，让模型无需逐层 list_dir 就了解项目骨架。
+    if let Some(map) = repo_map.filter(|map| !map.trim().is_empty()) {
+        injected.push(ChatMessage {
+            role: "system".to_string(),
+            content: format!(
+                "当前工作区结构摘要（已忽略 .git/node_modules/target 等噪声目录，可能有省略）：\n{map}\n\
+需要查看更深层目录或文件内容时，再调用 list_dir / read_file。"
+            ),
+        });
+    }
     injected.extend(messages);
     injected
 }
@@ -555,6 +573,36 @@ fn feed_tool_denial(
     }));
 }
 
+/// 带退避重试的 chat_completion，容忍偶发网络抖动 / 5xx / 限流，避免一次瞬时失败打断整轮长任务。
+///
+/// 可重试错误（网络收发失败、服务端错误、429）按 0.5s→1s→2s 退避重试，最多 4 次；
+/// 确定性错误（认证、余额、参数、上下文超限）立即返回不重试。重试时向前端推送提示。
+async fn chat_completion_with_retry(
+    api_key: &str,
+    messages: Vec<serde_json::Value>,
+    model: &str,
+    tools: Option<Vec<serde_json::Value>>,
+    app: &AppHandle,
+) -> Result<mdga_deepseek_client::ChatCompletionResult, String> {
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match chat_completion(api_key, messages.clone(), model, tools.clone()).await {
+            Ok(result) => return Ok(result),
+            Err(err) if err.is_retryable() && attempt < MAX_ATTEMPTS => {
+                let delay_ms = 500u64 * 2u64.pow(attempt - 1);
+                let _ = app.emit(
+                    "chat-chunk",
+                    format!("\n\n（网络波动，正在重试（第 {attempt}/{} 次）…）\n\n", MAX_ATTEMPTS - 1),
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+}
+
 /// Agent 工具循环：最多 MAX_TOOL_ROUNDS 轮，每轮带工具问模型、执行返回的工具、把结果回灌，
 /// 直到模型不再调用工具或达到轮数上限。所有工具执行前都经 SessionSecurityContext 裁决。
 #[allow(clippy::too_many_arguments)]
@@ -586,14 +634,14 @@ async fn chat_with_builtin_tools(
         // 推送轮次进度，让前端展示「第 N 轮」而非黑盒等待。
         let _ = app.emit("agent-round", round + 1);
 
-        let completion = chat_completion(
+        let completion = chat_completion_with_retry(
             api_key,
             wire_messages.clone(),
             model,
             Some(all_builtin_tool_schemas()),
+            app,
         )
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
         usage = merge_usage(usage, completion.usage.clone());
 
         // 区分结构化 tool_calls 与从正文兜底解析出的 DSML 调用：
@@ -704,7 +752,11 @@ async fn chat_with_builtin_tools(
                     None,
                 ),
                 Err(message) => (
-                    serde_json::json!({ "ok": false, "error": message }),
+                    serde_json::json!({
+                        "ok": false,
+                        "error": message,
+                        "hint": "工具执行失败。请阅读 error 判断是参数错误、路径不存在还是命令/环境问题，据此调整后重试或改用其他工具/写法；不要原样重复同一次失败的调用。"
+                    }),
                     "failed",
                     Some(message.clone()),
                 ),
@@ -731,9 +783,7 @@ async fn chat_with_builtin_tools(
     }
 
     // 达到最大轮数仍未收敛：做一次不带工具的收尾，强制模型给最终答复。
-    let final_result = chat_completion(api_key, wire_messages, model, None)
-        .await
-        .map_err(|e| e.to_string())?;
+    let final_result = chat_completion_with_retry(api_key, wire_messages, model, None, app).await?;
     usage = merge_usage(usage, final_result.usage);
     let final_text = final_result
         .content
@@ -1079,6 +1129,7 @@ mod tests {
             messages,
             Some("C:\\Users\\AIT\\Desktop\\MDGA"),
             Some("MDGA"),
+            None,
         );
 
         assert_eq!(injected[0].role, "system");
@@ -1094,6 +1145,28 @@ mod tests {
         assert!(injected[1].content.contains("edit_file"));
         assert!(injected[1].content.contains("search_text"));
         assert_eq!(injected[2].role, "user");
+    }
+
+    #[test]
+    fn injects_repo_map_when_provided() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "项目结构是什么".to_string(),
+        }];
+
+        let injected = messages_with_workspace_context(
+            messages,
+            Some("C:\\Users\\AIT\\Desktop\\MDGA"),
+            Some("MDGA"),
+            Some("src/\n  main.rs\nCargo.toml"),
+        );
+
+        // sys(workspace) + sys(tools) + sys(repo map) + user
+        assert_eq!(injected.len(), 4);
+        assert_eq!(injected[2].role, "system");
+        assert!(injected[2].content.contains("工作区结构摘要"));
+        assert!(injected[2].content.contains("main.rs"));
+        assert_eq!(injected[3].role, "user");
     }
 
     #[test]
