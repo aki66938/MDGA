@@ -777,32 +777,91 @@ function ApprovalModal({
 
 // ── MessageContent ──────────────────────────────────────────────────────────
 
+/** 渲染块：单个非工具 part，或一段连续的工具调用（聚合为可折叠组） */
+type RenderBlock =
+  | { kind: "part"; part: TextPart | NoticePart; index: number }
+  | { kind: "tools"; parts: ToolPart[]; index: number };
+
 function MessageContent({ msg }: { msg: Message }) {
+  // 连续的工具卡片聚合成一个可折叠组；叙述文字与通知保持原位，时间轴不变。
+  const blocks: RenderBlock[] = [];
+  msg.parts.forEach((part, i) => {
+    if (part.type === "tool") {
+      const tail = blocks[blocks.length - 1];
+      if (tail && tail.kind === "tools") {
+        tail.parts.push(part);
+      } else {
+        blocks.push({ kind: "tools", parts: [part], index: i });
+      }
+    } else {
+      blocks.push({ kind: "part", part, index: i });
+    }
+  });
+
   return (
     <>
-      {msg.parts.map((part, i) => {
+      {blocks.map((block) => {
+        if (block.kind === "tools") {
+          return <ToolGroup key={`t${block.index}`} parts={block.parts} />;
+        }
+        const { part, index } = block;
         if (part.type === "text") {
           return msg.role === "user" ? (
-            <p key={i}>{part.content}</p>
+            <p key={index}>{part.content}</p>
           ) : (
-            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]}>
+            <ReactMarkdown key={index} remarkPlugins={[remarkGfm]}>
               {part.content}
             </ReactMarkdown>
           );
         }
-        if (part.type === "tool") {
-          return <ToolInlineRow key={i} part={part} />;
-        }
-        if (part.type === "notice") {
-          return (
-            <div key={i} className="notice-inline" aria-label="系统通知">
-              ⊜ {part.text}
-            </div>
-          );
-        }
-        return null;
+        return (
+          <div key={index} className="notice-inline" aria-label="系统通知">
+            ⊜ {part.text}
+          </div>
+        );
       })}
     </>
+  );
+}
+
+// ── ToolGroup ───────────────────────────────────────────────────────────────
+
+function ToolGroup({ parts }: { parts: ToolPart[] }) {
+  // 连续工具调用的折叠组：执行中实时显示运行行，全部完成后默认折叠为一行摘要，
+  // 点击可展开查看每一步（对标 CC/Codex 的工具过程折叠）。
+  const [expanded, setExpanded] = useState(false);
+  const running = parts.filter((p) => p.status === "running");
+  const failed = parts.filter((p) => p.status === "failed").length;
+  const denied = parts.filter((p) => p.status === "denied").length;
+
+  // 只有一条时不加折叠壳，直接显示
+  if (parts.length === 1) {
+    return <ToolInlineRow part={parts[0]} />;
+  }
+
+  const visibleRows = expanded ? parts : running;
+
+  return (
+    <div className="tool-group">
+      <button
+        className="tool-group__summary"
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="tool-group__caret">{expanded ? "▾" : "▸"}</span>
+        已执行 {parts.length} 个工具动作
+        {failed > 0 && <span className="tool-group__failed"> · {failed} 失败</span>}
+        {denied > 0 && <span className="tool-group__failed"> · {denied} 被拒</span>}
+        {running.length > 0 && <span className="tool-group__running"> · 进行中…</span>}
+      </button>
+      {visibleRows.length > 0 && (
+        <div className="tool-group__rows">
+          {visibleRows.map((p, i) => (
+            <ToolInlineRow key={i} part={p} />
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 

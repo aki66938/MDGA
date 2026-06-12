@@ -23,7 +23,6 @@ use mdga_tool_runtime::{
 
 /// Agent 工具循环单次会话内允许的最大工具轮数。作为防失控的硬上限兜底；
 /// 真正的终止由「模型不再调用工具」自然触发，提高到 20 让多步开发任务不被过早截断。
-const MAX_TOOL_ROUNDS: usize = 20;
 /// 触发上下文压缩的软上限默认值（以上一次响应返回的 prompt_tokens 为准）。
 /// DeepSeek V4 Flash 虽标称 1M，但更早就会退化/卡住，故保守取值。
 /// 可用环境变量 MDGA_CONTEXT_SOFT_LIMIT 覆盖（便于压测验证压缩机制）。
@@ -806,8 +805,9 @@ async fn chat_completion_with_retry(
     }
 }
 
-/// Agent 工具循环：最多 MAX_TOOL_ROUNDS 轮，每轮带工具问模型、执行返回的工具、把结果回灌，
-/// 直到模型不再调用工具或达到轮数上限。所有工具执行前都经 SessionSecurityContext 裁决。
+/// Agent 工具循环：每轮带工具问模型、执行返回的工具、把结果回灌，直到模型不再调用工具
+/// （自然终止）或用户中断。不设轮数上限——上下文自动压缩兜底体积，取消按钮兜底失控；
+/// 所有工具执行前都经 SessionSecurityContext 裁决。
 #[allow(clippy::too_many_arguments)]
 async fn chat_with_builtin_tools(
     api_key: &str,
@@ -830,7 +830,9 @@ async fn chat_with_builtin_tools(
     // 上一次响应返回的 prompt_tokens，作为当前上下文体积的真实信号，驱动轮内压缩。
     let mut last_prompt_tokens: u64 = 0;
 
-    for round in 0..MAX_TOOL_ROUNDS {
+    let mut round: usize = 0;
+    loop {
+        round += 1;
         // 轮次之间检查取消：用户点击停止后安全收尾，保留已执行的工具结果。
         if cancel.load(Ordering::SeqCst) {
             let _ = app.emit("chat-chunk", "\n\n（已中断）".to_string());
@@ -868,10 +870,10 @@ async fn chat_with_builtin_tools(
         }
 
         // 推送轮次进度与思考状态，让前端展示「第 N 轮 · 思考中」而非黑盒等待。
-        let _ = app.emit("agent-round", round + 1);
+        let _ = app.emit("agent-round", round);
         let _ = app.emit(
             "agent-status",
-            serde_json::json!({ "state": "thinking", "round": round + 1 }),
+            serde_json::json!({ "state": "thinking", "round": round }),
         );
 
         let completion = chat_completion_with_retry(
@@ -1032,27 +1034,6 @@ async fn chat_with_builtin_tools(
             }));
         }
     }
-
-    // 达到最大轮数仍未收敛：做一次不带工具的收尾，强制模型给最终答复。
-    let final_result = chat_completion_with_retry(api_key, wire_messages, model, None, app).await?;
-    usage = merge_usage(usage, final_result.usage);
-    let final_text = final_result
-        .content
-        .as_deref()
-        .map(strip_dsml_markup)
-        .unwrap_or_default();
-    if final_text.trim().is_empty() {
-        // 模型在收尾时只想继续调工具（被清洗后为空）：给出明确上限提示，而非泄漏 DSML 或空白。
-        let _ = app.emit(
-            "chat-chunk",
-            format!(
-                "（已达到本轮工具调用上限 {MAX_TOOL_ROUNDS} 步，任务可能尚未完成。如需继续，请回复\"继续\"。）"
-            ),
-        );
-    } else {
-        let _ = app.emit("chat-chunk", final_text);
-    }
-    Ok(usage)
 }
 
 fn recover_tool_calls_from_content(content: &str) -> Vec<ToolCall> {

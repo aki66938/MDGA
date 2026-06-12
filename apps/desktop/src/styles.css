@@ -623,6 +623,48 @@ h1 {
   margin-left: 4px;
 }
 
+/* ── 连续工具调用折叠组 ── */
+
+.tool-group {
+  margin: 4px 0;
+}
+
+.tool-group__summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: none;
+  padding: 3px 0;
+  color: #9aa0a8;
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.tool-group__summary:hover {
+  color: #69717d;
+}
+
+.tool-group__caret {
+  font-size: 10px;
+  width: 12px;
+}
+
+.tool-group__failed {
+  color: #d1242f;
+}
+
+.tool-group__running {
+  color: #b0865a;
+}
+
+.tool-group__rows {
+  padding-left: 18px;
+  border-left: 2px solid #ebedef;
+  margin-left: 5px;
+}
+
 /* ── Agent 工作状态行（发送期间常驻，对标 CC/Codex 的 thinking 指示器） ── */
 
 .agent-working {
