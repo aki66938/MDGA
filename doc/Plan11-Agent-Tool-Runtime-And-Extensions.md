@@ -418,6 +418,26 @@ activity_events
 - 可以运行 `dir`、`git status`、测试命令。⏳ 待 dev 手测
 - 高风险命令的审批分级留到后续版本细化。
 
+### 主体完成情况（0.0.9 里程碑）
+
+> **结论：Plan11 主体（Phase 1–4）已于 0.0.9 全部实现并经 dev 验证、发版（tag `v0.0.9`）。**
+>
+> 已落地的 Agent Tool Runtime 核心能力：
+>
+> - **可信执行内核**：模型只发 tool call，Host 负责真实执行、权限校验、结果回传，不再让模型伪造"已完成"。
+> - **完整文件工具组**：`create_file`、`read_file`、`write_file`、`edit_file`、`delete_file`、`list_dir`、`make_dir`、`stat_path`、`search_text`、`move_path`、`delete_dir` 共 11 个文件工具，统一 workspace path guard。
+> - **命令执行**：`run_command`（PowerShell，cwd=workspace，超时 / 输出截断 / 超时杀进程），仅 Full Access 可用。
+> - **多轮 Agent loop**：最大 5 轮工具循环，模型基于真实结果持续推理。
+> - **权限四档**：Restricted / Ask Every Time / Workspace Auto / Full Access，前端选择器透传后端 SessionSecurityContext。
+> - **审计与可视化**：工具执行事件持久化到 `activity_events` 表，前端折叠面板展示每步工具名、目标路径、成败。
+> - **DSML 兜底**：容忍单 / 双竖线 DSML 解析，修复模型内嵌工具调用泄漏成正文的 Bug。
+>
+> 这意味着 **MDGA 的 Agent 底模已经成型**：本地文件读写、命令执行、多轮推理、权限边界、审计闭环都已具备。
+>
+> **下一步动作**：Agent 内核底座完成后，工作重心从"打通能力"转向"补齐整体产品功能"。Phase 5（MCP Adapter）与 Phase 6（Skills）属于生态扩展层，**优先级后置**；当前应优先回到 Plan01 Phase 1/2 中尚未补齐的产品级功能（详见下方"后续产品功能补齐路线"）。MCP / Skills 待产品基础体验完整、Activity Event 数据积累充分后再启动。
+
+---
+
 ### Phase 5 - MCP Adapter
 
 目标：
