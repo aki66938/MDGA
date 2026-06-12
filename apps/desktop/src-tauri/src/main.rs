@@ -1,10 +1,10 @@
 use mdga_deepseek_client::{
-    chat_completion, chat_stream, detect_api_key_status, parse_dsml_tool_calls, ChatMessage,
-    ToolCall,
+    chat_completion, chat_stream, detect_api_key_status, parse_dsml_tool_calls, strip_dsml_markup,
+    ChatMessage, ToolCall,
 };
 use mdga_sandbox_runtime::{
-    ensure_tool_allowed, session_security_context, NetworkMode, SessionSecurityContext,
-    ToolCapability,
+    decide_tool_access, is_low_risk_command, session_security_context, NetworkMode,
+    SessionSecurityContext, ToolCapability, ToolDecision,
 };
 use mdga_shared::{ApiKeyStatus, PermissionMode};
 use mdga_storage::{
@@ -25,10 +25,14 @@ use mdga_tool_runtime::{
 /// 真正的终止由「模型不再调用工具」自然触发，提高到 20 让多步开发任务不被过早截断。
 const MAX_TOOL_ROUNDS: usize = 20;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
+use tokio::sync::oneshot;
+
+/// 审批请求自增序号，用于生成唯一 action_id。
+static APPROVAL_SEQ: AtomicU64 = AtomicU64::new(1);
 
 // ── 应用状态 ──────────────────────────────────────────────────────────────
 
@@ -37,6 +41,9 @@ struct AppState {
     /// 正在运行的 Agent 会话取消标志，按 conversation_id 索引。用户点击停止时置 true，
     /// 工具循环在轮次之间和工具执行前检查并安全收尾。
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// 等待用户审批的高风险动作，按 action_id 索引。respond_approval 命令收到前端决定后，
+    /// 通过对应的 oneshot 通道唤醒正在 await 的工具循环。
+    approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
 }
 
 // ── DeepSeek ──────────────────────────────────────────────────────────────
@@ -243,6 +250,23 @@ fn cancel_agent(state: State<AppState>, conversation_id: String) -> Result<(), S
     Ok(())
 }
 
+/// 前端对一次高风险动作审批请求作出回应（允许或拒绝）。
+///
+/// 通过 action_id 找到对应的 oneshot 通道并发送结果，唤醒正在等待的工具循环；
+/// 找不到对应请求时为无操作（可能已超时或已被其他途径处理）。
+#[tauri::command]
+fn respond_approval(
+    state: State<AppState>,
+    action_id: String,
+    approved: bool,
+) -> Result<(), String> {
+    let mut approvals = state.approvals.lock().map_err(|e| e.to_string())?;
+    if let Some(sender) = approvals.remove(&action_id) {
+        let _ = sender.send(approved);
+    }
+    Ok(())
+}
+
 // ── 工作区管理 ─────────────────────────────────────────────────────────────
 
 /// 返回当前用户授权的活动工作区。
@@ -362,7 +386,7 @@ create_file、write_file 或 delete_file 工具完成真实本地操作；不要
     });
     injected.push(ChatMessage {
         role: "system".to_string(),
-        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 仅在 Full Access 权限下可用，用于列目录、git status、构建或测试等低风险命令。每一步都要基于真实工具结果继续，工具失败时如实说明原因。".to_string(),
+        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。".to_string(),
     });
     injected.extend(messages);
     injected
@@ -420,6 +444,115 @@ fn record_tool_event(
     );
 }
 
+/// 单次工具调用的权限门控结果。
+enum ToolGate {
+    /// 直接放行执行。
+    Allow,
+    /// 需要用户逐次审批。
+    Ask,
+    /// 当前权限模式直接拒绝，附带原因。
+    Deny(String),
+}
+
+/// 对单次工具调用做权限门控。
+///
+/// run_command 在 Workspace Auto 下，若命令属于低风险白名单则直接放行，否则按能力裁决；
+/// 其余工具按权限模式映射到放行 / 审批 / 拒绝。
+fn gate_tool_decision(
+    context: &SessionSecurityContext,
+    tool_name: &str,
+    arguments: &str,
+) -> ToolGate {
+    let capability = match tool_capability_for_name(tool_name) {
+        Ok(capability) => capability,
+        Err(message) => return ToolGate::Deny(message),
+    };
+
+    // 低风险命令白名单：Workspace Auto 下免审批直接执行常见检查 / 构建 / 测试命令。
+    if tool_name == "run_command"
+        && matches!(context.permission_mode, mdga_shared::PermissionMode::WorkspaceAuto)
+    {
+        if let Ok(request) = serde_json::from_str::<RunCommandRequest>(arguments) {
+            if is_low_risk_command(&request.command) {
+                return ToolGate::Allow;
+            }
+        }
+    }
+
+    match decide_tool_access(context, capability) {
+        ToolDecision::Allow => ToolGate::Allow,
+        ToolDecision::AskUser => ToolGate::Ask,
+        ToolDecision::Deny => ToolGate::Deny("当前权限模式不允许此操作".to_string()),
+    }
+}
+
+/// 向前端发起一次审批请求并等待用户决定。
+///
+/// 生成唯一 action_id，注册 oneshot 通道，emit "approval-request" 事件，
+/// 然后 await 前端通过 respond_approval 命令送回的结果。通道异常时默认拒绝（安全优先）。
+async fn request_tool_approval(app: &AppHandle, tool_name: &str, arguments: &str) -> bool {
+    let action_id = format!("act-{}", APPROVAL_SEQ.fetch_add(1, Ordering::SeqCst));
+    let (sender, receiver) = oneshot::channel::<bool>();
+    {
+        let state = app.state::<AppState>();
+        let mut approvals = state.approvals.lock().expect("approvals mutex poisoned");
+        approvals.insert(action_id.clone(), sender);
+    }
+
+    let _ = app.emit(
+        "approval-request",
+        serde_json::json!({
+            "actionId": action_id,
+            "toolName": tool_name,
+            "target": approval_target(arguments),
+        }),
+    );
+
+    receiver.await.unwrap_or(false)
+}
+
+/// 从工具参数中提取审批展示用的目标（path / from / command）。
+fn approval_target(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            ["path", "from", "command"]
+                .iter()
+                .find_map(|key| value.get(*key).and_then(|v| v.as_str()).map(str::to_string))
+        })
+        .unwrap_or_default()
+}
+
+/// 记录一次工具被拒绝（权限拒绝或用户拒绝），并把拒绝结果回灌给模型，让它换方案或说明。
+#[allow(clippy::too_many_arguments)]
+fn feed_tool_denial(
+    app: &AppHandle,
+    conversation_id: &str,
+    tool_name: &str,
+    arguments: &str,
+    workspace_path: &str,
+    reason: &str,
+    tool_call_id: &str,
+    wire_messages: &mut Vec<serde_json::Value>,
+) {
+    record_tool_event(
+        app,
+        conversation_id,
+        "tool_denied",
+        tool_name,
+        "denied",
+        arguments,
+        None,
+        Some(reason),
+        workspace_path,
+    );
+    wire_messages.push(serde_json::json!({
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": serde_json::json!({ "ok": false, "error": reason }).to_string()
+    }));
+}
+
 /// Agent 工具循环：最多 MAX_TOOL_ROUNDS 轮，每轮带工具问模型、执行返回的工具、把结果回灌，
 /// 直到模型不再调用工具或达到轮数上限。所有工具执行前都经 SessionSecurityContext 裁决。
 #[allow(clippy::too_many_arguments)]
@@ -474,21 +607,24 @@ async fn chat_with_builtin_tools(
                 .unwrap_or_default()
         };
 
-        // 模型不再调用工具：发出最终回复并结束循环。
+        // 模型不再调用工具：发出最终回复并结束循环（清洗掉可能泄漏的 DSML 标记）。
         if tool_calls.is_empty() {
-            if let Some(content) = completion.content {
-                let _ = app.emit("chat-chunk", content);
+            if let Some(content) = completion.content.as_deref() {
+                let _ = app.emit("chat-chunk", strip_dsml_markup(content));
             }
             return Ok(usage);
         }
 
         // 多轮过程流式可见：把模型调用工具前的叙述实时推送，让用户看到「为什么这么做」。
-        if had_structured_calls {
-            if let Some(content) = completion.content.as_deref() {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    let _ = app.emit("chat-chunk", format!("{trimmed}\n\n"));
-                }
+        // 结构化调用的 content 是纯叙述；DSML 兜底路径的 content 含标记，需清洗后只留叙述前缀。
+        if let Some(content) = completion.content.as_deref() {
+            let narration = if had_structured_calls {
+                content.trim().to_string()
+            } else {
+                strip_dsml_markup(content)
+            };
+            if !narration.trim().is_empty() {
+                let _ = app.emit("chat-chunk", format!("{}\n\n", narration.trim()));
             }
         }
 
@@ -505,6 +641,46 @@ async fn chat_with_builtin_tools(
             }
             let tool_name = call.function.name.clone();
             let arguments = call.function.arguments.clone();
+
+            // 权限门控：低风险白名单命令直接放行，否则按权限模式决定放行 / 审批 / 拒绝。
+            let decision = gate_tool_decision(&security_context, &tool_name, &arguments);
+            let proceed = match decision {
+                ToolGate::Allow => true,
+                ToolGate::Deny(reason) => {
+                    feed_tool_denial(
+                        app,
+                        conversation_id,
+                        &tool_name,
+                        &arguments,
+                        workspace_path,
+                        &reason,
+                        &call.id,
+                        &mut wire_messages,
+                    );
+                    false
+                }
+                ToolGate::Ask => {
+                    let approved =
+                        request_tool_approval(app, &tool_name, &arguments).await;
+                    if !approved {
+                        feed_tool_denial(
+                            app,
+                            conversation_id,
+                            &tool_name,
+                            &arguments,
+                            workspace_path,
+                            "用户拒绝了该操作",
+                            &call.id,
+                            &mut wire_messages,
+                        );
+                    }
+                    approved
+                }
+            };
+            if !proceed {
+                continue;
+            }
+
             record_tool_event(
                 app,
                 conversation_id,
@@ -557,8 +733,21 @@ async fn chat_with_builtin_tools(
         .await
         .map_err(|e| e.to_string())?;
     usage = merge_usage(usage, final_result.usage);
-    if let Some(content) = final_result.content {
-        let _ = app.emit("chat-chunk", content);
+    let final_text = final_result
+        .content
+        .as_deref()
+        .map(strip_dsml_markup)
+        .unwrap_or_default();
+    if final_text.trim().is_empty() {
+        // 模型在收尾时只想继续调工具（被清洗后为空）：给出明确上限提示，而非泄漏 DSML 或空白。
+        let _ = app.emit(
+            "chat-chunk",
+            format!(
+                "（已达到本轮工具调用上限 {MAX_TOOL_ROUNDS} 步，任务可能尚未完成。如需继续，请回复\"继续\"。）"
+            ),
+        );
+    } else {
+        let _ = app.emit("chat-chunk", final_text);
     }
     Ok(usage)
 }
@@ -756,8 +945,8 @@ fn execute_builtin_tool_call(
     tool_name: &str,
     arguments: &str,
 ) -> Result<serde_json::Value, String> {
-    let capability = tool_capability_for_name(tool_name)?;
-    ensure_tool_allowed(security_context, capability).map_err(|err| err.to_string())?;
+    // 权限门控已在工具循环（gate_tool_decision）完成，这里只做工具名校验与真实执行。
+    tool_capability_for_name(tool_name)?;
     let workspace_path = security_context.workspace_root.as_str();
 
     match tool_name {
@@ -1031,6 +1220,7 @@ fn main() {
             app.manage(AppState {
                 db: Mutex::new(db),
                 cancels: Mutex::new(HashMap::new()),
+                approvals: Mutex::new(HashMap::new()),
             });
             Ok(())
         })
@@ -1046,6 +1236,7 @@ fn main() {
             remove_conversation,
             get_conversation_events,
             cancel_agent,
+            respond_approval,
             get_workspace,
             set_workspace_path,
             clear_workspace,

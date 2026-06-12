@@ -618,3 +618,50 @@ Plan11 是当前 MVP 下一步的核心计划。没有 Plan11，workspace 只能
 - 不实现 `run_command`，避免风险面过早扩大。
 - 不做复杂 UI，先保证真实本地行为跑通。
 - 完成源码变更并经 dev 验证后，必须更新 history、推送 main、推送三段式 release tag。
+
+---
+
+## 11. DSML 兜底解析参考（排错查阅用）
+
+> 本章节集中记录 DeepSeek「DSML 工具标记泄漏」问题的成因、表现与现有防线，便于下次遇到同类 Bug 时快速定位。
+
+### 11.1 DSML 是什么
+
+DeepSeek 在返回工具调用时，**标准方式**是 OpenAI 兼容的结构化 `tool_calls` 字段（`choices[0].message.tool_calls`）。但某些模型版本 / 某些情况下，它**不返回结构化字段，而是把工具调用以 DSML（DeepSeek Markup Language）标记直接写进正文 `content`**，形如：
+
+```text
+<｜｜DSML｜｜tool_calls>
+  <｜｜DSML｜｜invoke name="read_file">
+    <｜｜DSML｜｜parameter name="path" string="true">src/app.py</｜｜DSML｜｜parameter>
+  </｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>
+```
+
+如果 Host 不识别它，这段标记就会作为普通文本渲染到界面，且工具**不会真正执行** —— 这就是「DSML 泄漏」。
+
+### 11.2 两个关键坑
+
+1. **竖线数量不固定**：分隔符用的是全角竖线 U+FF5C（`｜`），不同模型版本会用**单竖线** `<｜DSML｜...>` 或**双竖线** `<｜｜DSML｜｜...>`。早期解析器硬编码单竖线，碰到双竖线就漏解析（0.0.9 修复）。
+   - 解法：`strip_dsml_bars()` 先移除所有 U+FF5C，把两种变体归一化成 `<DSML...>` 再解析。
+
+2. **撞工具轮数上限时的收尾请求会泄漏**：工具循环达到 `MAX_TOOL_ROUNDS`（当前 20）后，会做一次**不带 tools 的收尾请求**逼模型给最终答复。但模型若仍想调工具，就会把 DSML 吐进正文，而收尾分支若不清洗就会原样输出（0.0.12 修复）。
+   - 解法：所有发给用户的最终正文都过 `strip_dsml_markup()`，从第一个 `<DSML` 标记处截断、只留前面的自然语言叙述；若清洗后为空，改发「已达工具调用上限」提示。
+
+### 11.3 现有三层防线（都在 `crates/deepseek-client/src/lib.rs`）
+
+| 函数 | 职责 |
+|------|------|
+| `strip_dsml_bars()` | 移除全角竖线，归一化单/双竖线变体 |
+| `parse_dsml_tool_calls()` | 从正文恢复 DSML 工具调用为可执行 ToolCall（兜底执行路径） |
+| `strip_dsml_markup()` | 从展示正文中截断 DSML 标记，保证永不泄漏到界面 |
+
+调用位置在 `apps/desktop/src-tauri/src/main.rs` 的 `chat_with_builtin_tools`：
+- 每轮：结构化 `tool_calls` 为空时，用 `parse_dsml_tool_calls` 兜底恢复并执行。
+- 所有最终正文 emit 前用 `strip_dsml_markup` 清洗（no-tool-calls 分支、撞上限收尾分支、DSML 兜底路径的叙述前缀）。
+
+### 11.4 下次若仍泄漏，排查顺序
+
+1. 看泄漏的标记长什么样：是新的竖线数量（如三竖线）还是新的标签名（非 `invoke`/`parameter`/`tool_calls`）？若是，扩展 `strip_dsml_bars` / 解析器的标记常量。
+2. 确认是否撞了 `MAX_TOOL_ROUNDS` 上限：看泄漏是否出现在很长的多步任务结尾、且伴随 token 数很大。若是，考虑该路径的清洗是否覆盖到。
+3. 确认是否走了某个**未经 `strip_dsml_markup` 清洗**的新 emit 路径（新增功能时容易遗漏）。
+4. 在 `deepseek-client` 用真实泄漏样本补一个解析/清洗单测，红→绿。

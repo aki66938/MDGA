@@ -327,6 +327,19 @@ fn strip_dsml_bars(content: &str) -> String {
     content.replace('\u{FF5C}', "")
 }
 
+/// 从将要展示给用户的正文中清除 DSML 工具标记，避免泄漏成可见文本。
+///
+/// DeepSeek 偶尔把 DSML 工具调用直接吐进正文（尤其在不带 tools 的收尾请求里）。工具调用
+/// 总是出现在叙述之后，因此从第一个 DSML 标记处截断，保留前面的自然语言叙述，丢弃整段标记。
+/// 正文中若没有 DSML 标记则原样返回。
+pub fn strip_dsml_markup(content: &str) -> String {
+    let normalized = strip_dsml_bars(content);
+    match normalized.find("<DSML") {
+        Some(pos) => normalized[..pos].trim_end().to_string(),
+        None => content.to_string(),
+    }
+}
+
 fn parse_dsml_parameters(body: &str) -> serde_json::Map<String, serde_json::Value> {
     let mut params = serde_json::Map::new();
     let mut cursor = 0;
@@ -429,6 +442,23 @@ mod tests {
         assert_eq!(parsed["path"], "helloworld.txt");
         assert_eq!(parsed["oldText"], "helloworld");
         assert_eq!(parsed["newText"], "123456");
+    }
+
+    #[test]
+    fn strips_leaked_dsml_markup_keeping_narration() {
+        // 模拟撞上限收尾时，模型把叙述 + DSML 调用一起吐进正文的情况。
+        let content = "让我直接重写整个文件，移除所有 emoji 字符：\n\n<｜｜DSML｜｜tool_calls> <｜｜DSML｜｜invoke name=\"read_file\"> <｜｜DSML｜｜parameter name=\"path\" string=\"true\">src/CalculatorApp/calculator.py</｜｜DSML｜｜parameter> </｜｜DSML｜｜invoke> </｜｜DSML｜｜tool_calls>";
+
+        let cleaned = strip_dsml_markup(content);
+
+        assert_eq!(cleaned, "让我直接重写整个文件，移除所有 emoji 字符：");
+        assert!(!cleaned.contains("DSML"));
+    }
+
+    #[test]
+    fn strip_dsml_markup_returns_plain_text_untouched() {
+        let content = "这是一段普通回复，没有任何工具标记。";
+        assert_eq!(strip_dsml_markup(content), content);
     }
 
     #[test]

@@ -615,11 +615,96 @@ h1 {
 .tool-inline--succeeded .tool-inline__icon { color: #2da44e; }
 .tool-inline--failed    .tool-inline__icon { color: #d1242f; }
 .tool-inline--running   .tool-inline__icon { color: #9aa0a8; }
+.tool-inline--denied    .tool-inline__icon { color: #bf8700; }
 
 .tool-inline__error {
   font-size: 11.5px;
   color: #d1242f;
   margin-left: 4px;
+}
+
+/* ── 高风险动作审批弹窗 ── */
+
+.approval-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(31, 35, 40, 0.32);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.approval-card {
+  width: min(420px, 90vw);
+  background: #ffffff;
+  border: 1px solid #e4e5e7;
+  border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 12px 32px rgba(31, 35, 40, 0.18);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.approval-card__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: #1f2328;
+}
+
+.approval-card__detail {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 12px;
+  background: #fafbfc;
+  border: 1px solid #ebedef;
+  border-radius: 8px;
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 13px;
+}
+
+.approval-card__tool {
+  color: #1f2328;
+  flex-shrink: 0;
+}
+
+.approval-card__target {
+  color: #69717d;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-card__hint {
+  margin: 0;
+  font-size: 13px;
+  color: #69717d;
+}
+
+.approval-card__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.approval-card__btn {
+  flex: 1;
+  border: 1px solid #d8dadd;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #1f2328;
+  cursor: pointer;
+  padding: 9px 14px;
+  font-size: 13px;
+}
+
+.approval-card__btn--allow {
+  background: #1f2328;
+  color: #ffffff;
+  border-color: #1f2328;
 }
 
 /* ── 更新提示横幅（固定在侧边栏底部） ── */

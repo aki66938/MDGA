@@ -78,19 +78,21 @@ Agent 能力强化（Plan12，本文）
 - 多步任务中工具卡片交错出现在叙述之间，而非扎堆底部。✅
 - 工具执行时能看到运行中→完成的实时状态变化。✅
 
-### 0.0.12 - 安全放权 + 真实审批
+### 0.0.12 - 安全放权 + 真实审批 ✅ 已实现并发版
 
 目标：让 Agent 在不开 Full Access 的前提下能跑低风险命令，并补齐真实审批闭环。
 
 任务：
 
-- `run_command` **低风险命令白名单**：`cargo check`、`cargo test`、`npm test`、`npm run build`、`git status`、`git diff`、`dir` 等在 Workspace Auto 下放行，无需 Full Access；白名单外命令仍需 Full Access 或审批。
-- **Ask Every Time 真实弹窗**：越界路径、高风险工具（删除、命令、越界写入）暂停等用户确认（补掉 0.0.9 留的降级坑）。
+- 修复权限裁决 Bug：AskEveryTime 此前对所有能力（含只读）都返回 AskUser，导致连读文件都报错、整模式不可用；改为只读直接放行，仅变更/命令/网络走审批。✅
+- `run_command` **低风险命令白名单**：`cargo check/test`、`npm test`、`npm run build`、`git status/diff` 等在 Workspace Auto 下放行，无需 Full Access；含管道/串联/重定向的命令一律不算低风险（防绕过）。✅
+- **Ask Every Time 真实弹窗**：后端 emit `approval-request` → 前端弹窗「允许一次/拒绝」→ oneshot 通道唤醒工具循环；拒绝则回灌模型让它换方案，被拒工具显示 ⊘ 卡片。✅
+- 顺带修复 DSML 标记泄漏（详见 Plan11「DSML 兜底解析」参考章节）。✅
 
 验收：
 
-- Workspace Auto 下 Agent 可自行运行测试/构建/git status。
-- Ask Every Time 下高风险动作弹窗确认，确认后执行、拒绝后跳过并告知模型。
+- Workspace Auto 下 Agent 可自行运行测试/构建/git status。✅
+- Ask Every Time 下高风险动作弹窗确认，确认后执行、拒绝后跳过并告知模型。✅
 
 ### 0.0.13 - 错误自纠 + 项目认知
 

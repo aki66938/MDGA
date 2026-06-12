@@ -25,8 +25,15 @@ type ToolPart = {
   type: "tool";
   toolName: string;
   target: string;
-  status: "running" | "succeeded" | "failed";
+  status: "running" | "succeeded" | "failed" | "denied";
   error?: string;
+};
+
+/** 高风险动作审批请求，由后端在 AskEveryTime / 越界场景下发起 */
+type ApprovalRequest = {
+  actionId: string;
+  toolName: string;
+  target: string;
 };
 
 type MessagePart = TextPart | ToolPart;
@@ -108,6 +115,7 @@ export function App() {
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("workspace_auto");
   const [draftWorkspace, setDraftWorkspace] = useState<DraftWorkspace | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const streamingTextRef = useRef(""); // 只累积纯文字内容，用于 chat-done 持久化
@@ -139,6 +147,16 @@ export function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // 持续监听高风险动作审批请求，弹出确认框
+  useEffect(() => {
+    const unlisten = listen<ApprovalRequest>("approval-request", (e) => {
+      setApproval(e.payload);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -301,6 +319,15 @@ export function App() {
         const parts = [...last.parts];
         if (status === "running") {
           parts.push({ type: "tool", toolName, target, status: "running" });
+        } else if (status === "denied") {
+          // 被拒绝的工具没有 running 阶段，直接插入一张拒绝卡片
+          parts.push({
+            type: "tool",
+            toolName,
+            target,
+            status: "denied",
+            error: errorMessage ?? undefined,
+          });
         } else {
           // 从后往前找同名的最近 running 卡片并更新状态
           for (let i = parts.length - 1; i >= 0; i--) {
@@ -333,6 +360,7 @@ export function App() {
     const finalConvId = convId;
     const unlistenDone = await listen("chat-done", async () => {
       setSending(false);
+      setApproval(null);
       unlistenChunk();
       unlistenTool();
       unlistenUsage();
@@ -381,8 +409,20 @@ export function App() {
   }
 
   async function handleStop() {
+    // 若有挂起的审批请求，先拒绝它，避免后端工具循环卡在等待中
+    if (approval) {
+      await invoke("respond_approval", { actionId: approval.actionId, approved: false }).catch(() => {});
+      setApproval(null);
+    }
     if (!activeConvId) return;
     await invoke("cancel_agent", { conversationId: activeConvId }).catch(() => {});
+  }
+
+  async function respondApproval(approved: boolean) {
+    if (!approval) return;
+    const actionId = approval.actionId;
+    setApproval(null);
+    await invoke("respond_approval", { actionId, approved }).catch(() => {});
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -588,7 +628,50 @@ export function App() {
           )}
         </div>
       </section>
+
+      {approval && (
+        <ApprovalModal
+          approval={approval}
+          onAllow={() => respondApproval(true)}
+          onDeny={() => respondApproval(false)}
+        />
+      )}
     </main>
+  );
+}
+
+// ── ApprovalModal ───────────────────────────────────────────────────────────
+
+function ApprovalModal({
+  approval,
+  onAllow,
+  onDeny,
+}: {
+  approval: ApprovalRequest;
+  onAllow: () => void;
+  onDeny: () => void;
+}) {
+  return (
+    <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="高风险动作审批">
+      <div className="approval-card">
+        <p className="approval-card__title">Agent 请求执行高风险动作</p>
+        <div className="approval-card__detail">
+          <span className="approval-card__tool">{approval.toolName}</span>
+          {approval.target && (
+            <span className="approval-card__target">{approval.target}</span>
+          )}
+        </div>
+        <p className="approval-card__hint">是否允许本次操作？</p>
+        <div className="approval-card__actions">
+          <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={onAllow}>
+            允许一次
+          </button>
+          <button type="button" className="approval-card__btn" onClick={onDeny}>
+            拒绝
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -620,14 +703,17 @@ function MessageContent({ msg }: { msg: Message }) {
 
 function ToolInlineRow({ part }: { part: ToolPart }) {
   const { toolName, target, status, error } = part;
+  const icon =
+    status === "running" ? "⚙" :
+    status === "succeeded" ? "✓" :
+    status === "denied" ? "⊘" : "✗";
   return (
     <div className={`tool-inline tool-inline--${status}`} aria-label={`${toolName} ${status}`}>
-      <span className="tool-inline__icon" aria-hidden="true">
-        {status === "running" ? "⚙" : status === "succeeded" ? "✓" : "✗"}
-      </span>
+      <span className="tool-inline__icon" aria-hidden="true">{icon}</span>
       <span className="tool-inline__name">{toolName}</span>
       {target && <span className="tool-inline__target">{target}</span>}
       {status === "running" && <span className="tool-inline__dots" aria-hidden="true">…</span>}
+      {status === "denied" && <span className="tool-inline__error">{error ?? "已拒绝"}</span>}
       {status === "failed" && error && (
         <span className="tool-inline__error">{error}</span>
       )}
