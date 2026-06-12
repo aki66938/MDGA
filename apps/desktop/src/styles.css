@@ -623,6 +623,134 @@ h1 {
   margin-left: 4px;
 }
 
+/* ── 会话搜索与管理动作 ── */
+
+.conv-search {
+  width: 100%;
+  border: 1px solid #e0e2e5;
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 13px;
+  background: #ffffff;
+  color: #1f2328;
+  margin-bottom: 6px;
+  outline: none;
+}
+
+.conv-search:focus {
+  border-color: #b0b5bc;
+}
+
+.conv-item__actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.conv-item__action {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.1s;
+  padding: 0;
+  line-height: 1;
+  filter: grayscale(1) opacity(0.7);
+}
+
+.conv-item:hover .conv-item__action {
+  opacity: 1;
+}
+
+.conv-item__action:hover {
+  background: #e0e2e5;
+  filter: none;
+}
+
+.conv-item__pin-mark {
+  font-size: 10px;
+  margin-right: 4px;
+  filter: grayscale(0.6);
+}
+
+.conv-item__rename {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #b0b5bc;
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 13px;
+  outline: none;
+}
+
+.archived-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 8px 10px 4px;
+  color: #9aa0a8;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.archived-toggle:hover {
+  color: #69717d;
+}
+
+/* ── 代码块（高亮 + 复制按钮） ── */
+
+.code-block {
+  position: relative;
+  margin: 8px 0;
+}
+
+.code-block pre {
+  margin: 0;
+  padding: 14px;
+  border-radius: 8px;
+  background: #f6f8fa;
+  border: 1px solid #ebedef;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.code-block__copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  border: 1px solid #d8dadd;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #69717d;
+  font-size: 11px;
+  padding: 3px 8px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+
+.code-block:hover .code-block__copy {
+  opacity: 1;
+}
+
+.code-block__copy:hover {
+  color: #1f2328;
+  border-color: #b0b5bc;
+}
+
 /* ── 连续工具调用折叠组 ── */
 
 .tool-group {
@@ -711,6 +839,295 @@ h1 {
   border-radius: 0 6px 6px 0;
   font-size: 12.5px;
   color: #8b929b;
+}
+
+/* ── Diff 块与变更汇总 ── */
+
+.tool-inline-wrap {
+  margin: 1px 0;
+}
+
+.tool-inline--clickable {
+  cursor: pointer;
+}
+
+.tool-inline--clickable:hover .tool-inline__name {
+  color: #4f5661;
+}
+
+.tool-inline__stats {
+  display: inline-flex;
+  gap: 5px;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-inline__expand {
+  font-size: 11px;
+  color: #b0b5bc;
+}
+
+.diff-added { color: #2da44e; }
+.diff-removed { color: #d1242f; }
+
+.diff-block {
+  margin: 4px 0 6px 20px;
+  padding: 10px 12px;
+  border: 1px solid #ebedef;
+  border-radius: 8px;
+  background: #fafbfc;
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-x: auto;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.diff-line { display: inline; white-space: pre; }
+.diff-line--add { background: #e6ffec; color: #1a7f37; }
+.diff-line--del { background: #ffebe9; color: #cf222e; }
+.diff-line--hunk { color: #9aa0a8; }
+
+.tool-live-output {
+  margin: 2px 0 4px 20px;
+  padding: 8px 10px;
+  border-left: 2px solid #d8dadd;
+  background: #fafbfc;
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: #69717d;
+  max-height: 180px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.changeset-summary {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #9aa0a8;
+}
+
+/* ── 任务清单（todo_write） ── */
+
+.todo-panel {
+  width: min(760px, 100%);
+  align-self: center;
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  border: 1px solid #ebedef;
+  border-radius: 10px;
+  background: #fafbfc;
+  font-size: 12.5px;
+}
+
+.todo-panel__head {
+  font-weight: 600;
+  color: #69717d;
+  margin-right: 10px;
+}
+
+.todo-panel__items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 4px;
+}
+
+.todo-item { color: #69717d; }
+.todo-item--done { color: #9aa0a8; text-decoration: line-through; }
+.todo-item--in_progress { color: #1f2328; font-weight: 600; }
+
+/* ── Composer 扩展（计划模式 / 斜杠菜单） ── */
+
+.composer-area {
+  position: relative;
+  width: min(760px, 100%);
+  align-self: center;
+  flex-shrink: 0;
+  margin-top: 12px;
+}
+
+.composer-area .composer {
+  width: 100%;
+  margin-top: 0;
+}
+
+.composer__side {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.composer__plan {
+  border: 1px solid #d8dadd;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #9aa0a8;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+.composer__plan--on {
+  background: #1f2328;
+  color: #ffffff;
+  border-color: #1f2328;
+}
+
+.slash-menu {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  margin-bottom: 6px;
+  background: #ffffff;
+  border: 1px solid #e0e2e5;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(31, 35, 40, 0.12);
+  overflow: hidden;
+  z-index: 50;
+}
+
+.slash-menu__item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 9px 14px;
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+}
+
+.slash-menu__item:hover {
+  background: #f0f1f3;
+}
+
+.slash-menu__cmd {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  color: #1f2328;
+  flex-shrink: 0;
+}
+
+.slash-menu__desc {
+  color: #9aa0a8;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Topbar 按钮 / 设置面板 / 变更面板 ── */
+
+.topbar-btn {
+  border: 1px solid #d8dadd;
+  border-radius: 99px;
+  background: #ffffff;
+  color: #69717d;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 5px 12px;
+}
+
+.topbar-btn:hover {
+  color: #1f2328;
+  border-color: #b0b5bc;
+}
+
+.panel-card {
+  width: min(560px, 92vw);
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid #f0f1f3;
+  font-size: 13px;
+}
+
+.settings-row__label {
+  color: #69717d;
+  flex-shrink: 0;
+}
+
+.settings-row__value {
+  color: #1f2328;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.changes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.changes-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12.5px;
+}
+
+.changes-row:hover {
+  background: #fafbfc;
+}
+
+.changes-row--reverted {
+  opacity: 0.5;
+}
+
+.changes-row__tool {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  color: #4f5661;
+  flex-shrink: 0;
+  font-size: 12px;
+}
+
+.changes-row__path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #69717d;
+}
+
+.changes-row__state {
+  color: #b0b5bc;
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+
+.changes-row__revert {
+  border: 1px solid #d8dadd;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #69717d;
+  cursor: pointer;
+  font-size: 11.5px;
+  padding: 3px 8px;
+  flex-shrink: 0;
+}
+
+.changes-row__revert:hover {
+  color: #cf222e;
+  border-color: #f5c0c0;
 }
 
 /* ── 高风险动作审批弹窗 ── */

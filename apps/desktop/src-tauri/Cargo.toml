@@ -12,6 +12,7 @@ mdga-storage = { path = "../../../crates/storage" }
 mdga-token-accounting = { path = "../../../crates/token-accounting" }
 mdga-tool-runtime = { path = "../../../crates/tool-runtime" }
 rusqlite.workspace = true
+similar.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

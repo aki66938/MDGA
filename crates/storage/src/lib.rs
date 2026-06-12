@@ -15,6 +15,10 @@ pub struct Conversation {
     pub workspace_path: Option<String>,
     pub workspace_name: Option<String>,
     pub mode: String,
+    /// 置顶：列表排序时优先于普通会话。
+    pub pinned: bool,
+    /// 归档：从主列表移入「已归档」区，不删除数据。
+    pub archived: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -61,6 +65,27 @@ pub struct ActivityEventRecord {
     pub output_json: Option<String>,
     pub error_message: Option<String>,
     pub workspace_path: Option<String>,
+    pub created_at: i64,
+}
+
+/// 文件变更检查点：每次写类工具执行前的文件快照，支撑回退（rewind）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileCheckpoint {
+    pub id: String,
+    pub conversation_id: String,
+    /// 会话内单调递增序号，回退按序号倒序执行。
+    pub seq: i64,
+    pub tool_name: String,
+    pub rel_path: String,
+    /// 变更前的文件全文；None 表示此前文件不存在（回退 = 删除）。
+    pub prev_content: Option<String>,
+    /// 工具相关附加信息（如 move_path 的 from/to）。
+    pub extra_json: Option<String>,
+    /// 是否可回退（delete_dir 递归删除等不可回退）。
+    pub revertible: bool,
+    /// 是否已被回退。
+    pub reverted: bool,
     pub created_at: i64,
 }
 
@@ -123,12 +148,36 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_activity_conv
             ON activity_events (conversation_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS file_checkpoints (
+            id              TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            seq             INTEGER NOT NULL,
+            tool_name       TEXT NOT NULL,
+            rel_path        TEXT NOT NULL,
+            prev_content    TEXT,
+            extra_json      TEXT,
+            revertible      INTEGER NOT NULL DEFAULT 1,
+            reverted        INTEGER NOT NULL DEFAULT 0,
+            created_at      INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_checkpoints_conv
+            ON file_checkpoints (conversation_id, seq);
+
+        CREATE TABLE IF NOT EXISTS permission_rules (
+            id         TEXT PRIMARY KEY,
+            rule       TEXT NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL
+        );
         ",
     )?;
     add_column_if_missing(&conn, "conversations", "workspace_path", "TEXT")?;
     add_column_if_missing(&conn, "conversations", "workspace_name", "TEXT")?;
     add_column_if_missing(&conn, "conversations", "mode", "TEXT NOT NULL DEFAULT 'chat_only'")?;
     add_column_if_missing(&conn, "messages", "parts_json", "TEXT")?;
+    add_column_if_missing(&conn, "conversations", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(&conn, "conversations", "archived", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(conn)
 }
 
@@ -198,17 +247,19 @@ pub fn create_conversation_with_workspace(
         workspace_path: workspace_path.map(str::to_string),
         workspace_name: workspace_name.map(str::to_string),
         mode: mode.to_string(),
+        pinned: false,
+        archived: false,
         created_at: now,
         updated_at: now,
     })
 }
 
-/// 查询所有会话，按最近更新时间倒序排列。
+/// 查询所有会话：置顶在前，其余按最近更新时间倒序；归档的也返回，由前端分区展示。
 pub fn list_conversations(conn: &Connection) -> SqlResult<Vec<Conversation>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, workspace_path, workspace_name, mode, created_at, updated_at
+        "SELECT id, title, workspace_path, workspace_name, mode, pinned, archived, created_at, updated_at
          FROM conversations
-         ORDER BY updated_at DESC",
+         ORDER BY pinned DESC, updated_at DESC",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(Conversation {
@@ -217,11 +268,31 @@ pub fn list_conversations(conn: &Connection) -> SqlResult<Vec<Conversation>> {
             workspace_path: row.get(2)?,
             workspace_name: row.get(3)?,
             mode: row.get(4)?,
-            created_at: row.get(5)?,
-            updated_at: row.get(6)?,
+            pinned: row.get::<_, i64>(5)? != 0,
+            archived: row.get::<_, i64>(6)? != 0,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
         })
     })?;
     rows.collect()
+}
+
+/// 设置会话置顶状态。
+pub fn set_conversation_pinned(conn: &Connection, conv_id: &str, pinned: bool) -> SqlResult<()> {
+    conn.execute(
+        "UPDATE conversations SET pinned = ?1 WHERE id = ?2",
+        params![pinned as i64, conv_id],
+    )?;
+    Ok(())
+}
+
+/// 设置会话归档状态。归档不删除数据，只影响前端分区展示。
+pub fn set_conversation_archived(conn: &Connection, conv_id: &str, archived: bool) -> SqlResult<()> {
+    conn.execute(
+        "UPDATE conversations SET archived = ?1 WHERE id = ?2",
+        params![archived as i64, conv_id],
+    )?;
+    Ok(())
 }
 
 /// 按 ID 查询单个会话。
@@ -229,7 +300,7 @@ pub fn list_conversations(conn: &Connection) -> SqlResult<Vec<Conversation>> {
 /// 输入数据库连接和会话 ID；输出完整 Conversation 或 None，供发送链路读取 session 级工作区快照。
 pub fn get_conversation(conn: &Connection, conv_id: &str) -> SqlResult<Option<Conversation>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, workspace_path, workspace_name, mode, created_at, updated_at
+        "SELECT id, title, workspace_path, workspace_name, mode, pinned, archived, created_at, updated_at
          FROM conversations
          WHERE id = ?1
          LIMIT 1",
@@ -243,8 +314,10 @@ pub fn get_conversation(conn: &Connection, conv_id: &str) -> SqlResult<Option<Co
             workspace_path: row.get(2)?,
             workspace_name: row.get(3)?,
             mode: row.get(4)?,
-            created_at: row.get(5)?,
-            updated_at: row.get(6)?,
+            pinned: row.get::<_, i64>(5)? != 0,
+            archived: row.get::<_, i64>(6)? != 0,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
         }))
     } else {
         Ok(None)
@@ -313,6 +386,106 @@ pub fn get_messages(conn: &Connection, conv_id: &str) -> SqlResult<Vec<StoredMes
             created_at: row.get(6)?,
         })
     })?;
+    rows.collect()
+}
+
+/// 删除会话的全部消息（/compact 手动压缩时由摘要替换原文前调用）。
+pub fn delete_messages(conn: &Connection, conv_id: &str) -> SqlResult<()> {
+    conn.execute(
+        "DELETE FROM messages WHERE conversation_id = ?1",
+        params![conv_id],
+    )?;
+    Ok(())
+}
+
+// ── File Checkpoint CRUD ─────────────────────────────────────────────────
+
+/// 记录一次文件变更检查点（写类工具执行成功后调用，保存变更前快照）。
+pub fn record_file_checkpoint(
+    conn: &Connection,
+    conv_id: &str,
+    tool_name: &str,
+    rel_path: &str,
+    prev_content: Option<&str>,
+    extra_json: Option<&str>,
+    revertible: bool,
+) -> SqlResult<FileCheckpoint> {
+    let id = Uuid::new_v4().to_string();
+    let now = now_ts();
+    let seq: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM file_checkpoints WHERE conversation_id = ?1",
+        params![conv_id],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO file_checkpoints
+         (id, conversation_id, seq, tool_name, rel_path, prev_content, extra_json, revertible, reverted, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
+        params![id, conv_id, seq, tool_name, rel_path, prev_content, extra_json, revertible as i64, now],
+    )?;
+    Ok(FileCheckpoint {
+        id,
+        conversation_id: conv_id.to_string(),
+        seq,
+        tool_name: tool_name.to_string(),
+        rel_path: rel_path.to_string(),
+        prev_content: prev_content.map(str::to_string),
+        extra_json: extra_json.map(str::to_string),
+        revertible,
+        reverted: false,
+        created_at: now,
+    })
+}
+
+/// 查询会话的全部检查点，按序号正序（含已回退的，供 UI 展示状态）。
+pub fn list_file_checkpoints(conn: &Connection, conv_id: &str) -> SqlResult<Vec<FileCheckpoint>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, conversation_id, seq, tool_name, rel_path, prev_content, extra_json, revertible, reverted, created_at
+         FROM file_checkpoints
+         WHERE conversation_id = ?1
+         ORDER BY seq ASC",
+    )?;
+    let rows = stmt.query_map([conv_id], |row| {
+        Ok(FileCheckpoint {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            seq: row.get(2)?,
+            tool_name: row.get(3)?,
+            rel_path: row.get(4)?,
+            prev_content: row.get(5)?,
+            extra_json: row.get(6)?,
+            revertible: row.get::<_, i64>(7)? != 0,
+            reverted: row.get::<_, i64>(8)? != 0,
+            created_at: row.get(9)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 把一个检查点标记为已回退。
+pub fn mark_checkpoint_reverted(conn: &Connection, checkpoint_id: &str) -> SqlResult<()> {
+    conn.execute(
+        "UPDATE file_checkpoints SET reverted = 1 WHERE id = ?1",
+        params![checkpoint_id],
+    )?;
+    Ok(())
+}
+
+// ── Permission Rule CRUD ─────────────────────────────────────────────────
+
+/// 保存一条「总是允许」权限规则（如 `cmd:git push`、`tool:write_file`）；重复插入幂等。
+pub fn add_permission_rule(conn: &Connection, rule: &str) -> SqlResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO permission_rules (id, rule, created_at) VALUES (?1, ?2, ?3)",
+        params![Uuid::new_v4().to_string(), rule, now_ts()],
+    )?;
+    Ok(())
+}
+
+/// 读取全部权限规则。
+pub fn list_permission_rules(conn: &Connection) -> SqlResult<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT rule FROM permission_rules ORDER BY created_at ASC")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     rows.collect()
 }
 
@@ -473,6 +646,46 @@ pub fn get_activity_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn records_and_lists_file_checkpoints_with_seq() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+        let conv = create_conversation(&conn).expect("conv");
+
+        let c1 = record_file_checkpoint(&conn, &conv.id, "write_file", "a.txt", Some("old"), None, true)
+            .expect("checkpoint 1");
+        let c2 = record_file_checkpoint(&conn, &conv.id, "create_file", "b.txt", None, None, true)
+            .expect("checkpoint 2");
+        assert_eq!(c1.seq, 1);
+        assert_eq!(c2.seq, 2);
+
+        mark_checkpoint_reverted(&conn, &c2.id).expect("mark reverted");
+        let list = list_file_checkpoints(&conn, &conv.id).expect("list");
+        assert_eq!(list.len(), 2);
+        assert!(!list[0].reverted);
+        assert!(list[1].reverted);
+        assert_eq!(list[0].prev_content.as_deref(), Some("old"));
+        assert_eq!(list[1].prev_content, None);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn permission_rules_are_idempotent() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        add_permission_rule(&conn, "cmd:git push").expect("rule 1");
+        add_permission_rule(&conn, "cmd:git push").expect("rule dup");
+        add_permission_rule(&conn, "tool:write_file").expect("rule 2");
+
+        let rules = list_permission_rules(&conn).expect("list");
+        assert_eq!(rules.len(), 2);
+        assert!(rules.contains(&"cmd:git push".to_string()));
+
+        let _ = std::fs::remove_file(db_path);
+    }
 
     #[test]
     fn saves_and_replaces_active_workspace() {

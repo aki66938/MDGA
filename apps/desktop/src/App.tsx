@@ -4,6 +4,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+import "highlight.js/styles/github.css";
 import {
   DEEPSEEK_MODELS,
   DEFAULT_DEEPSEEK_MODEL_ID,
@@ -27,7 +29,33 @@ type ToolPart = {
   target: string;
   status: "running" | "succeeded" | "failed" | "denied";
   error?: string;
+  /** 文件写类工具的行级 diff（unified 格式），点击行可展开查看 */
+  diff?: string;
+  added?: number;
+  removed?: number;
+  /** run_command 运行中的实时输出（行累积，截断保留尾部） */
+  liveOutput?: string;
 };
+
+/** Agent 自维护的任务清单项（todo_write 工具） */
+type TodoItem = {
+  text: string;
+  status: "pending" | "in_progress" | "done";
+};
+
+/** 文件变更检查点（rewind 用） */
+type FileCheckpoint = {
+  id: string;
+  conversationId: string;
+  seq: number;
+  toolName: string;
+  relPath: string;
+  revertible: boolean;
+  reverted: boolean;
+  createdAt: number;
+};
+
+type AppInfo = { version: string; dataDir: string };
 
 /** 高风险动作审批请求，由后端在 AskEveryTime / 越界场景下发起 */
 type ApprovalRequest = {
@@ -66,6 +94,8 @@ type Conversation = {
   workspacePath?: string | null;
   workspaceName?: string | null;
   mode: "chat_only" | "local_workspace";
+  pinned: boolean;
+  archived: boolean;
   createdAt: number;
   updatedAt: number;
 };
@@ -106,6 +136,19 @@ const PERMISSION_MODES: PermissionMode[] = [
   "full_access",
 ];
 
+/** 斜杠命令清单：输入框以 / 开头时弹出 */
+const SLASH_COMMANDS: Array<{ cmd: string; desc: string }> = [
+  { cmd: "/compact", desc: "把当前会话历史压缩为摘要，释放上下文" },
+  { cmd: "/clear", desc: "开启一个全新会话" },
+  { cmd: "/init", desc: "让 Agent 分析项目并生成 MDGA.md 长期记忆" },
+  { cmd: "/rewind", desc: "打开文件变更记录，可回退改动" },
+  { cmd: "/model", desc: "切换模型，例如 /model deepseek-v4-pro" },
+];
+
+/** /init 发送的固定提示词（对标 CC 的 /init 生成 CLAUDE.md） */
+const INIT_PROMPT =
+  "请分析当前工作区项目：阅读关键文件、理解项目目标、技术栈、目录结构与开发约定，然后在工作区根目录创建（或更新）MDGA.md 文件，写入项目长期记忆：项目目标、架构概览、关键约定、常用命令。内容要精炼，控制在 100 行以内。";
+
 // ── App ───────────────────────────────────────────────────────────────────
 
 export function App() {
@@ -120,9 +163,26 @@ export function App() {
   const [draftWorkspace, setDraftWorkspace] = useState<DraftWorkspace | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
+  // 侧边栏：搜索过滤、行内重命名、归档区展开
+  const [searchQuery, setSearchQuery] = useState("");
+  const [editingConvId, setEditingConvId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
   // Agent 实时状态：思考中 / 执行工具 / 压缩上下文 / 输出中，发送期间常驻显示
   const [agentStatus, setAgentStatus] = useState<string | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
+  // Agent 自维护任务清单（todo_write），常驻输入框上方
+  const [todos, setTodos] = useState<TodoItem[]>([]);
+  // 计划模式：先出计划等确认，本轮不执行工具
+  const [planMode, setPlanMode] = useState(false);
+  // 设置面板 / 变更记录面板
+  const [showSettings, setShowSettings] = useState(false);
+  const [showChanges, setShowChanges] = useState(false);
+  const [checkpoints, setCheckpoints] = useState<FileCheckpoint[]>([]);
+  const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  // @文件引用补全
+  const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
+  const [fileMention, setFileMention] = useState<string | null>(null);
   // 上下文用量（上次请求 prompt_tokens / 压缩阈值），常驻状态栏
   const [ctxUsage, setCtxUsage] = useState<{ promptTokens: number; softLimit: number } | null>(null);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
@@ -182,6 +242,98 @@ export function App() {
     );
     return () => clearInterval(timer);
   }, [sending]);
+
+  // 启动时恢复默认模型与权限模式（localStorage 持久化）
+  useEffect(() => {
+    const savedModel = localStorage.getItem("mdga.defaultModel");
+    if (savedModel && DEEPSEEK_MODELS.some((m) => m.id === savedModel)) {
+      setModel(savedModel as DeepSeekModelId);
+    }
+    const savedMode = localStorage.getItem("mdga.defaultPermissionMode");
+    if (savedMode && PERMISSION_MODES.includes(savedMode as PermissionMode)) {
+      setPermissionMode(savedMode as PermissionMode);
+    }
+  }, []);
+
+  // todo 清单实时更新（todo_write 工具）
+  useEffect(() => {
+    const unlisten = listen<TodoItem[]>("todo-update", (e) => {
+      setTodos(Array.isArray(e.payload) ? e.payload : []);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // 后台命令完成通知：插入通知卡片
+  useEffect(() => {
+    const unlisten = listen<{ command: string; exitCode?: number | null; error?: string }>(
+      "background-command-done",
+      (e) => {
+        const { command, exitCode, error } = e.payload;
+        const text = error
+          ? `后台命令失败：${command} — ${error}`
+          : `后台命令完成：${command}（退出码 ${exitCode ?? "?"}）`;
+        appendNoticeToLastMessage(text);
+      }
+    );
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // 命令实时输出：附加到最近一个运行中的 run_command 卡片
+  useEffect(() => {
+    const unlisten = listen<string>("command-output", (e) => {
+      setMessages((prev) => {
+        const updated = [...prev];
+        const lastIdx = updated.length - 1;
+        const last = updated[lastIdx];
+        if (!last || last.role !== "assistant") return prev;
+        const parts = [...last.parts];
+        for (let i = parts.length - 1; i >= 0; i--) {
+          const p = parts[i];
+          if (p.type === "tool" && p.toolName === "run_command" && p.status === "running") {
+            const existing = p.liveOutput ?? "";
+            // 只保留尾部 4000 字符，防止超长输出拖垮渲染
+            const next = (existing + e.payload + "\n").slice(-4000);
+            parts[i] = { ...p, liveOutput: next };
+            updated[lastIdx] = { ...last, parts };
+            streamingPartsRef.current = parts;
+            return updated;
+          }
+        }
+        return prev;
+      });
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // 会话切换时加载工作区文件列表（@引用补全），并清空 todo
+  useEffect(() => {
+    setTodos([]);
+    setWorkspaceFiles([]);
+    if (!activeConvId) return;
+    invoke<string[]>("list_workspace_files", { conversationId: activeConvId })
+      .then(setWorkspaceFiles)
+      .catch(() => setWorkspaceFiles([]));
+  }, [activeConvId]);
+
+  /** 向当前最后一条 assistant 消息追加通知卡片 */
+  function appendNoticeToLastMessage(text: string) {
+    setMessages((prev) => {
+      const updated = [...prev];
+      const lastIdx = updated.length - 1;
+      const last = updated[lastIdx];
+      if (!last || last.role !== "assistant") return prev;
+      const parts: MessagePart[] = [...last.parts, { type: "notice", text }];
+      updated[lastIdx] = { ...last, parts };
+      streamingPartsRef.current = parts;
+      return updated;
+    });
+  }
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -261,6 +413,41 @@ export function App() {
     }
   }
 
+  async function handleTogglePin(e: React.MouseEvent, conv: Conversation) {
+    e.stopPropagation();
+    await invoke("pin_conversation", {
+      conversationId: conv.id,
+      pinned: !conv.pinned,
+    }).catch(() => {});
+    await loadConversations();
+  }
+
+  async function handleToggleArchive(e: React.MouseEvent, conv: Conversation) {
+    e.stopPropagation();
+    await invoke("archive_conversation", {
+      conversationId: conv.id,
+      archived: !conv.archived,
+    }).catch(() => {});
+    await loadConversations();
+  }
+
+  function startRename(e: React.MouseEvent, conv: Conversation) {
+    e.stopPropagation();
+    setEditingConvId(conv.id);
+    setEditingTitle(conv.title);
+  }
+
+  async function commitRename() {
+    const id = editingConvId;
+    const title = editingTitle.trim();
+    setEditingConvId(null);
+    if (!id || !title) return;
+    await invoke("rename_conversation", { conversationId: id, title }).catch(() => {});
+    setConversations((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, title } : c))
+    );
+  }
+
   async function handleSelectWorkspace() {
     try {
       const selected = await open({ directory: true, multiple: false });
@@ -274,9 +461,61 @@ export function App() {
 
   // ── 发送消息 ────────────────────────────────────────────────────────────
 
+  /** 处理斜杠命令；返回 true 表示已消费输入，不再走正常发送。 */
+  async function handleSlashCommand(text: string): Promise<boolean> {
+    if (!text.startsWith("/")) return false;
+    const [cmd, ...rest] = text.split(/\s+/);
+    switch (cmd) {
+      case "/clear":
+        setInput("");
+        await handleNewConversation();
+        return true;
+      case "/rewind":
+        setInput("");
+        await openChangesPanel();
+        return true;
+      case "/model": {
+        const target = rest.join(" ").trim();
+        const found = DEEPSEEK_MODELS.find((m) => m.id === target);
+        setInput("");
+        if (found) {
+          setModel(found.id);
+          localStorage.setItem("mdga.defaultModel", found.id);
+        }
+        return true;
+      }
+      case "/compact": {
+        setInput("");
+        if (!activeConvId) return true;
+        setAgentStatus("正在压缩会话…");
+        setSending(true);
+        try {
+          await invoke("compact_history", { conversationId: activeConvId, model });
+          const stored = await invoke<StoredMessage[]>("load_messages", {
+            conversationId: activeConvId,
+          });
+          setMessages(stored.map(storedToMessage));
+        } catch (err) {
+          appendNoticeToLastMessage(humanizeError(String(err)));
+        } finally {
+          setSending(false);
+        }
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
   async function handleSend() {
-    const text = input.trim();
+    let text = input.trim();
     if (!text || sending) return;
+    // /init 替换为固定提示词走正常发送；其余斜杠命令直接消费
+    if (text === "/init") {
+      text = INIT_PROMPT;
+    } else if (await handleSlashCommand(text)) {
+      return;
+    }
 
     let convId = activeConvId;
     if (!convId) {
@@ -343,9 +582,23 @@ export function App() {
 
     // tool-event：running 时插入新卡片，succeeded/failed 时更新最近匹配的 running 卡片
     const unlistenTool = await listen<ToolEvent>("tool-event", (e) => {
-      const { toolName, status, inputJson, errorMessage } = e.payload;
+      const { toolName, status, inputJson, outputJson, errorMessage } = e.payload;
       if (status === "running") setAgentStatus(`正在执行 ${toolName}…`);
       const target = extractTarget(inputJson);
+      // 解析输出中的 diff 信息（文件写类工具）
+      let diff: string | undefined;
+      let added: number | undefined;
+      let removed: number | undefined;
+      if (outputJson) {
+        try {
+          const out = JSON.parse(outputJson) as Record<string, unknown>;
+          if (typeof out.diff === "string") diff = out.diff;
+          if (typeof out.added === "number") added = out.added;
+          if (typeof out.removed === "number") removed = out.removed;
+        } catch {
+          // 输出非 JSON 时忽略
+        }
+      }
       setMessages((prev) => {
         const updated = [...prev];
         const lastIdx = updated.length - 1;
@@ -364,7 +617,7 @@ export function App() {
             error: errorMessage ?? undefined,
           });
         } else {
-          // 从后往前找同名的最近 running 卡片并更新状态
+          // 从后往前找同名的最近 running 卡片并更新状态（附带 diff 与最终输出）
           for (let i = parts.length - 1; i >= 0; i--) {
             const p = parts[i];
             if (p.type === "tool" && p.toolName === toolName && p.status === "running") {
@@ -372,6 +625,9 @@ export function App() {
                 ...p,
                 status: status as "succeeded" | "failed",
                 error: errorMessage ?? undefined,
+                diff,
+                added,
+                removed,
               };
               break;
             }
@@ -472,13 +728,14 @@ export function App() {
         })),
         model,
         permissionMode,
+        planMode,
       });
     } catch (err) {
       setMessages((prev) => {
         const updated = [...prev];
         updated[updated.length - 1] = {
           role: "assistant",
-          parts: [{ type: "text", content: `错误：${err}` }],
+          parts: [{ type: "text", content: humanizeError(String(err)) }],
         };
         return updated;
       });
@@ -503,11 +760,63 @@ export function App() {
     await invoke("cancel_agent", { conversationId: activeConvId }).catch(() => {});
   }
 
-  async function respondApproval(approved: boolean) {
+  async function respondApproval(approved: boolean, remember = false) {
     if (!approval) return;
     const actionId = approval.actionId;
     setApproval(null);
-    await invoke("respond_approval", { actionId, approved }).catch(() => {});
+    await invoke("respond_approval", { actionId, approved, remember }).catch(() => {});
+  }
+
+  async function openChangesPanel() {
+    if (!activeConvId) return;
+    const list = await invoke<FileCheckpoint[]>("get_checkpoints", {
+      conversationId: activeConvId,
+    }).catch(() => [] as FileCheckpoint[]);
+    setCheckpoints(list);
+    setShowChanges(true);
+  }
+
+  async function handleRevert(checkpointId: string) {
+    if (!activeConvId) return;
+    try {
+      const count = await invoke<number>("revert_to_checkpoint", {
+        conversationId: activeConvId,
+        checkpointId,
+      });
+      appendNoticeToLastMessage(`已回退 ${count} 处文件变更`);
+      await openChangesPanel(); // 刷新列表状态
+    } catch (err) {
+      appendNoticeToLastMessage(humanizeError(String(err)));
+    }
+  }
+
+  async function openSettings() {
+    const info = await invoke<AppInfo>("get_app_info").catch(() => null);
+    setAppInfo(info);
+    setShowSettings(true);
+  }
+
+  function handleModelChange(next: DeepSeekModelId) {
+    setModel(next);
+    localStorage.setItem("mdga.defaultModel", next);
+  }
+
+  function handlePermissionModeChange(next: PermissionMode) {
+    setPermissionMode(next);
+    localStorage.setItem("mdga.defaultPermissionMode", next);
+  }
+
+  /** 输入框 @文件引用：取光标前最后一个 @ 开头的 token 作为过滤词 */
+  function updateFileMention(value: string) {
+    const match = /(?:^|\s)@([^\s@]*)$/.exec(value);
+    setFileMention(match ? match[1] : null);
+  }
+
+  function applyFileMention(path: string) {
+    setInput((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (m) =>
+      m.startsWith(" ") ? ` @${path} ` : `@${path} `
+    ));
+    setFileMention(null);
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -530,6 +839,80 @@ export function App() {
   const activeConversation = conversations.find((conv) => conv.id === activeConvId);
   const conversationUsage = aggregateUsage(messages);
 
+  // 侧边栏列表：按标题搜索过滤，归档的拆到独立折叠区（置顶排序由后端 SQL 保证）
+  const query = searchQuery.trim().toLowerCase();
+  const filteredConversations = conversations.filter(
+    (c) => !query || c.title.toLowerCase().includes(query)
+  );
+  const visibleConversations = filteredConversations.filter((c) => !c.archived);
+  const archivedConversations = filteredConversations.filter((c) => c.archived);
+
+  function renderConvItem(conv: Conversation) {
+    return (
+      <div
+        key={conv.id}
+        className={`conv-item${conv.id === activeConvId ? " conv-item--active" : ""}`}
+        onClick={() => handleSelectConversation(conv.id)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => e.key === "Enter" && handleSelectConversation(conv.id)}
+      >
+        {editingConvId === conv.id ? (
+          <input
+            className="conv-item__rename"
+            value={editingTitle}
+            autoFocus
+            onChange={(e) => setEditingTitle(e.target.value)}
+            onClick={(e) => e.stopPropagation()}
+            onBlur={commitRename}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitRename();
+              if (e.key === "Escape") setEditingConvId(null);
+            }}
+          />
+        ) : (
+          <span
+            className="conv-item__title"
+            onDoubleClick={(e) => startRename(e, conv)}
+            title="双击重命名"
+          >
+            {conv.pinned && <span className="conv-item__pin-mark">📌</span>}
+            {conv.title}
+          </span>
+        )}
+        <span className="conv-item__actions">
+          <button
+            className="conv-item__action"
+            type="button"
+            aria-label={conv.pinned ? "取消置顶" : "置顶"}
+            title={conv.pinned ? "取消置顶" : "置顶"}
+            onClick={(e) => handleTogglePin(e, conv)}
+          >
+            📌
+          </button>
+          <button
+            className="conv-item__action"
+            type="button"
+            aria-label={conv.archived ? "取消归档" : "归档"}
+            title={conv.archived ? "取消归档" : "归档"}
+            onClick={(e) => handleToggleArchive(e, conv)}
+          >
+            {conv.archived ? "↩" : "🗂"}
+          </button>
+          <button
+            className="conv-item__delete"
+            type="button"
+            aria-label="删除会话"
+            title="删除"
+            onClick={(e) => handleDeleteConversation(e, conv.id)}
+          >
+            ×
+          </button>
+        </span>
+      </div>
+    );
+  }
+
   // ── UI ──────────────────────────────────────────────────────────────────
 
   return (
@@ -542,27 +925,28 @@ export function App() {
 
         {conversations.length > 0 && (
           <nav className="conv-list" aria-label="会话列表">
+            <input
+              className="conv-search"
+              type="search"
+              placeholder="搜索会话…"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              aria-label="搜索会话"
+            />
             <p className="nav-label">历史对话</p>
-            {conversations.map((conv) => (
-              <div
-                key={conv.id}
-                className={`conv-item${conv.id === activeConvId ? " conv-item--active" : ""}`}
-                onClick={() => handleSelectConversation(conv.id)}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => e.key === "Enter" && handleSelectConversation(conv.id)}
-              >
-                <span className="conv-item__title">{conv.title}</span>
+            {visibleConversations.map(renderConvItem)}
+            {archivedConversations.length > 0 && (
+              <>
                 <button
-                  className="conv-item__delete"
+                  className="archived-toggle"
                   type="button"
-                  aria-label="删除会话"
-                  onClick={(e) => handleDeleteConversation(e, conv.id)}
+                  onClick={() => setShowArchived((v) => !v)}
                 >
-                  ×
+                  {showArchived ? "▾" : "▸"} 已归档（{archivedConversations.length}）
                 </button>
-              </div>
-            ))}
+                {showArchived && archivedConversations.map(renderConvItem)}
+              </>
+            )}
           </nav>
         )}
 
@@ -614,7 +998,7 @@ export function App() {
             <select
               className="model-select"
               value={permissionMode}
-              onChange={(e) => setPermissionMode(e.target.value as PermissionMode)}
+              onChange={(e) => handlePermissionModeChange(e.target.value as PermissionMode)}
               disabled={sending}
               aria-label="权限模式"
             >
@@ -638,7 +1022,7 @@ export function App() {
             <select
               className="model-select"
               value={model}
-              onChange={(e) => setModel(e.target.value as DeepSeekModelId)}
+              onChange={(e) => handleModelChange(e.target.value as DeepSeekModelId)}
               disabled={sending}
               aria-label="模型选择"
               title={DEEPSEEK_MODELS.find((item) => item.id === model)?.description}
@@ -647,6 +1031,25 @@ export function App() {
                 <option key={item.id} value={item.id}>{item.label}</option>
               ))}
             </select>
+            {activeConvId && (
+              <button
+                className="topbar-btn"
+                type="button"
+                title="文件变更记录（可回退）"
+                onClick={openChangesPanel}
+              >
+                变更
+              </button>
+            )}
+            <button
+              className="topbar-btn"
+              type="button"
+              title="设置"
+              onClick={openSettings}
+              aria-label="设置"
+            >
+              ⚙
+            </button>
           </div>
         </header>
 
@@ -709,23 +1112,76 @@ export function App() {
           <ConversationUsageSummary usage={conversationUsage} />
         )}
 
-        <div className="composer">
-          <textarea
-            aria-label="Message"
-            placeholder="随心输入（Enter 发送，Shift+Enter 换行）"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-          />
-          {sending ? (
-            <button type="button" className="composer__stop" onClick={handleStop}>
-              停止
-            </button>
-          ) : (
-            <button type="button" onClick={handleSend} disabled={!input.trim()}>
-              发送
-            </button>
+        {todos.length > 0 && <TodoPanel items={todos} />}
+
+        <div className="composer-area">
+          {/* 斜杠命令菜单 */}
+          {input.startsWith("/") && !input.includes(" ") && !sending && (
+            <div className="slash-menu" role="menu">
+              {SLASH_COMMANDS.filter((c) => c.cmd.startsWith(input)).map((c) => (
+                <button
+                  key={c.cmd}
+                  className="slash-menu__item"
+                  type="button"
+                  onClick={() => setInput(c.cmd === "/model" ? "/model " : c.cmd)}
+                >
+                  <span className="slash-menu__cmd">{c.cmd}</span>
+                  <span className="slash-menu__desc">{c.desc}</span>
+                </button>
+              ))}
+            </div>
           )}
+
+          {/* @文件引用补全 */}
+          {fileMention !== null && workspaceFiles.length > 0 && (
+            <div className="slash-menu" role="menu">
+              {workspaceFiles
+                .filter((f) => f.toLowerCase().includes(fileMention.toLowerCase()))
+                .slice(0, 8)
+                .map((f) => (
+                  <button
+                    key={f}
+                    className="slash-menu__item"
+                    type="button"
+                    onClick={() => applyFileMention(f)}
+                  >
+                    <span className="slash-menu__cmd">@{f}</span>
+                  </button>
+                ))}
+            </div>
+          )}
+
+          <div className="composer">
+            <textarea
+              aria-label="Message"
+              placeholder={planMode ? "计划模式：先出计划，确认后再执行（Enter 发送）" : "随心输入（Enter 发送，Shift+Enter 换行，/ 命令，@ 引用文件）"}
+              value={input}
+              onChange={(e) => {
+                setInput(e.target.value);
+                updateFileMention(e.target.value);
+              }}
+              onKeyDown={handleKeyDown}
+            />
+            <div className="composer__side">
+              <button
+                type="button"
+                className={`composer__plan${planMode ? " composer__plan--on" : ""}`}
+                title="计划模式：让 Agent 先给出分步计划，确认后再执行"
+                onClick={() => setPlanMode((v) => !v)}
+              >
+                计划
+              </button>
+              {sending ? (
+                <button type="button" className="composer__stop" onClick={handleStop}>
+                  停止
+                </button>
+              ) : (
+                <button type="button" onClick={handleSend} disabled={!input.trim()}>
+                  发送
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       </section>
 
@@ -733,10 +1189,177 @@ export function App() {
         <ApprovalModal
           approval={approval}
           onAllow={() => respondApproval(true)}
+          onAlwaysAllow={() => respondApproval(true, true)}
           onDeny={() => respondApproval(false)}
         />
       )}
+
+      {showChanges && (
+        <ChangesModal
+          checkpoints={checkpoints}
+          onRevert={handleRevert}
+          onClose={() => setShowChanges(false)}
+        />
+      )}
+
+      {showSettings && (
+        <SettingsModal
+          appInfo={appInfo}
+          model={model}
+          permissionMode={permissionMode}
+          onModelChange={handleModelChange}
+          onPermissionModeChange={handlePermissionModeChange}
+          onCheckUpdate={() => {
+            invoke<string | null>("check_update")
+              .then((v) => {
+                if (v) setUpdate({ status: "available", version: v });
+              })
+              .catch(() => {});
+          }}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
     </main>
+  );
+}
+
+// ── TodoPanel ───────────────────────────────────────────────────────────────
+
+function TodoPanel({ items }: { items: TodoItem[] }) {
+  // Agent 自维护任务清单：常驻输入框上方，实时反映多步任务进度。
+  const done = items.filter((t) => t.status === "done").length;
+  return (
+    <div className="todo-panel" aria-label="任务清单">
+      <span className="todo-panel__head">任务 {done}/{items.length}</span>
+      <div className="todo-panel__items">
+        {items.map((t, i) => (
+          <span key={i} className={`todo-item todo-item--${t.status}`}>
+            {t.status === "done" ? "☑" : t.status === "in_progress" ? "◐" : "☐"} {t.text}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── ChangesModal ────────────────────────────────────────────────────────────
+
+function ChangesModal({
+  checkpoints,
+  onRevert,
+  onClose,
+}: {
+  checkpoints: FileCheckpoint[];
+  onRevert: (id: string) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="文件变更记录">
+      <div className="approval-card panel-card">
+        <p className="approval-card__title">文件变更记录</p>
+        {checkpoints.length === 0 ? (
+          <p className="approval-card__hint">本会话还没有文件变更。</p>
+        ) : (
+          <div className="changes-list">
+            {checkpoints.map((c) => (
+              <div key={c.id} className={`changes-row${c.reverted ? " changes-row--reverted" : ""}`}>
+                <span className="changes-row__tool">{c.toolName}</span>
+                <span className="changes-row__path" title={c.relPath}>{c.relPath}</span>
+                {c.reverted ? (
+                  <span className="changes-row__state">已回退</span>
+                ) : c.revertible ? (
+                  <button
+                    className="changes-row__revert"
+                    type="button"
+                    title="回退此变更及其后的所有变更"
+                    onClick={() => onRevert(c.id)}
+                  >
+                    回退到此前
+                  </button>
+                ) : (
+                  <span className="changes-row__state">不可回退</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="approval-card__actions">
+          <button type="button" className="approval-card__btn" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── SettingsModal ───────────────────────────────────────────────────────────
+
+function SettingsModal({
+  appInfo,
+  model,
+  permissionMode,
+  onModelChange,
+  onPermissionModeChange,
+  onCheckUpdate,
+  onClose,
+}: {
+  appInfo: AppInfo | null;
+  model: DeepSeekModelId;
+  permissionMode: PermissionMode;
+  onModelChange: (m: DeepSeekModelId) => void;
+  onPermissionModeChange: (m: PermissionMode) => void;
+  onCheckUpdate: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="设置">
+      <div className="approval-card panel-card">
+        <p className="approval-card__title">设置</p>
+        <div className="settings-row">
+          <span className="settings-row__label">默认模型</span>
+          <select
+            className="model-select"
+            value={model}
+            onChange={(e) => onModelChange(e.target.value as DeepSeekModelId)}
+          >
+            {DEEPSEEK_MODELS.map((item) => (
+              <option key={item.id} value={item.id}>{item.label}</option>
+            ))}
+          </select>
+        </div>
+        <div className="settings-row">
+          <span className="settings-row__label">默认权限模式</span>
+          <select
+            className="model-select"
+            value={permissionMode}
+            onChange={(e) => onPermissionModeChange(e.target.value as PermissionMode)}
+          >
+            {PERMISSION_MODES.map((mode) => (
+              <option key={mode} value={mode}>{getPermissionModeLabel(mode)}</option>
+            ))}
+          </select>
+        </div>
+        <div className="settings-row">
+          <span className="settings-row__label">数据目录</span>
+          <span className="settings-row__value" title={appInfo?.dataDir}>
+            {appInfo?.dataDir ?? "…"}
+          </span>
+        </div>
+        <div className="settings-row">
+          <span className="settings-row__label">版本</span>
+          <span className="settings-row__value">v{appInfo?.version ?? "…"}</span>
+        </div>
+        <div className="approval-card__actions">
+          <button type="button" className="approval-card__btn" onClick={onCheckUpdate}>
+            检查更新
+          </button>
+          <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -745,10 +1368,12 @@ export function App() {
 function ApprovalModal({
   approval,
   onAllow,
+  onAlwaysAllow,
   onDeny,
 }: {
   approval: ApprovalRequest;
   onAllow: () => void;
+  onAlwaysAllow: () => void;
   onDeny: () => void;
 }) {
   return (
@@ -761,10 +1386,13 @@ function ApprovalModal({
             <span className="approval-card__target">{approval.target}</span>
           )}
         </div>
-        <p className="approval-card__hint">是否允许本次操作？</p>
+        <p className="approval-card__hint">是否允许本次操作？「总是允许」会记住同类动作，后续免审批。</p>
         <div className="approval-card__actions">
           <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={onAllow}>
             允许一次
+          </button>
+          <button type="button" className="approval-card__btn" onClick={onAlwaysAllow}>
+            总是允许
           </button>
           <button type="button" className="approval-card__btn" onClick={onDeny}>
             拒绝
@@ -798,6 +1426,18 @@ function MessageContent({ msg }: { msg: Message }) {
     }
   });
 
+  // ChangeSet 汇总：本条消息内所有带 diff 的文件变更聚合为一行摘要。
+  const changedFiles = new Set<string>();
+  let totalAdded = 0;
+  let totalRemoved = 0;
+  msg.parts.forEach((part) => {
+    if (part.type === "tool" && (part.added !== undefined || part.removed !== undefined)) {
+      changedFiles.add(part.target);
+      totalAdded += part.added ?? 0;
+      totalRemoved += part.removed ?? 0;
+    }
+  });
+
   return (
     <>
       {blocks.map((block) => {
@@ -809,7 +1449,12 @@ function MessageContent({ msg }: { msg: Message }) {
           return msg.role === "user" ? (
             <p key={index}>{part.content}</p>
           ) : (
-            <ReactMarkdown key={index} remarkPlugins={[remarkGfm]}>
+            <ReactMarkdown
+              key={index}
+              remarkPlugins={[remarkGfm]}
+              rehypePlugins={[rehypeHighlight]}
+              components={{ pre: CodeBlock }}
+            >
               {part.content}
             </ReactMarkdown>
           );
@@ -820,6 +1465,13 @@ function MessageContent({ msg }: { msg: Message }) {
           </div>
         );
       })}
+      {changedFiles.size > 0 && (
+        <div className="changeset-summary" aria-label="变更汇总">
+          本轮变更 {changedFiles.size} 个文件
+          <span className="diff-added"> +{totalAdded}</span>
+          <span className="diff-removed"> −{totalRemoved}</span>
+        </div>
+      )}
     </>
   );
 }
@@ -865,25 +1517,98 @@ function ToolGroup({ parts }: { parts: ToolPart[] }) {
   );
 }
 
+// ── CodeBlock ───────────────────────────────────────────────────────────────
+
+function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
+  // 代码块外壳：右上角悬浮复制按钮，点击复制整块代码文本。
+  const preRef = useRef<HTMLPreElement>(null);
+  const [copied, setCopied] = useState(false);
+
+  async function handleCopy() {
+    const text = preRef.current?.innerText ?? "";
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // 剪贴板不可用时静默失败
+    }
+  }
+
+  return (
+    <div className="code-block">
+      <button className="code-block__copy" type="button" onClick={handleCopy}>
+        {copied ? "已复制 ✓" : "复制"}
+      </button>
+      <pre ref={preRef} {...props} />
+    </div>
+  );
+}
+
 // ── ToolInlineRow ───────────────────────────────────────────────────────────
 
 function ToolInlineRow({ part }: { part: ToolPart }) {
-  const { toolName, target, status, error } = part;
+  const { toolName, target, status, error, diff, added, removed, liveOutput } = part;
+  const [showDiff, setShowDiff] = useState(false);
   const icon =
     status === "running" ? "⚙" :
     status === "succeeded" ? "✓" :
     status === "denied" ? "⊘" : "✗";
+  const hasDiff = typeof diff === "string" && diff.trim().length > 0;
   return (
-    <div className={`tool-inline tool-inline--${status}`} aria-label={`${toolName} ${status}`}>
-      <span className="tool-inline__icon" aria-hidden="true">{icon}</span>
-      <span className="tool-inline__name">{toolName}</span>
-      {target && <span className="tool-inline__target">{target}</span>}
-      {status === "running" && <span className="tool-inline__dots" aria-hidden="true">…</span>}
-      {status === "denied" && <span className="tool-inline__error">{error ?? "已拒绝"}</span>}
-      {status === "failed" && error && (
-        <span className="tool-inline__error">{error}</span>
+    <div className="tool-inline-wrap">
+      <div
+        className={`tool-inline tool-inline--${status}${hasDiff ? " tool-inline--clickable" : ""}`}
+        aria-label={`${toolName} ${status}`}
+        onClick={hasDiff ? () => setShowDiff((v) => !v) : undefined}
+        role={hasDiff ? "button" : undefined}
+      >
+        <span className="tool-inline__icon" aria-hidden="true">{icon}</span>
+        <span className="tool-inline__name">{toolName}</span>
+        {target && <span className="tool-inline__target">{target}</span>}
+        {(added !== undefined || removed !== undefined) && (
+          <span className="tool-inline__stats">
+            {added ? <span className="diff-added">+{added}</span> : null}
+            {removed ? <span className="diff-removed">−{removed}</span> : null}
+          </span>
+        )}
+        {hasDiff && <span className="tool-inline__expand">{showDiff ? "▾" : "▸ diff"}</span>}
+        {status === "running" && <span className="tool-inline__dots" aria-hidden="true">…</span>}
+        {status === "denied" && <span className="tool-inline__error">{error ?? "已拒绝"}</span>}
+        {status === "failed" && error && (
+          <span className="tool-inline__error">{error}</span>
+        )}
+      </div>
+      {status === "running" && liveOutput && (
+        <pre className="tool-live-output">{liveOutput}</pre>
       )}
+      {showDiff && hasDiff && <DiffBlock diff={diff!} />}
     </div>
+  );
+}
+
+// ── DiffBlock ───────────────────────────────────────────────────────────────
+
+function DiffBlock({ diff }: { diff: string }) {
+  // 按行渲染 unified diff：+ 绿、- 红、@@ 弱化。
+  return (
+    <pre className="diff-block">
+      {diff.split("\n").map((line, i) => {
+        const cls = line.startsWith("+")
+          ? "diff-line--add"
+          : line.startsWith("-")
+            ? "diff-line--del"
+            : line.startsWith("@@")
+              ? "diff-line--hunk"
+              : "";
+        return (
+          <span key={i} className={`diff-line ${cls}`}>
+            {line}
+            {"\n"}
+          </span>
+        );
+      })}
+    </pre>
   );
 }
 
@@ -975,6 +1700,35 @@ function aggregateUsage(messages: Message[]): UsageSummary | null {
 function formatUsd(cost: number): string {
   if (cost < 0.0001 && cost > 0) return "<$0.0001";
   return `$${cost.toFixed(6).replace(/\.?0+$/, "")}`;
+}
+
+/** 把后端原始错误串映射为面向用户的友好提示与建议动作；未识别的错误保留原文便于反馈。 */
+function humanizeError(raw: string): string {
+  if (raw.includes("DEEPSEEK_API_KEY")) {
+    return "未检测到 API Key：请在 Windows 系统环境变量中配置 DEEPSEEK_API_KEY，然后重启应用。";
+  }
+  if (raw.includes("认证失败")) {
+    return "API Key 无效：请检查系统环境变量 DEEPSEEK_API_KEY 是否填写正确。";
+  }
+  if (raw.includes("余额不足")) {
+    return "DeepSeek 账户余额不足：请前往 DeepSeek 开放平台充值后重试。";
+  }
+  if (raw.includes("限流")) {
+    return "请求被限流：当前请求过于频繁，请稍等片刻再发送。";
+  }
+  if (raw.includes("上下文长度超限")) {
+    return "上下文超出模型上限：建议新建会话继续，或精简本次输入后重试。";
+  }
+  if (raw.includes("网络连接失败") || raw.toLowerCase().includes("error sending request")) {
+    return "网络连接失败：已自动重试仍未成功，请检查网络（或代理设置）后重新发送。";
+  }
+  if (raw.includes("会话不存在")) {
+    return "会话状态异常：请新建一个会话后继续。";
+  }
+  if (raw.includes("工作区路径不存在")) {
+    return "工作区不可用：所选目录不存在或已被移动，请重新选择工作区。";
+  }
+  return `出错了：${raw}`;
 }
 
 function basenameFromPath(path: string): string {

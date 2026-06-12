@@ -112,7 +112,11 @@ pub async fn chat_stream<F>(
 where
     F: Fn(String),
 {
-    let client = Client::new();
+    // 流式请求只限连接超时，不设总超时（长回复的流式读取可能远超固定时长）。
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(DeepSeekError::Http)?;
 
     let body = serde_json::json!({
         "model": model,
@@ -196,7 +200,13 @@ pub async fn chat_completion(
     model: &str,
     tools: Option<Vec<serde_json::Value>>,
 ) -> Result<ChatCompletionResult, DeepSeekError> {
-    let client = Client::new();
+    // 必须设置总超时：服务端 hang 时若无超时会无限等待，前端表现为「正在思考」永不出 token。
+    // 超时映射为可重试的 Http 错误，由上层退避重试。
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(DeepSeekError::Http)?;
     let mut body = serde_json::json!({
         "model": model,
         "messages": messages,

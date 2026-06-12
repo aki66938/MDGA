@@ -110,6 +110,9 @@ pub struct RunCommandRequest {
     pub command: String,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// 后台运行：由调用方（桌面端）处理，run_command 本身不感知；保留字段用于参数解析。
+    #[serde(default)]
+    pub background: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -558,6 +561,20 @@ pub fn run_command(
     workspace_root: impl AsRef<Path>,
     request: RunCommandRequest,
 ) -> Result<RunCommandResult, ToolRuntimeError> {
+    run_command_streaming(workspace_root, request, None)
+}
+
+/// 行级流式输出回调：命令每产生一行 stdout/stderr 调用一次，供 UI 实时展示。
+pub type CommandLineCallback = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+
+/// 与 run_command 相同，但可选地把命令输出逐行回调给调用方（实时展示）。
+///
+/// 回调在读取线程中触发，调用方需保证回调自身线程安全且不阻塞过久。
+pub fn run_command_streaming(
+    workspace_root: impl AsRef<Path>,
+    request: RunCommandRequest,
+    on_line: Option<CommandLineCallback>,
+) -> Result<RunCommandResult, ToolRuntimeError> {
     let command = request.command.trim();
     if command.is_empty() {
         return Err(ToolRuntimeError::EmptyCommand);
@@ -579,11 +596,13 @@ pub fn run_command(
         .spawn()
         .map_err(|err| ToolRuntimeError::CommandFailed(err.to_string()))?;
 
-    // 用独立线程抽干 stdout/stderr，避免管道缓冲填满导致死锁。
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let stdout_handle = std::thread::spawn(move || drain_pipe(stdout_pipe.as_mut()));
-    let stderr_handle = std::thread::spawn(move || drain_pipe(stderr_pipe.as_mut()));
+    // 用独立线程抽干 stdout/stderr，避免管道缓冲填满导致死锁；有回调时逐行转发。
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_cb = on_line.clone();
+    let err_cb = on_line;
+    let stdout_handle = std::thread::spawn(move || drain_pipe_streaming(stdout_pipe, out_cb));
+    let stderr_handle = std::thread::spawn(move || drain_pipe_streaming(stderr_pipe, err_cb));
 
     let started = Instant::now();
     let mut timed_out = false;
@@ -620,20 +639,43 @@ pub fn run_command(
     })
 }
 
-/// 读取子进程管道，按 UTF-8 lossy 解码并截断到 MAX_COMMAND_OUTPUT_BYTES。
-fn drain_pipe(pipe: Option<&mut impl Read>) -> (String, bool) {
+/// 逐行读取子进程管道：UTF-8 lossy 解码、截断到 MAX_COMMAND_OUTPUT_BYTES，
+/// 可选地把每行实时回调给调用方。
+fn drain_pipe_streaming(
+    pipe: Option<impl Read>,
+    on_line: Option<CommandLineCallback>,
+) -> (String, bool) {
     let Some(pipe) = pipe else {
         return (String::new(), false);
     };
-    let mut buffer = Vec::new();
-    if pipe.read_to_end(&mut buffer).is_err() {
-        return (String::from_utf8_lossy(&buffer).to_string(), false);
+    let reader = std::io::BufReader::new(pipe);
+    let mut collected = String::new();
+    let mut truncated = false;
+    let mut raw_line = Vec::new();
+    let mut reader = reader;
+    loop {
+        raw_line.clear();
+        match std::io::BufRead::read_until(&mut reader, b'\n', &mut raw_line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&raw_line).to_string();
+                if let Some(cb) = on_line.as_ref() {
+                    cb(line.trim_end_matches(['\r', '\n']).to_string());
+                }
+                if collected.len() < MAX_COMMAND_OUTPUT_BYTES {
+                    collected.push_str(&line);
+                    if collected.len() > MAX_COMMAND_OUTPUT_BYTES {
+                        collected.truncate(MAX_COMMAND_OUTPUT_BYTES);
+                        truncated = true;
+                    }
+                } else {
+                    truncated = true;
+                }
+            }
+            Err(_) => break,
+        }
     }
-    let truncated = buffer.len() > MAX_COMMAND_OUTPUT_BYTES;
-    if truncated {
-        buffer.truncate(MAX_COMMAND_OUTPUT_BYTES);
-    }
-    (String::from_utf8_lossy(&buffer).to_string(), truncated)
+    (collected, truncated)
 }
 
 fn default_search_limit() -> usize {
@@ -896,6 +938,46 @@ fn walk_workspace_map(
         *count += 1;
         if is_dir {
             walk_workspace_map(&path, depth + 1, lines, count, truncated);
+        }
+    }
+}
+
+/// 平铺列出工作区内的文件相对路径（@文件引用补全用），忽略噪声目录，cap 限制总量。
+pub fn workspace_file_list(workspace_root: &str, cap: usize) -> Vec<String> {
+    let root = Path::new(workspace_root);
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    collect_files_flat(root, root, &mut files, cap);
+    files
+}
+
+fn collect_files_flat(root: &Path, dir: &Path, files: &mut Vec<String>, cap: usize) {
+    if files.len() >= cap {
+        return;
+    }
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = read_dir.flatten().collect();
+    entries.sort_by_key(|entry| {
+        let is_dir = entry.path().is_dir();
+        (!is_dir, entry.file_name().to_string_lossy().to_lowercase())
+    });
+    for entry in entries {
+        if files.len() >= cap {
+            return;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if path.is_dir() {
+            if name.starts_with('.') || MAP_IGNORE_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            collect_files_flat(root, &path, files, cap);
+        } else if let Ok(rel) = path.strip_prefix(root) {
+            files.push(rel.to_string_lossy().replace('\\', "/"));
         }
     }
 }
@@ -1284,6 +1366,7 @@ mod tests {
             RunCommandRequest {
                 command: "Get-ChildItem -Name".to_string(),
                 timeout_secs: Some(30),
+                background: false,
             },
         )
         .expect("command should execute");
@@ -1303,6 +1386,7 @@ mod tests {
             RunCommandRequest {
                 command: "   ".to_string(),
                 timeout_secs: None,
+                background: false,
             },
         )
         .expect_err("empty command should be rejected");

@@ -8,10 +8,13 @@ use mdga_sandbox_runtime::{
 };
 use mdga_shared::{ApiKeyStatus, PermissionMode};
 use mdga_storage::{
-    clear_active_workspace, create_conversation, delete_conversation, get_active_workspace,
-    create_conversation_with_workspace, get_activity_events, get_conversation, get_messages,
-    init_db, list_conversations, record_activity_event, save_active_workspace, save_message,
-    update_title, ActivityEventRecord, Conversation, StoredMessage, Workspace,
+    add_permission_rule, clear_active_workspace, create_conversation, delete_conversation,
+    delete_messages, get_active_workspace, create_conversation_with_workspace,
+    get_activity_events, get_conversation, get_messages, init_db, list_conversations,
+    list_file_checkpoints, list_permission_rules, mark_checkpoint_reverted,
+    record_activity_event, record_file_checkpoint, save_active_workspace, save_message,
+    set_conversation_archived, set_conversation_pinned, update_title, ActivityEventRecord,
+    Conversation, FileCheckpoint, StoredMessage, Workspace,
 };
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use mdga_tool_runtime::{
@@ -53,9 +56,10 @@ struct AppState {
     /// 正在运行的 Agent 会话取消标志，按 conversation_id 索引。用户点击停止时置 true，
     /// 工具循环在轮次之间和工具执行前检查并安全收尾。
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    /// 等待用户审批的高风险动作，按 action_id 索引。respond_approval 命令收到前端决定后，
-    /// 通过对应的 oneshot 通道唤醒正在 await 的工具循环。
-    approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    /// 等待用户审批的高风险动作，按 action_id 索引，附带该动作对应的「总是允许」规则串。
+    /// respond_approval 命令收到前端决定后，通过 oneshot 通道唤醒正在 await 的工具循环；
+    /// 用户勾选记住时把规则写入 permission_rules 表。
+    approvals: Mutex<HashMap<String, (oneshot::Sender<bool>, String)>>,
 }
 
 // ── DeepSeek ──────────────────────────────────────────────────────────────
@@ -77,14 +81,18 @@ async fn send_message(
     messages: Vec<ChatMessage>,
     model: String,
     permission_mode: String,
+    plan_mode: Option<bool>,
 ) -> Result<(), String> {
     let api_key = std::env::var("DEEPSEEK_API_KEY")
         .map_err(|_| "DEEPSEEK_API_KEY 未配置".to_string())?;
-    let conversation = {
+    let plan_mode = plan_mode.unwrap_or(false);
+    let (conversation, permission_rules) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        get_conversation(&db, &conversation_id)
+        let conversation = get_conversation(&db, &conversation_id)
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| "会话不存在".to_string())?
+            .ok_or_else(|| "会话不存在".to_string())?;
+        let rules = list_permission_rules(&db).unwrap_or_default();
+        (conversation, rules)
     };
     // 工作区已绑定时生成 repo map 与长期记忆，注入项目结构摘要和持久约定供模型开局认知。
     let repo_map = conversation
@@ -96,13 +104,20 @@ async fn send_message(
         .workspace_path
         .as_deref()
         .and_then(read_workspace_memory);
-    let messages = messages_with_workspace_context(
+    let mut messages = messages_with_workspace_context(
         messages,
         conversation.workspace_path.as_deref(),
         conversation.workspace_name.as_deref(),
         repo_map.as_deref(),
         workspace_memory.as_deref(),
     );
+    // 计划模式：要求模型只产出分步计划并等待确认，本轮不提供工具。
+    if plan_mode {
+        messages.insert(0, ChatMessage {
+            role: "system".to_string(),
+            content: "用户开启了计划模式：请基于需求给出清晰的分步执行计划（目标、步骤、涉及文件、风险点），然后停止并等待用户确认。本轮不要执行任何实际操作。".to_string(),
+        });
+    }
     let permission = permission_mode_from_str(&permission_mode);
 
     // 注册本轮会话的取消令牌，供 cancel_agent 命令置位、工具循环检查。
@@ -112,7 +127,14 @@ async fn send_message(
         cancels.insert(conversation_id.clone(), cancel_token.clone());
     }
 
-    let result = if let Some(workspace_path) = conversation.workspace_path.as_deref() {
+    let result = if plan_mode {
+        // 计划模式走纯流式（无工具），让模型把计划直接流给用户审阅。
+        chat_stream(&api_key, messages, &model, |chunk| {
+            let _ = app.emit("chat-chunk", chunk);
+        })
+        .await
+        .map_err(|e| e.to_string())
+    } else if let Some(workspace_path) = conversation.workspace_path.as_deref() {
         chat_with_builtin_tools(
             &api_key,
             messages,
@@ -122,6 +144,7 @@ async fn send_message(
             &conversation_id,
             &app,
             cancel_token.clone(),
+            permission_rules,
         )
         .await
     } else {
@@ -253,6 +276,165 @@ fn remove_conversation(
     delete_conversation(&db, &conversation_id).map_err(|e| e.to_string())
 }
 
+/// 设置会话置顶状态；置顶会话在列表中排在最前。
+#[tauri::command]
+fn pin_conversation(
+    state: State<AppState>,
+    conversation_id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    set_conversation_pinned(&db, &conversation_id, pinned).map_err(|e| e.to_string())
+}
+
+/// 返回应用信息（版本号、数据目录路径），供设置页展示。
+#[tauri::command]
+fn get_app_info(app: AppHandle) -> Result<serde_json::Value, String> {
+    let version = app.package_info().version.to_string();
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    Ok(serde_json::json!({ "version": version, "dataDir": data_dir }))
+}
+
+/// 设置会话归档状态；归档会话移入侧边栏「已归档」区，数据不删除。
+#[tauri::command]
+fn archive_conversation(
+    state: State<AppState>,
+    conversation_id: String,
+    archived: bool,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    set_conversation_archived(&db, &conversation_id, archived).map_err(|e| e.to_string())
+}
+
+/// 返回指定会话的全部文件变更检查点（含已回退的），供「变更记录」面板展示。
+#[tauri::command]
+fn get_checkpoints(
+    state: State<AppState>,
+    conversation_id: String,
+) -> Result<Vec<FileCheckpoint>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    list_file_checkpoints(&db, &conversation_id).map_err(|e| e.to_string())
+}
+
+/// 回退到指定检查点之前：把该检查点及其后的所有可回退变更按倒序撤销（CC 的 rewind）。
+/// 返回成功回退的条数；不可回退的变更跳过。
+#[tauri::command]
+fn revert_to_checkpoint(
+    state: State<AppState>,
+    conversation_id: String,
+    checkpoint_id: String,
+) -> Result<usize, String> {
+    let (workspace, targets) = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let conversation = get_conversation(&db, &conversation_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("会话不存在")?;
+        let workspace = conversation
+            .workspace_path
+            .ok_or("该会话未绑定工作区")?;
+        let all = list_file_checkpoints(&db, &conversation_id).map_err(|e| e.to_string())?;
+        let target_seq = all
+            .iter()
+            .find(|c| c.id == checkpoint_id)
+            .map(|c| c.seq)
+            .ok_or("检查点不存在")?;
+        let mut targets: Vec<FileCheckpoint> = all
+            .into_iter()
+            .filter(|c| c.seq >= target_seq && !c.reverted && c.revertible)
+            .collect();
+        // 按序号倒序撤销，后发生的变更先回退。
+        targets.sort_by(|a, b| b.seq.cmp(&a.seq));
+        (workspace, targets)
+    };
+
+    let mut reverted = 0;
+    for checkpoint in &targets {
+        if apply_checkpoint_revert(&workspace, checkpoint).is_ok() {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            let _ = mark_checkpoint_reverted(&db, &checkpoint.id);
+            reverted += 1;
+        }
+    }
+    Ok(reverted)
+}
+
+/// 手动压缩会话历史（/compact）：把全部消息摘要成一条任务备忘录替换原文。
+#[tauri::command]
+async fn compact_history(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    conversation_id: String,
+    model: String,
+) -> Result<(), String> {
+    let api_key = std::env::var("DEEPSEEK_API_KEY")
+        .map_err(|_| "DEEPSEEK_API_KEY 未配置".to_string())?;
+    let messages = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        get_messages(&db, &conversation_id).map_err(|e| e.to_string())?
+    };
+    if messages.len() < 4 {
+        return Err("当前会话消息较少，无需压缩".to_string());
+    }
+
+    let transcript: String = messages
+        .iter()
+        .map(|m| {
+            let body: String = m.content.chars().take(800).collect();
+            format!("[{}] {}", m.role, body)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!(
+        "你是对话压缩器。请把下面这段用户与 AI 助手的完整对话压缩成简明的中文备忘录，\
+保留：1）用户的总体目标与关键需求；2）已完成的事项与结论；3）重要决策与原因；\
+4）涉及的文件清单；5）当前进度与待办。只输出备忘录本身。\n\n{transcript}"
+    );
+    let result = chat_completion_with_retry(
+        &api_key,
+        vec![serde_json::json!({ "role": "user", "content": prompt })],
+        &model,
+        None,
+        &app,
+    )
+    .await?;
+    let summary = result.content.unwrap_or_default();
+    if summary.trim().is_empty() {
+        return Err("压缩失败：模型未返回摘要".to_string());
+    }
+
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    delete_messages(&db, &conversation_id).map_err(|e| e.to_string())?;
+    save_message(
+        &db,
+        &conversation_id,
+        "assistant",
+        &format!("📋 对话已手动压缩（/compact），以下为此前内容的摘要：\n\n{summary}"),
+        None,
+        None,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// 平铺列出当前会话工作区内的文件相对路径，供输入框 @文件引用补全。
+#[tauri::command]
+fn list_workspace_files(
+    state: State<AppState>,
+    conversation_id: String,
+) -> Result<Vec<String>, String> {
+    let workspace = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        get_conversation(&db, &conversation_id)
+            .map_err(|e| e.to_string())?
+            .and_then(|c| c.workspace_path)
+            .ok_or("该会话未绑定工作区")?
+    };
+    Ok(mdga_tool_runtime::workspace_file_list(&workspace, 500))
+}
+
 /// 返回指定会话的所有工具 Activity Event，按时间正序，供前端展示历史过程面板。
 #[tauri::command]
 fn get_conversation_events(
@@ -276,18 +458,27 @@ fn cancel_agent(state: State<AppState>, conversation_id: String) -> Result<(), S
     Ok(())
 }
 
-/// 前端对一次高风险动作审批请求作出回应（允许或拒绝）。
+/// 前端对一次高风险动作审批请求作出回应（允许 / 拒绝 / 总是允许）。
 ///
 /// 通过 action_id 找到对应的 oneshot 通道并发送结果，唤醒正在等待的工具循环；
-/// 找不到对应请求时为无操作（可能已超时或已被其他途径处理）。
+/// remember=true 且批准时，把该动作的规则写入 permission_rules 表，后续同类动作免审批。
 #[tauri::command]
 fn respond_approval(
     state: State<AppState>,
     action_id: String,
     approved: bool,
+    remember: Option<bool>,
 ) -> Result<(), String> {
-    let mut approvals = state.approvals.lock().map_err(|e| e.to_string())?;
-    if let Some(sender) = approvals.remove(&action_id) {
+    let entry = {
+        let mut approvals = state.approvals.lock().map_err(|e| e.to_string())?;
+        approvals.remove(&action_id)
+    };
+    if let Some((sender, rule)) = entry {
+        if approved && remember.unwrap_or(false) && !rule.is_empty() {
+            if let Ok(db) = state.db.lock() {
+                let _ = add_permission_rule(&db, &rule);
+            }
+        }
         let _ = sender.send(approved);
     }
     Ok(())
@@ -414,7 +605,7 @@ create_file、write_file 或 delete_file 工具完成真实本地操作；不要
     });
     injected.push(ChatMessage {
         role: "system".to_string(),
-        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。若某次工具调用失败，请阅读返回的 error，判断是参数、路径还是环境问题，调整后重试或换用其他工具，不要原样重复同一次失败调用。".to_string(),
+        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。若某次工具调用失败，请阅读返回的 error，判断是参数、路径还是环境问题，调整后重试或换用其他工具，不要原样重复同一次失败调用。对于多步骤任务，请先调用 todo_write 列出步骤清单并随进度更新状态（同一时刻只有一项 in_progress），让用户实时看到进度。需要在大型代码库做只读调查（找实现、理结构、读懂模块）时，优先调用 run_subtask 委托独立子代理，避免主对话上下文膨胀。长时间运行的命令（启动服务、watch 等）用 run_command 的 background=true。用户消息中的 @相对路径 表示工作区文件引用，直接用 read_file 读取即可。".to_string(),
     });
     // repo map：开局注入工作区结构摘要，让模型无需逐层 list_dir 就了解项目骨架。
     if let Some(map) = repo_map.filter(|map| !map.trim().is_empty()) {
@@ -514,14 +705,50 @@ enum ToolGate {
     Deny(String),
 }
 
+/// 由工具名与参数推导「总是允许」规则串：命令取前两个 token 作前缀，其余工具按工具名。
+fn permission_rule_for(tool_name: &str, arguments: &str) -> String {
+    if tool_name == "run_command" {
+        if let Ok(request) = serde_json::from_str::<RunCommandRequest>(arguments) {
+            let prefix: Vec<&str> = request.command.split_whitespace().take(2).collect();
+            if !prefix.is_empty() {
+                return format!("cmd:{}", prefix.join(" "));
+            }
+        }
+        return String::new();
+    }
+    format!("tool:{tool_name}")
+}
+
+/// 判断已保存的权限规则是否覆盖本次调用。
+fn permission_rules_allow(rules: &[String], tool_name: &str, arguments: &str) -> bool {
+    if tool_name == "run_command" {
+        if let Ok(request) = serde_json::from_str::<RunCommandRequest>(arguments) {
+            let cmd = request.command.trim().to_lowercase();
+            return rules.iter().any(|rule| {
+                rule.strip_prefix("cmd:")
+                    .map(|prefix| {
+                        let p = prefix.to_lowercase();
+                        cmd == p || cmd.starts_with(&format!("{p} "))
+                    })
+                    .unwrap_or(false)
+            });
+        }
+        return false;
+    }
+    rules
+        .iter()
+        .any(|rule| rule.strip_prefix("tool:") == Some(tool_name))
+}
+
 /// 对单次工具调用做权限门控。
 ///
 /// run_command 在 Workspace Auto 下，若命令属于低风险白名单则直接放行，否则按能力裁决；
-/// 其余工具按权限模式映射到放行 / 审批 / 拒绝。
+/// 裁决为「需审批」时先查用户保存的「总是允许」规则，命中则免审批放行。
 fn gate_tool_decision(
     context: &SessionSecurityContext,
     tool_name: &str,
     arguments: &str,
+    rules: &[String],
 ) -> ToolGate {
     let capability = match tool_capability_for_name(tool_name) {
         Ok(capability) => capability,
@@ -541,22 +768,29 @@ fn gate_tool_decision(
 
     match decide_tool_access(context, capability) {
         ToolDecision::Allow => ToolGate::Allow,
-        ToolDecision::AskUser => ToolGate::Ask,
+        ToolDecision::AskUser => {
+            if permission_rules_allow(rules, tool_name, arguments) {
+                ToolGate::Allow
+            } else {
+                ToolGate::Ask
+            }
+        }
         ToolDecision::Deny => ToolGate::Deny("当前权限模式不允许此操作".to_string()),
     }
 }
 
 /// 向前端发起一次审批请求并等待用户决定。
 ///
-/// 生成唯一 action_id，注册 oneshot 通道，emit "approval-request" 事件，
+/// 生成唯一 action_id，注册 oneshot 通道（附「总是允许」规则串），emit "approval-request"，
 /// 然后 await 前端通过 respond_approval 命令送回的结果。通道异常时默认拒绝（安全优先）。
 async fn request_tool_approval(app: &AppHandle, tool_name: &str, arguments: &str) -> bool {
     let action_id = format!("act-{}", APPROVAL_SEQ.fetch_add(1, Ordering::SeqCst));
+    let rule = permission_rule_for(tool_name, arguments);
     let (sender, receiver) = oneshot::channel::<bool>();
     {
         let state = app.state::<AppState>();
         let mut approvals = state.approvals.lock().expect("approvals mutex poisoned");
-        approvals.insert(action_id.clone(), sender);
+        approvals.insert(action_id.clone(), (sender, rule));
     }
 
     let _ = app.emit(
@@ -611,6 +845,472 @@ fn feed_tool_denial(
         "tool_call_id": tool_call_id,
         "content": serde_json::json!({ "ok": false, "error": reason }).to_string()
     }));
+}
+
+// ── 文件变更检查点与 diff ────────────────────────────────────────────────
+
+/// 写类工具执行前捕获的回退数据快照。
+struct CheckpointCapture {
+    rel_path: String,
+    prev_content: Option<String>,
+    extra_json: Option<String>,
+    revertible: bool,
+}
+
+/// 检查点快照的单文件大小上限；超限文件跳过快照并标记不可回退，防止数据库膨胀。
+const CHECKPOINT_MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
+
+/// 把工作区相对路径安全拼接为绝对路径；含 `..` 的路径拒绝（防越界回写）。
+fn safe_workspace_join(workspace: &str, rel: &str) -> Option<std::path::PathBuf> {
+    if rel.contains("..") {
+        return None;
+    }
+    Some(std::path::Path::new(workspace).join(rel.trim_start_matches(['\\', '/'])))
+}
+
+/// 在写类工具执行前读取目标文件现状，供成功后记录检查点（rewind 用）。
+/// 非写类工具返回 None。必须在工具执行前调用。
+fn capture_checkpoint_before(
+    workspace: &str,
+    tool_name: &str,
+    arguments: &str,
+) -> Option<CheckpointCapture> {
+    let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let read_prev = |rel: &str| -> Option<String> {
+        let path = safe_workspace_join(workspace, rel)?;
+        let meta = std::fs::metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > CHECKPOINT_MAX_SNAPSHOT_BYTES {
+            return None;
+        }
+        std::fs::read_to_string(&path).ok()
+    };
+
+    match tool_name {
+        "create_file" => {
+            let rel = args.get("path")?.as_str()?;
+            Some(CheckpointCapture {
+                rel_path: rel.to_string(),
+                prev_content: None,
+                extra_json: None,
+                revertible: true,
+            })
+        }
+        "write_file" | "edit_file" => {
+            let rel = args.get("path")?.as_str()?;
+            let prev = read_prev(rel);
+            let existed = safe_workspace_join(workspace, rel)
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            // 文件存在但快照失败（过大/非文本）时无法恢复原内容，标记不可回退。
+            let revertible = prev.is_some() || !existed;
+            Some(CheckpointCapture {
+                rel_path: rel.to_string(),
+                prev_content: prev,
+                extra_json: None,
+                revertible,
+            })
+        }
+        "delete_file" => {
+            let rel = args.get("path")?.as_str()?;
+            let prev = read_prev(rel);
+            let revertible = prev.is_some();
+            Some(CheckpointCapture {
+                rel_path: rel.to_string(),
+                prev_content: prev,
+                extra_json: None,
+                revertible,
+            })
+        }
+        "move_path" => {
+            let from = args.get("from")?.as_str()?;
+            let to = args.get("to")?.as_str()?;
+            Some(CheckpointCapture {
+                rel_path: from.to_string(),
+                prev_content: None,
+                extra_json: Some(serde_json::json!({ "from": from, "to": to }).to_string()),
+                revertible: true,
+            })
+        }
+        "make_dir" => {
+            let rel = args.get("path")?.as_str()?;
+            Some(CheckpointCapture {
+                rel_path: rel.to_string(),
+                prev_content: None,
+                extra_json: None,
+                revertible: true,
+            })
+        }
+        "delete_dir" => {
+            let rel = args.get("path")?.as_str()?;
+            Some(CheckpointCapture {
+                rel_path: rel.to_string(),
+                prev_content: None,
+                extra_json: None,
+                revertible: false,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 计算行级 unified diff，返回 (diff 文本, 新增行数, 删除行数)；diff 文本截断防膨胀。
+fn compute_line_diff(old: &str, new: &str) -> (String, usize, usize) {
+    let diff = similar::TextDiff::from_lines(old, new);
+    let (mut added, mut removed) = (0usize, 0usize);
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => added += 1,
+            similar::ChangeTag::Delete => removed += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    let mut text = diff.unified_diff().context_radius(2).to_string();
+    const MAX_DIFF_CHARS: usize = 4_000;
+    if text.chars().count() > MAX_DIFF_CHARS {
+        text = text.chars().take(MAX_DIFF_CHARS).collect::<String>() + "\n…(diff 过长已截断)";
+    }
+    (text, added, removed)
+}
+
+/// 工具成功后计算该次变更的 diff（仅文本写类工具）；返回 None 表示该工具无 diff 概念。
+fn post_execution_diff(
+    workspace: &str,
+    tool_name: &str,
+    arguments: &str,
+    capture: &CheckpointCapture,
+) -> Option<(String, usize, usize)> {
+    let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let prev = capture.prev_content.as_deref().unwrap_or("");
+    match tool_name {
+        "create_file" | "write_file" => {
+            let new = args.get("content")?.as_str()?;
+            Some(compute_line_diff(prev, new))
+        }
+        "edit_file" => {
+            let path = safe_workspace_join(workspace, &capture.rel_path)?;
+            let new = std::fs::read_to_string(path).ok()?;
+            Some(compute_line_diff(prev, &new))
+        }
+        "delete_file" => {
+            if prev.is_empty() {
+                return None;
+            }
+            Some(compute_line_diff(prev, ""))
+        }
+        _ => None,
+    }
+}
+
+/// 把检查点落库（失败只忽略，不阻塞工具链路）。
+fn persist_checkpoint(
+    app: &AppHandle,
+    conversation_id: &str,
+    tool_name: &str,
+    capture: &CheckpointCapture,
+) {
+    let state = app.state::<AppState>();
+    let guard = state.db.lock();
+    if let Ok(db) = guard {
+        let _ = record_file_checkpoint(
+            &db,
+            conversation_id,
+            tool_name,
+            &capture.rel_path,
+            capture.prev_content.as_deref(),
+            capture.extra_json.as_deref(),
+            capture.revertible,
+        );
+    };
+}
+
+/// 对单个检查点执行文件系统回退。
+fn apply_checkpoint_revert(workspace: &str, checkpoint: &FileCheckpoint) -> Result<(), String> {
+    if !checkpoint.revertible {
+        return Err("该变更不可回退".to_string());
+    }
+    match checkpoint.tool_name.as_str() {
+        "create_file" => {
+            if let Some(path) = safe_workspace_join(workspace, &checkpoint.rel_path) {
+                let _ = std::fs::remove_file(path);
+            }
+            Ok(())
+        }
+        "write_file" | "edit_file" => {
+            let path = safe_workspace_join(workspace, &checkpoint.rel_path)
+                .ok_or("路径不安全")?;
+            match checkpoint.prev_content.as_deref() {
+                Some(content) => std::fs::write(path, content).map_err(|e| e.to_string()),
+                None => {
+                    let _ = std::fs::remove_file(path);
+                    Ok(())
+                }
+            }
+        }
+        "delete_file" => {
+            let path = safe_workspace_join(workspace, &checkpoint.rel_path)
+                .ok_or("路径不安全")?;
+            let content = checkpoint
+                .prev_content
+                .as_deref()
+                .ok_or("缺少回退内容")?;
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(path, content).map_err(|e| e.to_string())
+        }
+        "move_path" => {
+            let extra: serde_json::Value = checkpoint
+                .extra_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .ok_or("缺少移动信息")?;
+            let from = extra.get("from").and_then(|v| v.as_str()).ok_or("缺少 from")?;
+            let to = extra.get("to").and_then(|v| v.as_str()).ok_or("缺少 to")?;
+            let from_abs = safe_workspace_join(workspace, from).ok_or("路径不安全")?;
+            let to_abs = safe_workspace_join(workspace, to).ok_or("路径不安全")?;
+            std::fs::rename(to_abs, from_abs).map_err(|e| e.to_string())
+        }
+        "make_dir" => {
+            if let Some(path) = safe_workspace_join(workspace, &checkpoint.rel_path) {
+                let _ = std::fs::remove_dir(path);
+            }
+            Ok(())
+        }
+        other => Err(format!("不支持回退的工具: {other}")),
+    }
+}
+
+// ── todo / 后台命令 / 子任务 ─────────────────────────────────────────────
+
+/// todo_write 工具：更新任务清单并推送给前端实时展示，不触碰文件系统。
+fn execute_todo_write(app: &AppHandle, arguments: &str) -> Result<serde_json::Value, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|e| format!("工具参数解析失败: {e}"))?;
+    let items = parsed
+        .get("items")
+        .and_then(|v| v.as_array())
+        .ok_or("todo_write 需要 items 数组")?;
+    if items.len() > 50 {
+        return Err("todo 项过多（上限 50）".to_string());
+    }
+    let _ = app.emit("todo-update", serde_json::Value::Array(items.clone()));
+    Ok(serde_json::json!({
+        "count": items.len(),
+        "note": "任务清单已更新并实时展示给用户"
+    }))
+}
+
+/// 构造把命令输出逐行推送到前端的回调（"command-output" 事件）。
+fn command_line_callback(app: &AppHandle) -> mdga_tool_runtime::CommandLineCallback {
+    let app = app.clone();
+    std::sync::Arc::new(move |line: String| {
+        let _ = app.emit("command-output", line);
+    })
+}
+
+/// run_command 工具的桌面端执行：前台流式输出；background=true 时立即返回、
+/// 后台线程跑完后通过 "background-command-done" 事件通知。
+fn execute_run_command_tool(
+    app: &AppHandle,
+    security_context: &SessionSecurityContext,
+    arguments: &str,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::from_str::<RunCommandRequest>(arguments)
+        .map_err(|e| format!("工具参数解析失败: {e}"))?;
+    let workspace = security_context.workspace_root.clone();
+
+    if request.background {
+        let app_bg = app.clone();
+        let command_label = request.command.clone();
+        std::thread::spawn(move || {
+            let cb = command_line_callback(&app_bg);
+            let outcome = mdga_tool_runtime::run_command_streaming(
+                &workspace,
+                RunCommandRequest {
+                    background: false,
+                    ..request
+                },
+                Some(cb),
+            );
+            let payload = match outcome {
+                Ok(result) => serde_json::json!({
+                    "command": command_label,
+                    "exitCode": result.exit_code,
+                    "timedOut": result.timed_out,
+                    "stdout": result.stdout.chars().take(2000).collect::<String>(),
+                    "stderr": result.stderr.chars().take(1000).collect::<String>(),
+                }),
+                Err(err) => serde_json::json!({
+                    "command": command_label,
+                    "error": err.to_string()
+                }),
+            };
+            let _ = app_bg.emit("background-command-done", payload);
+        });
+        return Ok(serde_json::json!({
+            "background": true,
+            "note": "命令已在后台启动，结果稍后通知用户；你无需等待，继续后续步骤即可。"
+        }));
+    }
+
+    let cb = command_line_callback(app);
+    serde_json::to_value(
+        mdga_tool_runtime::run_command_streaming(&workspace, request, Some(cb))
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// 子任务探索代理可用的只读工具集合。
+fn read_only_tool_schemas() -> Vec<serde_json::Value> {
+    const READ_ONLY: &[&str] = &["list_dir", "read_file", "search_text", "stat_path"];
+    all_builtin_tool_schemas()
+        .into_iter()
+        .filter(|schema| {
+            schema
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .map(|name| READ_ONLY.contains(&name))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+const SUBTASK_MAX_ROUNDS: usize = 15;
+
+/// run_subtask 工具：用独立上下文跑一个只读探索子代理，返回简明报告与消耗的 usage。
+/// 子代理只能 list/read/search/stat，工具事件以 `sub:` 前缀推给前端展示。
+async fn execute_run_subtask(
+    api_key: &str,
+    model: &str,
+    workspace_path: &str,
+    arguments: &str,
+    app: &AppHandle,
+    conversation_id: &str,
+) -> (Result<serde_json::Value, String>, Option<mdga_shared::RawUsage>) {
+    let parsed: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(value) => value,
+        Err(e) => return (Err(format!("工具参数解析失败: {e}")), None),
+    };
+    let Some(description) = parsed.get("description").and_then(|v| v.as_str()) else {
+        return (Err("run_subtask 缺少 description".to_string()), None);
+    };
+    let security_context = match session_security_context(
+        workspace_path.to_string(),
+        PermissionMode::Restricted,
+        NetworkMode::Disabled,
+    ) {
+        Ok(ctx) => ctx,
+        Err(e) => return (Err(e.to_string()), None),
+    };
+
+    let mut wire = vec![
+        serde_json::json!({
+            "role": "system",
+            "content": format!(
+                "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、stat_path 这些只读工具调查代码与文件，禁止任何写入或命令执行。完成调查后，输出一份简明、信息密度高的中文报告，直接回答委托内容，不要寒暄。"
+            )
+        }),
+        serde_json::json!({ "role": "user", "content": description }),
+    ];
+    let mut usage: Option<mdga_shared::RawUsage> = None;
+    let mut report = String::new();
+
+    for _ in 0..SUBTASK_MAX_ROUNDS {
+        let completion = match chat_completion_with_retry(
+            api_key,
+            wire.clone(),
+            model,
+            Some(read_only_tool_schemas()),
+            app,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => return (Err(e), usage),
+        };
+        usage = merge_usage(usage, completion.usage.clone());
+
+        let tool_calls = if completion.tool_calls.is_empty() {
+            completion
+                .content
+                .as_deref()
+                .map(recover_tool_calls_from_content)
+                .unwrap_or_default()
+        } else {
+            completion.tool_calls.clone()
+        };
+
+        if tool_calls.is_empty() {
+            report = completion
+                .content
+                .as_deref()
+                .map(strip_dsml_markup)
+                .unwrap_or_default();
+            break;
+        }
+
+        wire.push(assistant_message_for_tool_calls(
+            completion.assistant_message.clone(),
+            &tool_calls,
+        ));
+        for call in &tool_calls {
+            let name = call.function.name.as_str();
+            let display_name = format!("sub:{name}");
+            record_tool_event(
+                app,
+                conversation_id,
+                "tool_started",
+                &display_name,
+                "running",
+                &call.function.arguments,
+                None,
+                None,
+                workspace_path,
+            );
+            let result = if matches!(name, "list_dir" | "read_file" | "search_text" | "stat_path")
+            {
+                execute_builtin_tool_call(&security_context, name, &call.function.arguments)
+            } else {
+                Err("子任务仅允许只读工具".to_string())
+            };
+            let (output, status, error) = match &result {
+                Ok(value) => (
+                    serde_json::json!({ "ok": true, "result": value }),
+                    "succeeded",
+                    None,
+                ),
+                Err(message) => (
+                    serde_json::json!({ "ok": false, "error": message }),
+                    "failed",
+                    Some(message.clone()),
+                ),
+            };
+            let output_str = output.to_string();
+            record_tool_event(
+                app,
+                conversation_id,
+                if status == "succeeded" { "tool_succeeded" } else { "tool_failed" },
+                &display_name,
+                status,
+                &call.function.arguments,
+                Some(&output_str),
+                error.as_deref(),
+                workspace_path,
+            );
+            wire.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": output_str
+            }));
+        }
+    }
+
+    if report.trim().is_empty() {
+        report = "（子任务在限定轮数内未给出报告）".to_string();
+    }
+    let capped: String = report.chars().take(8_000).collect();
+    (Ok(serde_json::json!({ "report": capped })), usage)
 }
 
 /// 读取上下文压缩软上限：优先取环境变量 MDGA_CONTEXT_SOFT_LIMIT（便于低阈值压测），否则用默认值。
@@ -818,6 +1518,7 @@ async fn chat_with_builtin_tools(
     conversation_id: &str,
     app: &AppHandle,
     cancel: Arc<AtomicBool>,
+    permission_rules: Vec<String>,
 ) -> Result<Option<mdga_shared::RawUsage>, String> {
     let security_context = session_security_context(
         workspace_path.to_string(),
@@ -945,8 +1646,9 @@ async fn chat_with_builtin_tools(
             let tool_name = call.function.name.clone();
             let arguments = call.function.arguments.clone();
 
-            // 权限门控：低风险白名单命令直接放行，否则按权限模式决定放行 / 审批 / 拒绝。
-            let decision = gate_tool_decision(&security_context, &tool_name, &arguments);
+            // 权限门控：白名单命令与「总是允许」规则直接放行，否则按权限模式放行 / 审批 / 拒绝。
+            let decision =
+                gate_tool_decision(&security_context, &tool_name, &arguments, &permission_rules);
             let proceed = match decision {
                 ToolGate::Allow => true,
                 ToolGate::Deny(reason) => {
@@ -996,14 +1698,49 @@ async fn chat_with_builtin_tools(
                 workspace_path,
             );
 
-            let result =
-                execute_builtin_tool_call(&security_context, &tool_name, &arguments);
+            // 写类工具执行前捕获回退快照（rewind 用），必须先于执行。
+            let capture = capture_checkpoint_before(workspace_path, &tool_name, &arguments);
+
+            // 特殊工具走专用执行器：todo/子任务/命令（流式 + 后台）；其余走通用文件工具执行。
+            let result = match tool_name.as_str() {
+                "todo_write" => execute_todo_write(app, &arguments),
+                "run_command" => execute_run_command_tool(app, &security_context, &arguments),
+                "run_subtask" => {
+                    let _ = app.emit(
+                        "agent-status",
+                        serde_json::json!({ "state": "thinking", "round": round }),
+                    );
+                    let (sub_result, sub_usage) = execute_run_subtask(
+                        api_key,
+                        model,
+                        workspace_path,
+                        &arguments,
+                        app,
+                        conversation_id,
+                    )
+                    .await;
+                    usage = merge_usage(usage, sub_usage);
+                    sub_result
+                }
+                _ => execute_builtin_tool_call(&security_context, &tool_name, &arguments),
+            };
+
             let (output, status, error) = match &result {
-                Ok(value) => (
-                    serde_json::json!({ "ok": true, "result": value }),
-                    "succeeded",
-                    None,
-                ),
+                Ok(value) => {
+                    let mut out = serde_json::json!({ "ok": true, "result": value });
+                    // 文本写类工具：附加行级 diff 供 UI 展示，并把回退快照落库。
+                    if let Some(cap) = capture.as_ref() {
+                        if let Some((diff, added, removed)) =
+                            post_execution_diff(workspace_path, &tool_name, &arguments, cap)
+                        {
+                            out["diff"] = serde_json::Value::String(diff);
+                            out["added"] = serde_json::json!(added);
+                            out["removed"] = serde_json::json!(removed);
+                        }
+                        persist_checkpoint(app, conversation_id, &tool_name, cap);
+                    }
+                    (out, "succeeded", None)
+                }
                 Err(message) => (
                     serde_json::json!({
                         "ok": false,
@@ -1154,14 +1891,56 @@ fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": "Run a single PowerShell command in the workspace directory. Use for low-risk checks like listing files, git status, building or running tests. Only available under Full Access permission mode.",
+                "description": "Run a single PowerShell command in the workspace directory. Low-risk commands (cargo check/test, npm test, git status/diff, dir) run directly under Workspace Auto; others need Full Access or user approval. Set background=true for long-running commands (servers, watchers): it returns immediately and the result is reported later.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "The PowerShell command line to execute." },
-                        "timeoutSecs": { "type": "integer", "description": "Optional timeout in seconds, default 120, max 600." }
+                        "timeoutSecs": { "type": "integer", "description": "Optional timeout in seconds, default 120, max 600." },
+                        "background": { "type": "boolean", "description": "Run in background and return immediately. Defaults to false." }
                     },
                     "required": ["command"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "todo_write",
+                "description": "Maintain a visible todo list for the current multi-step task. Call this at the start of a complex task to plan steps, and update statuses as you progress (exactly one item in_progress at a time). The list is shown to the user as live progress.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "description": "The full todo list, replacing the previous one.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "text": { "type": "string", "description": "Short description of the step." },
+                                    "status": { "type": "string", "enum": ["pending", "in_progress", "done"], "description": "Current status of this step." }
+                                },
+                                "required": ["text", "status"]
+                            }
+                        }
+                    },
+                    "required": ["items"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "run_subtask",
+                "description": "Delegate a focused READ-ONLY exploration subtask (e.g. 'find where X is implemented', 'summarize how module Y works') to a sub-agent with its own fresh context. The sub-agent can only list/read/search files and returns a concise text report. Use this to investigate large codebases without bloating the main conversation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": { "type": "string", "description": "Clear, self-contained description of what to investigate and what the report should contain." }
+                    },
+                    "required": ["description"],
                     "additionalProperties": false
                 }
             }
@@ -1317,7 +2096,9 @@ fn execute_create_file_tool_call(
 
 fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability, String> {
     match tool_name {
-        "list_dir" | "read_file" | "stat_path" | "search_text" => Ok(ToolCapability::FileRead),
+        // todo_write 只更新任务清单 UI，不触碰文件系统，等同列表级低风险。
+        "list_dir" | "read_file" | "stat_path" | "search_text" | "todo_write"
+        | "run_subtask" => Ok(ToolCapability::FileRead),
         "create_file" | "write_file" | "edit_file" | "make_dir" | "move_path" => {
             Ok(ToolCapability::FileWrite)
         }
@@ -1639,6 +2420,13 @@ fn main() {
             persist_message,
             rename_conversation,
             remove_conversation,
+            pin_conversation,
+            archive_conversation,
+            get_app_info,
+            get_checkpoints,
+            revert_to_checkpoint,
+            compact_history,
+            list_workspace_files,
             get_conversation_events,
             cancel_agent,
             respond_approval,
