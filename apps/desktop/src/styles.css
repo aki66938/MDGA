@@ -623,6 +623,54 @@ h1 {
   margin-left: 4px;
 }
 
+/* ── Agent 工作状态行（发送期间常驻，对标 CC/Codex 的 thinking 指示器） ── */
+
+.agent-working {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  font-size: 13px;
+  color: #8b929b;
+}
+
+.agent-working__spinner {
+  display: inline-block;
+  animation: agent-spin 1.6s linear infinite;
+  color: #b0865a;
+}
+
+@keyframes agent-spin {
+  0%   { transform: rotate(0deg);   opacity: 1; }
+  50%  { transform: rotate(180deg); opacity: 0.5; }
+  100% { transform: rotate(360deg); opacity: 1; }
+}
+
+.agent-working__elapsed {
+  font-variant-numeric: tabular-nums;
+  color: #b0b5bc;
+  font-size: 12px;
+}
+
+/* ── 上下文用量徽标（状态栏） ── */
+
+.ctx-usage {
+  font-variant-numeric: tabular-nums;
+  color: #69717d;
+}
+
+/* ── 内联系统通知（上下文压缩等） ── */
+
+.notice-inline {
+  margin: 6px 0;
+  padding: 6px 10px;
+  border-left: 3px solid #d8dadd;
+  background: #fafbfc;
+  border-radius: 0 6px 6px 0;
+  font-size: 12.5px;
+  color: #8b929b;
+}
+
 /* ── 高风险动作审批弹窗 ── */
 
 .approval-overlay {

@@ -36,7 +36,10 @@ type ApprovalRequest = {
   target: string;
 };
 
-type MessagePart = TextPart | ToolPart;
+/** 系统通知卡片：上下文压缩等用户需要感知的运行时事件，内联显示在对话流中 */
+type NoticePart = { type: "notice"; text: string };
+
+type MessagePart = TextPart | ToolPart | NoticePart;
 
 type Message = {
   role: "user" | "assistant";
@@ -117,6 +120,11 @@ export function App() {
   const [draftWorkspace, setDraftWorkspace] = useState<DraftWorkspace | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
+  // Agent 实时状态：思考中 / 执行工具 / 压缩上下文 / 输出中，发送期间常驻显示
+  const [agentStatus, setAgentStatus] = useState<string | null>(null);
+  const [elapsedSec, setElapsedSec] = useState(0);
+  // 上下文用量（上次请求 prompt_tokens / 压缩阈值），常驻状态栏
+  const [ctxUsage, setCtxUsage] = useState<{ promptTokens: number; softLimit: number } | null>(null);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const streamingTextRef = useRef(""); // 只累积纯文字内容，用于 chat-done 持久化（供模型上下文）
@@ -159,6 +167,21 @@ export function App() {
       unlisten.then((fn) => fn());
     };
   }, []);
+
+  // 发送期间的耗时计时器：每秒刷新，让用户确信 agent 仍在工作而不是被截断
+  useEffect(() => {
+    if (!sending) {
+      setElapsedSec(0);
+      setAgentStatus(null);
+      return;
+    }
+    const start = Date.now();
+    const timer = setInterval(
+      () => setElapsedSec(Math.floor((Date.now() - start) / 1000)),
+      1000
+    );
+    return () => clearInterval(timer);
+  }, [sending]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -299,6 +322,7 @@ export function App() {
 
     // chat-chunk：追加文字到当前 assistant 消息的最后一个 text part
     const unlistenChunk = await listen<string>("chat-chunk", (e) => {
+      setAgentStatus("正在输出回复…");
       streamingTextRef.current += e.payload;
       setMessages((prev) => {
         const updated = [...prev];
@@ -320,6 +344,7 @@ export function App() {
     // tool-event：running 时插入新卡片，succeeded/failed 时更新最近匹配的 running 卡片
     const unlistenTool = await listen<ToolEvent>("tool-event", (e) => {
       const { toolName, status, inputJson, errorMessage } = e.payload;
+      if (status === "running") setAgentStatus(`正在执行 ${toolName}…`);
       const target = extractTarget(inputJson);
       setMessages((prev) => {
         const updated = [...prev];
@@ -358,6 +383,46 @@ export function App() {
       });
     });
 
+    // agent-status：后端推送的实时状态（思考中第 N 轮 / 压缩上下文中）
+    const unlistenStatus = await listen<{ state: string; round?: number }>(
+      "agent-status",
+      (e) => {
+        const { state, round } = e.payload;
+        if (state === "thinking") {
+          setAgentStatus(round ? `正在思考…（第 ${round} 轮）` : "正在思考…");
+        } else if (state === "compacting") {
+          setAgentStatus("正在压缩上下文…");
+        }
+      }
+    );
+
+    // context-usage：每轮请求后的真实上下文体积，驱动状态栏百分比
+    const unlistenCtx = await listen<{ promptTokens: number; softLimit: number }>(
+      "context-usage",
+      (e) => setCtxUsage(e.payload)
+    );
+
+    // context-compacted：压缩事件，在对话流中插入通知卡片（对标 CC/Codex 的 compact 提示）
+    const unlistenCompact = await listen<{ kind: string; count?: number }>(
+      "context-compacted",
+      (e) => {
+        const text =
+          e.payload.kind === "summary"
+            ? "上下文较长，已自动压缩为任务进度摘要，对话继续"
+            : `上下文较长，已压缩 ${e.payload.count ?? 0} 条较早的工具输出`;
+        setMessages((prev) => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          const last = updated[lastIdx];
+          if (last.role !== "assistant") return prev;
+          const parts: MessagePart[] = [...last.parts, { type: "notice", text }];
+          updated[lastIdx] = { ...last, parts };
+          streamingPartsRef.current = parts;
+          return updated;
+        });
+      }
+    );
+
     const unlistenUsage = await listen<UsageSummary>("chat-usage", (e) => {
       streamingUsageRef.current = e.payload;
       setMessages((prev) => {
@@ -374,6 +439,9 @@ export function App() {
       setApproval(null);
       unlistenChunk();
       unlistenTool();
+      unlistenStatus();
+      unlistenCtx();
+      unlistenCompact();
       unlistenUsage();
       unlistenDone();
 
@@ -417,6 +485,9 @@ export function App() {
       setSending(false);
       unlistenChunk();
       unlistenTool();
+      unlistenStatus();
+      unlistenCtx();
+      unlistenCompact();
       unlistenUsage();
       unlistenDone();
     }
@@ -556,6 +627,14 @@ export function App() {
                 {activeConversation.workspaceName}
               </span>
             )}
+            {ctxUsage && ctxUsage.softLimit > 0 && (
+              <span
+                className="ctx-usage"
+                title={`上次请求 ${ctxUsage.promptTokens.toLocaleString()} tokens / 自动压缩阈值 ${ctxUsage.softLimit.toLocaleString()}`}
+              >
+                上下文 {Math.round((ctxUsage.promptTokens / ctxUsage.softLimit) * 100)}%
+              </span>
+            )}
             <select
               className="model-select"
               value={model}
@@ -583,6 +662,13 @@ export function App() {
                 )}
               </div>
             ))}
+            {sending && (
+              <div className="agent-working" aria-label="Agent 工作状态">
+                <span className="agent-working__spinner" aria-hidden="true">✦</span>
+                <span>{agentStatus ?? "正在思考…"}</span>
+                <span className="agent-working__elapsed">{elapsedSec}s</span>
+              </div>
+            )}
             <div ref={messagesEndRef} />
           </section>
         ) : (
@@ -706,6 +792,13 @@ function MessageContent({ msg }: { msg: Message }) {
         }
         if (part.type === "tool") {
           return <ToolInlineRow key={i} part={part} />;
+        }
+        if (part.type === "notice") {
+          return (
+            <div key={i} className="notice-inline" aria-label="系统通知">
+              ⊜ {part.text}
+            </div>
+          );
         }
         return null;
       })}
