@@ -116,16 +116,18 @@
 - 斜杠命令框架：/compact、/clear、/init、/model、/rewind
 - @文件引用补全
 
-### M5 - MCP 接入（0.1.x 起点候选）
-- MCP server 注册/启停/工具发现，统一进权限层与 activity_events
-- 对标 Plan11 Phase 5 验收：接入 filesystem 或 GitHub MCP server
+### M5 - MCP 接入 ✅ 代码已实现（待 dev 验证）
+- 新增 `crates/mcp-client`：最小 stdio JSON-RPC 客户端（initialize 握手 / tools/list / tools/call）✅
+- 设置页 MCP 管理：添加（名称+启动命令）、启停、删除、连接状态与工具数 ✅
+- MCP 工具以 `mcp_<server>_<tool>` 函数名并入模型工具集；统一按 NetworkAccess 能力进权限层（WorkspaceAuto 审批 / FullAccess 放行 / 可「总是允许」），全量进 activity_events ✅
 
-### M6 - Skills（M5 后）
-- MDGA skill 目录规范、SKILL.md 加载、按需注入
-- 对标 Plan11 Phase 6
+### M6 - Skills ✅ 代码已实现（待 dev 验证）
+- 技能目录规范：工作区 `.mdga/skills/<name>/SKILL.md`（frontmatter description）✅
+- 渐进披露：system 注入技能名+描述清单，模型按需调用 `load_skill` 加载完整说明 ✅
 
-### M7 - 文件导入与问答（最后）
-- 依赖视觉/解析能力评估（DeepSeek 视觉支持或外挂识图模型）
+### M7 - 文件导入与问答 ✅ 文本类已实现（待 dev 验证）
+- 📎 导入按钮：TXT/MD/CSV/JSON/PDF/DOCX 文本抽取（cap 10 万字符），自动发送总结+问答 ✅
+- 图片/扫描件：依赖视觉模型，明确提示暂不支持，留待后续评估 ⏳
 
 ---
 

@@ -170,6 +170,14 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             rule       TEXT NOT NULL UNIQUE,
             created_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS mcp_servers (
+            id         TEXT PRIMARY KEY,
+            name       TEXT NOT NULL,
+            command    TEXT NOT NULL,
+            enabled    INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL
+        );
         ",
     )?;
     add_column_if_missing(&conn, "conversations", "workspace_path", "TEXT")?;
@@ -468,6 +476,69 @@ pub fn mark_checkpoint_reverted(conn: &Connection, checkpoint_id: &str) -> SqlRe
         "UPDATE file_checkpoints SET reverted = 1 WHERE id = ?1",
         params![checkpoint_id],
     )?;
+    Ok(())
+}
+
+// ── MCP Server CRUD ──────────────────────────────────────────────────────
+
+/// MCP server 配置记录。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerRecord {
+    pub id: String,
+    pub name: String,
+    /// 完整启动命令行（Windows 下经 cmd /C 执行，兼容 npx/uvx）。
+    pub command: String,
+    pub enabled: bool,
+    pub created_at: i64,
+}
+
+/// 新增一个 MCP server 配置。
+pub fn add_mcp_server(conn: &Connection, name: &str, command: &str) -> SqlResult<McpServerRecord> {
+    let id = Uuid::new_v4().to_string();
+    let now = now_ts();
+    conn.execute(
+        "INSERT INTO mcp_servers (id, name, command, enabled, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
+        params![id, name, command, now],
+    )?;
+    Ok(McpServerRecord {
+        id,
+        name: name.to_string(),
+        command: command.to_string(),
+        enabled: true,
+        created_at: now,
+    })
+}
+
+/// 列出全部 MCP server 配置。
+pub fn list_mcp_servers(conn: &Connection) -> SqlResult<Vec<McpServerRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, command, enabled, created_at FROM mcp_servers ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(McpServerRecord {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            command: row.get(2)?,
+            enabled: row.get::<_, i64>(3)? != 0,
+            created_at: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 设置 MCP server 启用状态。
+pub fn set_mcp_server_enabled(conn: &Connection, id: &str, enabled: bool) -> SqlResult<()> {
+    conn.execute(
+        "UPDATE mcp_servers SET enabled = ?1 WHERE id = ?2",
+        params![enabled as i64, id],
+    )?;
+    Ok(())
+}
+
+/// 删除一个 MCP server 配置。
+pub fn remove_mcp_server(conn: &Connection, id: &str) -> SqlResult<()> {
+    conn.execute("DELETE FROM mcp_servers WHERE id = ?1", params![id])?;
     Ok(())
 }
 

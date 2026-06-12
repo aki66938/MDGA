@@ -305,11 +305,37 @@ fn parse_chat_completion_response(
 /// 这是可接受的取舍。原生 tool_calls 路径不受影响。
 pub fn parse_dsml_tool_calls(raw_content: &str) -> Vec<ToolCall> {
     let content = strip_dsml_bars(raw_content);
-    let content = content.as_str();
+    // 先尝试 DSML 变体；没有命中时再尝试 XML 风格的 <ToolCall name="..."> 变体
+    //（实测 DeepSeek 偶尔会输出这种格式，工具名/参数同样可恢复执行）。
+    let calls = parse_markup_tool_calls(
+        &content,
+        "<DSMLinvoke name=\"",
+        "</DSMLinvoke>",
+        "<DSMLparameter name=\"",
+        "</DSMLparameter>",
+    );
+    if !calls.is_empty() {
+        return calls;
+    }
+    parse_markup_tool_calls(
+        &content,
+        "<ToolCall name=\"",
+        "</ToolCall>",
+        "<parameter name=\"",
+        "</parameter>",
+    )
+}
+
+/// 通用的「标记式工具调用」解析器：按给定的 invoke/parameter 起止标记从正文恢复 ToolCall。
+fn parse_markup_tool_calls(
+    content: &str,
+    invoke_marker: &str,
+    invoke_end: &str,
+    param_marker: &str,
+    param_end: &str,
+) -> Vec<ToolCall> {
     let mut calls = Vec::new();
     let mut cursor = 0;
-    let invoke_marker = "<DSMLinvoke name=\"";
-    let invoke_end = "</DSMLinvoke>";
 
     while let Some(offset) = content[cursor..].find(invoke_marker) {
         let start = cursor + offset + invoke_marker.len();
@@ -325,7 +351,8 @@ pub fn parse_dsml_tool_calls(raw_content: &str) -> Vec<ToolCall> {
             break;
         };
         let body_end = body_start + body_end_offset;
-        let params = parse_dsml_parameters(&content[body_start..body_end]);
+        let params =
+            parse_markup_parameters(&content[body_start..body_end], param_marker, param_end);
         let Ok(arguments) = serde_json::to_string(&params) else {
             cursor = body_end + invoke_end.len();
             continue;
@@ -350,24 +377,30 @@ fn strip_dsml_bars(content: &str) -> String {
     content.replace('\u{FF5C}', "")
 }
 
-/// 从将要展示给用户的正文中清除 DSML 工具标记，避免泄漏成可见文本。
+/// 从将要展示给用户的正文中清除工具调用标记（DSML 与 <ToolCall> 两种变体），避免泄漏成可见文本。
 ///
-/// DeepSeek 偶尔把 DSML 工具调用直接吐进正文（尤其在不带 tools 的收尾请求里）。工具调用
-/// 总是出现在叙述之后，因此从第一个 DSML 标记处截断，保留前面的自然语言叙述，丢弃整段标记。
-/// 正文中若没有 DSML 标记则原样返回。
+/// DeepSeek 偶尔把工具调用直接吐进正文（尤其在不带 tools 的收尾请求里）。工具调用
+/// 总是出现在叙述之后，因此从第一个标记处截断，保留前面的自然语言叙述，丢弃整段标记。
+/// 正文中若没有标记则原样返回。
 pub fn strip_dsml_markup(content: &str) -> String {
     let normalized = strip_dsml_bars(content);
-    match normalized.find("<DSML") {
+    let cut = [normalized.find("<DSML"), normalized.find("<ToolCall")]
+        .into_iter()
+        .flatten()
+        .min();
+    match cut {
         Some(pos) => normalized[..pos].trim_end().to_string(),
         None => content.to_string(),
     }
 }
 
-fn parse_dsml_parameters(body: &str) -> serde_json::Map<String, serde_json::Value> {
+fn parse_markup_parameters(
+    body: &str,
+    param_marker: &str,
+    param_end: &str,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut params = serde_json::Map::new();
     let mut cursor = 0;
-    let param_marker = "<DSMLparameter name=\"";
-    let param_end = "</DSMLparameter>";
 
     while let Some(offset) = body[cursor..].find(param_marker) {
         let start = cursor + offset + param_marker.len();
@@ -492,6 +525,31 @@ mod tests {
     fn strip_dsml_markup_returns_plain_text_untouched() {
         let content = "这是一段普通回复，没有任何工具标记。";
         assert_eq!(strip_dsml_markup(content), content);
+    }
+
+    #[test]
+    fn parses_xmlish_toolcall_variant_from_content() {
+        // 真实泄漏样本（0.0.17 dev 实测）：模型用 <ToolCall name="..."> XML 风格输出工具调用。
+        let content = r#"好的，我来给 README.md 文件中增加一行 helloworld。
+
+<ToolCall name="search_file"> <parameter name="target_directory" string="true">/</parameter> <parameter name="pattern" string="true">README.md</parameter> <parameter name="recursive" string="false">false</parameter> </ToolCall>"#;
+
+        let calls = parse_dsml_tool_calls(content);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "search_file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("arguments should be json");
+        assert_eq!(parsed["pattern"], "README.md");
+        assert_eq!(parsed["recursive"], "false");
+    }
+
+    #[test]
+    fn strips_leaked_toolcall_markup_keeping_narration() {
+        let content = "我先找到文件：\n\n<ToolCall name=\"search_file\"> <parameter name=\"pattern\" string=\"true\">README.md</parameter> </ToolCall>";
+        let cleaned = strip_dsml_markup(content);
+        assert_eq!(cleaned, "我先找到文件：");
+        assert!(!cleaned.contains("ToolCall"));
     }
 
     #[test]

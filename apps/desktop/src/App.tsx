@@ -57,6 +57,16 @@ type FileCheckpoint = {
 
 type AppInfo = { version: string; dataDir: string };
 
+/** MCP server 配置与连接状态 */
+type McpServer = {
+  id: string;
+  name: string;
+  command: string;
+  enabled: boolean;
+  connected: boolean;
+  toolCount: number;
+};
+
 /** 高风险动作审批请求，由后端在 AskEveryTime / 越界场景下发起 */
 type ApprovalRequest = {
   actionId: string;
@@ -180,6 +190,7 @@ export function App() {
   const [showChanges, setShowChanges] = useState(false);
   const [checkpoints, setCheckpoints] = useState<FileCheckpoint[]>([]);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   // @文件引用补全
   const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
   const [fileMention, setFileMention] = useState<string | null>(null);
@@ -516,6 +527,12 @@ export function App() {
     } else if (await handleSlashCommand(text)) {
       return;
     }
+    await sendText(text);
+  }
+
+  /** 发送一段文本（供输入框与文件导入复用）。 */
+  async function sendText(text: string) {
+    if (!text || sending) return;
 
     let convId = activeConvId;
     if (!convId) {
@@ -701,6 +718,31 @@ export function App() {
       unlistenUsage();
       unlistenDone();
 
+      // 兜底清洗：模型可能把工具调用标记直接吐进正文（纯聊天会话尤其常见——没有工具
+      // 时模型会幻觉 <ToolCall>/DSML 语法）。截断标记、保留叙述，并提示用户原因。
+      const leakIdx = findToolMarkupIndex(streamingTextRef.current);
+      if (leakIdx >= 0) {
+        const sanitized = streamingTextRef.current.slice(0, leakIdx).trimEnd();
+        streamingTextRef.current = sanitized;
+        const conv = conversations.find((c) => c.id === finalConvId);
+        const noticeText = conv?.workspacePath
+          ? "已清理模型输出中的内部工具标记"
+          : "本会话未绑定工作区，Agent 无法执行本地文件操作。请点击「+ 新对话」并选择工作区后再试。";
+        const sanitizedParts: MessagePart[] = [
+          ...(sanitized ? [{ type: "text", content: sanitized } as MessagePart] : []),
+          { type: "notice", text: noticeText },
+        ];
+        streamingPartsRef.current = sanitizedParts;
+        setMessages((prev) => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          if (updated[lastIdx]?.role === "assistant") {
+            updated[lastIdx] = { ...updated[lastIdx], parts: sanitizedParts };
+          }
+          return updated;
+        });
+      }
+
       const usageJson = streamingUsageRef.current
         ? JSON.stringify(streamingUsageRef.current)
         : null;
@@ -790,10 +832,55 @@ export function App() {
     }
   }
 
+  async function refreshMcpServers() {
+    const list = await invoke<McpServer[]>("get_mcp_servers").catch(() => [] as McpServer[]);
+    setMcpServers(list);
+  }
+
   async function openSettings() {
     const info = await invoke<AppInfo>("get_app_info").catch(() => null);
     setAppInfo(info);
+    await refreshMcpServers();
     setShowSettings(true);
+  }
+
+  async function handleAddMcpServer(name: string, command: string) {
+    await invoke("create_mcp_server", { name, command }).catch((err) => {
+      appendNoticeToLastMessage(humanizeError(String(err)));
+    });
+    await refreshMcpServers();
+  }
+
+  async function handleToggleMcpServer(id: string, enabled: boolean) {
+    await invoke("toggle_mcp_server", { serverId: id, enabled }).catch(() => {});
+    await refreshMcpServers();
+  }
+
+  async function handleDeleteMcpServer(id: string) {
+    await invoke("delete_mcp_server", { serverId: id }).catch(() => {});
+    await refreshMcpServers();
+  }
+
+  /** 导入本地文档：抽取文本后自动作为消息发送，进入问答流程。 */
+  async function handleImportFile() {
+    if (sending) return;
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "文档", extensions: ["txt", "md", "csv", "json", "log", "pdf", "docx", "xml", "html", "toml", "yaml", "yml"] }],
+      });
+      if (!selected || Array.isArray(selected)) return;
+      const result = await invoke<{ name: string; text: string; truncated: boolean }>(
+        "import_file_text",
+        { path: selected }
+      );
+      const note = result.truncated ? "\n\n（文档过长，已截断导入前 10 万字符）" : "";
+      const prepared = `请阅读以下导入文档《${result.name}》，先给出简要总结，然后准备回答我关于它的问题：${note}\n\n${result.text}`;
+      setInput(prepared.slice(0, 200) + (prepared.length > 200 ? "…" : ""));
+      await sendText(prepared);
+    } catch (err) {
+      appendNoticeToLastMessage(humanizeError(String(err)));
+    }
   }
 
   function handleModelChange(next: DeepSeekModelId) {
@@ -984,6 +1071,16 @@ export function App() {
             </button>
           </div>
         )}
+
+        {/* 侧边栏底部 footer：设置入口 */}
+        <button
+          className="sidebar-footer"
+          type="button"
+          onClick={openSettings}
+          aria-label="设置"
+        >
+          <span aria-hidden="true">⚙</span> 设置
+        </button>
       </aside>
 
       {/* 工作区 */}
@@ -1006,11 +1103,15 @@ export function App() {
                 <option key={mode} value={mode}>{getPermissionModeLabel(mode)}</option>
               ))}
             </select>
-            {activeConversation?.workspaceName && (
+            {activeConversation?.workspaceName ? (
               <span title={activeConversation.workspacePath ?? undefined}>
                 {activeConversation.workspaceName}
               </span>
-            )}
+            ) : activeConversation ? (
+              <span title="本会话未绑定工作区，Agent 无法执行本地操作；新建对话时可选择工作区">
+                纯聊天
+              </span>
+            ) : null}
             {ctxUsage && ctxUsage.softLimit > 0 && (
               <span
                 className="ctx-usage"
@@ -1041,15 +1142,6 @@ export function App() {
                 变更
               </button>
             )}
-            <button
-              className="topbar-btn"
-              type="button"
-              title="设置"
-              onClick={openSettings}
-              aria-label="设置"
-            >
-              ⚙
-            </button>
           </div>
         </header>
 
@@ -1165,6 +1257,15 @@ export function App() {
             <div className="composer__side">
               <button
                 type="button"
+                className="composer__plan"
+                title="导入本地文档（txt/md/csv/pdf/docx），总结并问答"
+                onClick={handleImportFile}
+                disabled={sending}
+              >
+                📎
+              </button>
+              <button
+                type="button"
                 className={`composer__plan${planMode ? " composer__plan--on" : ""}`}
                 title="计划模式：让 Agent 先给出分步计划，确认后再执行"
                 onClick={() => setPlanMode((v) => !v)}
@@ -1207,8 +1308,13 @@ export function App() {
           appInfo={appInfo}
           model={model}
           permissionMode={permissionMode}
+          mcpServers={mcpServers}
           onModelChange={handleModelChange}
           onPermissionModeChange={handlePermissionModeChange}
+          onAddMcpServer={handleAddMcpServer}
+          onToggleMcpServer={handleToggleMcpServer}
+          onDeleteMcpServer={handleDeleteMcpServer}
+          onRefreshMcp={refreshMcpServers}
           onCheckUpdate={() => {
             invoke<string | null>("check_update")
               .then((v) => {
@@ -1299,19 +1405,31 @@ function SettingsModal({
   appInfo,
   model,
   permissionMode,
+  mcpServers,
   onModelChange,
   onPermissionModeChange,
+  onAddMcpServer,
+  onToggleMcpServer,
+  onDeleteMcpServer,
+  onRefreshMcp,
   onCheckUpdate,
   onClose,
 }: {
   appInfo: AppInfo | null;
   model: DeepSeekModelId;
   permissionMode: PermissionMode;
+  mcpServers: McpServer[];
   onModelChange: (m: DeepSeekModelId) => void;
   onPermissionModeChange: (m: PermissionMode) => void;
+  onAddMcpServer: (name: string, command: string) => void;
+  onToggleMcpServer: (id: string, enabled: boolean) => void;
+  onDeleteMcpServer: (id: string) => void;
+  onRefreshMcp: () => void;
   onCheckUpdate: () => void;
   onClose: () => void;
 }) {
+  const [mcpName, setMcpName] = useState("");
+  const [mcpCommand, setMcpCommand] = useState("");
   return (
     <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="设置">
       <div className="approval-card panel-card">
@@ -1350,6 +1468,66 @@ function SettingsModal({
           <span className="settings-row__label">版本</span>
           <span className="settings-row__value">v{appInfo?.version ?? "…"}</span>
         </div>
+
+        {/* MCP server 管理 */}
+        <div className="settings-section">
+          <div className="settings-section__head">
+            <span>MCP 服务器</span>
+            <button className="changes-row__revert" type="button" onClick={onRefreshMcp}>
+              刷新状态
+            </button>
+          </div>
+          {mcpServers.map((s) => (
+            <div key={s.id} className="changes-row">
+              <span className={`mcp-dot${s.connected ? " mcp-dot--on" : ""}`} aria-hidden="true">●</span>
+              <span className="changes-row__tool">{s.name}</span>
+              <span className="changes-row__path" title={s.command}>
+                {s.connected ? `${s.toolCount} 个工具` : s.enabled ? "未连接" : "已停用"}
+              </span>
+              <button
+                className="changes-row__revert"
+                type="button"
+                onClick={() => onToggleMcpServer(s.id, !s.enabled)}
+              >
+                {s.enabled ? "停用" : "启用"}
+              </button>
+              <button
+                className="changes-row__revert"
+                type="button"
+                onClick={() => onDeleteMcpServer(s.id)}
+              >
+                删除
+              </button>
+            </div>
+          ))}
+          <div className="mcp-add">
+            <input
+              className="conv-search"
+              placeholder="名称（如 filesystem）"
+              value={mcpName}
+              onChange={(e) => setMcpName(e.target.value)}
+            />
+            <input
+              className="conv-search"
+              placeholder="启动命令（如 npx -y @modelcontextprotocol/server-filesystem C:\\data）"
+              value={mcpCommand}
+              onChange={(e) => setMcpCommand(e.target.value)}
+            />
+            <button
+              className="approval-card__btn"
+              type="button"
+              disabled={!mcpName.trim() || !mcpCommand.trim()}
+              onClick={() => {
+                onAddMcpServer(mcpName.trim(), mcpCommand.trim());
+                setMcpName("");
+                setMcpCommand("");
+              }}
+            >
+              添加并连接
+            </button>
+          </div>
+        </div>
+
         <div className="approval-card__actions">
           <button type="button" className="approval-card__btn" onClick={onCheckUpdate}>
             检查更新
@@ -1700,6 +1878,17 @@ function aggregateUsage(messages: Message[]): UsageSummary | null {
 function formatUsd(cost: number): string {
   if (cost < 0.0001 && cost > 0) return "<$0.0001";
   return `$${cost.toFixed(6).replace(/\.?0+$/, "")}`;
+}
+
+/** 查找正文中工具调用标记的最早位置（<ToolCall>、DSML 各变体）；无标记返回 -1。 */
+function findToolMarkupIndex(text: string): number {
+  const markers = ["<ToolCall", "<DSML", "<｜DSML", "<｜｜DSML"];
+  let min = -1;
+  for (const marker of markers) {
+    const idx = text.indexOf(marker);
+    if (idx >= 0 && (min < 0 || idx < min)) min = idx;
+  }
+  return min;
 }
 
 /** 把后端原始错误串映射为面向用户的友好提示与建议动作；未识别的错误保留原文便于反馈。 */

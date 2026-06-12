@@ -7,14 +7,16 @@ use mdga_sandbox_runtime::{
     SessionSecurityContext, ToolCapability, ToolDecision,
 };
 use mdga_shared::{ApiKeyStatus, PermissionMode};
+use mdga_mcp_client::{function_name_for, McpClient};
 use mdga_storage::{
-    add_permission_rule, clear_active_workspace, create_conversation, delete_conversation,
-    delete_messages, get_active_workspace, create_conversation_with_workspace,
-    get_activity_events, get_conversation, get_messages, init_db, list_conversations,
-    list_file_checkpoints, list_permission_rules, mark_checkpoint_reverted,
-    record_activity_event, record_file_checkpoint, save_active_workspace, save_message,
-    set_conversation_archived, set_conversation_pinned, update_title, ActivityEventRecord,
-    Conversation, FileCheckpoint, StoredMessage, Workspace,
+    add_mcp_server, add_permission_rule, clear_active_workspace, create_conversation,
+    delete_conversation, delete_messages, get_active_workspace,
+    create_conversation_with_workspace, get_activity_events, get_conversation, get_messages,
+    init_db, list_conversations, list_file_checkpoints, list_mcp_servers,
+    list_permission_rules, mark_checkpoint_reverted, record_activity_event,
+    record_file_checkpoint, remove_mcp_server, save_active_workspace, save_message,
+    set_conversation_archived, set_conversation_pinned, set_mcp_server_enabled, update_title,
+    ActivityEventRecord, Conversation, FileCheckpoint, McpServerRecord, StoredMessage, Workspace,
 };
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use mdga_tool_runtime::{
@@ -60,6 +62,78 @@ struct AppState {
     /// respond_approval 命令收到前端决定后，通过 oneshot 通道唤醒正在 await 的工具循环；
     /// 用户勾选记住时把规则写入 permission_rules 表。
     approvals: Mutex<HashMap<String, (oneshot::Sender<bool>, String)>>,
+    /// 已连接的 MCP server 客户端，按配置 id 索引。Arc 包裹以便在锁外调用。
+    mcp: Mutex<HashMap<String, Arc<McpClient>>>,
+}
+
+/// MCP 工具与模型函数名的绑定关系，按 send 周期收集后传入工具循环。
+#[derive(Clone)]
+struct McpBinding {
+    fn_name: String,
+    server_id: String,
+    tool_name: String,
+    schema: serde_json::Value,
+}
+
+/// 收集所有已连接 MCP server 的工具绑定（函数名、调度信息与 schema）。
+fn collect_mcp_bindings(app: &AppHandle) -> Vec<McpBinding> {
+    let state = app.state::<AppState>();
+    let guard = state.mcp.lock();
+    let Ok(map) = guard else {
+        return Vec::new();
+    };
+    let mut bindings = Vec::new();
+    for (server_id, client) in map.iter() {
+        for tool in &client.tools {
+            let fn_name = function_name_for(&client.server_name, &tool.name);
+            let parameters = if tool.input_schema.is_object() {
+                tool.input_schema.clone()
+            } else {
+                serde_json::json!({ "type": "object", "properties": {} })
+            };
+            bindings.push(McpBinding {
+                fn_name: fn_name.clone(),
+                server_id: server_id.clone(),
+                tool_name: tool.name.clone(),
+                schema: serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": fn_name,
+                        "description": format!("[MCP:{}] {}", client.server_name, tool.description),
+                        "parameters": parameters
+                    }
+                }),
+            });
+        }
+    }
+    bindings
+}
+
+/// 后台连接一个 MCP server；成功后放入 AppState 并 emit 状态事件。
+fn spawn_mcp_connect(app: &AppHandle, record: McpServerRecord) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let result = McpClient::connect(&record.name, &record.command);
+        match result {
+            Ok(client) => {
+                let tool_count = client.tools.len();
+                let state = app.state::<AppState>();
+                if let Ok(mut map) = state.mcp.lock() {
+                    map.insert(record.id.clone(), Arc::new(client));
+                }
+                let _ = app.emit(
+                    "mcp-status",
+                    serde_json::json!({ "id": record.id, "status": "connected", "toolCount": tool_count }),
+                );
+            }
+            Err(err) => {
+                let _ = app.emit(
+                    "mcp-status",
+                    serde_json::json!({ "id": record.id, "status": "failed", "error": err.to_string() }),
+                );
+            }
+        }
+    });
 }
 
 // ── DeepSeek ──────────────────────────────────────────────────────────────
@@ -104,12 +178,18 @@ async fn send_message(
         .workspace_path
         .as_deref()
         .and_then(read_workspace_memory);
+    let skills = conversation
+        .workspace_path
+        .as_deref()
+        .map(load_workspace_skills)
+        .unwrap_or_default();
     let mut messages = messages_with_workspace_context(
         messages,
         conversation.workspace_path.as_deref(),
         conversation.workspace_name.as_deref(),
         repo_map.as_deref(),
         workspace_memory.as_deref(),
+        &skills,
     );
     // 计划模式：要求模型只产出分步计划并等待确认，本轮不提供工具。
     if plan_mode {
@@ -135,6 +215,7 @@ async fn send_message(
         .await
         .map_err(|e| e.to_string())
     } else if let Some(workspace_path) = conversation.workspace_path.as_deref() {
+        let mcp_bindings = collect_mcp_bindings(&app);
         chat_with_builtin_tools(
             &api_key,
             messages,
@@ -145,6 +226,7 @@ async fn send_message(
             &app,
             cancel_token.clone(),
             permission_rules,
+            mcp_bindings,
         )
         .await
     } else {
@@ -435,6 +517,217 @@ fn list_workspace_files(
     Ok(mdga_tool_runtime::workspace_file_list(&workspace, 500))
 }
 
+/// 列出 MCP server 配置及连接状态（connected/disconnected + 工具数）。
+#[tauri::command]
+fn get_mcp_servers(state: State<AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let records = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        list_mcp_servers(&db).map_err(|e| e.to_string())?
+    };
+    let connected = state.mcp.lock().map_err(|e| e.to_string())?;
+    Ok(records
+        .into_iter()
+        .map(|r| {
+            let client = connected.get(&r.id);
+            serde_json::json!({
+                "id": r.id,
+                "name": r.name,
+                "command": r.command,
+                "enabled": r.enabled,
+                "connected": client.is_some(),
+                "toolCount": client.map(|c| c.tools.len()).unwrap_or(0),
+            })
+        })
+        .collect())
+}
+
+/// 新增 MCP server 配置并立即后台尝试连接。
+#[tauri::command]
+fn create_mcp_server(
+    app: AppHandle,
+    state: State<AppState>,
+    name: String,
+    command: String,
+) -> Result<(), String> {
+    let name = name.trim();
+    let command = command.trim();
+    if name.is_empty() || command.is_empty() {
+        return Err("名称与启动命令不能为空".to_string());
+    }
+    let record = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        add_mcp_server(&db, name, command).map_err(|e| e.to_string())?
+    };
+    spawn_mcp_connect(&app, record);
+    Ok(())
+}
+
+/// 启用 / 停用一个 MCP server：停用立即断开，启用立即后台重连。
+#[tauri::command]
+fn toggle_mcp_server(
+    app: AppHandle,
+    state: State<AppState>,
+    server_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let record = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        set_mcp_server_enabled(&db, &server_id, enabled).map_err(|e| e.to_string())?;
+        list_mcp_servers(&db)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|r| r.id == server_id)
+    };
+    if enabled {
+        if let Some(record) = record {
+            spawn_mcp_connect(&app, record);
+        }
+    } else if let Ok(mut map) = state.mcp.lock() {
+        map.remove(&server_id); // Drop 时杀子进程
+    }
+    Ok(())
+}
+
+/// 删除一个 MCP server 配置并断开连接。
+#[tauri::command]
+fn delete_mcp_server(state: State<AppState>, server_id: String) -> Result<(), String> {
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        remove_mcp_server(&db, &server_id).map_err(|e| e.to_string())?;
+    }
+    if let Ok(mut map) = state.mcp.lock() {
+        map.remove(&server_id);
+    }
+    Ok(())
+}
+
+/// 导入本地文档并抽取纯文本（TXT/MD/CSV/JSON/PDF/DOCX），供发送给模型问答。
+#[tauri::command]
+fn import_file_text(path: String) -> Result<serde_json::Value, String> {
+    const MAX_IMPORT_CHARS: usize = 100_000;
+    let file_path = std::path::Path::new(&path);
+    if !file_path.is_file() {
+        return Err("文件不存在".to_string());
+    }
+    let name = file_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = file_path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    let text = match ext.as_str() {
+        "txt" | "md" | "markdown" | "csv" | "json" | "log" | "xml" | "html" | "toml"
+        | "yaml" | "yml" => std::fs::read_to_string(file_path)
+            .map_err(|e| format!("读取文件失败: {e}"))?,
+        "pdf" => pdf_extract::extract_text(file_path)
+            .map_err(|e| format!("PDF 解析失败: {e}"))?,
+        "docx" => extract_docx_text(file_path)?,
+        other => {
+            return Err(format!(
+                "暂不支持 .{other} 格式（支持 txt/md/csv/json/pdf/docx 等文本类文档；图片需视觉模型，后续版本支持）"
+            ));
+        }
+    };
+
+    let truncated = text.chars().count() > MAX_IMPORT_CHARS;
+    let capped: String = text.chars().take(MAX_IMPORT_CHARS).collect();
+    Ok(serde_json::json!({ "name": name, "text": capped, "truncated": truncated }))
+}
+
+/// 从 .docx（zip 内 word/document.xml）抽取纯文本：拼接所有 <w:t> 文本节点，段落换行。
+fn extract_docx_text(path: &std::path::Path) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("打开文件失败: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("DOCX 解析失败: {e}"))?;
+    let mut doc = archive
+        .by_name("word/document.xml")
+        .map_err(|_| "DOCX 缺少 document.xml".to_string())?;
+    let mut xml = String::new();
+    std::io::Read::read_to_string(&mut doc, &mut xml).map_err(|e| format!("读取失败: {e}"))?;
+
+    // 轻量抽取：<w:p> 段落分行，<w:t> 文本节点取内容；不引入完整 XML 解析依赖。
+    let mut out = String::new();
+    let paragraphs = xml.split("</w:p>");
+    for paragraph in paragraphs {
+        let mut cursor = 0;
+        let bytes = paragraph;
+        while let Some(start) = bytes[cursor..].find("<w:t") {
+            let tag_start = cursor + start;
+            let Some(open_end) = bytes[tag_start..].find('>') else { break };
+            let text_start = tag_start + open_end + 1;
+            let Some(close) = bytes[text_start..].find("</w:t>") else { break };
+            out.push_str(&bytes[text_start..text_start + close]);
+            cursor = text_start + close + 6;
+        }
+        if !out.ends_with('\n') && !out.is_empty() {
+            out.push('\n');
+        }
+    }
+    Ok(out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'"))
+}
+
+/// 扫描工作区 .mdga/skills/*/SKILL.md，返回技能名与描述（首行 frontmatter 或首段）。
+fn load_workspace_skills(workspace: &str) -> Vec<(String, String)> {
+    let skills_dir = std::path::Path::new(workspace).join(".mdga").join("skills");
+    let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+        return Vec::new();
+    };
+    let mut skills = Vec::new();
+    for entry in entries.flatten().take(30) {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let skill_md = dir.join("SKILL.md");
+        let Ok(content) = std::fs::read_to_string(&skill_md) else {
+            continue;
+        };
+        // 描述：取 frontmatter 的 description: 行，否则取第一行非空文本。
+        let description = content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("description:").map(|d| d.trim().to_string()))
+            .or_else(|| {
+                content
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty() && !l.starts_with("---") && !l.starts_with('#'))
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        skills.push((name, description));
+    }
+    skills
+}
+
+/// load_skill 工具：按名加载工作区技能的完整 SKILL.md 内容（按需注入，CC 渐进披露同款）。
+fn execute_load_skill(workspace: &str, arguments: &str) -> Result<serde_json::Value, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|e| format!("工具参数解析失败: {e}"))?;
+    let name = parsed
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or("load_skill 缺少 name")?;
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("技能名只允许字母数字、横线与下划线".to_string());
+    }
+    let path = std::path::Path::new(workspace)
+        .join(".mdga")
+        .join("skills")
+        .join(name)
+        .join("SKILL.md");
+    let content = std::fs::read_to_string(&path).map_err(|_| format!("技能 {name} 不存在"))?;
+    let capped: String = content.chars().take(32_000).collect();
+    Ok(serde_json::json!({ "name": name, "skill": capped }))
+}
+
 /// 返回指定会话的所有工具 Activity Event，按时间正序，供前端展示历史过程面板。
 #[tauri::command]
 fn get_conversation_events(
@@ -583,10 +876,22 @@ fn messages_with_workspace_context(
     workspace_name: Option<&str>,
     repo_map: Option<&str>,
     workspace_memory: Option<&str>,
+    skills: &[(String, String)],
 ) -> Vec<ChatMessage> {
     // 把后端可信的 session 工作区快照注入模型上下文，使 DeepSeek 能回答当前工作区问题。
     let Some(path) = workspace_path.filter(|path| !path.trim().is_empty()) else {
-        return messages;
+        // 纯聊天会话（未绑定工作区）：明确告知模型没有任何工具，防止它凭训练记忆
+        // 幻觉输出 <ToolCall>/DSML 等工具调用标记（0.0.17 dev 实测出现过）。
+        let mut injected = Vec::with_capacity(messages.len() + 1);
+        injected.push(ChatMessage {
+            role: "system".to_string(),
+            content: "当前会话未绑定工作区，你没有任何本地文件、目录或命令工具可用。\
+如果用户要求读写文件、列目录、修改代码或执行命令，请直接告知：需要点击「+ 新对话」并选择工作区后才能执行本地操作。\
+绝对不要输出任何工具调用标记（如 <ToolCall>、DSML 标记等），也不要假装已经执行了本地操作。"
+                .to_string(),
+        });
+        injected.extend(messages);
+        return injected;
     };
     let name = workspace_name
         .filter(|name| !name.trim().is_empty())
@@ -624,6 +929,20 @@ create_file、write_file 或 delete_file 工具完成真实本地操作；不要
             role: "system".to_string(),
             content: format!(
                 "项目长期记忆（来自工作区根目录的 MDGA.md，跨会话持久有效，优先遵循其中的目标与约定）：\n{memory}"
+            ),
+        });
+    }
+    // 技能列表（渐进披露）：只注入名称与描述，完整说明由模型按需调用 load_skill 加载。
+    if !skills.is_empty() {
+        let list = skills
+            .iter()
+            .map(|(name, desc)| format!("- {name}：{desc}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        injected.push(ChatMessage {
+            role: "system".to_string(),
+            content: format!(
+                "当前工作区可用技能（来自 .mdga/skills/）。当任务与某项技能匹配时，先调用 load_skill 加载其完整说明再执行：\n{list}"
             ),
         });
     }
@@ -1100,6 +1419,27 @@ fn execute_todo_write(app: &AppHandle, arguments: &str) -> Result<serde_json::Va
     }))
 }
 
+/// 执行一次 MCP 外部工具调用：经已连接客户端转发，结果文本截断后回灌模型。
+fn execute_mcp_tool(
+    app: &AppHandle,
+    binding: &McpBinding,
+    arguments: &str,
+) -> Result<serde_json::Value, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(arguments).unwrap_or(serde_json::json!({}));
+    let client = {
+        let state = app.state::<AppState>();
+        let guard = state.mcp.lock().map_err(|e| e.to_string())?;
+        guard.get(&binding.server_id).cloned()
+    };
+    let client = client.ok_or("MCP server 未连接，请在设置中检查其状态")?;
+    let text = client
+        .call_tool(&binding.tool_name, args)
+        .map_err(|e| e.to_string())?;
+    let capped: String = text.chars().take(32_000).collect();
+    Ok(serde_json::json!({ "content": capped }))
+}
+
 /// 构造把命令输出逐行推送到前端的回调（"command-output" 事件）。
 fn command_line_callback(app: &AppHandle) -> mdga_tool_runtime::CommandLineCallback {
     let app = app.clone();
@@ -1519,6 +1859,7 @@ async fn chat_with_builtin_tools(
     app: &AppHandle,
     cancel: Arc<AtomicBool>,
     permission_rules: Vec<String>,
+    mcp_bindings: Vec<McpBinding>,
 ) -> Result<Option<mdga_shared::RawUsage>, String> {
     let security_context = session_security_context(
         workspace_path.to_string(),
@@ -1526,6 +1867,11 @@ async fn chat_with_builtin_tools(
         NetworkMode::Disabled,
     )
     .map_err(|e| e.to_string())?;
+    // 工具 schema：Built-in + 已连接 MCP server 的外部工具。
+    let tool_schemas: Vec<serde_json::Value> = all_builtin_tool_schemas()
+        .into_iter()
+        .chain(mcp_bindings.iter().map(|b| b.schema.clone()))
+        .collect();
     let mut wire_messages = chat_messages_to_wire(messages);
     let mut usage: Option<mdga_shared::RawUsage> = None;
     // 上一次响应返回的 prompt_tokens，作为当前上下文体积的真实信号，驱动轮内压缩。
@@ -1581,7 +1927,7 @@ async fn chat_with_builtin_tools(
             api_key,
             wire_messages.clone(),
             model,
-            Some(all_builtin_tool_schemas()),
+            Some(tool_schemas.clone()),
             app,
         )
         .await?;
@@ -1701,9 +2047,14 @@ async fn chat_with_builtin_tools(
             // 写类工具执行前捕获回退快照（rewind 用），必须先于执行。
             let capture = capture_checkpoint_before(workspace_path, &tool_name, &arguments);
 
-            // 特殊工具走专用执行器：todo/子任务/命令（流式 + 后台）；其余走通用文件工具执行。
-            let result = match tool_name.as_str() {
+            // 特殊工具走专用执行器：MCP 外部工具 / todo / 技能 / 子任务 / 命令（流式 + 后台）。
+            let mcp_binding = mcp_bindings.iter().find(|b| b.fn_name == tool_name);
+            let result = if let Some(binding) = mcp_binding {
+                execute_mcp_tool(app, binding, &arguments)
+            } else {
+                match tool_name.as_str() {
                 "todo_write" => execute_todo_write(app, &arguments),
+                "load_skill" => execute_load_skill(workspace_path, &arguments),
                 "run_command" => execute_run_command_tool(app, &security_context, &arguments),
                 "run_subtask" => {
                     let _ = app.emit(
@@ -1723,6 +2074,7 @@ async fn chat_with_builtin_tools(
                     sub_result
                 }
                 _ => execute_builtin_tool_call(&security_context, &tool_name, &arguments),
+                }
             };
 
             let (output, status, error) = match &result {
@@ -1933,6 +2285,21 @@ fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
+                "name": "load_skill",
+                "description": "Load the full instructions of a workspace skill (from .mdga/skills/<name>/SKILL.md). Call this when the available-skills list (in system context) has a skill matching the current task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Skill directory name from the available-skills list." }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
                 "name": "run_subtask",
                 "description": "Delegate a focused READ-ONLY exploration subtask (e.g. 'find where X is implemented', 'summarize how module Y works') to a sub-agent with its own fresh context. The sub-agent can only list/read/search files and returns a concise text report. Use this to investigate large codebases without bloating the main conversation.",
                 "parameters": {
@@ -2095,10 +2462,14 @@ fn execute_create_file_tool_call(
 }
 
 fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability, String> {
+    // MCP 外部工具统一按网络能力裁决：Workspace Auto 下逐次审批，Full Access 放行。
+    if tool_name.starts_with("mcp_") {
+        return Ok(ToolCapability::NetworkAccess);
+    }
     match tool_name {
         // todo_write 只更新任务清单 UI，不触碰文件系统，等同列表级低风险。
         "list_dir" | "read_file" | "stat_path" | "search_text" | "todo_write"
-        | "run_subtask" => Ok(ToolCapability::FileRead),
+        | "run_subtask" | "load_skill" => Ok(ToolCapability::FileRead),
         "create_file" | "write_file" | "edit_file" | "make_dir" | "move_path" => {
             Ok(ToolCapability::FileWrite)
         }
@@ -2144,6 +2515,7 @@ mod tests {
             Some("MDGA"),
             None,
             None,
+            &[],
         );
 
         assert_eq!(injected[0].role, "system");
@@ -2201,6 +2573,7 @@ mod tests {
             Some("MDGA"),
             Some("src/\n  main.rs\nCargo.toml"),
             None,
+            &[],
         );
 
         // sys(workspace) + sys(tools) + sys(repo map) + user
@@ -2224,6 +2597,7 @@ mod tests {
             Some("MDGA"),
             None,
             Some("项目目标：做一个计算器。代码规范：KISS。"),
+            &[],
         );
 
         // sys(workspace) + sys(tools) + sys(memory) + user
@@ -2407,7 +2781,23 @@ fn main() {
                 db: Mutex::new(db),
                 cancels: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
+                mcp: Mutex::new(HashMap::new()),
             });
+
+            // 启动时后台连接所有已启用的 MCP server，不阻塞窗口加载。
+            {
+                let state = app.state::<AppState>();
+                let servers = state
+                    .db
+                    .lock()
+                    .ok()
+                    .and_then(|db| list_mcp_servers(&db).ok())
+                    .unwrap_or_default();
+                let handle = app.handle().clone();
+                for record in servers.into_iter().filter(|s| s.enabled) {
+                    spawn_mcp_connect(&handle, record);
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2427,6 +2817,11 @@ fn main() {
             revert_to_checkpoint,
             compact_history,
             list_workspace_files,
+            get_mcp_servers,
+            create_mcp_server,
+            toggle_mcp_server,
+            delete_mcp_server,
+            import_file_text,
             get_conversation_events,
             cancel_agent,
             respond_approval,

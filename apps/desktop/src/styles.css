@@ -1024,6 +1024,31 @@ h1 {
 
 /* ── Topbar 按钮 / 设置面板 / 变更面板 ── */
 
+.sidebar-footer {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: none;
+  border-top: 1px solid #e4e5e7;
+  background: none;
+  color: #69717d;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 12px 10px 4px;
+  text-align: left;
+}
+
+.sidebar-footer:hover {
+  color: #1f2328;
+}
+
+/* 有更新横幅时，横幅承担 margin-top:auto，footer 紧随其后即可 */
+.update-banner + .sidebar-footer {
+  margin-top: 8px;
+}
+
 .topbar-btn {
   border: 1px solid #d8dadd;
   border-radius: 99px;
@@ -1066,6 +1091,38 @@ h1 {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
+}
+
+.settings-section {
+  margin-top: 10px;
+  padding-top: 8px;
+}
+
+.settings-section__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 600;
+  color: #69717d;
+  margin-bottom: 6px;
+}
+
+.mcp-dot {
+  color: #d1242f;
+  font-size: 9px;
+  flex-shrink: 0;
+}
+
+.mcp-dot--on {
+  color: #2da44e;
+}
+
+.mcp-add {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .changes-list {
