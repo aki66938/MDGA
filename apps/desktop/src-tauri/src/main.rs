@@ -29,9 +29,10 @@ use mdga_tool_runtime::{
 /// Agent 工具循环单次会话内允许的最大工具轮数。作为防失控的硬上限兜底；
 /// 真正的终止由「模型不再调用工具」自然触发，提高到 20 让多步开发任务不被过早截断。
 /// 触发上下文压缩的软上限默认值（以上一次响应返回的 prompt_tokens 为准）。
-/// DeepSeek V4 Flash 虽标称 1M，但更早就会退化/卡住，故保守取值。
-/// 可用环境变量 MDGA_CONTEXT_SOFT_LIMIT 覆盖（便于压测验证压缩机制）。
-const CONTEXT_SOFT_LIMIT_TOKENS: u64 = 96_000;
+/// DeepSeek V4 Flash / Pro 官方标称 1M 上下文，故取 800K：在接近上限前压缩，
+/// 留约 200K headroom 给模型输出与当轮工具结果，避免顶满 1M 触发服务端退化。
+/// 可用环境变量 MDGA_CONTEXT_SOFT_LIMIT 覆盖（便于低阈值压测验证压缩机制）。
+const CONTEXT_SOFT_LIMIT_TOKENS: u64 = 800_000;
 /// 摘要压缩时保留最近 N 条 wire 消息原文，更早的历史压缩成任务进度摘要。
 const KEEP_RECENT_WIRE_MESSAGES: usize = 8;
 /// 压缩时保留最近 N 次工具结果全文，更早的大体积结果替换为短桩。

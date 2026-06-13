@@ -7,6 +7,23 @@ import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import "highlight.js/styles/github.css";
 import {
+  SquarePen, Search, Pin, Archive, ArchiveRestore, Trash2, Settings2,
+  Paperclip, ListChecks, Square, ArrowUp, GitCompare, Plug, Sun, Moon,
+  Check, X, Ban, Loader2, Info, CircleDot, CheckSquare, ChevronRight,
+  ChevronDown, FolderOpen, Gauge, AtSign,
+} from "lucide-react";
+
+/** MDGA 品牌标识：深海声纳波纹（致敬 DeepSeek 的「deep」，非官方鲸鱼 logo） */
+function BrandMark({ size = 24 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 32 32" aria-hidden="true">
+      <path d="M4 19 C9 13 14 13 16 16 C18 19 23 19 28 13" fill="none"
+        stroke="var(--brand)" strokeWidth="2.6" strokeLinecap="round" />
+      <circle cx="16" cy="16" r="2.4" fill="var(--brand)" />
+    </svg>
+  );
+}
+import {
   DEEPSEEK_MODELS,
   DEFAULT_DEEPSEEK_MODEL_ID,
   getApiKeyStatusLabel,
@@ -191,6 +208,7 @@ export function App() {
   const [checkpoints, setCheckpoints] = useState<FileCheckpoint[]>([]);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+  const [theme, setTheme] = useState<"light" | "dark">("light");
   // @文件引用补全
   const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
   const [fileMention, setFileMention] = useState<string | null>(null);
@@ -253,6 +271,18 @@ export function App() {
     );
     return () => clearInterval(timer);
   }, [sending]);
+
+  // 主题：启动时从 localStorage 恢复（默认跟随系统），并同步到 <html data-theme>
+  useEffect(() => {
+    const saved = localStorage.getItem("mdga.theme") as "light" | "dark" | null;
+    const initial =
+      saved ?? (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    setTheme(initial);
+  }, []);
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("mdga.theme", theme);
+  }, [theme]);
 
   // 启动时恢复默认模型与权限模式（localStorage 持久化）
   useEffect(() => {
@@ -963,7 +993,7 @@ export function App() {
             onDoubleClick={(e) => startRename(e, conv)}
             title="双击重命名"
           >
-            {conv.pinned && <span className="conv-item__pin-mark">📌</span>}
+            {conv.pinned && <Pin size={11} className="conv-item__pin-mark" />}
             {conv.title}
           </span>
         )}
@@ -975,7 +1005,7 @@ export function App() {
             title={conv.pinned ? "取消置顶" : "置顶"}
             onClick={(e) => handleTogglePin(e, conv)}
           >
-            📌
+            <Pin size={14} />
           </button>
           <button
             className="conv-item__action"
@@ -984,7 +1014,7 @@ export function App() {
             title={conv.archived ? "取消归档" : "归档"}
             onClick={(e) => handleToggleArchive(e, conv)}
           >
-            {conv.archived ? "↩" : "🗂"}
+            {conv.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
           </button>
           <button
             className="conv-item__delete"
@@ -993,7 +1023,7 @@ export function App() {
             title="删除"
             onClick={(e) => handleDeleteConversation(e, conv.id)}
           >
-            ×
+            <Trash2 size={14} />
           </button>
         </span>
       </div>
@@ -1006,20 +1036,27 @@ export function App() {
     <main className="app-shell">
       {/* 侧边栏 */}
       <aside className="sidebar" aria-label="MDGA navigation">
+        <div className="brand-row">
+          <BrandMark size={22} />
+          <span className="brand-row__name">MDGA</span>
+        </div>
         <button className="new-chat" type="button" onClick={handleNewConversation}>
-          + 新对话
+          <SquarePen size={16} /> 新对话
         </button>
 
         {conversations.length > 0 && (
           <nav className="conv-list" aria-label="会话列表">
-            <input
-              className="conv-search"
-              type="search"
-              placeholder="搜索会话…"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              aria-label="搜索会话"
-            />
+            <div className="conv-search-wrap">
+              <Search size={14} className="conv-search-wrap__icon" />
+              <input
+                className="conv-search"
+                type="search"
+                placeholder="搜索会话…"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                aria-label="搜索会话"
+              />
+            </div>
             <p className="nav-label">历史对话</p>
             {visibleConversations.map(renderConvItem)}
             {archivedConversations.length > 0 && (
@@ -1029,7 +1066,7 @@ export function App() {
                   type="button"
                   onClick={() => setShowArchived((v) => !v)}
                 >
-                  {showArchived ? "▾" : "▸"} 已归档（{archivedConversations.length}）
+                  {showArchived ? <ChevronDown size={13} /> : <ChevronRight size={13} />} 已归档（{archivedConversations.length}）
                 </button>
                 {showArchived && archivedConversations.map(renderConvItem)}
               </>
@@ -1072,15 +1109,21 @@ export function App() {
           </div>
         )}
 
-        {/* 侧边栏底部 footer：设置入口 */}
-        <button
-          className="sidebar-footer"
-          type="button"
-          onClick={openSettings}
-          aria-label="设置"
-        >
-          <span aria-hidden="true">⚙</span> 设置
-        </button>
+        {/* 侧边栏底部 footer：设置 + 主题切换 */}
+        <div className="sidebar-footer">
+          <button className="sidebar-footer__btn" type="button" onClick={openSettings}>
+            <Settings2 size={16} /> 设置
+          </button>
+          <button
+            className="sidebar-footer__icon"
+            type="button"
+            aria-label={theme === "dark" ? "切换到亮色" : "切换到深色"}
+            title={theme === "dark" ? "切换到亮色" : "切换到深色「深海」"}
+            onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+          >
+            {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
+        </div>
       </aside>
 
       {/* 工作区 */}
@@ -1091,47 +1134,23 @@ export function App() {
             <h1>MDGA</h1>
           </div>
           <div className="status-strip" aria-label="status">
-            <span>{getApiKeyStatusLabel(apiKeyStatus)}</span>
-            <select
-              className="model-select"
-              value={permissionMode}
-              onChange={(e) => handlePermissionModeChange(e.target.value as PermissionMode)}
-              disabled={sending}
-              aria-label="权限模式"
-            >
-              {PERMISSION_MODES.map((mode) => (
-                <option key={mode} value={mode}>{getPermissionModeLabel(mode)}</option>
-              ))}
-            </select>
             {activeConversation?.workspaceName ? (
-              <span title={activeConversation.workspacePath ?? undefined}>
-                {activeConversation.workspaceName}
+              <span className="chip" title={activeConversation.workspacePath ?? undefined}>
+                <FolderOpen size={13} /> {activeConversation.workspaceName}
               </span>
             ) : activeConversation ? (
-              <span title="本会话未绑定工作区，Agent 无法执行本地操作；新建对话时可选择工作区">
+              <span className="chip" title="本会话未绑定工作区，Agent 无法执行本地操作；新建对话时可选择工作区">
                 纯聊天
               </span>
             ) : null}
             {ctxUsage && ctxUsage.softLimit > 0 && (
               <span
-                className="ctx-usage"
+                className="chip chip--accent"
                 title={`上次请求 ${ctxUsage.promptTokens.toLocaleString()} tokens / 自动压缩阈值 ${ctxUsage.softLimit.toLocaleString()}`}
               >
-                上下文 {Math.round((ctxUsage.promptTokens / ctxUsage.softLimit) * 100)}%
+                <Gauge size={13} /> {Math.round((ctxUsage.promptTokens / ctxUsage.softLimit) * 100)}%
               </span>
             )}
-            <select
-              className="model-select"
-              value={model}
-              onChange={(e) => handleModelChange(e.target.value as DeepSeekModelId)}
-              disabled={sending}
-              aria-label="模型选择"
-              title={DEEPSEEK_MODELS.find((item) => item.id === model)?.description}
-            >
-              {DEEPSEEK_MODELS.map((item) => (
-                <option key={item.id} value={item.id}>{item.label}</option>
-              ))}
-            </select>
             {activeConvId && (
               <button
                 className="topbar-btn"
@@ -1139,7 +1158,7 @@ export function App() {
                 title="文件变更记录（可回退）"
                 onClick={openChangesPanel}
               >
-                变更
+                <GitCompare size={14} /> 变更
               </button>
             )}
           </div>
@@ -1159,7 +1178,9 @@ export function App() {
             ))}
             {sending && (
               <div className="agent-working" aria-label="Agent 工作状态">
-                <span className="agent-working__spinner" aria-hidden="true">✦</span>
+                <span className="thinking-dots" aria-hidden="true">
+                  <i /><i /><i />
+                </span>
                 <span>{agentStatus ?? "正在思考…"}</span>
                 <span className="agent-working__elapsed">{elapsedSec}s</span>
               </div>
@@ -1237,13 +1258,60 @@ export function App() {
                     type="button"
                     onClick={() => applyFileMention(f)}
                   >
-                    <span className="slash-menu__cmd">@{f}</span>
+                    <AtSign size={14} className="slash-menu__icon" />
+                    <span className="slash-menu__cmd">{f}</span>
                   </button>
                 ))}
             </div>
           )}
 
+          {/* 控制行：权限模式 + 计划（左）/ 模型（右）。可随时切换，改动在当前回复结束后的下一轮生效。 */}
+          <div className="composer-controls">
+            <div className="composer-controls__left">
+              <select
+                className="control-select"
+                value={permissionMode}
+                onChange={(e) => handlePermissionModeChange(e.target.value as PermissionMode)}
+                aria-label="权限模式"
+                title={sending ? "切换将在当前回复结束后的下一轮生效" : "权限模式"}
+              >
+                {PERMISSION_MODES.map((mode) => (
+                  <option key={mode} value={mode}>{getPermissionModeLabel(mode)}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className={`control-toggle${planMode ? " control-toggle--on" : ""}`}
+                title="计划模式：让 Agent 先给出分步计划，确认后再执行"
+                onClick={() => setPlanMode((v) => !v)}
+              >
+                <ListChecks size={14} /> 计划
+              </button>
+            </div>
+            <select
+              className="control-select"
+              value={model}
+              onChange={(e) => handleModelChange(e.target.value as DeepSeekModelId)}
+              aria-label="模型选择"
+              title={sending ? "切换将在当前回复结束后的下一轮生效" : DEEPSEEK_MODELS.find((item) => item.id === model)?.description}
+            >
+              {DEEPSEEK_MODELS.map((item) => (
+                <option key={item.id} value={item.id}>{item.label}</option>
+              ))}
+            </select>
+          </div>
+
           <div className="composer">
+            <button
+              type="button"
+              className="composer__attach"
+              title="导入本地文档（txt/md/csv/pdf/docx），总结并问答"
+              aria-label="导入文档"
+              onClick={handleImportFile}
+              disabled={sending}
+            >
+              <Paperclip size={18} />
+            </button>
             <textarea
               aria-label="Message"
               placeholder={planMode ? "计划模式：先出计划，确认后再执行（Enter 发送）" : "随心输入（Enter 发送，Shift+Enter 换行，/ 命令，@ 引用文件）"}
@@ -1254,34 +1322,15 @@ export function App() {
               }}
               onKeyDown={handleKeyDown}
             />
-            <div className="composer__side">
-              <button
-                type="button"
-                className="composer__plan"
-                title="导入本地文档（txt/md/csv/pdf/docx），总结并问答"
-                onClick={handleImportFile}
-                disabled={sending}
-              >
-                📎
+            {sending ? (
+              <button type="button" className="composer__send composer__send--stop" onClick={handleStop} aria-label="停止">
+                <Square size={14} fill="currentColor" />
               </button>
-              <button
-                type="button"
-                className={`composer__plan${planMode ? " composer__plan--on" : ""}`}
-                title="计划模式：让 Agent 先给出分步计划，确认后再执行"
-                onClick={() => setPlanMode((v) => !v)}
-              >
-                计划
+            ) : (
+              <button type="button" className="composer__send" onClick={handleSend} disabled={!input.trim()} aria-label="发送">
+                <ArrowUp size={18} />
               </button>
-              {sending ? (
-                <button type="button" className="composer__stop" onClick={handleStop}>
-                  停止
-                </button>
-              ) : (
-                <button type="button" onClick={handleSend} disabled={!input.trim()}>
-                  发送
-                </button>
-              )}
-            </div>
+            )}
           </div>
         </div>
       </section>
@@ -1306,6 +1355,7 @@ export function App() {
       {showSettings && (
         <SettingsModal
           appInfo={appInfo}
+          apiKeyLabel={getApiKeyStatusLabel(apiKeyStatus)}
           model={model}
           permissionMode={permissionMode}
           mcpServers={mcpServers}
@@ -1340,7 +1390,7 @@ function TodoPanel({ items }: { items: TodoItem[] }) {
       <div className="todo-panel__items">
         {items.map((t, i) => (
           <span key={i} className={`todo-item todo-item--${t.status}`}>
-            {t.status === "done" ? "☑" : t.status === "in_progress" ? "◐" : "☐"} {t.text}
+            {t.status === "done" ? <CheckSquare size={13} /> : t.status === "in_progress" ? <CircleDot size={13} /> : <Square size={13} />} {t.text}
           </span>
         ))}
       </div>
@@ -1403,6 +1453,7 @@ function ChangesModal({
 
 function SettingsModal({
   appInfo,
+  apiKeyLabel,
   model,
   permissionMode,
   mcpServers,
@@ -1416,6 +1467,7 @@ function SettingsModal({
   onClose,
 }: {
   appInfo: AppInfo | null;
+  apiKeyLabel: string;
   model: DeepSeekModelId;
   permissionMode: PermissionMode;
   mcpServers: McpServer[];
@@ -1434,6 +1486,10 @@ function SettingsModal({
     <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="设置">
       <div className="approval-card panel-card">
         <p className="approval-card__title">设置</p>
+        <div className="settings-row">
+          <span className="settings-row__label">DeepSeek API Key</span>
+          <span className="settings-row__value">{apiKeyLabel}</span>
+        </div>
         <div className="settings-row">
           <span className="settings-row__label">默认模型</span>
           <select
@@ -1472,7 +1528,7 @@ function SettingsModal({
         {/* MCP server 管理 */}
         <div className="settings-section">
           <div className="settings-section__head">
-            <span>MCP 服务器</span>
+            <span><Plug size={14} /> MCP 服务器</span>
             <button className="changes-row__revert" type="button" onClick={onRefreshMcp}>
               刷新状态
             </button>
@@ -1639,7 +1695,7 @@ function MessageContent({ msg }: { msg: Message }) {
         }
         return (
           <div key={index} className="notice-inline" aria-label="系统通知">
-            ⊜ {part.text}
+            <Info size={13} /> {part.text}
           </div>
         );
       })}
@@ -1678,7 +1734,7 @@ function ToolGroup({ parts }: { parts: ToolPart[] }) {
         type="button"
         onClick={() => setExpanded((v) => !v)}
       >
-        <span className="tool-group__caret">{expanded ? "▾" : "▸"}</span>
+        <span className="tool-group__caret">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
         已执行 {parts.length} 个工具动作
         {failed > 0 && <span className="tool-group__failed"> · {failed} 失败</span>}
         {denied > 0 && <span className="tool-group__failed"> · {denied} 被拒</span>}
@@ -1716,7 +1772,7 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
   return (
     <div className="code-block">
       <button className="code-block__copy" type="button" onClick={handleCopy}>
-        {copied ? "已复制 ✓" : "复制"}
+        {copied ? <><Check size={12} /> 已复制</> : "复制"}
       </button>
       <pre ref={preRef} {...props} />
     </div>
@@ -1729,9 +1785,9 @@ function ToolInlineRow({ part }: { part: ToolPart }) {
   const { toolName, target, status, error, diff, added, removed, liveOutput } = part;
   const [showDiff, setShowDiff] = useState(false);
   const icon =
-    status === "running" ? "⚙" :
-    status === "succeeded" ? "✓" :
-    status === "denied" ? "⊘" : "✗";
+    status === "running" ? <Loader2 size={13} className="spin" /> :
+    status === "succeeded" ? <Check size={13} /> :
+    status === "denied" ? <Ban size={13} /> : <X size={13} />;
   const hasDiff = typeof diff === "string" && diff.trim().length > 0;
   return (
     <div className="tool-inline-wrap">
@@ -1750,7 +1806,11 @@ function ToolInlineRow({ part }: { part: ToolPart }) {
             {removed ? <span className="diff-removed">−{removed}</span> : null}
           </span>
         )}
-        {hasDiff && <span className="tool-inline__expand">{showDiff ? "▾" : "▸ diff"}</span>}
+        {hasDiff && (
+          <span className="tool-inline__expand">
+            {showDiff ? <ChevronDown size={13} /> : <ChevronRight size={13} />} diff
+          </span>
+        )}
         {status === "running" && <span className="tool-inline__dots" aria-hidden="true">…</span>}
         {status === "denied" && <span className="tool-inline__error">{error ?? "已拒绝"}</span>}
         {status === "failed" && error && (
