@@ -226,6 +226,7 @@ export function App() {
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [balance, setBalance] = useState<BalanceState>({ status: "idle" });
   const [permRules, setPermRules] = useState<string[]>([]);
+  const [commandSandbox, setCommandSandbox] = useState(true);
   // Steering：运行中已排队但尚未被注入的插话消息
   const [queuedSteering, setQueuedSteering] = useState<string[]>([]);
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -923,11 +924,17 @@ export function App() {
     await refreshPermRules();
   }
 
+  async function handleToggleSandbox(enabled: boolean) {
+    setCommandSandbox(enabled);
+    await invoke("set_command_sandbox", { enabled }).catch(() => {});
+  }
+
   async function openSettings() {
     const info = await invoke<AppInfo>("get_app_info").catch(() => null);
     setAppInfo(info);
     await refreshMcpServers();
     await refreshPermRules();
+    setCommandSandbox(await invoke<boolean>("get_command_sandbox").catch(() => true));
     setShowSettings(true);
     refreshBalance();
   }
@@ -1444,6 +1451,8 @@ export function App() {
           permissionMode={permissionMode}
           mcpServers={mcpServers}
           permRules={permRules}
+          commandSandbox={commandSandbox}
+          onToggleSandbox={handleToggleSandbox}
           onModelChange={handleModelChange}
           onPermissionModeChange={handlePermissionModeChange}
           onAddMcpServer={handleAddMcpServer}
@@ -1541,6 +1550,8 @@ function SettingsModal({
   permissionMode,
   mcpServers,
   permRules,
+  commandSandbox,
+  onToggleSandbox,
   onModelChange,
   onPermissionModeChange,
   onAddMcpServer,
@@ -1560,6 +1571,8 @@ function SettingsModal({
   permissionMode: PermissionMode;
   mcpServers: McpServer[];
   permRules: string[];
+  commandSandbox: boolean;
+  onToggleSandbox: (enabled: boolean) => void;
   onModelChange: (m: DeepSeekModelId) => void;
   onPermissionModeChange: (m: PermissionMode) => void;
   onAddMcpServer: (name: string, command: string) => void;
@@ -1707,6 +1720,18 @@ function SettingsModal({
                 <li><b>工作区自动</b>：工作区内读写自动执行，低风险命令直接跑，其余审批。</li>
                 <li><b>完全访问</b>：放开执行，仍保留审计与回退。</li>
               </ul>
+
+              <div className="settings-row" style={{ marginTop: 16 }}>
+                <span className="settings-row__label">命令沙箱</span>
+                <label className="toggle">
+                  <input type="checkbox" checked={commandSandbox} onChange={(e) => onToggleSandbox(e.target.checked)} />
+                  <span>{commandSandbox ? "已开启" : "已关闭"}</span>
+                </label>
+              </div>
+              <p className="settings-desc">
+                开启后，run_command 在<b>受限令牌沙箱</b>中执行：剥离管理员特权、进程随会话干净销毁、子进程环境擦除 API Key 等密钥。
+                少数需要特权的命令可能受影响，可临时关闭。（网络与文件路径隔离将在后续 AppContainer 版本提供。）
+              </p>
             </>
           )}
 

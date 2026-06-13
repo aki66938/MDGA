@@ -1202,6 +1202,17 @@ h1 {
   overflow-y: auto;
 }
 
+/* 设置开关 */
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.toggle input { width: 16px; height: 16px; accent-color: var(--brand); cursor: pointer; }
+
 /* 检查更新按钮：固定尺寸，文字在「检查更新/检查中…/结果」间切换不变形 */
 .check-update-btn {
   min-width: 240px;

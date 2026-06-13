@@ -74,6 +74,8 @@ struct AppState {
     repo_maps: Mutex<HashMap<String, String>>,
     /// 托管后台 shell：background=true 启动的命令，按 shell_id 索引，可轮询输出 / 杀进程。
     bg_shells: Mutex<HashMap<String, BgShell>>,
+    /// 命令沙箱开关（默认开）：前台 run_command 是否在受限令牌沙箱中执行。
+    command_sandbox: AtomicBool,
 }
 
 /// 一个托管的后台 shell 进程状态。
@@ -554,6 +556,18 @@ fn list_workspace_files(
             .ok_or("该会话未绑定工作区")?
     };
     Ok(mdga_tool_runtime::workspace_file_list(&workspace, 500))
+}
+
+/// 读取命令沙箱开关状态。
+#[tauri::command]
+fn get_command_sandbox(state: State<AppState>) -> bool {
+    state.command_sandbox.load(Ordering::SeqCst)
+}
+
+/// 设置命令沙箱开关。开启时前台命令在受限令牌沙箱中执行（降权 + 进程清理 + 密钥擦除）。
+#[tauri::command]
+fn set_command_sandbox(state: State<AppState>, enabled: bool) {
+    state.command_sandbox.store(enabled, Ordering::SeqCst);
 }
 
 /// 列出全部权限规则（allow / deny），供设置页管理。
@@ -2046,11 +2060,13 @@ fn execute_run_command_tool(
                 }
                 let _ = app_line.emit("command-output", line);
             });
+            // 后台命令暂不沙箱化（沙箱路径不支持轮询/kill），M8.2 再统一。
             let outcome = mdga_tool_runtime::run_command_streaming(
                 &workspace,
                 RunCommandRequest { background: false, ..request },
                 Some(cb),
                 Some(cancel_thread.clone()),
+                false,
             );
             let final_status = if cancel_thread.load(Ordering::SeqCst) {
                 "killed"
@@ -2074,9 +2090,11 @@ fn execute_run_command_tool(
         }));
     }
 
+    // 前台命令：按设置决定是否在受限令牌沙箱中执行。
+    let sandbox = app.state::<AppState>().command_sandbox.load(Ordering::SeqCst);
     let cb = command_line_callback(app);
     serde_json::to_value(
-        mdga_tool_runtime::run_command_streaming(&workspace, request, Some(cb), None)
+        mdga_tool_runtime::run_command_streaming(&workspace, request, Some(cb), None, sandbox)
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
@@ -3698,6 +3716,7 @@ fn main() {
                 steering: Mutex::new(HashMap::new()),
                 repo_maps: Mutex::new(HashMap::new()),
                 bg_shells: Mutex::new(HashMap::new()),
+                command_sandbox: AtomicBool::new(true),
             });
 
             // 启动时后台连接所有已启用的 MCP server，不阻塞窗口加载。
@@ -3741,6 +3760,8 @@ fn main() {
             get_permission_rules,
             create_permission_rule,
             delete_permission_rule,
+            get_command_sandbox,
+            set_command_sandbox,
             import_file_text,
             get_conversation_events,
             cancel_agent,

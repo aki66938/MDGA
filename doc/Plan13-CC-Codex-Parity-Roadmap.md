@@ -116,6 +116,10 @@
 - 斜杠命令框架：/compact、/clear、/init、/model、/rewind
 - @文件引用补全
 
+### M8 - OS 沙箱（分阶段）
+- **M8.1 受限令牌**（0.0.23）✅ 代码已实现（待 dev 真机验证）：run_command 在 CreateRestrictedToken（DISABLE_MAX_PRIVILEGE + 禁用 Administrators SID，派生自调用方令牌故免特权）+ Job Object（KILL_ON_JOB_CLOSE）中执行；密钥环境擦除；fail-closed；`-EncodedCommand` 规避转义；设置开关（默认开）。**只降权+清理，不隔离网络/文件路径。**
+- **M8.2 AppContainer**（待做）：网络默认禁、文件系统仅 ACL 授权工作区——头号隔离目标，重型 FFI，单独攻坚。
+
 ### M5 - MCP 接入 ✅ 代码已实现（待 dev 验证）
 - 新增 `crates/mcp-client`：最小 stdio JSON-RPC 客户端（initialize 握手 / tools/list / tools/call）✅
 - 设置页 MCP 管理：添加（名称+启动命令）、启停、删除、连接状态与工具数 ✅

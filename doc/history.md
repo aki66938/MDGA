@@ -32,3 +32,4 @@
 | 0.0.20 | Agent 基础设施四件地基：① 大文件分页读取（read_file 支持 offset/limit，模型可分段翻页）② 细粒度权限规则（deny 优先 + 按工具/路径 glob，如 deny:read_file:**/.env）③ 运行中插话 Steering（Agent 工作时输入排队，下一轮注入纠偏，不打断任务）④ Hooks 生命周期（.mdga/hooks.json 的 PreToolUse 可拦截工具、PostToolUse 后处理）<br>设置页重做为左栏分类导航 + 右栏内容双栏，加入各项说明；弹窗加宽<br>思考与工具运行图标统一为四角星缓转闪动（DeepSeek 蓝） | Claude Code |
 | 0.0.21 | 修复自动更新：开启 updater 清单产物（createUpdaterArtifacts），CI 发版起会生成并发布 latest.json，客户端「检查更新」从此可真正发现新版并自动下载安装<br>检查更新全程反馈：检查中 / 已是最新 / 发现新版本 / 失败原因，不再点了无反应 | Claude Code |
 | 0.0.22 | 搜索升级为 ripgrep 同源引擎：自动尊重 .gitignore、跳过隐藏/噪声文件，支持正则，搜大型项目又快又准<br>上下文缓存优化：工作区结构摘要按会话缓存，提升 DeepSeek 缓存命中、降低费用与延迟<br>模型容灾：主模型持续不可用（过载/限流）时自动切换同族备用模型继续<br>托管后台命令：后台命令返回句柄，Agent 可轮询输出、查看状态、随时终止<br>检查更新按钮交互优化：结果直接在按钮上显示 10 秒、期间禁用防误触，尺寸不变 | Claude Code |
+| 0.0.23 | 命令沙箱（受限令牌，M8.1）：run_command 在降权的受限令牌 + Job Object 沙箱中执行——剥离管理员特权、进程随会话干净销毁、子进程环境擦除密钥；失败即拒绝执行不降级<br>设置「模型与权限」新增命令沙箱开关，少数需特权命令受阻时可临时关闭<br>（网络与文件路径隔离将由后续 AppContainer 版本 M8.2 提供） | Claude Code |
