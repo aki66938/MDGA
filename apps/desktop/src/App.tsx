@@ -9,8 +9,8 @@ import "highlight.js/styles/github.css";
 import {
   SquarePen, Search, Pin, Archive, ArchiveRestore, Trash2, Settings2,
   Paperclip, ListChecks, Square, ArrowUp, GitCompare, Plug, Sun, Moon,
-  Check, X, Ban, Sparkle, Info, CircleDot, CheckSquare, ChevronRight,
-  ChevronDown, FolderOpen, Gauge, AtSign,
+  Check, X, Ban, Info, CircleDot, CheckSquare, ChevronRight,
+  ChevronDown, FolderOpen, Gauge, AtSign, CornerDownRight,
 } from "lucide-react";
 
 /** MDGA 品牌标识：深海声纳波纹（致敬 DeepSeek 的「deep」，非官方鲸鱼 logo） */
@@ -223,6 +223,9 @@ export function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [balance, setBalance] = useState<BalanceState>({ status: "idle" });
+  const [permRules, setPermRules] = useState<string[]>([]);
+  // Steering：运行中已排队但尚未被注入的插话消息
+  const [queuedSteering, setQueuedSteering] = useState<string[]>([]);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   // @文件引用补全
   const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
@@ -315,6 +318,16 @@ export function App() {
   useEffect(() => {
     const unlisten = listen<TodoItem[]>("todo-update", (e) => {
       setTodos(Array.isArray(e.payload) ? e.payload : []);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Steering：一条排队的插话被注入后，从待注入列表里移除一条
+  useEffect(() => {
+    const unlisten = listen<string>("steering-injected", () => {
+      setQueuedSteering((prev) => prev.slice(1));
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -755,6 +768,7 @@ export function App() {
     const unlistenDone = await listen("chat-done", async () => {
       setSending(false);
       setApproval(null);
+      setQueuedSteering([]);
       unlistenChunk();
       unlistenTool();
       unlistenStatus();
@@ -892,10 +906,26 @@ export function App() {
     }
   }
 
+  async function refreshPermRules() {
+    const list = await invoke<string[]>("get_permission_rules").catch(() => [] as string[]);
+    setPermRules(list);
+  }
+
+  async function handleAddPermRule(rule: string) {
+    await invoke("create_permission_rule", { rule }).catch(() => {});
+    await refreshPermRules();
+  }
+
+  async function handleDeletePermRule(rule: string) {
+    await invoke("delete_permission_rule", { rule }).catch(() => {});
+    await refreshPermRules();
+  }
+
   async function openSettings() {
     const info = await invoke<AppInfo>("get_app_info").catch(() => null);
     setAppInfo(info);
     await refreshMcpServers();
+    await refreshPermRules();
     setShowSettings(true);
     refreshBalance();
   }
@@ -965,8 +995,23 @@ export function App() {
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      if (sending) {
+        queueSteeringMessage();
+      } else {
+        handleSend();
+      }
     }
+  }
+
+  /** Agent 运行中，把输入作为插话排队（下一轮注入），不打断当前任务。 */
+  async function queueSteeringMessage() {
+    const text = input.trim();
+    if (!text || !activeConvId) return;
+    setInput("");
+    setQueuedSteering((prev) => [...prev, text]);
+    await invoke("queue_steering", { conversationId: activeConvId, text }).catch(() => {
+      setQueuedSteering((prev) => prev.filter((m) => m !== text));
+    });
   }
 
   async function handleInstallUpdate() {
@@ -1204,9 +1249,7 @@ export function App() {
             ))}
             {sending && (
               <div className="agent-working" aria-label="Agent 工作状态">
-                <span className="thinking-dots" aria-hidden="true">
-                  <i /><i /><i />
-                </span>
+                <span className="star-spin" aria-hidden="true">✦</span>
                 <span>{agentStatus ?? "正在思考…"}</span>
                 <span className="agent-working__elapsed">{elapsedSec}s</span>
               </div>
@@ -1252,6 +1295,17 @@ export function App() {
         )}
 
         {todos.length > 0 && <TodoPanel items={todos} />}
+
+        {queuedSteering.length > 0 && (
+          <div className="steering-queue" aria-label="排队的插话">
+            {queuedSteering.map((m, i) => (
+              <span key={i} className="steering-chip" title={m}>
+                <CornerDownRight size={12} /> {m.length > 30 ? m.slice(0, 30) + "…" : m}
+              </span>
+            ))}
+            <span className="steering-queue__hint">将在下一轮注入</span>
+          </div>
+        )}
 
         <div className="composer-area">
           {/* 斜杠命令菜单 */}
@@ -1340,7 +1394,7 @@ export function App() {
             </button>
             <textarea
               aria-label="Message"
-              placeholder={planMode ? "计划模式：先出计划，确认后再执行（Enter 发送）" : "随心输入（Enter 发送，Shift+Enter 换行，/ 命令，@ 引用文件）"}
+              placeholder={sending ? "Agent 运行中：输入并回车可插话，下一轮生效（不打断当前任务）" : planMode ? "计划模式：先出计划，确认后再执行（Enter 发送）" : "随心输入（Enter 发送，Shift+Enter 换行，/ 命令，@ 引用文件）"}
               value={input}
               onChange={(e) => {
                 setInput(e.target.value);
@@ -1387,12 +1441,15 @@ export function App() {
           model={model}
           permissionMode={permissionMode}
           mcpServers={mcpServers}
+          permRules={permRules}
           onModelChange={handleModelChange}
           onPermissionModeChange={handlePermissionModeChange}
           onAddMcpServer={handleAddMcpServer}
           onToggleMcpServer={handleToggleMcpServer}
           onDeleteMcpServer={handleDeleteMcpServer}
           onRefreshMcp={refreshMcpServers}
+          onAddPermRule={handleAddPermRule}
+          onDeletePermRule={handleDeletePermRule}
           onCheckUpdate={() => {
             invoke<string | null>("check_update")
               .then((v) => {
@@ -1487,12 +1544,15 @@ function SettingsModal({
   model,
   permissionMode,
   mcpServers,
+  permRules,
   onModelChange,
   onPermissionModeChange,
   onAddMcpServer,
   onToggleMcpServer,
   onDeleteMcpServer,
   onRefreshMcp,
+  onAddPermRule,
+  onDeletePermRule,
   onCheckUpdate,
   onClose,
 }: {
@@ -1503,170 +1563,195 @@ function SettingsModal({
   model: DeepSeekModelId;
   permissionMode: PermissionMode;
   mcpServers: McpServer[];
+  permRules: string[];
   onModelChange: (m: DeepSeekModelId) => void;
   onPermissionModeChange: (m: PermissionMode) => void;
   onAddMcpServer: (name: string, command: string) => void;
   onToggleMcpServer: (id: string, enabled: boolean) => void;
   onDeleteMcpServer: (id: string) => void;
   onRefreshMcp: () => void;
+  onAddPermRule: (rule: string) => void;
+  onDeletePermRule: (rule: string) => void;
   onCheckUpdate: () => void;
   onClose: () => void;
 }) {
   const [mcpName, setMcpName] = useState("");
   const [mcpCommand, setMcpCommand] = useState("");
+  const [ruleInput, setRuleInput] = useState("");
+  const [section, setSection] = useState<"account" | "model" | "rules" | "mcp" | "about">("account");
+
+  const NAV: Array<{ id: typeof section; label: string }> = [
+    { id: "account", label: "账户" },
+    { id: "model", label: "模型与权限" },
+    { id: "rules", label: "权限规则" },
+    { id: "mcp", label: "MCP 服务器" },
+    { id: "about", label: "关于" },
+  ];
+
   return (
     <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="设置">
-      <div className="approval-card panel-card">
-        <p className="approval-card__title">设置</p>
-        <div className="settings-row">
-          <span className="settings-row__label">DeepSeek API Key</span>
-          <span className="settings-row__value">{apiKeyLabel}</span>
-        </div>
-
-        {/* 账户余额（DeepSeek /user/balance，唯一账户信息接口） */}
-        <div className="settings-section">
-          <div className="settings-section__head">
-            <span>账户余额</span>
+      <div className="approval-card panel-card settings-modal">
+        <nav className="settings-nav" aria-label="设置分类">
+          <p className="settings-nav__title">设置</p>
+          {NAV.map((n) => (
             <button
-              className="changes-row__revert"
+              key={n.id}
               type="button"
-              onClick={onRefreshBalance}
-              disabled={balance.status === "loading"}
+              className={`settings-nav__item${section === n.id ? " settings-nav__item--active" : ""}`}
+              onClick={() => setSection(n.id)}
             >
-              {balance.status === "loading" ? "查询中…" : "刷新"}
+              {n.label}
             </button>
-          </div>
-          {balance.status === "error" && (
-            <p className="settings-row__value" style={{ color: "var(--danger)" }}>{balance.message}</p>
-          )}
-          {balance.status === "ok" && (
-            <>
-              <div className="settings-row">
-                <span className="settings-row__label">状态</span>
-                <span className="settings-row__value" style={{ color: balance.data.isAvailable ? "var(--success)" : "var(--danger)" }}>
-                  {balance.data.isAvailable ? "余额充足，可正常调用" : "余额不足"}
-                </span>
-              </div>
-              {balance.data.balanceInfos.length === 0 && (
-                <p className="settings-row__value">未返回余额明细</p>
-              )}
-              {balance.data.balanceInfos.map((b) => (
-                <div key={b.currency} className="balance-card">
-                  <div className="balance-card__total">
-                    <span className="balance-card__amount">{b.totalBalance}</span>
-                    <span className="balance-card__currency">{b.currency}</span>
-                  </div>
-                  <div className="balance-card__detail">
-                    <span>充值 {b.toppedUpBalance}</span>
-                    <span>赠送 {b.grantedBalance}</span>
-                  </div>
-                </div>
-              ))}
-            </>
-          )}
-        </div>
-
-        <div className="settings-row">
-          <span className="settings-row__label">默认模型</span>
-          <select
-            className="model-select"
-            value={model}
-            onChange={(e) => onModelChange(e.target.value as DeepSeekModelId)}
-          >
-            {DEEPSEEK_MODELS.map((item) => (
-              <option key={item.id} value={item.id}>{item.label}</option>
-            ))}
-          </select>
-        </div>
-        <div className="settings-row">
-          <span className="settings-row__label">默认权限模式</span>
-          <select
-            className="model-select"
-            value={permissionMode}
-            onChange={(e) => onPermissionModeChange(e.target.value as PermissionMode)}
-          >
-            {PERMISSION_MODES.map((mode) => (
-              <option key={mode} value={mode}>{getPermissionModeLabel(mode)}</option>
-            ))}
-          </select>
-        </div>
-        <div className="settings-row">
-          <span className="settings-row__label">数据目录</span>
-          <span className="settings-row__value" title={appInfo?.dataDir}>
-            {appInfo?.dataDir ?? "…"}
-          </span>
-        </div>
-        <div className="settings-row">
-          <span className="settings-row__label">版本</span>
-          <span className="settings-row__value">v{appInfo?.version ?? "…"}</span>
-        </div>
-
-        {/* MCP server 管理 */}
-        <div className="settings-section">
-          <div className="settings-section__head">
-            <span><Plug size={14} /> MCP 服务器</span>
-            <button className="changes-row__revert" type="button" onClick={onRefreshMcp}>
-              刷新状态
-            </button>
-          </div>
-          {mcpServers.map((s) => (
-            <div key={s.id} className="changes-row">
-              <span className={`mcp-dot${s.connected ? " mcp-dot--on" : ""}`} aria-hidden="true">●</span>
-              <span className="changes-row__tool">{s.name}</span>
-              <span className="changes-row__path" title={s.command}>
-                {s.connected ? `${s.toolCount} 个工具` : s.enabled ? "未连接" : "已停用"}
-              </span>
-              <button
-                className="changes-row__revert"
-                type="button"
-                onClick={() => onToggleMcpServer(s.id, !s.enabled)}
-              >
-                {s.enabled ? "停用" : "启用"}
-              </button>
-              <button
-                className="changes-row__revert"
-                type="button"
-                onClick={() => onDeleteMcpServer(s.id)}
-              >
-                删除
-              </button>
-            </div>
           ))}
-          <div className="mcp-add">
-            <input
-              className="conv-search"
-              placeholder="名称（如 filesystem）"
-              value={mcpName}
-              onChange={(e) => setMcpName(e.target.value)}
-            />
-            <input
-              className="conv-search"
-              placeholder="启动命令（如 npx -y @modelcontextprotocol/server-filesystem C:\\data）"
-              value={mcpCommand}
-              onChange={(e) => setMcpCommand(e.target.value)}
-            />
-            <button
-              className="approval-card__btn"
-              type="button"
-              disabled={!mcpName.trim() || !mcpCommand.trim()}
-              onClick={() => {
-                onAddMcpServer(mcpName.trim(), mcpCommand.trim());
-                setMcpName("");
-                setMcpCommand("");
-              }}
-            >
-              添加并连接
-            </button>
-          </div>
-        </div>
-
-        <div className="approval-card__actions">
-          <button type="button" className="approval-card__btn" onClick={onCheckUpdate}>
-            检查更新
-          </button>
-          <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={onClose}>
+          <button type="button" className="settings-nav__close" onClick={onClose}>
             关闭
           </button>
+        </nav>
+
+        <div className="settings-content">
+          {section === "account" && (
+            <>
+              <h3 className="settings-content__h">账户</h3>
+              <div className="settings-row">
+                <span className="settings-row__label">DeepSeek API Key</span>
+                <span className="settings-row__value">{apiKeyLabel}</span>
+              </div>
+              <p className="settings-desc">API Key 仅从系统环境变量 <code>DEEPSEEK_API_KEY</code> 读取，不在应用内保存。</p>
+
+              <div className="settings-section__head" style={{ marginTop: 16 }}>
+                <span>账户余额</span>
+                <button
+                  className="changes-row__revert"
+                  type="button"
+                  onClick={onRefreshBalance}
+                  disabled={balance.status === "loading"}
+                >
+                  {balance.status === "loading" ? "查询中…" : "刷新"}
+                </button>
+              </div>
+              {balance.status === "error" && (
+                <p className="settings-row__value" style={{ color: "var(--danger)" }}>{balance.message}</p>
+              )}
+              {balance.status === "ok" && (
+                <>
+                  <div className="settings-row">
+                    <span className="settings-row__label">状态</span>
+                    <span className="settings-row__value" style={{ color: balance.data.isAvailable ? "var(--success)" : "var(--danger)" }}>
+                      {balance.data.isAvailable ? "余额充足，可正常调用" : "余额不足"}
+                    </span>
+                  </div>
+                  {balance.data.balanceInfos.length === 0 && <p className="settings-row__value">未返回余额明细</p>}
+                  {balance.data.balanceInfos.map((b) => (
+                    <div key={b.currency} className="balance-card">
+                      <div className="balance-card__total">
+                        <span className="balance-card__amount">{b.totalBalance}</span>
+                        <span className="balance-card__currency">{b.currency}</span>
+                      </div>
+                      <div className="balance-card__detail">
+                        <span>充值 {b.toppedUpBalance}</span>
+                        <span>赠送 {b.grantedBalance}</span>
+                      </div>
+                    </div>
+                  ))}
+                </>
+              )}
+            </>
+          )}
+
+          {section === "model" && (
+            <>
+              <h3 className="settings-content__h">模型与权限</h3>
+              <div className="settings-row">
+                <span className="settings-row__label">默认模型</span>
+                <select className="model-select" value={model} onChange={(e) => onModelChange(e.target.value as DeepSeekModelId)}>
+                  {DEEPSEEK_MODELS.map((item) => (
+                    <option key={item.id} value={item.id}>{item.label}</option>
+                  ))}
+                </select>
+              </div>
+              <p className="settings-desc">新会话的默认模型。会话中也可在输入框上方临时切换，改动在下一轮生效。</p>
+
+              <div className="settings-row" style={{ marginTop: 12 }}>
+                <span className="settings-row__label">默认权限模式</span>
+                <select className="model-select" value={permissionMode} onChange={(e) => onPermissionModeChange(e.target.value as PermissionMode)}>
+                  {PERMISSION_MODES.map((mode) => (
+                    <option key={mode} value={mode}>{getPermissionModeLabel(mode)}</option>
+                  ))}
+                </select>
+              </div>
+              <ul className="settings-desc settings-desc--list">
+                <li><b>受限</b>：只允许聊天与只读，不能改文件或执行命令。</li>
+                <li><b>每次询问</b>：每个写入/命令/越界动作都弹窗确认。</li>
+                <li><b>工作区自动</b>：工作区内读写自动执行，低风险命令直接跑，其余审批。</li>
+                <li><b>完全访问</b>：放开执行，仍保留审计与回退。</li>
+              </ul>
+            </>
+          )}
+
+          {section === "rules" && (
+            <>
+              <h3 className="settings-content__h">权限规则</h3>
+              <p className="settings-desc">
+                细粒度规则按 <b>deny 优先</b> 生效。格式：<code>[allow:|deny:]&lt;工具&gt;:&lt;路径glob&gt;</code>，
+                或 <code>cmd:&lt;命令前缀&gt;</code>、<code>tool:&lt;工具名&gt;</code>。
+                例：<code>deny:read_file:**/.env</code>、<code>allow:cmd:git push</code>。审批弹窗的「总是允许」会自动生成 allow 规则。
+              </p>
+              {permRules.length === 0 && <p className="settings-row__value">暂无规则。</p>}
+              {permRules.map((r) => (
+                <div key={r} className="changes-row">
+                  <span className={`mcp-dot${r.startsWith("deny:") ? "" : " mcp-dot--on"}`} aria-hidden="true">●</span>
+                  <span className="changes-row__path" title={r} style={{ fontFamily: "monospace" }}>{r}</span>
+                  <button className="changes-row__revert" type="button" onClick={() => onDeletePermRule(r)}>删除</button>
+                </div>
+              ))}
+              <div className="mcp-add">
+                <input className="conv-search" placeholder="如 deny:read_file:**/.env 或 allow:cmd:git push" value={ruleInput} onChange={(e) => setRuleInput(e.target.value)} />
+                <button className="approval-card__btn" type="button" disabled={!ruleInput.trim()} onClick={() => { onAddPermRule(ruleInput.trim()); setRuleInput(""); }}>添加规则</button>
+              </div>
+            </>
+          )}
+
+          {section === "mcp" && (
+            <>
+              <div className="settings-content__h" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span><Plug size={15} style={{ verticalAlign: "-2px" }} /> MCP 服务器</span>
+                <button className="changes-row__revert" type="button" onClick={onRefreshMcp}>刷新状态</button>
+              </div>
+              <p className="settings-desc">接入外部 MCP 服务器，其工具会并入模型工具集，统一经权限审批与审计。需本机已安装 Node（npx）或对应运行时。</p>
+              {mcpServers.map((s) => (
+                <div key={s.id} className="changes-row">
+                  <span className={`mcp-dot${s.connected ? " mcp-dot--on" : ""}`} aria-hidden="true">●</span>
+                  <span className="changes-row__tool">{s.name}</span>
+                  <span className="changes-row__path" title={s.command}>
+                    {s.connected ? `${s.toolCount} 个工具` : s.enabled ? "未连接" : "已停用"}
+                  </span>
+                  <button className="changes-row__revert" type="button" onClick={() => onToggleMcpServer(s.id, !s.enabled)}>{s.enabled ? "停用" : "启用"}</button>
+                  <button className="changes-row__revert" type="button" onClick={() => onDeleteMcpServer(s.id)}>删除</button>
+                </div>
+              ))}
+              <div className="mcp-add">
+                <input className="conv-search" placeholder="名称（如 filesystem）" value={mcpName} onChange={(e) => setMcpName(e.target.value)} />
+                <input className="conv-search" placeholder="启动命令（如 npx -y @modelcontextprotocol/server-filesystem C:\\data）" value={mcpCommand} onChange={(e) => setMcpCommand(e.target.value)} />
+                <button className="approval-card__btn" type="button" disabled={!mcpName.trim() || !mcpCommand.trim()} onClick={() => { onAddMcpServer(mcpName.trim(), mcpCommand.trim()); setMcpName(""); setMcpCommand(""); }}>添加并连接</button>
+              </div>
+            </>
+          )}
+
+          {section === "about" && (
+            <>
+              <h3 className="settings-content__h">关于</h3>
+              <div className="settings-row">
+                <span className="settings-row__label">版本</span>
+                <span className="settings-row__value">v{appInfo?.version ?? "…"}</span>
+              </div>
+              <div className="settings-row">
+                <span className="settings-row__label">数据目录</span>
+                <span className="settings-row__value" title={appInfo?.dataDir}>{appInfo?.dataDir ?? "…"}</span>
+              </div>
+              <p className="settings-desc">会话、token 账本、权限规则等本地数据保存在数据目录的 SQLite 中。</p>
+              <button type="button" className="approval-card__btn" style={{ marginTop: 12 }} onClick={onCheckUpdate}>检查更新</button>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -1861,7 +1946,7 @@ function ToolInlineRow({ part }: { part: ToolPart }) {
   const { toolName, target, status, error, diff, added, removed, liveOutput } = part;
   const [showDiff, setShowDiff] = useState(false);
   const icon =
-    status === "running" ? <Sparkle size={13} className="twinkle" fill="currentColor" /> :
+    status === "running" ? <span className="star-spin tool-inline__star" aria-hidden="true">✦</span> :
     status === "succeeded" ? <Check size={13} /> :
     status === "denied" ? <Ban size={13} /> : <X size={13} />;
   const hasDiff = typeof diff === "string" && diff.trim().length > 0;

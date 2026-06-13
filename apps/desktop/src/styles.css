@@ -884,33 +884,6 @@ h1 {
   color: var(--text-3);
 }
 
-/* 思考指示：三点柔和脉冲，比旋转圆圈更像「在思考」 */
-.thinking-dots {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.thinking-dots i {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--brand);
-  display: inline-block;
-  animation: thinking-pulse 1.4s ease-in-out infinite;
-}
-
-.thinking-dots i:nth-child(2) { animation-delay: .2s; }
-.thinking-dots i:nth-child(3) { animation-delay: .4s; }
-
-@keyframes thinking-pulse {
-  0%, 60%, 100% { opacity: .25; transform: translateY(0); }
-  30%           { opacity: 1;   transform: translateY(-2px); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .thinking-dots i { animation: none; opacity: .6; }
-}
 
 .agent-working__elapsed {
   font-variant-numeric: tabular-nums;
@@ -1035,6 +1008,35 @@ h1 {
 .todo-item { color: var(--text-2); }
 .todo-item--done { color: var(--text-3); text-decoration: line-through; }
 .todo-item--in_progress { color: var(--text); font-weight: 600; }
+
+/* ── Steering 插话队列 ── */
+
+.steering-queue {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  width: min(760px, 100%);
+  align-self: center;
+  margin-bottom: 6px;
+}
+
+.steering-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--brand);
+  background: var(--brand-tint);
+  border: 1px solid var(--brand-tint-strong);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+
+.steering-queue__hint {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
 
 /* ── Composer 扩展（计划模式 / 斜杠菜单） ── */
 
@@ -1193,10 +1195,117 @@ h1 {
   border-color: var(--text-3);
 }
 
-.panel-card {
-  width: min(560px, 92vw);
-  max-height: 80vh;
+/* 复合选择器(0,2,0)确保宽度胜过其后定义的 .approval-card(0,1,0) */
+.approval-card.panel-card {
+  width: min(980px, 96vw);
+  max-height: 88vh;
   overflow-y: auto;
+}
+
+/* 设置：左栏导航 + 右栏内容双栏 */
+.approval-card.settings-modal {
+  padding: 0;
+  overflow: hidden;
+  display: block;
+  height: min(620px, 88vh);
+}
+
+.settings-modal {
+  display: grid !important;
+  grid-template-columns: 184px minmax(0, 1fr);
+}
+
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 16px 12px;
+  background: var(--surface-2);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+}
+
+.settings-nav__title {
+  margin: 0 0 10px 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.settings-nav__item {
+  text-align: left;
+  border: none;
+  background: none;
+  color: var(--text-2);
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.settings-nav__item:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.settings-nav__item--active {
+  background: var(--brand-tint);
+  color: var(--brand);
+  font-weight: 500;
+}
+
+.settings-nav__close {
+  margin-top: auto;
+  text-align: left;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.settings-nav__close:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.settings-content {
+  padding: 22px 26px;
+  overflow-y: auto;
+}
+
+.settings-content__h {
+  margin: 0 0 14px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.settings-desc {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+  margin: 8px 0 0;
+}
+
+.settings-desc code {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11.5px;
+  background: var(--surface-3);
+  padding: 1px 5px;
+  border-radius: 5px;
+  color: var(--text-2);
+}
+
+.settings-desc--list {
+  list-style: none;
+  padding: 0;
+}
+
+.settings-desc--list li {
+  margin: 3px 0;
 }
 
 .settings-row {
@@ -1626,17 +1735,20 @@ h1 {
 
 .slash-menu__icon { color: var(--text-3); flex-shrink: 0; }
 
-/* 工具运行中：四角星闪动（缩放 + 透明度脉冲，非旋转），品牌蓝 */
-.twinkle {
+/* 思考 / 工具运行四角星：早期版本的 ✦ 缓慢整圈旋转 + 透明度脉冲，配色用 DeepSeek 蓝 */
+.star-spin {
+  display: inline-block;
   color: var(--brand);
-  animation: mdga-twinkle 1.3s ease-in-out infinite;
+  animation: agent-spin 1.6s linear infinite;
 }
-@keyframes mdga-twinkle {
-  0%, 100% { transform: scale(0.78) rotate(0deg);   opacity: 0.55; }
-  50%      { transform: scale(1.12) rotate(45deg);  opacity: 1; }
+.tool-inline__star { font-size: 13px; line-height: 1; }
+@keyframes agent-spin {
+  0%   { transform: rotate(0deg);   opacity: 1; }
+  50%  { transform: rotate(180deg); opacity: 0.5; }
+  100% { transform: rotate(360deg); opacity: 1; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .twinkle { animation: none; opacity: 0.8; }
+  .star-spin { animation: none; opacity: 0.85; }
 }
 
 /* tool-inline 图标颜色随状态（Lucide 继承 currentColor） */

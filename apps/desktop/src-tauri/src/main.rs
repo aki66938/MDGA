@@ -14,7 +14,8 @@ use mdga_storage::{
     create_conversation_with_workspace, get_activity_events, get_conversation, get_messages,
     init_db, list_conversations, list_file_checkpoints, list_mcp_servers,
     list_permission_rules, mark_checkpoint_reverted, record_activity_event,
-    record_file_checkpoint, remove_mcp_server, save_active_workspace, save_message,
+    record_file_checkpoint, remove_mcp_server, remove_permission_rule, save_active_workspace,
+    save_message,
     set_conversation_archived, set_conversation_pinned, set_mcp_server_enabled, update_title,
     ActivityEventRecord, Conversation, FileCheckpoint, McpServerRecord, StoredMessage, Workspace,
 };
@@ -65,6 +66,9 @@ struct AppState {
     approvals: Mutex<HashMap<String, (oneshot::Sender<bool>, String)>>,
     /// 已连接的 MCP server 客户端，按配置 id 索引。Arc 包裹以便在锁外调用。
     mcp: Mutex<HashMap<String, Arc<McpClient>>>,
+    /// Steering：用户在 Agent 运行中排队的插话消息，按 conversation_id 索引。
+    /// 工具循环在每轮开始时取出并作为 user 消息注入，实现「运行中纠偏」。
+    steering: Mutex<HashMap<String, Vec<String>>>,
 }
 
 /// MCP 工具与模型函数名的绑定关系，按 send 周期收集后传入工具循环。
@@ -238,10 +242,13 @@ async fn send_message(
         .map_err(|e| e.to_string())
     };
 
-    // 无论成功或失败都要清理取消令牌，避免下一轮误判为已取消。
+    // 无论成功或失败都要清理取消令牌与残留的 steering 队列，避免影响下一轮。
     {
         if let Ok(mut cancels) = state.cancels.lock() {
             cancels.remove(&conversation_id);
+        }
+        if let Ok(mut steering) = state.steering.lock() {
+            steering.remove(&conversation_id);
         }
     }
 
@@ -526,6 +533,31 @@ fn list_workspace_files(
     Ok(mdga_tool_runtime::workspace_file_list(&workspace, 500))
 }
 
+/// 列出全部权限规则（allow / deny），供设置页管理。
+#[tauri::command]
+fn get_permission_rules(state: State<AppState>) -> Result<Vec<String>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    list_permission_rules(&db).map_err(|e| e.to_string())
+}
+
+/// 新增一条权限规则（如 `deny:read_file:**/.env`、`allow:cmd:git push`）。
+#[tauri::command]
+fn create_permission_rule(state: State<AppState>, rule: String) -> Result<(), String> {
+    let rule = rule.trim();
+    if rule.is_empty() {
+        return Err("规则不能为空".to_string());
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    add_permission_rule(&db, rule).map_err(|e| e.to_string())
+}
+
+/// 删除一条权限规则。
+#[tauri::command]
+fn delete_permission_rule(state: State<AppState>, rule: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    remove_permission_rule(&db, &rule).map_err(|e| e.to_string())
+}
+
 /// 列出 MCP server 配置及连接状态（connected/disconnected + 工具数）。
 #[tauri::command]
 fn get_mcp_servers(state: State<AppState>) -> Result<Vec<serde_json::Value>, String> {
@@ -745,6 +777,24 @@ fn get_conversation_events(
 ) -> Result<Vec<ActivityEventRecord>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     get_activity_events(&db, &conversation_id).map_err(|e| e.to_string())
+}
+
+/// 在 Agent 运行中排队一条插话消息（steering）。下一轮循环开始时作为 user 消息注入，
+/// 让用户无需打断即可纠偏 / 追加要求。返回当前队列长度。
+#[tauri::command]
+fn queue_steering(
+    state: State<AppState>,
+    conversation_id: String,
+    text: String,
+) -> Result<usize, String> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("插话内容不能为空".to_string());
+    }
+    let mut steering = state.steering.lock().map_err(|e| e.to_string())?;
+    let queue = steering.entry(conversation_id).or_default();
+    queue.push(text);
+    Ok(queue.len())
 }
 
 /// 请求中断指定会话正在运行的 Agent 工具循环。
@@ -1047,25 +1097,98 @@ fn permission_rule_for(tool_name: &str, arguments: &str) -> String {
     format!("tool:{tool_name}")
 }
 
-/// 判断已保存的权限规则是否覆盖本次调用。
-fn permission_rules_allow(rules: &[String], tool_name: &str, arguments: &str) -> bool {
-    if tool_name == "run_command" {
-        if let Ok(request) = serde_json::from_str::<RunCommandRequest>(arguments) {
-            let cmd = request.command.trim().to_lowercase();
-            return rules.iter().any(|rule| {
-                rule.strip_prefix("cmd:")
-                    .map(|prefix| {
-                        let p = prefix.to_lowercase();
-                        cmd == p || cmd.starts_with(&format!("{p} "))
-                    })
-                    .unwrap_or(false)
-            });
-        }
-        return false;
+/// 极简 glob 匹配：`*` 与 `**` 都视为「任意字符序列（含 /）」，支持 `**/.env`、`src/**`、`*.env`。
+fn glob_match(pattern: &str, text: &str) -> bool {
+    // 把 ** 折叠为 *，再按 * 切段，依次顺序匹配（首段需前缀对齐、末段需后缀对齐）。
+    let pat = pattern.replace("**", "*");
+    let parts: Vec<&str> = pat.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text; // 无通配，精确匹配
     }
-    rules
-        .iter()
-        .any(|rule| rule.strip_prefix("tool:") == Some(tool_name))
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !text.starts_with(part) {
+                return false;
+            }
+            pos = part.len();
+        } else if i == parts.len() - 1 {
+            return text[pos..].ends_with(part);
+        } else {
+            match text[pos..].find(part) {
+                Some(idx) => pos += idx + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+/// 单条权限规则对本次调用的裁决：deny 命中返回 Some(false)，allow 命中返回 Some(true)，未命中 None。
+///
+/// 规则格式：`[allow:|deny:]<body>`（无前缀默认 allow，向后兼容旧规则）。body 为：
+/// `cmd:<前缀>`（run_command 命令前缀）| `tool:<工具名>`（按工具名）| `<工具名>:<glob>`（工具+路径 glob）。
+fn rule_decision(rule: &str, tool_name: &str, arguments: &str) -> Option<bool> {
+    let (effect, body) = if let Some(r) = rule.strip_prefix("deny:") {
+        (false, r)
+    } else if let Some(r) = rule.strip_prefix("allow:") {
+        (true, r)
+    } else {
+        (true, rule)
+    };
+
+    if let Some(prefix) = body.strip_prefix("cmd:") {
+        if tool_name == "run_command" {
+            if let Ok(request) = serde_json::from_str::<RunCommandRequest>(arguments) {
+                let cmd = request.command.trim().to_lowercase();
+                let p = prefix.trim().to_lowercase();
+                if !p.is_empty() && (cmd == p || cmd.starts_with(&format!("{p} "))) {
+                    return Some(effect);
+                }
+            }
+        }
+        return None;
+    }
+    if let Some(name) = body.strip_prefix("tool:") {
+        return if name == tool_name { Some(effect) } else { None };
+    }
+    // <toolname>:<glob> —— 工具名 + 路径 glob
+    if let Some((rtool, glob)) = body.split_once(':') {
+        if rtool == tool_name {
+            let path = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|v| {
+                    ["path", "from", "to"]
+                        .iter()
+                        .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(str::to_string))
+                })
+                .unwrap_or_default();
+            if glob_match(glob, &path) {
+                return Some(effect);
+            }
+        }
+    }
+    None
+}
+
+/// 汇总权限规则：deny 优先。返回 Some(false)=显式拒绝，Some(true)=显式放行，None=无规则覆盖。
+fn permission_rules_decision(rules: &[String], tool_name: &str, arguments: &str) -> Option<bool> {
+    let mut allowed = false;
+    for rule in rules {
+        match rule_decision(rule, tool_name, arguments) {
+            Some(false) => return Some(false), // deny 立即否决
+            Some(true) => allowed = true,
+            None => {}
+        }
+    }
+    if allowed {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// 对单次工具调用做权限门控。
@@ -1083,6 +1206,11 @@ fn gate_tool_decision(
         Err(message) => return ToolGate::Deny(message),
     };
 
+    // 用户显式 deny 规则最高优先级：任何模式下都拒绝。
+    if permission_rules_decision(rules, tool_name, arguments) == Some(false) {
+        return ToolGate::Deny("已被用户的拒绝规则阻止".to_string());
+    }
+
     // 低风险命令白名单：Workspace Auto 下免审批直接执行常见检查 / 构建 / 测试命令。
     if tool_name == "run_command"
         && matches!(context.permission_mode, mdga_shared::PermissionMode::WorkspaceAuto)
@@ -1097,7 +1225,7 @@ fn gate_tool_decision(
     match decide_tool_access(context, capability) {
         ToolDecision::Allow => ToolGate::Allow,
         ToolDecision::AskUser => {
-            if permission_rules_allow(rules, tool_name, arguments) {
+            if permission_rules_decision(rules, tool_name, arguments) == Some(true) {
                 ToolGate::Allow
             } else {
                 ToolGate::Ask
@@ -1409,6 +1537,157 @@ fn apply_checkpoint_revert(workspace: &str, checkpoint: &FileCheckpoint) -> Resu
 }
 
 // ── todo / 后台命令 / 子任务 ─────────────────────────────────────────────
+
+// ── Hooks 生命周期系统 ──────────────────────────────────────────────────
+//
+// 从工作区 .mdga/hooks.json 读取用户定义的生命周期钩子。PreToolUse 在工具执行前运行，
+// 退出码非 0 则阻断该工具（stdout/stderr 作为原因回灌模型）；PostToolUse 在工具成功后运行（信息性）。
+// 钩子命令经 PowerShell 执行，工具的 { tool, arguments } 以 JSON 从 stdin 传入。
+
+#[derive(serde::Deserialize)]
+struct HookEntry {
+    matcher: String,
+    command: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct HooksConfig {
+    #[serde(rename = "PreToolUse", default)]
+    pre_tool_use: Vec<HookEntry>,
+    #[serde(rename = "PostToolUse", default)]
+    post_tool_use: Vec<HookEntry>,
+}
+
+fn load_hooks(workspace: &str) -> HooksConfig {
+    let path = std::path::Path::new(workspace).join(".mdga").join("hooks.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// matcher 匹配工具名：`*` 匹配全部，否则按 `,` 或 `|` 分隔的工具名列表精确匹配。
+fn hook_matcher_matches(matcher: &str, tool_name: &str) -> bool {
+    let m = matcher.trim();
+    m == "*"
+        || m.split([',', '|'])
+            .any(|t| t.trim() == tool_name)
+}
+
+/// 运行一条钩子命令：JSON 从 stdin 传入，30s 超时，返回 (是否成功, 输出文本)。
+fn run_hook_command(workspace: &str, command: &str, stdin_json: &str) -> (bool, String) {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    let mut child = match Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", command])
+        .current_dir(workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return (false, format!("钩子启动失败: {e}")),
+    };
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(stdin_json.as_bytes());
+    }
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let so = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut p) = stdout_pipe {
+            let _ = p.read_to_string(&mut s);
+        }
+        s
+    });
+    let se = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut p) = stderr_pipe {
+            let _ = p.read_to_string(&mut s);
+        }
+        s
+    });
+    let start = std::time::Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if start.elapsed() > std::time::Duration::from_secs(30) {
+                    let _ = child.kill();
+                    timed_out = true;
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            Err(_) => break None,
+        }
+    };
+    let out = so.join().unwrap_or_default();
+    let err = se.join().unwrap_or_default();
+    let text = format!("{out}{err}").trim().to_string();
+    if timed_out {
+        return (false, "钩子执行超时（30s）".to_string());
+    }
+    let ok = status.map(|s| s.success()).unwrap_or(false);
+    (ok, text)
+}
+
+/// 运行匹配的 PreToolUse 钩子；任一钩子退出码非 0 则返回 Some(阻断原因)。
+fn run_pre_tool_hooks(workspace: &str, tool_name: &str, arguments: &str) -> Option<String> {
+    let cfg = load_hooks(workspace);
+    if cfg.pre_tool_use.is_empty() {
+        return None;
+    }
+    let args_val: serde_json::Value =
+        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+    let payload =
+        serde_json::json!({ "hook": "PreToolUse", "tool": tool_name, "arguments": args_val })
+            .to_string();
+    for hook in &cfg.pre_tool_use {
+        if hook_matcher_matches(&hook.matcher, tool_name) {
+            let (ok, text) = run_hook_command(workspace, &hook.command, &payload);
+            if !ok {
+                let reason = if text.is_empty() {
+                    "被 PreToolUse 钩子阻断".to_string()
+                } else {
+                    format!("被 PreToolUse 钩子阻断：{text}")
+                };
+                return Some(reason);
+            }
+        }
+    }
+    None
+}
+
+/// 运行匹配的 PostToolUse 钩子（信息性，不阻断），把输出作为 activity 事件展示。
+fn run_post_tool_hooks(app: &AppHandle, workspace: &str, tool_name: &str, arguments: &str) {
+    let cfg = load_hooks(workspace);
+    if cfg.post_tool_use.is_empty() {
+        return;
+    }
+    let args_val: serde_json::Value =
+        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+    let payload =
+        serde_json::json!({ "hook": "PostToolUse", "tool": tool_name, "arguments": args_val })
+            .to_string();
+    for hook in &cfg.post_tool_use {
+        if hook_matcher_matches(&hook.matcher, tool_name) {
+            let (ok, text) = run_hook_command(workspace, &hook.command, &payload);
+            let _ = app.emit(
+                "tool-event",
+                serde_json::json!({
+                    "toolName": format!("hook:{tool_name}"),
+                    "status": if ok { "succeeded" } else { "failed" },
+                    "inputJson": serde_json::json!({ "command": hook.command }).to_string(),
+                    "outputJson": serde_json::Value::Null,
+                    "errorMessage": if ok || text.is_empty() { None } else { Some(text) },
+                }),
+            );
+        }
+    }
+}
 
 /// remember 工具：把一条值得跨会话记住的事实追加到工作区 MDGA.md 的「自动记忆」区。
 ///
@@ -2182,6 +2461,21 @@ async fn chat_with_builtin_tools(
             return Ok(usage);
         }
 
+        // Steering：取出用户在运行中排队的插话，作为 user 消息注入本轮，让模型即时纠偏。
+        let steering_msgs: Vec<String> = {
+            let state = app.state::<AppState>();
+            state
+                .steering
+                .lock()
+                .ok()
+                .and_then(|mut map| map.get_mut(conversation_id).map(std::mem::take))
+                .unwrap_or_default()
+        };
+        for msg in steering_msgs {
+            wire_messages.push(serde_json::json!({ "role": "user", "content": msg }));
+            let _ = app.emit("steering-injected", &msg);
+        }
+
         // 两级上下文压缩：超软上限先把较早的大体积工具结果换成短桩（机械、零成本）；
         // 若已无桩可压仍超限，触发摘要压缩（auto-compact），把旧历史压成任务进度摘要。
         let soft_limit = context_soft_limit_tokens();
@@ -2363,6 +2657,15 @@ async fn chat_with_builtin_tools(
                 continue;
             }
 
+            // PreToolUse 钩子：用户定义的执行前校验，退出码非 0 则阻断（原因回灌模型）。
+            if let Some(reason) = run_pre_tool_hooks(workspace_path, &tool_name, &arguments) {
+                feed_tool_denial(
+                    app, conversation_id, &tool_name, &arguments, workspace_path,
+                    &reason, &call.id, &mut wire_messages,
+                );
+                continue;
+            }
+
             record_tool_event(
                 app,
                 conversation_id,
@@ -2455,6 +2758,11 @@ async fn chat_with_builtin_tools(
                 "tool_call_id": call.id,
                 "content": output_str
             }));
+
+            // PostToolUse 钩子：工具成功后运行用户定义的后处理（如自动格式化 / 跑测试），信息性不阻断。
+            if status == "succeeded" {
+                run_post_tool_hooks(app, workspace_path, &tool_name, &arguments);
+            }
         }
     }
 }
@@ -2511,11 +2819,23 @@ fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
             "Edit an existing UTF-8 text file by replacing oldText with newText. Prefer this for code or text modifications.",
             &["path", "oldText", "newText"],
         ),
-        file_tool_schema(
-            "read_file",
-            "Read a UTF-8 text file inside the current MDGA conversation workspace. Use this when the user asks to inspect or summarize file contents.",
-            &["path"],
-        ),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a UTF-8 text file inside the workspace. Returns up to ~1500 lines by default with total line count and has_more. For large files, page through with offset (0-based start line) and limit (lines).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path inside the workspace." },
+                        "offset": { "type": "integer", "description": "0-based start line. Use with has_more to page large files. Default 0." },
+                        "limit": { "type": "integer", "description": "Max lines to return (<= 4000). Default ~1500." }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        }),
         file_tool_schema(
             "delete_file",
             "Delete a single file inside the current MDGA conversation workspace. Use this when the user asks to remove a file.",
@@ -2941,6 +3261,53 @@ mod tests {
     }
 
     #[test]
+    fn hook_matcher_matches_tool_lists() {
+        assert!(hook_matcher_matches("*", "write_file"));
+        assert!(hook_matcher_matches("write_file|edit_file", "edit_file"));
+        assert!(hook_matcher_matches("write_file, run_command", "run_command"));
+        assert!(!hook_matcher_matches("write_file|edit_file", "read_file"));
+    }
+
+    #[test]
+    fn glob_match_handles_wildcards() {
+        assert!(glob_match("**/.env", "src/config/.env"));
+        assert!(glob_match("src/**", "src/a/b.rs"));
+        assert!(glob_match("*.env", ".env"));
+        assert!(glob_match("*.env", "prod.env"));
+        assert!(!glob_match("*.env", "env.txt"));
+        assert!(glob_match("exact.txt", "exact.txt"));
+        assert!(!glob_match("exact.txt", "other.txt"));
+    }
+
+    #[test]
+    fn permission_rules_deny_takes_precedence() {
+        let rules = vec![
+            "allow:tool:read_file".to_string(),
+            "deny:read_file:**/.env".to_string(),
+        ];
+        // 读普通文件：allow 命中
+        assert_eq!(
+            permission_rules_decision(&rules, "read_file", "{\"path\":\"src/main.rs\"}"),
+            Some(true)
+        );
+        // 读 .env：deny 命中，优先否决
+        assert_eq!(
+            permission_rules_decision(&rules, "read_file", "{\"path\":\"src/.env\"}"),
+            Some(false)
+        );
+        // 旧式裸规则向后兼容（视为 allow）
+        assert_eq!(
+            permission_rules_decision(&["tool:write_file".to_string()], "write_file", "{}"),
+            Some(true)
+        );
+        // 命令前缀规则
+        assert_eq!(
+            permission_rules_decision(&["cmd:git push".to_string()], "run_command", "{\"command\":\"git push origin\"}"),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn html_to_text_strips_tags_and_scripts() {
         let html = "<html><head><style>.a{color:red}</style></head><body><h1>标题</h1><script>alert(1)</script><p>正文 &amp; 内容</p></body></html>";
         let text = html_to_text(html);
@@ -3178,6 +3545,7 @@ fn main() {
                 cancels: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 mcp: Mutex::new(HashMap::new()),
+                steering: Mutex::new(HashMap::new()),
             });
 
             // 启动时后台连接所有已启用的 MCP server，不阻塞窗口加载。
@@ -3218,9 +3586,13 @@ fn main() {
             create_mcp_server,
             toggle_mcp_server,
             delete_mcp_server,
+            get_permission_rules,
+            create_permission_rule,
+            delete_permission_rule,
             import_file_text,
             get_conversation_events,
             cancel_agent,
+            queue_steering,
             respond_approval,
             get_workspace,
             set_workspace_path,

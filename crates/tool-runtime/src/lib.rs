@@ -5,7 +5,11 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-const MAX_READ_BYTES: u64 = 256 * 1024;
+const MAX_READ_BYTES: u64 = 1024 * 1024;
+/// read_file 默认返回行数（未指定 limit 时），平衡上下文体积与一次读够。
+const DEFAULT_READ_LINES: usize = 1500;
+/// read_file 单次返回行数硬上限。
+const MAX_READ_LINES: usize = 4000;
 const MAX_SEARCH_FILE_BYTES: u64 = 128 * 1024;
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 120;
@@ -42,6 +46,12 @@ pub struct ListDirRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ReadFileRequest {
     pub path: String,
+    /// 起始行（0 基），用于分页读取大文件。默认 0。
+    #[serde(default)]
+    pub offset: usize,
+    /// 最多读取的行数。为 0 时使用默认上限 DEFAULT_READ_LINES。
+    #[serde(default)]
+    pub limit: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -139,6 +149,14 @@ pub struct ReadFileResult {
     pub absolute_path: String,
     pub content: String,
     pub bytes_read: u64,
+    /// 文件总行数（分页判断用）。
+    pub total_lines: usize,
+    /// 本次返回的起始行（0 基）。
+    pub start_line: usize,
+    /// 本次返回的行数。
+    pub returned_lines: usize,
+    /// 是否还有更多行未返回（提示模型用更大 offset 继续读）。
+    pub has_more: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -336,13 +354,30 @@ pub fn read_file(
     request: ReadFileRequest,
 ) -> Result<ReadFileResult, ToolRuntimeError> {
     let (_workspace, relative, target) = resolve_existing_path(workspace_root, &request.path)?;
-    let content = read_utf8_file(&target, MAX_READ_BYTES)?;
+    let full = read_utf8_file(&target, MAX_READ_BYTES)?;
+
+    // 分页：按行切片，offset 起、最多 limit 行（默认 DEFAULT_READ_LINES），让大文件可分段读取。
+    let lines: Vec<&str> = full.lines().collect();
+    let total_lines = lines.len();
+    let start_line = request.offset.min(total_lines);
+    let limit = if request.limit == 0 {
+        DEFAULT_READ_LINES
+    } else {
+        request.limit.min(MAX_READ_LINES)
+    };
+    let end = start_line.saturating_add(limit).min(total_lines);
+    let content = lines[start_line..end].join("\n");
+    let returned_lines = end - start_line;
 
     Ok(ReadFileResult {
         relative_path: normalize_relative_path(&relative),
         absolute_path: target.to_string_lossy().to_string(),
         bytes_read: content.len() as u64,
         content,
+        total_lines,
+        start_line,
+        returned_lines,
+        has_more: end < total_lines,
     })
 }
 
@@ -1147,12 +1182,29 @@ mod tests {
             &workspace,
             ReadFileRequest {
                 path: "note.txt".to_string(),
+                offset: 0,
+                limit: 0,
             },
         )
         .expect("file should read");
 
         assert_eq!(result.relative_path, "note.txt");
         assert_eq!(result.content, "hello");
+        assert_eq!(result.total_lines, 1);
+        assert!(!result.has_more);
+
+        // 分页：写多行后从 offset 读取
+        std::fs::write(workspace.join("big.txt"), "l0\nl1\nl2\nl3\nl4").unwrap();
+        let page = read_file(
+            &workspace,
+            ReadFileRequest { path: "big.txt".to_string(), offset: 1, limit: 2 },
+        )
+        .expect("paged read");
+        assert_eq!(page.content, "l1\nl2");
+        assert_eq!(page.total_lines, 5);
+        assert_eq!(page.start_line, 1);
+        assert_eq!(page.returned_lines, 2);
+        assert!(page.has_more);
 
         let _ = std::fs::remove_dir_all(workspace);
     }

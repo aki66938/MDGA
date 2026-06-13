@@ -560,6 +560,12 @@ pub fn list_permission_rules(conn: &Connection) -> SqlResult<Vec<String>> {
     rows.collect()
 }
 
+/// 删除一条权限规则。
+pub fn remove_permission_rule(conn: &Connection, rule: &str) -> SqlResult<()> {
+    conn.execute("DELETE FROM permission_rules WHERE rule = ?1", params![rule])?;
+    Ok(())
+}
+
 // ── Workspace CRUD ────────────────────────────────────────────────────────
 
 /// 保存当前活动工作区。
