@@ -190,6 +190,176 @@ where
     Ok(captured_usage)
 }
 
+/// 查找正文中工具调用标记（DSML / ToolCall 各变体）的最早字节位置；无标记返回 None。
+fn tool_markup_index(content: &str) -> Option<usize> {
+    let stripped = strip_dsml_bars(content);
+    // 在去竖线后的串里找标记，再映射回原串大致位置不可靠；改为直接在原串找各变体前缀。
+    ["<DSML", "<ToolCall", "<\u{FF5C}"]
+        .iter()
+        .filter_map(|m| content.find(m))
+        .min()
+        .or_else(|| {
+            // 去竖线后才暴露的 <DSML（原串是 <｜DSML）：用 stripped 命中则保守地从首个 '<' 截断
+            if stripped.contains("<DSML") || stripped.contains("<ToolCall") {
+                content.find('<')
+            } else {
+                None
+            }
+        })
+}
+
+/// 带工具的流式聊天：边流边把**安全的**叙述内容通过回调推送（token 级），
+/// 同时累积 delta.tool_calls，结束后返回结构化结果。
+///
+/// 内置防泄漏守卫：一旦检测到正文出现工具调用标记（DSML / `<ToolCall>`），停止外显后续内容，
+/// 把整段标记留给上层 DSML 兜底解析，避免标记 token 流到界面。完整 content 仍在返回值里供解析。
+pub async fn chat_stream_with_tools<F>(
+    api_key: &str,
+    messages: Vec<serde_json::Value>,
+    model: &str,
+    tools: Vec<serde_json::Value>,
+    on_content: F,
+) -> Result<ChatCompletionResult, DeepSeekError>
+where
+    F: Fn(String),
+{
+    const GUARD: usize = 12; // 末尾保留窗口，防止正在形成的标记被提前外显
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(DeepSeekError::Http)?;
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+        "stream_options": { "include_usage": true }
+    });
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools);
+        body["tool_choice"] = serde_json::json!("auto");
+    }
+
+    let response = client
+        .post("https://api.deepseek.com/chat/completions")
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(classify_api_error(status, &text));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut content_full = String::new();
+    let mut emitted_bytes = 0usize; // 已外显的 content 字节数
+    let mut leaked = false;
+    let mut usage: Option<RawUsage> = None;
+    // tool_calls 累积：按 index 收集 id / name / arguments 片段
+    let mut tool_acc: Vec<(String, String, String)> = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk?;
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+        loop {
+            let Some(pos) = buffer.find('\n') else { break };
+            let line = buffer[..pos].trim().to_string();
+            buffer = buffer[pos + 1..].to_string();
+            let Some(data) = line.strip_prefix("data: ") else { continue };
+            if data == "[DONE]" {
+                break;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+            if let Some(usage_val) = value.get("usage") {
+                if !usage_val.is_null() {
+                    usage = Some(parse_raw_usage(usage_val, data));
+                }
+            }
+            // 累积 tool_calls 片段
+            if let Some(calls) = value
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(|v| v.as_array())
+            {
+                for call in calls {
+                    let idx = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    while tool_acc.len() <= idx {
+                        tool_acc.push((String::new(), String::new(), String::new()));
+                    }
+                    if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                        if !id.is_empty() {
+                            tool_acc[idx].0 = id.to_string();
+                        }
+                    }
+                    if let Some(name) = call.pointer("/function/name").and_then(|v| v.as_str()) {
+                        if !name.is_empty() {
+                            tool_acc[idx].1 = name.to_string();
+                        }
+                    }
+                    if let Some(args) = call.pointer("/function/arguments").and_then(|v| v.as_str()) {
+                        tool_acc[idx].2.push_str(args);
+                    }
+                }
+            }
+            // 内容片段：守卫式外显
+            if let Some(delta) = value
+                .pointer("/choices/0/delta/content")
+                .and_then(|v| v.as_str())
+            {
+                if !delta.is_empty() {
+                    content_full.push_str(delta);
+                    if !leaked {
+                        if let Some(marker) = tool_markup_index(&content_full) {
+                            // 命中标记：外显到标记前，之后停止外显
+                            if marker > emitted_bytes {
+                                on_content(content_full[emitted_bytes..marker].to_string());
+                            }
+                            emitted_bytes = content_full.len();
+                            leaked = true;
+                        } else {
+                            // 未命中：外显到 len-GUARD（在字符边界上）
+                            let safe_end = content_full.len().saturating_sub(GUARD);
+                            if safe_end > emitted_bytes && content_full.is_char_boundary(safe_end) {
+                                on_content(content_full[emitted_bytes..safe_end].to_string());
+                                emitted_bytes = safe_end;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 收尾：未泄漏时把保留窗口里的安全尾巴补发
+    if !leaked && content_full.len() > emitted_bytes {
+        on_content(content_full[emitted_bytes..].to_string());
+    }
+
+    let tool_calls: Vec<ToolCall> = tool_acc
+        .into_iter()
+        .enumerate()
+        .filter(|(_, (_, name, _))| !name.is_empty())
+        .map(|(i, (id, name, args))| ToolCall {
+            id: if id.is_empty() { format!("call_{i}") } else { id },
+            kind: "function".to_string(),
+            function: ToolFunctionCall { name, arguments: args },
+        })
+        .collect();
+
+    let assistant_message = serde_json::json!({
+        "role": "assistant",
+        "content": if content_full.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(content_full.clone()) },
+        "tool_calls": tool_calls,
+    });
+
+    Ok(ChatCompletionResult {
+        content: if content_full.is_empty() { None } else { Some(content_full) },
+        tool_calls,
+        assistant_message,
+        usage,
+    })
+}
+
 /// 向 DeepSeek API 发起一次非流式聊天请求，可携带 tool schema。
 ///
 /// 输入 API Key、消息 JSON、模型名和可选工具列表；输出 assistant 内容、tool calls 和 usage。
@@ -633,6 +803,18 @@ mod tests {
             serde_json::from_str(&calls[0].function.arguments).expect("arguments should be json");
         assert_eq!(parsed["pattern"], "README.md");
         assert_eq!(parsed["recursive"], "false");
+    }
+
+    #[test]
+    fn tool_markup_index_detects_variants() {
+        assert!(tool_markup_index("纯叙述，没有标记").is_none());
+        assert!(tool_markup_index("先看文件 <DSMLinvoke").is_some());
+        assert!(tool_markup_index("好的 <ToolCall name=").is_some());
+        // 单/双竖线 DSML 变体
+        assert!(tool_markup_index("好的 <\u{FF5C}DSML\u{FF5C}invoke").is_some());
+        // 命中位置应在叙述之后
+        let idx = tool_markup_index("叙述 <ToolCall x").unwrap();
+        assert_eq!(&"叙述 <ToolCall x"[..idx], "叙述 ");
     }
 
     #[test]

@@ -9,7 +9,7 @@ import "highlight.js/styles/github.css";
 import {
   SquarePen, Search, Pin, Archive, ArchiveRestore, Trash2, Settings2,
   Paperclip, ListChecks, Square, ArrowUp, GitCompare, Plug, Sun, Moon,
-  Check, X, Ban, Loader2, Info, CircleDot, CheckSquare, ChevronRight,
+  Check, X, Ban, Sparkle, Info, CircleDot, CheckSquare, ChevronRight,
   ChevronDown, FolderOpen, Gauge, AtSign,
 } from "lucide-react";
 
@@ -1861,7 +1861,7 @@ function ToolInlineRow({ part }: { part: ToolPart }) {
   const { toolName, target, status, error, diff, added, removed, liveOutput } = part;
   const [showDiff, setShowDiff] = useState(false);
   const icon =
-    status === "running" ? <Loader2 size={13} className="spin" /> :
+    status === "running" ? <Sparkle size={13} className="twinkle" fill="currentColor" /> :
     status === "succeeded" ? <Check size={13} /> :
     status === "denied" ? <Ban size={13} /> : <X size={13} />;
   const hasDiff = typeof diff === "string" && diff.trim().length > 0;

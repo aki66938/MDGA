@@ -1626,9 +1626,18 @@ h1 {
 
 .slash-menu__icon { color: var(--text-3); flex-shrink: 0; }
 
-/* 旋转动画（工具卡运行中的 Loader 图标） */
-.spin { animation: mdga-spin 0.9s linear infinite; }
-@keyframes mdga-spin { to { transform: rotate(360deg); } }
+/* 工具运行中：四角星闪动（缩放 + 透明度脉冲，非旋转），品牌蓝 */
+.twinkle {
+  color: var(--brand);
+  animation: mdga-twinkle 1.3s ease-in-out infinite;
+}
+@keyframes mdga-twinkle {
+  0%, 100% { transform: scale(0.78) rotate(0deg);   opacity: 0.55; }
+  50%      { transform: scale(1.12) rotate(45deg);  opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .twinkle { animation: none; opacity: 0.8; }
+}
 
 /* tool-inline 图标颜色随状态（Lucide 继承 currentColor） */
 .tool-inline__icon { display: inline-flex; }

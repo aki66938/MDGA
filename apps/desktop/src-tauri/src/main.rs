@@ -1,6 +1,6 @@
 use mdga_deepseek_client::{
-    chat_completion, chat_stream, detect_api_key_status, get_user_balance, parse_dsml_tool_calls,
-    strip_dsml_markup, ChatMessage, ToolCall, UserBalance,
+    chat_completion, chat_stream, chat_stream_with_tools, detect_api_key_status, get_user_balance,
+    parse_dsml_tool_calls, strip_dsml_markup, ChatMessage, ToolCall, UserBalance,
 };
 use mdga_sandbox_runtime::{
     decide_tool_access, is_low_risk_command, session_security_context, NetworkMode,
@@ -919,7 +919,7 @@ create_file、write_file 或 delete_file 工具完成真实本地操作；不要
     });
     injected.push(ChatMessage {
         role: "system".to_string(),
-        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。若某次工具调用失败，请阅读返回的 error，判断是参数、路径还是环境问题，调整后重试或换用其他工具，不要原样重复同一次失败调用。对于多步骤任务，请先调用 todo_write 列出步骤清单并随进度更新状态（同一时刻只有一项 in_progress），让用户实时看到进度。需要在大型代码库做只读调查（找实现、理结构、读懂模块）时，优先调用 run_subtask 委托独立子代理，避免主对话上下文膨胀。长时间运行的命令（启动服务、watch 等）用 run_command 的 background=true。用户消息中的 @相对路径 表示工作区文件引用，直接用 read_file 读取即可。".to_string(),
+        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。若某次工具调用失败，请阅读返回的 error，判断是参数、路径还是环境问题，调整后重试或换用其他工具，不要原样重复同一次失败调用。对于多步骤任务，请先调用 todo_write 列出步骤清单并随进度更新状态（同一时刻只有一项 in_progress），让用户实时看到进度。需要在大型代码库做只读调查（找实现、理结构、读懂模块）时，优先调用 run_subtask 委托独立子代理，避免主对话上下文膨胀。长时间运行的命令（启动服务、watch 等）用 run_command 的 background=true。用户消息中的 @相对路径 表示工作区文件引用，直接用 read_file 读取即可。需要查阅在线文档、报错信息或你不确定的最新资料时，用 web_search 搜索、再用 web_fetch 抓取相关 URL 的正文，不要凭记忆臆测。遇到值得跨会话记住的项目约定、关键路径或踩过的坑，用 remember 写入项目长期记忆（精炼、可复用的事实才记，临时细节不要记）。".to_string(),
     });
     // repo map：开局注入工作区结构摘要，让模型无需逐层 list_dir 就了解项目骨架。
     if let Some(map) = repo_map.filter(|map| !map.trim().is_empty()) {
@@ -1410,6 +1410,42 @@ fn apply_checkpoint_revert(workspace: &str, checkpoint: &FileCheckpoint) -> Resu
 
 // ── todo / 后台命令 / 子任务 ─────────────────────────────────────────────
 
+/// remember 工具：把一条值得跨会话记住的事实追加到工作区 MDGA.md 的「自动记忆」区。
+///
+/// 让 Agent 在工作中自主沉淀经验（项目约定、踩过的坑、关键路径），下次会话自动注入。
+/// 去重：同样内容已存在则不重复追加。
+fn execute_remember(workspace: &str, arguments: &str) -> Result<serde_json::Value, String> {
+    const SECTION: &str = "## 自动记忆（由 Agent 维护）";
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|e| format!("工具参数解析失败: {e}"))?;
+    let fact = parsed
+        .get("fact")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("remember 缺少 fact")?;
+    if fact.chars().count() > 500 {
+        return Err("单条记忆过长（上限 500 字符），请精炼".to_string());
+    }
+    let path = std::path::Path::new(workspace).join("MDGA.md");
+    let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+    let entry = format!("- {fact}");
+    if content.contains(&entry) {
+        return Ok(serde_json::json!({ "note": "该记忆已存在，未重复添加" }));
+    }
+    if content.contains(SECTION) {
+        // 在 section 标题后插入
+        content = content.replacen(SECTION, &format!("{SECTION}\n{entry}"), 1);
+    } else {
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&format!("\n{SECTION}\n{entry}\n"));
+    }
+    std::fs::write(&path, content).map_err(|e| format!("写入 MDGA.md 失败: {e}"))?;
+    Ok(serde_json::json!({ "note": "已记入 MDGA.md，下次会话自动生效", "fact": fact }))
+}
+
 /// todo_write 工具：更新任务清单并推送给前端实时展示，不触碰文件系统。
 fn execute_todo_write(app: &AppHandle, arguments: &str) -> Result<serde_json::Value, String> {
     let parsed: serde_json::Value =
@@ -1426,6 +1462,209 @@ fn execute_todo_write(app: &AppHandle, arguments: &str) -> Result<serde_json::Va
         "count": items.len(),
         "note": "任务清单已更新并实时展示给用户"
     }))
+}
+
+/// 把 HTML 粗略转为可读纯文本：去掉 script/style 整块，剥离标签，解码实体，压缩空白。
+/// UTF-8 安全：按字符处理，不按字节，避免多字节中文被破坏。
+fn html_to_text(html: &str) -> String {
+    let mut s = html.to_string();
+    // 移除 script / style 整块（每轮重算 lower，保证偏移与 s 同步）
+    for tag in ["script", "style"] {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        loop {
+            let lower = s.to_lowercase();
+            let Some(start) = lower.find(&open) else { break };
+            match lower[start..].find(&close) {
+                Some(rel) => {
+                    let end = start + rel + close.len();
+                    s.replace_range(start..end, " ");
+                }
+                None => {
+                    s.replace_range(start.., " ");
+                    break;
+                }
+            }
+        }
+    }
+    // 按字符剥离标签
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                out.push(' ');
+            }
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    let decoded = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    decoded
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 可并行执行的只读工具集合（无副作用，并发安全）。
+const PARALLEL_READONLY_TOOLS: &[&str] =
+    &["read_file", "list_dir", "search_text", "stat_path", "web_fetch", "web_search"];
+
+/// 执行一个只读工具调用（同步文件工具或异步 web 工具），供并行批量执行。
+async fn execute_readonly_call(
+    security_context: &SessionSecurityContext,
+    tool_name: &str,
+    arguments: &str,
+) -> Result<serde_json::Value, String> {
+    match tool_name {
+        "web_fetch" => execute_web_fetch(arguments).await,
+        "web_search" => execute_web_search(arguments).await,
+        _ => execute_builtin_tool_call(security_context, tool_name, arguments),
+    }
+}
+
+/// web_fetch 工具：抓取一个 URL 并提取可读正文（截断防膨胀）。仅允许 http/https。
+async fn execute_web_fetch(arguments: &str) -> Result<serde_json::Value, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|e| format!("工具参数解析失败: {e}"))?;
+    let url = parsed.get("url").and_then(|v| v.as_str()).ok_or("web_fetch 缺少 url")?;
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("仅支持 http/https URL".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("MDGA/1.0 (+https://github.com/aki66938/MDGA)")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client.get(url).send().await.map_err(|e| format!("抓取失败: {e}"))?;
+    let status = resp.status();
+    let ctype = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = resp.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
+    let text = if ctype.contains("html") || body.trim_start().starts_with('<') {
+        html_to_text(&body)
+    } else {
+        body
+    };
+    let capped: String = text.chars().take(40_000).collect();
+    Ok(serde_json::json!({
+        "url": url,
+        "status": status.as_u16(),
+        "text": capped
+    }))
+}
+
+/// web_search 工具：通过 DuckDuckGo HTML 端点搜索，返回标题 / 链接 / 摘要列表（无需 API Key）。
+async fn execute_web_search(arguments: &str) -> Result<serde_json::Value, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|e| format!("工具参数解析失败: {e}"))?;
+    let query = parsed.get("query").and_then(|v| v.as_str()).ok_or("web_search 缺少 query")?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("Mozilla/5.0 (compatible; MDGA/1.0)")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post("https://html.duckduckgo.com/html/")
+        .form(&[("q", query)])
+        .send()
+        .await
+        .map_err(|e| format!("搜索失败: {e}"))?;
+    let html = resp.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
+    let results = parse_ddg_results(&html, 8);
+    if results.is_empty() {
+        return Ok(serde_json::json!({
+            "query": query,
+            "results": [],
+            "note": "未解析到结果（搜索页结构可能变化），可改用 web_fetch 直接抓取已知 URL。"
+        }));
+    }
+    Ok(serde_json::json!({ "query": query, "results": results }))
+}
+
+/// 从 DuckDuckGo HTML 结果页解析前 limit 条 { title, url, snippet }。
+fn parse_ddg_results(html: &str, limit: usize) -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    // 结果链接锚点：class="result__a" href="..."；摘要：class="result__snippet"
+    for chunk in html.split("result__a").skip(1) {
+        if results.len() >= limit {
+            break;
+        }
+        let Some(href_pos) = chunk.find("href=\"") else { continue };
+        let after = &chunk[href_pos + 6..];
+        let Some(end) = after.find('"') else { continue };
+        let raw_url = &after[..end];
+        let url = decode_ddg_url(raw_url);
+        // 标题：href 标签 > 之后到 </a>
+        let title = after
+            .find('>')
+            .and_then(|gt| after[gt + 1..].find("</a>").map(|e| &after[gt + 1..gt + 1 + e]))
+            .map(|t| html_to_text(t))
+            .unwrap_or_default();
+        let snippet = chunk
+            .find("result__snippet")
+            .and_then(|p| chunk[p..].find('>').map(|gt| &chunk[p + gt + 1..]))
+            .and_then(|s| s.find("</a>").map(|e| &s[..e]))
+            .map(|s| html_to_text(s))
+            .unwrap_or_default();
+        if url.starts_with("http") && !title.is_empty() {
+            results.push(serde_json::json!({
+                "title": title,
+                "url": url,
+                "snippet": snippet.chars().take(300).collect::<String>()
+            }));
+        }
+    }
+    results
+}
+
+/// DuckDuckGo 跳转链接 `//duckduckgo.com/l/?uddg=<编码真实URL>` 解码为真实 URL。
+fn decode_ddg_url(raw: &str) -> String {
+    let target = if let Some(pos) = raw.find("uddg=") {
+        let enc = &raw[pos + 5..];
+        let enc = enc.split('&').next().unwrap_or(enc);
+        percent_decode(enc)
+    } else {
+        raw.to_string()
+    };
+    if target.starts_with("//") {
+        format!("https:{target}")
+    } else {
+        target
+    }
+}
+
+/// 最小 percent-decode（仅用于 DDG 跳转 URL 还原）。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 /// 执行一次 MCP 外部工具调用：经已连接客户端转发，结果文本截断后回灌模型。
@@ -1854,6 +2093,54 @@ async fn chat_completion_with_retry(
     }
 }
 
+/// 带退避重试的流式工具轮：边流边把叙述 token 推到前端（"chat-chunk"），同时累积 tool_calls。
+///
+/// 仅在「尚未外显任何内容」时才对可重试错误重试，避免重试导致内容重复外显；
+/// 一旦已开始流式输出再失败，则直接返回错误。
+async fn stream_round_with_retry(
+    api_key: &str,
+    messages: Vec<serde_json::Value>,
+    model: &str,
+    tools: Vec<serde_json::Value>,
+    app: &AppHandle,
+) -> Result<mdga_deepseek_client::ChatCompletionResult, String> {
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let emitted = Arc::new(AtomicBool::new(false));
+        let emitted_cb = emitted.clone();
+        let app_cb = app.clone();
+        let result = chat_stream_with_tools(
+            api_key,
+            messages.clone(),
+            model,
+            tools.clone(),
+            move |chunk| {
+                emitted_cb.store(true, Ordering::SeqCst);
+                let _ = app_cb.emit("chat-chunk", chunk);
+            },
+        )
+        .await;
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err)
+                if err.is_retryable()
+                    && attempt < MAX_ATTEMPTS
+                    && !emitted.load(Ordering::SeqCst) =>
+            {
+                let delay_ms = 500u64 * 2u64.pow(attempt - 1);
+                let _ = app.emit(
+                    "chat-chunk",
+                    format!("\n\n（网络波动，正在重试（第 {attempt}/{} 次）…）\n\n", MAX_ATTEMPTS - 1),
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+}
+
 /// Agent 工具循环：每轮带工具问模型、执行返回的工具、把结果回灌，直到模型不再调用工具
 /// （自然终止）或用户中断。不设轮数上限——上下文自动压缩兜底体积，取消按钮兜底失控；
 /// 所有工具执行前都经 SessionSecurityContext 裁决。
@@ -1932,14 +2219,10 @@ async fn chat_with_builtin_tools(
             serde_json::json!({ "state": "thinking", "round": round }),
         );
 
-        let completion = chat_completion_with_retry(
-            api_key,
-            wire_messages.clone(),
-            model,
-            Some(tool_schemas.clone()),
-            app,
-        )
-        .await?;
+        // 流式获取本轮结果：叙述 token 边流边显（内置标记防泄漏守卫），同时累积 tool_calls。
+        let completion =
+            stream_round_with_retry(api_key, wire_messages.clone(), model, tool_schemas.clone(), app)
+                .await?;
         usage = merge_usage(usage, completion.usage.clone());
         if let Some(round_usage) = completion.usage.as_ref() {
             last_prompt_tokens = round_usage.prompt_tokens;
@@ -1953,10 +2236,9 @@ async fn chat_with_builtin_tools(
             );
         }
 
-        // 区分结构化 tool_calls 与从正文兜底解析出的 DSML 调用：
-        // 前者的 content 是模型的真实叙述（可展示），后者的 content 是 DSML 标记（不可展示）。
-        let had_structured_calls = !completion.tool_calls.is_empty();
-        let tool_calls = if had_structured_calls {
+        // tool_calls 优先取结构化（流式 delta 累积），为空时从正文兜底解析 DSML / <ToolCall> 变体。
+        // 叙述内容已在流式过程中实时外显（守卫防标记泄漏），此处不再重复 emit。
+        let tool_calls = if !completion.tool_calls.is_empty() {
             completion.tool_calls.clone()
         } else {
             completion
@@ -1966,31 +2248,71 @@ async fn chat_with_builtin_tools(
                 .unwrap_or_default()
         };
 
-        // 模型不再调用工具：发出最终回复并结束循环（清洗掉可能泄漏的 DSML 标记）。
+        // 模型不再调用工具：本轮叙述即最终回复，已流式输出完毕，结束循环。
         if tool_calls.is_empty() {
-            if let Some(content) = completion.content.as_deref() {
-                let _ = app.emit("chat-chunk", strip_dsml_markup(content));
-            }
             return Ok(usage);
-        }
-
-        // 多轮过程流式可见：把模型调用工具前的叙述实时推送，让用户看到「为什么这么做」。
-        // 结构化调用的 content 是纯叙述；DSML 兜底路径的 content 含标记，需清洗后只留叙述前缀。
-        if let Some(content) = completion.content.as_deref() {
-            let narration = if had_structured_calls {
-                content.trim().to_string()
-            } else {
-                strip_dsml_markup(content)
-            };
-            if !narration.trim().is_empty() {
-                let _ = app.emit("chat-chunk", format!("{}\n\n", narration.trim()));
-            }
         }
 
         wire_messages.push(assistant_message_for_tool_calls(
             completion.assistant_message,
             &tool_calls,
         ));
+
+        // 并行快路径：当本轮多个调用全部是「自动放行的只读工具」时并发执行（读多文件 / 抓多 URL 提速）。
+        let all_parallel_readonly = tool_calls.len() > 1
+            && tool_calls.iter().all(|call| {
+                PARALLEL_READONLY_TOOLS.contains(&call.function.name.as_str())
+                    && matches!(
+                        gate_tool_decision(
+                            &security_context,
+                            &call.function.name,
+                            &call.function.arguments,
+                            &permission_rules,
+                        ),
+                        ToolGate::Allow
+                    )
+            });
+        if all_parallel_readonly {
+            if cancel.load(Ordering::SeqCst) {
+                let _ = app.emit("chat-chunk", "\n\n（已中断）".to_string());
+                return Ok(usage);
+            }
+            // 先发运行事件（卡片同时出现），再并发执行。
+            for call in &tool_calls {
+                record_tool_event(
+                    app, conversation_id, "tool_started", &call.function.name, "running",
+                    &call.function.arguments, None, None, workspace_path,
+                );
+            }
+            let results = futures_util::future::join_all(tool_calls.iter().map(|call| {
+                let sec = &security_context;
+                async move {
+                    execute_readonly_call(sec, &call.function.name, &call.function.arguments).await
+                }
+            }))
+            .await;
+            for (call, result) in tool_calls.iter().zip(results.into_iter()) {
+                let (output, status, error) = match &result {
+                    Ok(value) => (serde_json::json!({ "ok": true, "result": value }), "succeeded", None),
+                    Err(message) => (
+                        serde_json::json!({ "ok": false, "error": message, "hint": "工具执行失败，请阅读 error 调整后重试或换用其他工具。" }),
+                        "failed",
+                        Some(message.clone()),
+                    ),
+                };
+                let output_str = output.to_string();
+                record_tool_event(
+                    app, conversation_id,
+                    if status == "succeeded" { "tool_succeeded" } else { "tool_failed" },
+                    &call.function.name, status, &call.function.arguments,
+                    Some(&output_str), error.as_deref(), workspace_path,
+                );
+                wire_messages.push(serde_json::json!({
+                    "role": "tool", "tool_call_id": call.id, "content": output_str
+                }));
+            }
+            continue;
+        }
 
         for call in tool_calls {
             // 工具执行前检查取消：避免停止后仍继续执行剩余工具。
@@ -2064,6 +2386,9 @@ async fn chat_with_builtin_tools(
                 match tool_name.as_str() {
                 "todo_write" => execute_todo_write(app, &arguments),
                 "load_skill" => execute_load_skill(workspace_path, &arguments),
+                "remember" => execute_remember(workspace_path, &arguments),
+                "web_fetch" => execute_web_fetch(&arguments).await,
+                "web_search" => execute_web_search(&arguments).await,
                 "run_command" => execute_run_command_tool(app, &security_context, &arguments),
                 "run_subtask" => {
                     let _ = app.emit(
@@ -2309,6 +2634,51 @@ fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
+                "name": "web_fetch",
+                "description": "Fetch a web page or document by URL and return its readable text content. Use this to read documentation, articles, error references, or any known URL. http/https only.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "The http/https URL to fetch." }
+                    },
+                    "required": ["url"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web and get a list of result titles, URLs and snippets. Use this when you need to find current information, documentation, or solutions you don't already know. Follow up with web_fetch on the most relevant URLs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "The search query." }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "remember",
+                "description": "Persist a concise fact worth remembering across sessions (project convention, a gotcha you hit, a key file path). It is appended to the workspace MDGA.md and auto-injected in future sessions. Use sparingly for durable, reusable facts — not transient details.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "fact": { "type": "string", "description": "One concise fact to remember (<= 500 chars)." }
+                    },
+                    "required": ["fact"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
                 "name": "run_subtask",
                 "description": "Delegate a focused READ-ONLY exploration subtask (e.g. 'find where X is implemented', 'summarize how module Y works') to a sub-agent with its own fresh context. The sub-agent can only list/read/search files and returns a concise text report. Use this to investigate large codebases without bloating the main conversation.",
                 "parameters": {
@@ -2476,14 +2846,15 @@ fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability, String> {
         return Ok(ToolCapability::NetworkAccess);
     }
     match tool_name {
-        // todo_write 只更新任务清单 UI，不触碰文件系统，等同列表级低风险。
+        // todo_write/load_skill/run_subtask 只读或纯 UI；remember 仅追加项目记忆文件，低风险。
         "list_dir" | "read_file" | "stat_path" | "search_text" | "todo_write"
-        | "run_subtask" | "load_skill" => Ok(ToolCapability::FileRead),
+        | "run_subtask" | "load_skill" | "remember" => Ok(ToolCapability::FileRead),
         "create_file" | "write_file" | "edit_file" | "make_dir" | "move_path" => {
             Ok(ToolCapability::FileWrite)
         }
         "delete_file" | "delete_dir" => Ok(ToolCapability::FileDelete),
         "run_command" => Ok(ToolCapability::CommandRun),
+        "web_fetch" | "web_search" => Ok(ToolCapability::NetworkAccess),
         other => Err(format!("未知工具: {other}")),
     }
 }
@@ -2567,6 +2938,22 @@ mod tests {
 
         // 幂等：再压一次不应重复处理
         assert_eq!(compact_tool_outputs(&mut wire, 3, 1_500), 0);
+    }
+
+    #[test]
+    fn html_to_text_strips_tags_and_scripts() {
+        let html = "<html><head><style>.a{color:red}</style></head><body><h1>标题</h1><script>alert(1)</script><p>正文 &amp; 内容</p></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("标题"));
+        assert!(text.contains("正文 & 内容"));
+        assert!(!text.contains("alert"));
+        assert!(!text.contains("color:red"));
+        assert!(!text.contains('<'));
+    }
+
+    #[test]
+    fn percent_decode_restores_url() {
+        assert_eq!(percent_decode("https%3A%2F%2Fa.com%2Fx"), "https://a.com/x");
     }
 
     #[test]

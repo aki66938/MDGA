@@ -2357,6 +2357,7 @@ dependencies = [
 name = "mdga-desktop"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "mdga-deepseek-client",
  "mdga-mcp-client",
  "mdga-sandbox-runtime",
@@ -2365,6 +2366,7 @@ dependencies = [
  "mdga-token-accounting",
  "mdga-tool-runtime",
  "pdf-extract",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",

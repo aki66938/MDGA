@@ -587,12 +587,17 @@ pub fn run_command_streaming(
             .clamp(1, MAX_COMMAND_TIMEOUT_SECS),
     );
 
-    let mut child = Command::new("powershell")
+    let mut builder = Command::new("powershell");
+    builder
         .args(["-NoProfile", "-NonInteractive", "-Command", command])
         .current_dir(&workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // 沙箱加固：从子进程环境中擦除敏感凭据，防止 Agent 命令通过环境变量读取或外泄
+    // API Key 等密钥（Plan06 / Plan09 要求：默认不把 DEEPSEEK_API_KEY 传给子进程）。
+    scrub_secret_env(&mut builder);
+    let mut child = builder
         .spawn()
         .map_err(|err| ToolRuntimeError::CommandFailed(err.to_string()))?;
 
@@ -637,6 +642,32 @@ pub fn run_command_streaming(
         timed_out,
         duration_ms,
     })
+}
+
+/// 从命令子进程的环境中移除敏感凭据变量（API Key / token / secret 等）。
+///
+/// 精确移除已知密钥变量，并按名称模式移除疑似密钥的变量；保留 PATH 等正常变量，
+/// 不做 env_clear（清空会破坏 PATH 导致命令找不到），是性能/可用性与安全的平衡。
+fn scrub_secret_env(builder: &mut Command) {
+    const EXACT: &[&str] = &["DEEPSEEK_API_KEY"];
+    for name in EXACT {
+        builder.env_remove(name);
+    }
+    // 按模式移除：变量名含 API_KEY / SECRET / TOKEN / PASSWORD 的一律不传给子进程。
+    let suspicious: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| {
+            let upper = k.to_uppercase();
+            upper.contains("API_KEY")
+                || upper.contains("APIKEY")
+                || upper.contains("SECRET")
+                || upper.contains("_TOKEN")
+                || upper.contains("PASSWORD")
+        })
+        .collect();
+    for name in suspicious {
+        builder.env_remove(name);
+    }
 }
 
 /// 逐行读取子进程管道：UTF-8 lossy 解码、截断到 MAX_COMMAND_OUTPUT_BYTES，

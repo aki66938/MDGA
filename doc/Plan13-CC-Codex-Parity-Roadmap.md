@@ -141,6 +141,21 @@
 
 ---
 
+### M8 - Agent 能力深化（0.0.19）✅ 代码已实现（待 dev 验证）
+
+Plan13 主体补齐后，从「更强 agent」第一性原则补的能力深化：
+
+- **联网能力** ✅：`web_fetch`（抓 URL → 提取正文）+ `web_search`（DuckDuckGo HTML，无需 Key）；NetworkAccess 能力，进权限审批与审计。Agent 可查文档 / 查报错 / 查库 API。
+- **流式叙述** ✅：工具循环改用 `chat_stream_with_tools`，叙述 token 边流边显；内置标记防泄漏守卫（检测到 DSML / `<ToolCall>` 即停止外显，留给兜底解析），杜绝标记 token 流到界面。
+- **并行只读工具** ✅：一轮内多个「自动放行只读工具」（read/list/search/stat/web_fetch/web_search）并发执行，读多文件 / 抓多 URL 提速。
+- **自动记忆** ✅：`remember` 工具把可复用事实追加到工作区 MDGA.md「自动记忆」区，下次会话自动注入。
+- **沙箱加固** ✅：`run_command` 子进程擦除敏感环境变量（DEEPSEEK_API_KEY 及含 SECRET/TOKEN/PASSWORD 的变量），落实 Plan06/09「默认不把 Key 传给子进程」。
+  - ⏳ 完整 OS 级隔离（Windows restricted token / ACL / 网络隔离）属安全关键 FFI，不与本批其他功能混做，留独立版本专门攻坚（Plan09 明确「沙箱失败不能静默降级」，半成品沙箱比无沙箱更危险）。
+
+> 数据治理（会话导出/删除/备份）与视觉/图片按主创决策不在本批。
+
+---
+
 ## 5. 执行原则
 
 - 每个里程碑可独立交付与验证，按 .dev-rules.md 的迭代节奏推进（CI 窗口不停工，版本归属主创裁决）。
