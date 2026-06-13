@@ -983,8 +983,8 @@ export function App() {
     refreshBalance();
   }
 
-  async function handleAddMcpServer(name: string, command: string) {
-    await invoke("create_mcp_server", { name, command }).catch((err) => {
+  async function handleAddMcpServer(name: string, command: string, authToken?: string) {
+    await invoke("create_mcp_server", { name, command, authToken: authToken || null }).catch((err) => {
       appendNoticeToLastMessage(humanizeError(String(err)));
     });
     await refreshMcpServers();
@@ -1639,7 +1639,7 @@ function SettingsModal({
   onClearData: () => void;
   onModelChange: (m: DeepSeekModelId) => void;
   onPermissionModeChange: (m: PermissionMode) => void;
-  onAddMcpServer: (name: string, command: string) => void;
+  onAddMcpServer: (name: string, command: string, authToken?: string) => void;
   onToggleMcpServer: (id: string, enabled: boolean) => void;
   onDeleteMcpServer: (id: string) => void;
   onRefreshMcp: () => void;
@@ -1650,6 +1650,7 @@ function SettingsModal({
 }) {
   const [mcpName, setMcpName] = useState("");
   const [mcpCommand, setMcpCommand] = useState("");
+  const [mcpToken, setMcpToken] = useState("");
   const [ruleInput, setRuleInput] = useState("");
   // 检查更新按钮自管理：idle → checking → result(10s) → idle，期间禁用、尺寸不变。
   const [checkLabel, setCheckLabel] = useState("检查更新");
@@ -1859,7 +1860,7 @@ function SettingsModal({
                 <span><Plug size={15} style={{ verticalAlign: "-2px" }} /> MCP 服务器</span>
                 <button className="changes-row__revert" type="button" onClick={onRefreshMcp}>刷新状态</button>
               </div>
-              <p className="settings-desc">接入外部 MCP 服务器，其工具会并入模型工具集，统一经权限审批与审计。需本机已安装 Node（npx）或对应运行时。</p>
+              <p className="settings-desc">接入外部 MCP 服务器，其工具会并入模型工具集，统一经权限审批与审计。<b>stdio</b>：填启动命令（需 Node/npx 等）；<b>HTTP</b>：填 http(s):// 地址，可选填 Token；留空且服务端要求授权时自动走浏览器 OAuth。</p>
               {mcpServers.map((s) => (
                 <div key={s.id} className="changes-row">
                   <span className={`mcp-dot${s.connected ? " mcp-dot--on" : ""}`} aria-hidden="true">●</span>
@@ -1872,9 +1873,10 @@ function SettingsModal({
                 </div>
               ))}
               <div className="mcp-add">
-                <input className="conv-search" placeholder="名称（如 filesystem）" value={mcpName} onChange={(e) => setMcpName(e.target.value)} />
-                <input className="conv-search" placeholder="启动命令（如 npx -y @modelcontextprotocol/server-filesystem C:\\data）" value={mcpCommand} onChange={(e) => setMcpCommand(e.target.value)} />
-                <button className="approval-card__btn" type="button" disabled={!mcpName.trim() || !mcpCommand.trim()} onClick={() => { onAddMcpServer(mcpName.trim(), mcpCommand.trim()); setMcpName(""); setMcpCommand(""); }}>添加并连接</button>
+                <input className="conv-search" placeholder="名称（如 filesystem / github）" value={mcpName} onChange={(e) => setMcpName(e.target.value)} />
+                <input className="conv-search" placeholder="启动命令 或 http(s):// 地址" value={mcpCommand} onChange={(e) => setMcpCommand(e.target.value)} />
+                <input className="conv-search" placeholder="Bearer Token（仅 HTTP，可选；留空走 OAuth）" value={mcpToken} onChange={(e) => setMcpToken(e.target.value)} />
+                <button className="approval-card__btn" type="button" disabled={!mcpName.trim() || !mcpCommand.trim()} onClick={() => { onAddMcpServer(mcpName.trim(), mcpCommand.trim(), mcpToken.trim() || undefined); setMcpName(""); setMcpCommand(""); setMcpToken(""); }}>添加并连接</button>
               </div>
             </>
           )}

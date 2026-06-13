@@ -186,6 +186,7 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     add_column_if_missing(&conn, "messages", "parts_json", "TEXT")?;
     add_column_if_missing(&conn, "conversations", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(&conn, "conversations", "archived", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(&conn, "mcp_servers", "auth_token", "TEXT")?;
     Ok(conn)
 }
 
@@ -493,25 +494,33 @@ pub fn mark_checkpoint_reverted(conn: &Connection, checkpoint_id: &str) -> SqlRe
 pub struct McpServerRecord {
     pub id: String,
     pub name: String,
-    /// 完整启动命令行（Windows 下经 cmd /C 执行，兼容 npx/uvx）。
+    /// 启动命令行（stdio）或 http(s):// URL（HTTP 传输）。
     pub command: String,
     pub enabled: bool,
+    /// HTTP 传输的静态 Bearer Token（OAuth 取得后也存于此）；None 表示无。
+    pub auth_token: Option<String>,
     pub created_at: i64,
 }
 
-/// 新增一个 MCP server 配置。
-pub fn add_mcp_server(conn: &Connection, name: &str, command: &str) -> SqlResult<McpServerRecord> {
+/// 新增一个 MCP server 配置（可选静态 token）。
+pub fn add_mcp_server(
+    conn: &Connection,
+    name: &str,
+    command: &str,
+    auth_token: Option<&str>,
+) -> SqlResult<McpServerRecord> {
     let id = Uuid::new_v4().to_string();
     let now = now_ts();
     conn.execute(
-        "INSERT INTO mcp_servers (id, name, command, enabled, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
-        params![id, name, command, now],
+        "INSERT INTO mcp_servers (id, name, command, enabled, auth_token, created_at) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+        params![id, name, command, auth_token, now],
     )?;
     Ok(McpServerRecord {
         id,
         name: name.to_string(),
         command: command.to_string(),
         enabled: true,
+        auth_token: auth_token.map(str::to_string),
         created_at: now,
     })
 }
@@ -519,7 +528,7 @@ pub fn add_mcp_server(conn: &Connection, name: &str, command: &str) -> SqlResult
 /// 列出全部 MCP server 配置。
 pub fn list_mcp_servers(conn: &Connection) -> SqlResult<Vec<McpServerRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, command, enabled, created_at FROM mcp_servers ORDER BY created_at ASC",
+        "SELECT id, name, command, enabled, auth_token, created_at FROM mcp_servers ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(McpServerRecord {
@@ -527,10 +536,20 @@ pub fn list_mcp_servers(conn: &Connection) -> SqlResult<Vec<McpServerRecord>> {
             name: row.get(1)?,
             command: row.get(2)?,
             enabled: row.get::<_, i64>(3)? != 0,
-            created_at: row.get(4)?,
+            auth_token: row.get(4)?,
+            created_at: row.get(5)?,
         })
     })?;
     rows.collect()
+}
+
+/// 更新 MCP server 的 auth_token（OAuth 取得 token 后持久化）。
+pub fn set_mcp_server_token(conn: &Connection, id: &str, token: &str) -> SqlResult<()> {
+    conn.execute(
+        "UPDATE mcp_servers SET auth_token = ?1 WHERE id = ?2",
+        params![token, id],
+    )?;
+    Ok(())
 }
 
 /// 设置 MCP server 启用状态。

@@ -139,11 +139,17 @@ fn collect_mcp_bindings(app: &AppHandle) -> Vec<McpBinding> {
 fn spawn_mcp_connect(app: &AppHandle, record: McpServerRecord) {
     let app = app.clone();
     std::thread::spawn(move || {
-        let result = McpClient::connect(&record.name, &record.command);
+        let result = McpClient::connect(&record.name, &record.command, record.auth_token.as_deref());
         match result {
             Ok(client) => {
                 let tool_count = client.tools.len();
                 let state = app.state::<AppState>();
+                // OAuth 取得的新 token：持久化到该 server 记录，下次连接直接复用。
+                if let Some(token) = client.obtained_token.clone() {
+                    if let Ok(db) = state.db.lock() {
+                        let _ = mdga_storage::set_mcp_server_token(&db, &record.id, &token);
+                    }
+                }
                 if let Ok(mut map) = state.mcp.lock() {
                     map.insert(record.id.clone(), Arc::new(client));
                 }
@@ -749,20 +755,23 @@ fn get_mcp_servers(state: State<AppState>) -> Result<Vec<serde_json::Value>, Str
 
 /// 新增 MCP server 配置并立即后台尝试连接。
 #[tauri::command]
+#[allow(non_snake_case)]
 fn create_mcp_server(
     app: AppHandle,
     state: State<AppState>,
     name: String,
     command: String,
+    authToken: Option<String>,
 ) -> Result<(), String> {
     let name = name.trim();
     let command = command.trim();
     if name.is_empty() || command.is_empty() {
-        return Err("名称与启动命令不能为空".to_string());
+        return Err("名称与启动命令/URL 不能为空".to_string());
     }
+    let token = authToken.as_deref().map(str::trim).filter(|t| !t.is_empty());
     let record = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        add_mcp_server(&db, name, command).map_err(|e| e.to_string())?
+        add_mcp_server(&db, name, command, token).map_err(|e| e.to_string())?
     };
     spawn_mcp_connect(&app, record);
     Ok(())
@@ -1120,7 +1129,15 @@ fn messages_with_workspace_context(
     let name = workspace_name
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("未命名工作区");
-    let mut injected = Vec::with_capacity(messages.len() + 1);
+    let mut injected = Vec::with_capacity(messages.len() + 2);
+    // 身份锚定：明确 MDGA 不是 Claude Code，配置在 .mdga/，防止模型沿用 .claude 等训练记忆里的约定。
+    injected.push(ChatMessage {
+        role: "system".to_string(),
+        content: "你是 MDGA（Make DeepSeek Great Again）桌面 Agent 的内置助手，运行在 MDGA 应用里。\
+你不是 Claude Code，也不是 Codex，不要沿用它们的约定：本应用的配置目录是工作区下的 .mdga/（不是 .claude/，MDGA 没有也不读取 .claude 目录及其中的 settings.json）。\
+MDGA 的可扩展配置都在 .mdga/ 下：技能 .mdga/skills/<名>/SKILL.md，钩子 .mdga/hooks.json，自定义斜杠命令 .mdga/commands/<名>.md，自定义子代理 .mdga/agents/<类型>.md，诊断命令 .mdga/diagnostics；项目长期记忆是工作区根目录的 MDGA.md。\
+安装/配置 MCP 服务器不是通过编辑任何配置文件——请调用 add_mcp_server 工具注册（它会写入 MDGA 的服务器表并立即连接、其工具随后即可调用），或让用户在「设置 → MCP 服务器」添加。绝不要去查找或编辑 .claude/settings.json 之类文件，那对 MDGA 完全无效。".to_string(),
+    });
     injected.push(ChatMessage {
         role: "system".to_string(),
         content: format!(
@@ -2123,6 +2140,29 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+/// add_mcp_server 工具：让 Agent 用 MDGA 真正的机制注册并连接一个 MCP 服务器
+/// （写入 SQLite 服务器表 + 后台连接），而不是去编辑无效的配置文件。
+fn execute_add_mcp_server(app: &AppHandle, arguments: &str) -> Result<serde_json::Value, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|e| format!("工具参数解析失败: {e}"))?;
+    let name = parsed.get("name").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        .ok_or("add_mcp_server 缺少 name")?;
+    let command = parsed.get("command").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        .ok_or("add_mcp_server 缺少 command（stdio 启动命令或 http(s):// URL）")?;
+    let token = parsed.get("authToken").and_then(|v| v.as_str()).map(str::trim).filter(|t| !t.is_empty());
+    let record = {
+        let state = app.state::<AppState>();
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        add_mcp_server(&db, name, command, token).map_err(|e| e.to_string())?
+    };
+    let server_id = record.id.clone();
+    spawn_mcp_connect(app, record);
+    Ok(serde_json::json!({
+        "serverId": server_id,
+        "note": format!("MCP 服务器 {name} 已注册并正在后台连接。连接成功后其工具会以 mcp_{name}_<工具名> 形式出现，可直接调用。")
+    }))
+}
+
 /// 执行一次 MCP 外部工具调用：经已连接客户端转发，结果文本截断后回灌模型。
 fn execute_mcp_tool(
     app: &AppHandle,
@@ -3021,6 +3061,7 @@ async fn chat_with_builtin_tools(
                 "todo_write" => execute_todo_write(app, &arguments),
                 "load_skill" => execute_load_skill(workspace_path, &arguments),
                 "remember" => execute_remember(workspace_path, &arguments),
+                "add_mcp_server" => execute_add_mcp_server(app, &arguments),
                 "web_fetch" => execute_web_fetch(&arguments).await,
                 "web_search" => execute_web_search(&arguments).await,
                 "list_shells" | "get_shell_output" | "kill_shell" => {
@@ -3346,6 +3387,23 @@ fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
+                "name": "add_mcp_server",
+                "description": "Register and connect an MCP server in MDGA's real mechanism (not by editing config files). Use this when the user asks you to install/add an MCP server for yourself. command is either a stdio launch command (e.g. 'npx -y @modelcontextprotocol/server-memory') or an http(s):// URL. After it connects, its tools become callable as mcp_<server>_<tool>.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Short server name, e.g. memory, github." },
+                        "command": { "type": "string", "description": "stdio launch command or http(s):// URL." },
+                        "authToken": { "type": "string", "description": "Optional Bearer token for HTTP servers." }
+                    },
+                    "required": ["name", "command"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
                 "name": "remember",
                 "description": "Persist a concise fact worth remembering across sessions (project convention, a gotcha you hit, a key file path). It is appended to the workspace MDGA.md and auto-injected in future sessions. Use sparingly for durable, reusable facts — not transient details.",
                 "parameters": {
@@ -3541,7 +3599,8 @@ fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability, String> {
             Ok(ToolCapability::FileWrite)
         }
         "delete_file" | "delete_dir" => Ok(ToolCapability::FileDelete),
-        "run_command" => Ok(ToolCapability::CommandRun),
+        // 注册 MCP 会拉起外部进程/网络服务，按命令执行级别裁决（FullAccess 或审批）。
+        "run_command" | "add_mcp_server" => Ok(ToolCapability::CommandRun),
         "web_fetch" | "web_search" => Ok(ToolCapability::NetworkAccess),
         other => Err(format!("未知工具: {other}")),
     }
@@ -3586,19 +3645,23 @@ mod tests {
             &[],
         );
 
+        // injected[0] 是 MDGA 身份锚定消息。
         assert_eq!(injected[0].role, "system");
-        assert!(injected[0].content.contains("C:\\Users\\AIT\\Desktop\\MDGA"));
         assert!(injected[0].content.contains("MDGA"));
-        assert!(injected[0].content.contains("除非用户明确授权越界"));
-        assert!(injected[0].content.contains("必须分别调用"));
-        assert!(injected[0].content.contains("read_file"));
-        assert!(injected[0].content.contains("write_file"));
-        assert!(injected[0].content.contains("delete_file"));
-        assert!(injected[0].content.contains("list_dir"));
+        assert!(injected[0].content.contains(".mdga"));
         assert_eq!(injected[1].role, "system");
-        assert!(injected[1].content.contains("edit_file"));
-        assert!(injected[1].content.contains("search_text"));
-        assert_eq!(injected[2].role, "user");
+        assert!(injected[1].content.contains("C:\\Users\\AIT\\Desktop\\MDGA"));
+        assert!(injected[1].content.contains("MDGA"));
+        assert!(injected[1].content.contains("除非用户明确授权越界"));
+        assert!(injected[1].content.contains("必须分别调用"));
+        assert!(injected[1].content.contains("read_file"));
+        assert!(injected[1].content.contains("write_file"));
+        assert!(injected[1].content.contains("delete_file"));
+        assert!(injected[1].content.contains("list_dir"));
+        assert_eq!(injected[2].role, "system");
+        assert!(injected[2].content.contains("edit_file"));
+        assert!(injected[2].content.contains("search_text"));
+        assert_eq!(injected[3].role, "user");
     }
 
     #[test]
@@ -3707,12 +3770,12 @@ mod tests {
             &[],
         );
 
-        // sys(workspace) + sys(tools) + sys(repo map) + user
-        assert_eq!(injected.len(), 4);
-        assert_eq!(injected[2].role, "system");
-        assert!(injected[2].content.contains("工作区结构摘要"));
-        assert!(injected[2].content.contains("main.rs"));
-        assert_eq!(injected[3].role, "user");
+        // sys(身份) + sys(workspace) + sys(tools) + sys(repo map) + user
+        assert_eq!(injected.len(), 5);
+        assert_eq!(injected[3].role, "system");
+        assert!(injected[3].content.contains("工作区结构摘要"));
+        assert!(injected[3].content.contains("main.rs"));
+        assert_eq!(injected[4].role, "user");
     }
 
     #[test]
@@ -3731,11 +3794,11 @@ mod tests {
             &[],
         );
 
-        // sys(workspace) + sys(tools) + sys(memory) + user
-        assert_eq!(injected.len(), 4);
-        assert_eq!(injected[2].role, "system");
-        assert!(injected[2].content.contains("项目长期记忆"));
-        assert!(injected[2].content.contains("做一个计算器"));
+        // sys(身份) + sys(workspace) + sys(tools) + sys(memory) + user
+        assert_eq!(injected.len(), 5);
+        assert_eq!(injected[3].role, "system");
+        assert!(injected[3].content.contains("项目长期记忆"));
+        assert!(injected[3].content.contains("做一个计算器"));
     }
 
     #[test]
