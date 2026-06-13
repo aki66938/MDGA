@@ -347,6 +347,12 @@ pub fn delete_conversation(conn: &Connection, conv_id: &str) -> SqlResult<()> {
     Ok(())
 }
 
+/// 清除全部会话（及级联消息），用于数据治理「清除所有会话」。
+pub fn delete_all_conversations(conn: &Connection) -> SqlResult<()> {
+    conn.execute("DELETE FROM conversations", [])?;
+    Ok(())
+}
+
 // ── Message CRUD ──────────────────────────────────────────────────────────
 
 /// 保存一条消息，并刷新所属会话的 updated_at。

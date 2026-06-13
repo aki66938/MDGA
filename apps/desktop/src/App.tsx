@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -227,6 +227,9 @@ export function App() {
   const [balance, setBalance] = useState<BalanceState>({ status: "idle" });
   const [permRules, setPermRules] = useState<string[]>([]);
   const [commandSandbox, setCommandSandbox] = useState(true);
+  const [taskBudget, setTaskBudget] = useState(0);
+  // 自定义斜杠命令（工作区 .mdga/commands/*.md）
+  const [customCommands, setCustomCommands] = useState<Array<{ name: string; description: string; body: string }>>([]);
   // Steering：运行中已排队但尚未被注入的插话消息
   const [queuedSteering, setQueuedSteering] = useState<string[]>([]);
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -387,10 +390,14 @@ export function App() {
   useEffect(() => {
     setTodos([]);
     setWorkspaceFiles([]);
+    setCustomCommands([]);
     if (!activeConvId) return;
     invoke<string[]>("list_workspace_files", { conversationId: activeConvId })
       .then(setWorkspaceFiles)
       .catch(() => setWorkspaceFiles([]));
+    invoke<Array<{ name: string; description: string; body: string }>>("list_custom_commands", { conversationId: activeConvId })
+      .then(setCustomCommands)
+      .catch(() => setCustomCommands([]));
   }, [activeConvId]);
 
   /** 向当前最后一条 assistant 消息追加通知卡片 */
@@ -574,8 +581,18 @@ export function App() {
         }
         return true;
       }
-      default:
+      default: {
+        // 自定义斜杠命令（.mdga/commands/<name>.md）：用命令体替换发送，$ARGUMENTS 替换为参数
+        const custom = customCommands.find((c) => c.name === cmd);
+        if (custom) {
+          const args = rest.join(" ");
+          const filled = custom.body.replace(/\$ARGUMENTS/g, args);
+          setInput("");
+          await sendText(filled);
+          return true;
+        }
         return false;
+      }
     }
   }
 
@@ -929,12 +946,39 @@ export function App() {
     await invoke("set_command_sandbox", { enabled }).catch(() => {});
   }
 
+  async function handleSetBudget(budget: number) {
+    setTaskBudget(budget);
+    await invoke("set_task_budget", { budget }).catch(() => {});
+  }
+
+  async function handleExportConversation() {
+    if (!activeConvId) return;
+    const path = await save({ defaultPath: "conversation.md", filters: [{ name: "Markdown", extensions: ["md"] }] }).catch(() => null);
+    if (!path) return;
+    await invoke("export_conversation", { conversationId: activeConvId, path }).catch((e) => appendNoticeToLastMessage(humanizeError(String(e))));
+  }
+
+  async function handleExportLedger() {
+    const path = await save({ defaultPath: "mdga-token-ledger.csv", filters: [{ name: "CSV", extensions: ["csv"] }] }).catch(() => null);
+    if (!path) return;
+    await invoke("export_token_ledger", { path }).catch((e) => appendNoticeToLastMessage(humanizeError(String(e))));
+  }
+
+  async function handleClearData() {
+    if (!window.confirm("确定清除所有会话与消息？此操作不可撤销。")) return;
+    await invoke("clear_all_conversations").catch(() => {});
+    setConversations([]);
+    setActiveConvId(null);
+    setMessages([]);
+  }
+
   async function openSettings() {
     const info = await invoke<AppInfo>("get_app_info").catch(() => null);
     setAppInfo(info);
     await refreshMcpServers();
     await refreshPermRules();
     setCommandSandbox(await invoke<boolean>("get_command_sandbox").catch(() => true));
+    setTaskBudget(await invoke<number>("get_task_budget").catch(() => 0));
     setShowSettings(true);
     refreshBalance();
   }
@@ -1320,17 +1364,19 @@ export function App() {
           {/* 斜杠命令菜单 */}
           {input.startsWith("/") && !input.includes(" ") && !sending && (
             <div className="slash-menu" role="menu">
-              {SLASH_COMMANDS.filter((c) => c.cmd.startsWith(input)).map((c) => (
-                <button
-                  key={c.cmd}
-                  className="slash-menu__item"
-                  type="button"
-                  onClick={() => setInput(c.cmd === "/model" ? "/model " : c.cmd)}
-                >
-                  <span className="slash-menu__cmd">{c.cmd}</span>
-                  <span className="slash-menu__desc">{c.desc}</span>
-                </button>
-              ))}
+              {[...SLASH_COMMANDS, ...customCommands.map((c) => ({ cmd: c.name, desc: c.description || "自定义命令" }))]
+                .filter((c) => c.cmd.startsWith(input))
+                .map((c) => (
+                  <button
+                    key={c.cmd}
+                    className="slash-menu__item"
+                    type="button"
+                    onClick={() => setInput(c.cmd === "/model" ? "/model " : c.cmd)}
+                  >
+                    <span className="slash-menu__cmd">{c.cmd}</span>
+                    <span className="slash-menu__desc">{c.desc}</span>
+                  </button>
+                ))}
             </div>
           )}
 
@@ -1453,6 +1499,12 @@ export function App() {
           permRules={permRules}
           commandSandbox={commandSandbox}
           onToggleSandbox={handleToggleSandbox}
+          taskBudget={taskBudget}
+          onSetBudget={handleSetBudget}
+          hasActiveConv={!!activeConvId}
+          onExportConversation={handleExportConversation}
+          onExportLedger={handleExportLedger}
+          onClearData={handleClearData}
           onModelChange={handleModelChange}
           onPermissionModeChange={handlePermissionModeChange}
           onAddMcpServer={handleAddMcpServer}
@@ -1552,6 +1604,12 @@ function SettingsModal({
   permRules,
   commandSandbox,
   onToggleSandbox,
+  taskBudget,
+  onSetBudget,
+  hasActiveConv,
+  onExportConversation,
+  onExportLedger,
+  onClearData,
   onModelChange,
   onPermissionModeChange,
   onAddMcpServer,
@@ -1573,6 +1631,12 @@ function SettingsModal({
   permRules: string[];
   commandSandbox: boolean;
   onToggleSandbox: (enabled: boolean) => void;
+  taskBudget: number;
+  onSetBudget: (budget: number) => void;
+  hasActiveConv: boolean;
+  onExportConversation: () => void;
+  onExportLedger: () => void;
+  onClearData: () => void;
   onModelChange: (m: DeepSeekModelId) => void;
   onPermissionModeChange: (m: PermissionMode) => void;
   onAddMcpServer: (name: string, command: string) => void;
@@ -1613,13 +1677,15 @@ function SettingsModal({
       setCheckBusy(false);
     }, 10000);
   }
-  const [section, setSection] = useState<"account" | "model" | "rules" | "mcp" | "about">("account");
+  const [section, setSection] = useState<"account" | "model" | "rules" | "mcp" | "data" | "about">("account");
+  const [budgetInput, setBudgetInput] = useState(String(taskBudget));
 
   const NAV: Array<{ id: typeof section; label: string }> = [
     { id: "account", label: "账户" },
     { id: "model", label: "模型与权限" },
     { id: "rules", label: "权限规则" },
     { id: "mcp", label: "MCP 服务器" },
+    { id: "data", label: "数据" },
     { id: "about", label: "关于" },
   ];
 
@@ -1732,6 +1798,35 @@ function SettingsModal({
                 开启后，run_command 在<b>受限令牌沙箱</b>中执行：剥离管理员特权、进程随会话干净销毁、子进程环境擦除 API Key 等密钥。
                 少数需要特权的命令可能受影响，可临时关闭。（网络与文件路径隔离将在后续 AppContainer 版本提供。）
               </p>
+
+              <div className="settings-row" style={{ marginTop: 16 }}>
+                <span className="settings-row__label">单任务 token 预算</span>
+                <span style={{ display: "flex", gap: 6 }}>
+                  <input
+                    className="conv-search"
+                    style={{ width: 120, marginBottom: 0 }}
+                    type="number"
+                    min={0}
+                    value={budgetInput}
+                    onChange={(e) => setBudgetInput(e.target.value)}
+                    onBlur={() => onSetBudget(Math.max(0, parseInt(budgetInput) || 0))}
+                  />
+                </span>
+              </div>
+              <p className="settings-desc">单次任务累计 token 超过此值时自动暂停，防止失控烧 token（0 = 不限）。当前 {taskBudget === 0 ? "不限" : taskBudget.toLocaleString()}。</p>
+            </>
+          )}
+
+          {section === "data" && (
+            <>
+              <h3 className="settings-content__h">数据</h3>
+              <p className="settings-desc">所有数据保存在本地，可随时导出、备份或删除。</p>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 12, maxWidth: 320 }}>
+                <button type="button" className="approval-card__btn" onClick={onExportConversation} disabled={!hasActiveConv}>导出当前会话（Markdown）</button>
+                <button type="button" className="approval-card__btn" onClick={onExportLedger}>导出 Token 账本（CSV）</button>
+                <button type="button" className="approval-card__btn" onClick={onClearData} style={{ color: "var(--danger)" }}>清除所有会话</button>
+              </div>
+              <p className="settings-desc">Token 账本 CSV 可与 DeepSeek 官方账单对照核对消费。</p>
             </>
           )}
 

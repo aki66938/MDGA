@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default capabilities for MDGA desktop","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","updater:default"]}}
+{"default":{"identifier":"default","description":"Default capabilities for MDGA desktop","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save","updater:default"]}}

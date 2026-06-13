@@ -76,6 +76,8 @@ struct AppState {
     bg_shells: Mutex<HashMap<String, BgShell>>,
     /// 命令沙箱开关（默认开）：前台 run_command 是否在受限令牌沙箱中执行。
     command_sandbox: AtomicBool,
+    /// 单次任务 token 预算（累计 total_tokens 上限）；0 = 不限。超出则暂停工具循环。
+    task_token_budget: AtomicU64,
 }
 
 /// 一个托管的后台 shell 进程状态。
@@ -542,6 +544,64 @@ async fn compact_history(
     .map_err(|e| e.to_string())
 }
 
+/// 列出工作区 .mdga/commands/*.md 自定义斜杠命令（name + description + body）。
+/// 命令体中的 $ARGUMENTS 由前端替换为用户在 /name 后输入的参数。
+#[tauri::command]
+fn list_custom_commands(
+    state: State<AppState>,
+    conversation_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let workspace = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        get_conversation(&db, &conversation_id)
+            .map_err(|e| e.to_string())?
+            .and_then(|c| c.workspace_path)
+    };
+    let Some(workspace) = workspace else {
+        return Ok(Vec::new());
+    };
+    let dir = std::path::Path::new(&workspace).join(".mdga").join("commands");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut cmds = Vec::new();
+    for entry in entries.flatten().take(50) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        // 解析 frontmatter description（可选），其余为命令体。
+        let (description, body) = parse_command_frontmatter(&raw);
+        cmds.push(serde_json::json!({
+            "name": format!("/{stem}"),
+            "description": description,
+            "body": body,
+        }));
+    }
+    Ok(cmds)
+}
+
+/// 从命令 markdown 解析 frontmatter 的 description，返回 (description, body)。
+fn parse_command_frontmatter(raw: &str) -> (String, String) {
+    let trimmed = raw.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            let front = &rest[..end];
+            let body = rest[end + 4..].trim_start().to_string();
+            let desc = front
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("description:").map(|d| d.trim().to_string()))
+                .unwrap_or_default();
+            return (desc, body);
+        }
+    }
+    // 无 frontmatter：首行非空作描述，全文作命令体
+    let desc = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string();
+    (desc, raw.trim().to_string())
+}
+
 /// 平铺列出当前会话工作区内的文件相对路径，供输入框 @文件引用补全。
 #[tauri::command]
 fn list_workspace_files(
@@ -568,6 +628,74 @@ fn get_command_sandbox(state: State<AppState>) -> bool {
 #[tauri::command]
 fn set_command_sandbox(state: State<AppState>, enabled: bool) {
     state.command_sandbox.store(enabled, Ordering::SeqCst);
+}
+
+/// 导出单个会话为 Markdown 文件（数据治理：用户可导出/备份）。
+#[tauri::command]
+fn export_conversation(
+    state: State<AppState>,
+    conversation_id: String,
+    path: String,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let conv = get_conversation(&db, &conversation_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("会话不存在")?;
+    let messages = get_messages(&db, &conversation_id).map_err(|e| e.to_string())?;
+    let mut md = format!("# {}\n\n", conv.title);
+    if let Some(ws) = conv.workspace_path.as_deref() {
+        md.push_str(&format!("> 工作区：{ws}\n\n"));
+    }
+    for m in messages {
+        let who = if m.role == "user" { "用户" } else { "助手" };
+        md.push_str(&format!("## {who}\n\n{}\n\n", m.content));
+    }
+    std::fs::write(&path, md).map_err(|e| format!("写入失败: {e}"))
+}
+
+/// 导出全部会话的 token 账本为 CSV（数据治理 + 对账）。
+#[tauri::command]
+fn export_token_ledger(state: State<AppState>, path: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let convs = list_conversations(&db).map_err(|e| e.to_string())?;
+    let mut csv = String::from(
+        "conversation_id,title,role,total_tokens,prompt_tokens,completion_tokens,estimated_cost_usd,created_at\n",
+    );
+    for conv in convs {
+        let messages = get_messages(&db, &conv.id).map_err(|e| e.to_string())?;
+        for m in messages {
+            let Some(usage_json) = m.usage_json.as_deref() else { continue };
+            let v: serde_json::Value = serde_json::from_str(usage_json).unwrap_or_default();
+            let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+            let cost = v.get("estimatedCostUsd").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let title = conv.title.replace([',', '\n', '"'], " ");
+            csv.push_str(&format!(
+                "{},{},{},{},{},{},{:.6},{}\n",
+                conv.id, title, m.role, g("totalTokens"), g("promptTokens"),
+                g("completionTokens"), cost, m.created_at
+            ));
+        }
+    }
+    std::fs::write(&path, csv).map_err(|e| format!("写入失败: {e}"))
+}
+
+/// 清除全部会话与消息（数据治理：用户主动删除本地数据）。
+#[tauri::command]
+fn clear_all_conversations(state: State<AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    mdga_storage::delete_all_conversations(&db).map_err(|e| e.to_string())
+}
+
+/// 读取单次任务 token 预算（0 = 不限）。
+#[tauri::command]
+fn get_task_budget(state: State<AppState>) -> u64 {
+    state.task_token_budget.load(Ordering::SeqCst)
+}
+
+/// 设置单次任务 token 预算；超出后工具循环暂停并提示。
+#[tauri::command]
+fn set_task_budget(state: State<AppState>, budget: u64) {
+    state.task_token_budget.store(budget, Ordering::SeqCst);
 }
 
 /// 列出全部权限规则（allow / deny），供设置页管理。
@@ -1595,6 +1723,18 @@ struct HooksConfig {
     post_tool_use: Vec<HookEntry>,
 }
 
+/// 读取工作区 .mdga/diagnostics 的诊断命令（首个非空非注释行）；不存在则 None。
+/// 例：写入 `cargo check` 或 `npm run typecheck`，Agent 改完代码收尾前自动跑、有错则修。
+fn read_diagnostics_command(workspace: &str) -> Option<String> {
+    let path = std::path::Path::new(workspace).join(".mdga").join("diagnostics");
+    let content = std::fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+}
+
 fn load_hooks(workspace: &str) -> HooksConfig {
     let path = std::path::Path::new(workspace).join(".mdga").join("hooks.json");
     std::fs::read_to_string(path)
@@ -2173,6 +2313,25 @@ async fn execute_run_subtask(
     let Some(description) = parsed.get("description").and_then(|v| v.as_str()) else {
         return (Err("run_subtask 缺少 description".to_string()), None);
     };
+    // 自定义子代理类型：agentType 指向 .mdga/agents/<type>.md，其内容作为子代理 system prompt。
+    let custom_agent = parsed
+        .get("agentType")
+        .and_then(|v| v.as_str())
+        .filter(|t| t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .and_then(|t| {
+            std::fs::read_to_string(
+                std::path::Path::new(workspace_path).join(".mdga").join("agents").join(format!("{t}.md")),
+            )
+            .ok()
+        });
+    let system_prompt = match custom_agent {
+        Some(def) => format!(
+            "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、stat_path 这些只读工具，禁止写入或命令执行。以下是你的角色定义：\n{def}\n完成后输出简明中文报告。"
+        ),
+        None => format!(
+            "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、stat_path 这些只读工具调查代码与文件，禁止任何写入或命令执行。完成调查后，输出一份简明、信息密度高的中文报告，直接回答委托内容，不要寒暄。"
+        ),
+    };
     let security_context = match session_security_context(
         workspace_path.to_string(),
         PermissionMode::Restricted,
@@ -2183,12 +2342,7 @@ async fn execute_run_subtask(
     };
 
     let mut wire = vec![
-        serde_json::json!({
-            "role": "system",
-            "content": format!(
-                "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、stat_path 这些只读工具调查代码与文件，禁止任何写入或命令执行。完成调查后，输出一份简明、信息密度高的中文报告，直接回答委托内容，不要寒暄。"
-            )
-        }),
+        serde_json::json!({ "role": "system", "content": system_prompt }),
         serde_json::json!({ "role": "user", "content": description }),
     ];
     let mut usage: Option<mdga_shared::RawUsage> = None;
@@ -2587,6 +2741,9 @@ async fn chat_with_builtin_tools(
     let mut usage: Option<mdga_shared::RawUsage> = None;
     // 上一次响应返回的 prompt_tokens，作为当前上下文体积的真实信号，驱动轮内压缩。
     let mut last_prompt_tokens: u64 = 0;
+    // 诊断反馈环：记录本轮是否发生文件改动 + 是否已跑过诊断（最多一轮，防循环）。
+    let mut edits_made = false;
+    let mut diagnostics_ran = false;
 
     let mut round: usize = 0;
     loop {
@@ -2654,6 +2811,21 @@ async fn chat_with_builtin_tools(
             stream_round_with_retry(api_key, wire_messages.clone(), model, tool_schemas.clone(), app)
                 .await?;
         usage = merge_usage(usage, completion.usage.clone());
+        // 成本预算：累计 total_tokens 超过预算则暂停（防失控烧 token）。
+        let budget = app.state::<AppState>().task_token_budget.load(Ordering::SeqCst);
+        if budget > 0 {
+            if let Some(u) = usage.as_ref() {
+                if u.total_tokens >= budget {
+                    let _ = app.emit(
+                        "chat-chunk",
+                        format!(
+                            "\n\n（已达本次任务 token 预算 {budget}，已暂停以控制费用。如需继续，请回复\"继续\"或在设置中调高预算。）"
+                        ),
+                    );
+                    return Ok(usage);
+                }
+            }
+        }
         if let Some(round_usage) = completion.usage.as_ref() {
             last_prompt_tokens = round_usage.prompt_tokens;
             // 推送上下文用量，前端常驻显示占用百分比（对标 CC/Codex 的 context 指示器）。
@@ -2678,8 +2850,31 @@ async fn chat_with_builtin_tools(
                 .unwrap_or_default()
         };
 
-        // 模型不再调用工具：本轮叙述即最终回复，已流式输出完毕，结束循环。
+        // 模型不再调用工具：本轮叙述即最终回复。收尾前若发生过改动且配置了诊断命令，
+        // 自动跑一次（typecheck/lint）；有错则回灌让 agent 修复后再收尾（最多一轮）。
         if tool_calls.is_empty() {
+            if edits_made && !diagnostics_ran {
+                if let Some(cmd) = read_diagnostics_command(workspace_path) {
+                    diagnostics_ran = true;
+                    let _ = app.emit("agent-status", serde_json::json!({ "state": "thinking", "round": round }));
+                    let _ = app.emit("chat-chunk", "\n\n（正在运行诊断检查…）\n\n".to_string());
+                    if let Ok(result) = mdga_tool_runtime::run_command(
+                        workspace_path,
+                        RunCommandRequest { command: cmd.clone(), timeout_secs: Some(180), background: false },
+                    ) {
+                        let failed = result.exit_code.unwrap_or(0) != 0 || result.timed_out;
+                        if failed {
+                            let out: String = format!("{}\n{}", result.stdout, result.stderr)
+                                .chars().take(6000).collect();
+                            wire_messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": format!("诊断命令 `{cmd}` 报告了问题，请修复后再结束：\n{out}")
+                            }));
+                            continue; // 回到循环让 agent 修
+                        }
+                    }
+                }
+            }
             return Ok(usage);
         }
 
@@ -2856,6 +3051,10 @@ async fn chat_with_builtin_tools(
             let (output, status, error) = match &result {
                 Ok(value) => {
                     let mut out = serde_json::json!({ "ok": true, "result": value });
+                    // 标记本轮发生过文件改动（驱动收尾前的诊断检查）。
+                    if capture.is_some() {
+                        edits_made = true;
+                    }
                     // 文本写类工具：附加行级 diff 供 UI 展示，并把回退快照落库。
                     if let Some(cap) = capture.as_ref() {
                         if let Some((diff, added, removed)) =
@@ -3163,11 +3362,12 @@ fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "run_subtask",
-                "description": "Delegate a focused READ-ONLY exploration subtask (e.g. 'find where X is implemented', 'summarize how module Y works') to a sub-agent with its own fresh context. The sub-agent can only list/read/search files and returns a concise text report. Use this to investigate large codebases without bloating the main conversation.",
+                "description": "Delegate a focused READ-ONLY exploration subtask (e.g. 'find where X is implemented', 'summarize how module Y works') to a sub-agent with its own fresh context. The sub-agent can only list/read/search files and returns a concise text report. Use this to investigate large codebases without bloating the main conversation. Optionally set agentType to use a custom agent role from .mdga/agents/<type>.md.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "description": { "type": "string", "description": "Clear, self-contained description of what to investigate and what the report should contain." }
+                        "description": { "type": "string", "description": "Clear, self-contained description of what to investigate and what the report should contain." },
+                        "agentType": { "type": "string", "description": "Optional custom agent type name (loads .mdga/agents/<type>.md as the sub-agent role)." }
                     },
                     "required": ["description"],
                     "additionalProperties": false
@@ -3717,6 +3917,7 @@ fn main() {
                 repo_maps: Mutex::new(HashMap::new()),
                 bg_shells: Mutex::new(HashMap::new()),
                 command_sandbox: AtomicBool::new(true),
+                task_token_budget: AtomicU64::new(0),
             });
 
             // 启动时后台连接所有已启用的 MCP server，不阻塞窗口加载。
@@ -3762,6 +3963,12 @@ fn main() {
             delete_permission_rule,
             get_command_sandbox,
             set_command_sandbox,
+            get_task_budget,
+            set_task_budget,
+            export_conversation,
+            export_token_ledger,
+            clear_all_conversations,
+            list_custom_commands,
             import_file_text,
             get_conversation_events,
             cancel_agent,
