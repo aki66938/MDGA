@@ -96,6 +96,9 @@ pub struct SearchTextRequest {
     pub query: String,
     #[serde(default = "default_search_limit")]
     pub max_results: usize,
+    /// query 是否按正则解释；false 时按字面子串匹配。默认 false。
+    #[serde(default)]
+    pub is_regex: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -517,9 +520,58 @@ pub fn search_text(
         return Err(ToolRuntimeError::NotADirectory);
     }
 
-    let mut matches = Vec::new();
     let max_results = request.max_results.clamp(1, DEFAULT_SEARCH_LIMIT);
-    collect_text_matches(&target, &target, query, max_results, &mut matches)?;
+    // 构建匹配器：正则或字面子串（字面时对 query 转义后整体作正则，统一走 regex 引擎）。
+    let pattern = if request.is_regex {
+        query.to_string()
+    } else {
+        regex::escape(query)
+    };
+    let matcher = regex::Regex::new(&pattern)
+        .map_err(|e| ToolRuntimeError::CommandFailed(format!("正则无效: {e}")))?;
+
+    // 用 ignore::WalkBuilder 做 gitignore 感知遍历（自动跳过 .gitignore 命中、.git、隐藏文件），
+    // 与 ripgrep 同源，速度快且不搜噪声目录。
+    let mut matches = Vec::new();
+    let walker = ignore::WalkBuilder::new(&target)
+        .hidden(true) // 跳过隐藏文件/目录
+        .git_ignore(true)
+        .git_global(false)
+        .require_git(false) // 即使工作区不是 git 仓库，也应用其中的 .gitignore
+        .parents(true)
+        .build();
+    'walk: for entry in walker.flatten() {
+        if matches.len() >= max_results {
+            break;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // 跳过过大文件与二进制（非 UTF-8）
+        let Ok(meta) = path.metadata() else { continue };
+        if meta.len() > MAX_SEARCH_FILE_BYTES {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else { continue };
+        for (line_no, line) in content.lines().enumerate() {
+            if matcher.is_match(line) {
+                let rel = path
+                    .strip_prefix(&target)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                matches.push(TextMatch {
+                    path: rel,
+                    line: line_no + 1,
+                    preview: line.chars().take(200).collect(),
+                });
+                if matches.len() >= max_results {
+                    break 'walk;
+                }
+            }
+        }
+    }
 
     Ok(SearchTextResult {
         relative_path: normalize_relative_path(&relative),
@@ -596,19 +648,22 @@ pub fn run_command(
     workspace_root: impl AsRef<Path>,
     request: RunCommandRequest,
 ) -> Result<RunCommandResult, ToolRuntimeError> {
-    run_command_streaming(workspace_root, request, None)
+    run_command_streaming(workspace_root, request, None, None)
 }
 
 /// 行级流式输出回调：命令每产生一行 stdout/stderr 调用一次，供 UI 实时展示。
 pub type CommandLineCallback = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+/// 外部取消标志：置 true 时杀掉命令进程（供后台 shell 的 kill 操作）。
+pub type CommandCancel = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
-/// 与 run_command 相同，但可选地把命令输出逐行回调给调用方（实时展示）。
+/// 与 run_command 相同，但可选地把命令输出逐行回调给调用方，并可选地接受取消标志。
 ///
 /// 回调在读取线程中触发，调用方需保证回调自身线程安全且不阻塞过久。
 pub fn run_command_streaming(
     workspace_root: impl AsRef<Path>,
     request: RunCommandRequest,
     on_line: Option<CommandLineCallback>,
+    cancel: Option<CommandCancel>,
 ) -> Result<RunCommandResult, ToolRuntimeError> {
     let command = request.command.trim();
     if command.is_empty() {
@@ -650,6 +705,15 @@ pub fn run_command_streaming(
         match child.try_wait() {
             Ok(Some(_status)) => break,
             Ok(None) => {
+                // 外部取消（后台 shell kill）：置位则杀进程收尾。
+                if cancel
+                    .as_ref()
+                    .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+                    .unwrap_or(false)
+                {
+                    let _ = child.kill();
+                    break;
+                }
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     timed_out = true;
@@ -758,61 +822,6 @@ fn read_utf8_file(path: &Path, max_bytes: u64) -> Result<String, ToolRuntimeErro
     }
     let bytes = std::fs::read(path)?;
     String::from_utf8(bytes).map_err(|_| ToolRuntimeError::NonUtf8Text)
-}
-
-fn collect_text_matches(
-    search_root: &Path,
-    current: &Path,
-    query: &str,
-    max_results: usize,
-    matches: &mut Vec<TextMatch>,
-) -> Result<(), ToolRuntimeError> {
-    if matches.len() >= max_results {
-        return Ok(());
-    }
-
-    for entry in std::fs::read_dir(current)? {
-        if matches.len() >= max_results {
-            break;
-        }
-        let entry = entry?;
-        let path = entry.path();
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
-            collect_text_matches(search_root, &path, query, max_results, matches)?;
-            continue;
-        }
-        if !meta.is_file() || meta.len() > MAX_SEARCH_FILE_BYTES {
-            continue;
-        }
-        let Ok(content) = read_utf8_file(&path, MAX_SEARCH_FILE_BYTES) else {
-            continue;
-        };
-        for (index, line) in content.lines().enumerate() {
-            if matches.len() >= max_results {
-                break;
-            }
-            if line.contains(query) {
-                let relative = path
-                    .strip_prefix(search_root)
-                    .unwrap_or(&path)
-                    .components()
-                    .filter_map(|component| match component {
-                        Component::Normal(part) => Some(part.to_string_lossy().to_string()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("/");
-                matches.push(TextMatch {
-                    path: relative,
-                    line: index + 1,
-                    preview: line.trim().chars().take(240).collect(),
-                });
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn validate_relative_path(path: &str) -> Result<PathBuf, ToolRuntimeError> {
@@ -1317,6 +1326,7 @@ mod tests {
                 path: ".".to_string(),
                 query: "token".to_string(),
                 max_results: 10,
+                is_regex: false,
             },
         )
         .expect("text should search");
@@ -1324,6 +1334,22 @@ mod tests {
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].path, "src/lib.rs");
         assert_eq!(result.matches[0].line, 2);
+
+        // 正则匹配 + gitignore 感知：被 .gitignore 命中的文件不应被搜到
+        std::fs::write(workspace.join(".gitignore"), "secret.txt\n").unwrap();
+        std::fs::write(workspace.join("secret.txt"), "let token = 9;").unwrap();
+        let re = search_text(
+            &workspace,
+            SearchTextRequest {
+                path: ".".to_string(),
+                query: r"let \w+ =".to_string(),
+                max_results: 10,
+                is_regex: true,
+            },
+        )
+        .expect("regex search");
+        assert!(re.matches.iter().any(|m| m.path == "src/lib.rs"));
+        assert!(!re.matches.iter().any(|m| m.path == "secret.txt"), "gitignore 命中应被跳过");
 
         let _ = std::fs::remove_dir_all(workspace);
     }

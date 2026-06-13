@@ -1025,17 +1025,6 @@ export function App() {
     }
   }
 
-  /** 手动检查更新：全程有反馈（检查中 / 发现新版 / 已是最新 / 失败）。 */
-  async function handleCheckUpdate() {
-    setUpdate({ status: "checking" });
-    try {
-      const v = await invoke<string | null>("check_update");
-      setUpdate(v ? { status: "available", version: v } : { status: "uptodate" });
-    } catch (err) {
-      setUpdate({ status: "error", message: humanizeError(String(err)) });
-    }
-  }
-
   const hasMessages = messages.length > 0;
   const activeConversation = conversations.find((conv) => conv.id === activeConvId);
   const conversationUsage = aggregateUsage(messages);
@@ -1463,8 +1452,7 @@ export function App() {
           onRefreshMcp={refreshMcpServers}
           onAddPermRule={handleAddPermRule}
           onDeletePermRule={handleDeletePermRule}
-          update={update}
-          onCheckUpdate={handleCheckUpdate}
+          onUpdateAvailable={(v) => setUpdate({ status: "available", version: v })}
           onClose={() => setShowSettings(false)}
         />
       )}
@@ -1561,8 +1549,7 @@ function SettingsModal({
   onRefreshMcp,
   onAddPermRule,
   onDeletePermRule,
-  update,
-  onCheckUpdate,
+  onUpdateAvailable,
   onClose,
 }: {
   appInfo: AppInfo | null;
@@ -1581,13 +1568,38 @@ function SettingsModal({
   onRefreshMcp: () => void;
   onAddPermRule: (rule: string) => void;
   onDeletePermRule: (rule: string) => void;
-  update: UpdateState;
-  onCheckUpdate: () => void;
+  onUpdateAvailable: (version: string) => void;
   onClose: () => void;
 }) {
   const [mcpName, setMcpName] = useState("");
   const [mcpCommand, setMcpCommand] = useState("");
   const [ruleInput, setRuleInput] = useState("");
+  // 检查更新按钮自管理：idle → checking → result(10s) → idle，期间禁用、尺寸不变。
+  const [checkLabel, setCheckLabel] = useState("检查更新");
+  const [checkBusy, setCheckBusy] = useState(false);
+  const checkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (checkTimerRef.current) clearTimeout(checkTimerRef.current); }, []);
+
+  async function handleCheckUpdateBtn() {
+    if (checkBusy) return;
+    setCheckBusy(true);
+    setCheckLabel("检查中…");
+    let label = "已是最新版本";
+    try {
+      const v = await invoke<string | null>("check_update");
+      if (v) {
+        label = `发现新版本 v${v}`;
+        onUpdateAvailable(v);
+      }
+    } catch {
+      label = "检查失败，请稍后重试";
+    }
+    setCheckLabel(label);
+    checkTimerRef.current = setTimeout(() => {
+      setCheckLabel("检查更新");
+      setCheckBusy(false);
+    }, 10000);
+  }
   const [section, setSection] = useState<"account" | "model" | "rules" | "mcp" | "about">("account");
 
   const NAV: Array<{ id: typeof section; label: string }> = [
@@ -1759,22 +1771,16 @@ function SettingsModal({
                 <span className="settings-row__value" title={appInfo?.dataDir}>{appInfo?.dataDir ?? "…"}</span>
               </div>
               <p className="settings-desc">会话、token 账本、权限规则等本地数据保存在数据目录的 SQLite 中。</p>
-              <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12 }}>
-                <button
-                  type="button"
-                  className="approval-card__btn"
-                  onClick={onCheckUpdate}
-                  disabled={update.status === "checking" || update.status === "downloading"}
-                >
-                  {update.status === "checking" ? "检查中…" : "检查更新"}
-                </button>
-                <span className="settings-desc" style={{ margin: 0 }}>
-                  {update.status === "uptodate" && "已是最新版本"}
-                  {update.status === "available" && `发现新版本 v${update.version}，可在左下角横幅安装`}
-                  {update.status === "downloading" && `正在下载… ${update.progress}%`}
-                  {update.status === "error" && <span style={{ color: "var(--danger)" }}>{update.message}</span>}
-                </span>
-              </div>
+              <button
+                type="button"
+                className="approval-card__btn check-update-btn"
+                style={{ marginTop: 12 }}
+                onClick={handleCheckUpdateBtn}
+                disabled={checkBusy}
+              >
+                {checkLabel}
+              </button>
+              <p className="settings-desc">发现新版本时，可在左下角横幅一键安装更新。</p>
             </>
           )}
         </div>

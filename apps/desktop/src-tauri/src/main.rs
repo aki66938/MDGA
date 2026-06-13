@@ -69,7 +69,24 @@ struct AppState {
     /// Steering：用户在 Agent 运行中排队的插话消息，按 conversation_id 索引。
     /// 工具循环在每轮开始时取出并作为 user 消息注入，实现「运行中纠偏」。
     steering: Mutex<HashMap<String, Vec<String>>>,
+    /// repo map 按会话缓存：避免每轮重新遍历工作区，并让 system 前缀字节稳定，
+    /// 最大化 DeepSeek prompt 缓存命中（缓存友好上下文）。
+    repo_maps: Mutex<HashMap<String, String>>,
+    /// 托管后台 shell：background=true 启动的命令，按 shell_id 索引，可轮询输出 / 杀进程。
+    bg_shells: Mutex<HashMap<String, BgShell>>,
 }
+
+/// 一个托管的后台 shell 进程状态。
+#[derive(Clone)]
+struct BgShell {
+    command: String,
+    output: Arc<Mutex<String>>,
+    status: Arc<Mutex<String>>, // running | done | killed | error
+    cancel: Arc<AtomicBool>,
+}
+
+/// 后台 shell 自增序号，生成唯一 shell_id。
+static BG_SHELL_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// MCP 工具与模型函数名的绑定关系，按 send 周期收集后传入工具循环。
 #[derive(Clone)]
@@ -174,11 +191,17 @@ async fn send_message(
         (conversation, rules)
     };
     // 工作区已绑定时生成 repo map 与长期记忆，注入项目结构摘要和持久约定供模型开局认知。
+    // repo map 按会话缓存：首轮生成后复用，保持 system 前缀字节稳定以提升 prompt 缓存命中。
     let repo_map = conversation
         .workspace_path
         .as_deref()
         .filter(|path| !path.trim().is_empty())
-        .map(mdga_tool_runtime::workspace_map);
+        .map(|path| {
+            let mut maps = state.repo_maps.lock().expect("repo_maps mutex poisoned");
+            maps.entry(conversation_id.clone())
+                .or_insert_with(|| mdga_tool_runtime::workspace_map(path))
+                .clone()
+        });
     let workspace_memory = conversation
         .workspace_path
         .as_deref()
@@ -969,7 +992,7 @@ create_file、write_file 或 delete_file 工具完成真实本地操作；不要
     });
     injected.push(ChatMessage {
         role: "system".to_string(),
-        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。若某次工具调用失败，请阅读返回的 error，判断是参数、路径还是环境问题，调整后重试或换用其他工具，不要原样重复同一次失败调用。对于多步骤任务，请先调用 todo_write 列出步骤清单并随进度更新状态（同一时刻只有一项 in_progress），让用户实时看到进度。需要在大型代码库做只读调查（找实现、理结构、读懂模块）时，优先调用 run_subtask 委托独立子代理，避免主对话上下文膨胀。长时间运行的命令（启动服务、watch 等）用 run_command 的 background=true。用户消息中的 @相对路径 表示工作区文件引用，直接用 read_file 读取即可。需要查阅在线文档、报错信息或你不确定的最新资料时，用 web_search 搜索、再用 web_fetch 抓取相关 URL 的正文，不要凭记忆臆测。遇到值得跨会话记住的项目约定、关键路径或踩过的坑，用 remember 写入项目长期记忆（精炼、可复用的事实才记，临时细节不要记）。".to_string(),
+        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。若某次工具调用失败，请阅读返回的 error，判断是参数、路径还是环境问题，调整后重试或换用其他工具，不要原样重复同一次失败调用。对于多步骤任务，请先调用 todo_write 列出步骤清单并随进度更新状态（同一时刻只有一项 in_progress），让用户实时看到进度。需要在大型代码库做只读调查（找实现、理结构、读懂模块）时，优先调用 run_subtask 委托独立子代理，避免主对话上下文膨胀。长时间运行的命令（启动服务、watch 等）用 run_command 的 background=true，它会立即返回 shellId；之后用 get_shell_output 轮询其输出与状态、用 kill_shell 终止、用 list_shells 查看所有后台进程。用户消息中的 @相对路径 表示工作区文件引用，直接用 read_file 读取即可。需要查阅在线文档、报错信息或你不确定的最新资料时，用 web_search 搜索、再用 web_fetch 抓取相关 URL 的正文，不要凭记忆臆测。遇到值得跨会话记住的项目约定、关键路径或踩过的坑，用 remember 写入项目长期记忆（精炼、可复用的事实才记，临时细节不要记）。".to_string(),
     });
     // repo map：开局注入工作区结构摘要，让模型无需逐层 list_dir 就了解项目骨架。
     if let Some(map) = repo_map.filter(|map| !map.trim().is_empty()) {
@@ -1987,45 +2010,115 @@ fn execute_run_command_tool(
     let workspace = security_context.workspace_root.clone();
 
     if request.background {
+        let shell_id = format!("sh-{}", BG_SHELL_SEQ.fetch_add(1, Ordering::SeqCst));
+        let output = Arc::new(Mutex::new(String::new()));
+        let status = Arc::new(Mutex::new("running".to_string()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        // 注册到 AppState，供 get_shell_output / kill_shell / list_shells 访问。
+        {
+            let st = app.state::<AppState>();
+            let mut shells = st.bg_shells.lock().expect("bg_shells mutex poisoned");
+            shells.insert(
+                shell_id.clone(),
+                BgShell {
+                    command: request.command.clone(),
+                    output: output.clone(),
+                    status: status.clone(),
+                    cancel: cancel.clone(),
+                },
+            );
+        }
         let app_bg = app.clone();
         let command_label = request.command.clone();
+        let out_buf = output.clone();
+        let cancel_thread = cancel.clone();
         std::thread::spawn(move || {
-            let cb = command_line_callback(&app_bg);
+            // 输出逐行累积到共享缓冲（尾部截断 32K），供轮询；同时实时推前端。
+            let app_line = app_bg.clone();
+            let cb: mdga_tool_runtime::CommandLineCallback = std::sync::Arc::new(move |line: String| {
+                if let Ok(mut buf) = out_buf.lock() {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                    let len = buf.chars().count();
+                    if len > 32_000 {
+                        *buf = buf.chars().skip(len - 32_000).collect();
+                    }
+                }
+                let _ = app_line.emit("command-output", line);
+            });
             let outcome = mdga_tool_runtime::run_command_streaming(
                 &workspace,
-                RunCommandRequest {
-                    background: false,
-                    ..request
-                },
+                RunCommandRequest { background: false, ..request },
                 Some(cb),
+                Some(cancel_thread.clone()),
             );
-            let payload = match outcome {
-                Ok(result) => serde_json::json!({
-                    "command": command_label,
-                    "exitCode": result.exit_code,
-                    "timedOut": result.timed_out,
-                    "stdout": result.stdout.chars().take(2000).collect::<String>(),
-                    "stderr": result.stderr.chars().take(1000).collect::<String>(),
-                }),
-                Err(err) => serde_json::json!({
-                    "command": command_label,
-                    "error": err.to_string()
-                }),
+            let final_status = if cancel_thread.load(Ordering::SeqCst) {
+                "killed"
+            } else if outcome.is_err() {
+                "error"
+            } else {
+                "done"
             };
-            let _ = app_bg.emit("background-command-done", payload);
+            if let Ok(mut s) = status.lock() {
+                *s = final_status.to_string();
+            }
+            let _ = app_bg.emit(
+                "background-command-done",
+                serde_json::json!({ "command": command_label, "status": final_status }),
+            );
         });
         return Ok(serde_json::json!({
             "background": true,
-            "note": "命令已在后台启动，结果稍后通知用户；你无需等待，继续后续步骤即可。"
+            "shellId": shell_id,
+            "note": "命令已在后台启动。用 get_shell_output 轮询输出、kill_shell 终止；你无需等待，继续后续步骤。"
         }));
     }
 
     let cb = command_line_callback(app);
     serde_json::to_value(
-        mdga_tool_runtime::run_command_streaming(&workspace, request, Some(cb))
+        mdga_tool_runtime::run_command_streaming(&workspace, request, Some(cb), None)
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
+}
+
+/// 后台 shell 工具：get_shell_output / kill_shell / list_shells。从 AppState 注册表读取/控制。
+fn execute_bg_shell_tool(
+    app: &AppHandle,
+    tool_name: &str,
+    arguments: &str,
+) -> Result<serde_json::Value, String> {
+    let st = app.state::<AppState>();
+    let shells = st.bg_shells.lock().map_err(|e| e.to_string())?;
+    match tool_name {
+        "list_shells" => {
+            let list: Vec<serde_json::Value> = shells
+                .iter()
+                .map(|(id, sh)| {
+                    serde_json::json!({
+                        "shellId": id,
+                        "command": sh.command,
+                        "status": sh.status.lock().map(|s| s.clone()).unwrap_or_default(),
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "shells": list }))
+        }
+        "get_shell_output" | "kill_shell" => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(arguments).map_err(|e| format!("工具参数解析失败: {e}"))?;
+            let id = parsed.get("shellId").and_then(|v| v.as_str()).ok_or("缺少 shellId")?;
+            let sh = shells.get(id).ok_or("shellId 不存在")?;
+            if tool_name == "kill_shell" {
+                sh.cancel.store(true, Ordering::SeqCst);
+                return Ok(serde_json::json!({ "shellId": id, "note": "已请求终止该后台命令" }));
+            }
+            let output = sh.output.lock().map(|o| o.clone()).unwrap_or_default();
+            let status = sh.status.lock().map(|s| s.clone()).unwrap_or_default();
+            Ok(serde_json::json!({ "shellId": id, "status": status, "output": output }))
+        }
+        other => Err(format!("未知后台 shell 工具: {other}")),
+    }
 }
 
 /// 子任务探索代理可用的只读工具集合。
@@ -2376,6 +2469,15 @@ async fn chat_completion_with_retry(
 ///
 /// 仅在「尚未外显任何内容」时才对可重试错误重试，避免重试导致内容重复外显；
 /// 一旦已开始流式输出再失败，则直接返回错误。
+/// 返回同族备用模型：flash↔pro 互为 fallback，持续失败（如 overload）时切换求生。
+fn fallback_model_for(model: &str) -> Option<&'static str> {
+    match model {
+        "deepseek-v4-flash" => Some("deepseek-v4-pro"),
+        "deepseek-v4-pro" => Some("deepseek-v4-flash"),
+        _ => None,
+    }
+}
+
 async fn stream_round_with_retry(
     api_key: &str,
     messages: Vec<serde_json::Value>,
@@ -2384,6 +2486,8 @@ async fn stream_round_with_retry(
     app: &AppHandle,
 ) -> Result<mdga_deepseek_client::ChatCompletionResult, String> {
     const MAX_ATTEMPTS: u32 = 4;
+    let mut model = model.to_string();
+    let mut fallback_used = false;
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -2393,7 +2497,7 @@ async fn stream_round_with_retry(
         let result = chat_stream_with_tools(
             api_key,
             messages.clone(),
-            model,
+            &model,
             tools.clone(),
             move |chunk| {
                 emitted_cb.store(true, Ordering::SeqCst);
@@ -2403,17 +2507,31 @@ async fn stream_round_with_retry(
         .await;
         match result {
             Ok(value) => return Ok(value),
-            Err(err)
-                if err.is_retryable()
-                    && attempt < MAX_ATTEMPTS
-                    && !emitted.load(Ordering::SeqCst) =>
-            {
-                let delay_ms = 500u64 * 2u64.pow(attempt - 1);
-                let _ = app.emit(
-                    "chat-chunk",
-                    format!("\n\n（网络波动，正在重试（第 {attempt}/{} 次）…）\n\n", MAX_ATTEMPTS - 1),
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            Err(err) if err.is_retryable() && !emitted.load(Ordering::SeqCst) => {
+                if attempt < MAX_ATTEMPTS {
+                    let delay_ms = 500u64 * 2u64.pow(attempt - 1);
+                    let _ = app.emit(
+                        "chat-chunk",
+                        format!("\n\n（网络波动，正在重试（第 {attempt}/{} 次）…）\n\n", MAX_ATTEMPTS - 1),
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                } else if !fallback_used {
+                    // 主模型多次失败（overload/限流）：切同族备用模型再试一轮。
+                    match fallback_model_for(&model) {
+                        Some(fb) => {
+                            let _ = app.emit(
+                                "chat-chunk",
+                                format!("\n\n（主模型持续不可用，已切换备用模型 {fb} 重试…）\n\n"),
+                            );
+                            model = fb.to_string();
+                            fallback_used = true;
+                            attempt = 0;
+                        }
+                        None => return Err(err.to_string()),
+                    }
+                } else {
+                    return Err(err.to_string());
+                }
             }
             Err(err) => return Err(err.to_string()),
         }
@@ -2692,6 +2810,9 @@ async fn chat_with_builtin_tools(
                 "remember" => execute_remember(workspace_path, &arguments),
                 "web_fetch" => execute_web_fetch(&arguments).await,
                 "web_search" => execute_web_search(&arguments).await,
+                "list_shells" | "get_shell_output" | "kill_shell" => {
+                    execute_bg_shell_tool(app, &tool_name, &arguments)
+                }
                 "run_command" => execute_run_command_tool(app, &security_context, &arguments),
                 "run_subtask" => {
                     let _ = app.emit(
@@ -2858,7 +2979,7 @@ fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
         ),
         file_tool_schema(
             "search_text",
-            "Search UTF-8 text files recursively inside a workspace directory.",
+            "Search UTF-8 text files recursively inside a workspace directory. Gitignore-aware (ripgrep-style): skips ignored and hidden files. Supports regex via isRegex.",
             &["path", "query"],
         ),
         serde_json::json!({
@@ -2908,6 +3029,30 @@ fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                     "required": ["command"],
                     "additionalProperties": false
                 }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_shell_output",
+                "description": "Poll a background shell's accumulated output and status (running/done/killed/error). Use with the shellId returned by run_command background=true.",
+                "parameters": { "type": "object", "properties": { "shellId": { "type": "string" } }, "required": ["shellId"], "additionalProperties": false }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "kill_shell",
+                "description": "Terminate a running background shell by shellId.",
+                "parameters": { "type": "object", "properties": { "shellId": { "type": "string" } }, "required": ["shellId"], "additionalProperties": false }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_shells",
+                "description": "List all background shells with their id, command and status.",
+                "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
             }
         }),
         serde_json::json!({
@@ -3046,11 +3191,15 @@ fn file_tool_schema(name: &str, description: &str, required: &[&str]) -> serde_j
     if required.contains(&"query") {
         properties["query"] = serde_json::json!({
             "type": "string",
-            "description": "Text to search for."
+            "description": "Text or regex to search for. Search is gitignore-aware (skips ignored/hidden files)."
         });
         properties["maxResults"] = serde_json::json!({
             "type": "integer",
             "description": "Maximum number of matches to return, up to 50."
+        });
+        properties["isRegex"] = serde_json::json!({
+            "type": "boolean",
+            "description": "Treat query as a regular expression. Defaults to false (literal substring)."
         });
     }
 
@@ -3168,7 +3317,8 @@ fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability, String> {
     match tool_name {
         // todo_write/load_skill/run_subtask 只读或纯 UI；remember 仅追加项目记忆文件，低风险。
         "list_dir" | "read_file" | "stat_path" | "search_text" | "todo_write"
-        | "run_subtask" | "load_skill" | "remember" => Ok(ToolCapability::FileRead),
+        | "run_subtask" | "load_skill" | "remember" | "list_shells" | "get_shell_output"
+        | "kill_shell" => Ok(ToolCapability::FileRead),
         "create_file" | "write_file" | "edit_file" | "make_dir" | "move_path" => {
             Ok(ToolCapability::FileWrite)
         }
@@ -3546,6 +3696,8 @@ fn main() {
                 approvals: Mutex::new(HashMap::new()),
                 mcp: Mutex::new(HashMap::new()),
                 steering: Mutex::new(HashMap::new()),
+                repo_maps: Mutex::new(HashMap::new()),
+                bg_shells: Mutex::new(HashMap::new()),
             });
 
             // 启动时后台连接所有已启用的 MCP server，不阻塞窗口加载。

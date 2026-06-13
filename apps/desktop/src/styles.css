@@ -1202,6 +1202,17 @@ h1 {
   overflow-y: auto;
 }
 
+/* 检查更新按钮：固定尺寸，文字在「检查更新/检查中…/结果」间切换不变形 */
+.check-update-btn {
+  min-width: 240px;
+  text-align: center;
+  justify-content: center;
+}
+.check-update-btn:disabled {
+  opacity: 0.85;
+  cursor: default;
+}
+
 /* 设置：左栏导航 + 右栏内容双栏 */
 .approval-card.settings-modal {
   padding: 0;
