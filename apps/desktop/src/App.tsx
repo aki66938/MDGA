@@ -166,6 +166,8 @@ type DraftWorkspace = {
 
 type UpdateState =
   | { status: "idle" }
+  | { status: "checking" }
+  | { status: "uptodate" }
   | { status: "available"; version: string }
   | { status: "downloading"; progress: number }
   | { status: "error"; message: string };
@@ -1023,6 +1025,17 @@ export function App() {
     }
   }
 
+  /** 手动检查更新：全程有反馈（检查中 / 发现新版 / 已是最新 / 失败）。 */
+  async function handleCheckUpdate() {
+    setUpdate({ status: "checking" });
+    try {
+      const v = await invoke<string | null>("check_update");
+      setUpdate(v ? { status: "available", version: v } : { status: "uptodate" });
+    } catch (err) {
+      setUpdate({ status: "error", message: humanizeError(String(err)) });
+    }
+  }
+
   const hasMessages = messages.length > 0;
   const activeConversation = conversations.find((conv) => conv.id === activeConvId);
   const conversationUsage = aggregateUsage(messages);
@@ -1450,13 +1463,8 @@ export function App() {
           onRefreshMcp={refreshMcpServers}
           onAddPermRule={handleAddPermRule}
           onDeletePermRule={handleDeletePermRule}
-          onCheckUpdate={() => {
-            invoke<string | null>("check_update")
-              .then((v) => {
-                if (v) setUpdate({ status: "available", version: v });
-              })
-              .catch(() => {});
-          }}
+          update={update}
+          onCheckUpdate={handleCheckUpdate}
           onClose={() => setShowSettings(false)}
         />
       )}
@@ -1553,6 +1561,7 @@ function SettingsModal({
   onRefreshMcp,
   onAddPermRule,
   onDeletePermRule,
+  update,
   onCheckUpdate,
   onClose,
 }: {
@@ -1572,6 +1581,7 @@ function SettingsModal({
   onRefreshMcp: () => void;
   onAddPermRule: (rule: string) => void;
   onDeletePermRule: (rule: string) => void;
+  update: UpdateState;
   onCheckUpdate: () => void;
   onClose: () => void;
 }) {
@@ -1749,7 +1759,22 @@ function SettingsModal({
                 <span className="settings-row__value" title={appInfo?.dataDir}>{appInfo?.dataDir ?? "…"}</span>
               </div>
               <p className="settings-desc">会话、token 账本、权限规则等本地数据保存在数据目录的 SQLite 中。</p>
-              <button type="button" className="approval-card__btn" style={{ marginTop: 12 }} onClick={onCheckUpdate}>检查更新</button>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12 }}>
+                <button
+                  type="button"
+                  className="approval-card__btn"
+                  onClick={onCheckUpdate}
+                  disabled={update.status === "checking" || update.status === "downloading"}
+                >
+                  {update.status === "checking" ? "检查中…" : "检查更新"}
+                </button>
+                <span className="settings-desc" style={{ margin: 0 }}>
+                  {update.status === "uptodate" && "已是最新版本"}
+                  {update.status === "available" && `发现新版本 v${update.version}，可在左下角横幅安装`}
+                  {update.status === "downloading" && `正在下载… ${update.progress}%`}
+                  {update.status === "error" && <span style={{ color: "var(--danger)" }}>{update.message}</span>}
+                </span>
+              </div>
             </>
           )}
         </div>
