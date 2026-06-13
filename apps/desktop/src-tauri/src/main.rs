@@ -1,6 +1,6 @@
 use mdga_deepseek_client::{
-    chat_completion, chat_stream, detect_api_key_status, parse_dsml_tool_calls, strip_dsml_markup,
-    ChatMessage, ToolCall,
+    chat_completion, chat_stream, detect_api_key_status, get_user_balance, parse_dsml_tool_calls,
+    strip_dsml_markup, ChatMessage, ToolCall, UserBalance,
 };
 use mdga_sandbox_runtime::{
     decide_tool_access, is_low_risk_command, session_security_context, NetworkMode,
@@ -368,6 +368,14 @@ fn pin_conversation(
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     set_conversation_pinned(&db, &conversation_id, pinned).map_err(|e| e.to_string())
+}
+
+/// 查询 DeepSeek 账户余额，供设置页展示。从环境变量读取 API Key，不缓存、不持久化。
+#[tauri::command]
+async fn get_account_balance() -> Result<UserBalance, String> {
+    let api_key = std::env::var("DEEPSEEK_API_KEY")
+        .map_err(|_| "DEEPSEEK_API_KEY 未配置".to_string())?;
+    get_user_balance(&api_key).await.map_err(|e| e.to_string())
 }
 
 /// 返回应用信息（版本号、数据目录路径），供设置页展示。
@@ -2814,6 +2822,7 @@ fn main() {
             pin_conversation,
             archive_conversation,
             get_app_info,
+            get_account_balance,
             get_checkpoints,
             revert_to_checkpoint,
             compact_history,

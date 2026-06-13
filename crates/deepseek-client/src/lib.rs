@@ -235,6 +235,71 @@ pub async fn chat_completion(
     parse_chat_completion_response(&value)
 }
 
+/// 单一币种的余额明细（金额为字符串，保留服务端原始精度）。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceInfo {
+    pub currency: String,
+    pub total_balance: String,
+    pub granted_balance: String,
+    pub topped_up_balance: String,
+}
+
+/// 账户余额信息（DeepSeek 公开账户接口仅提供余额，无更多用户资料）。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserBalance {
+    pub is_available: bool,
+    pub balance_infos: Vec<BalanceInfo>,
+}
+
+/// 查询 DeepSeek 账户余额。
+///
+/// 输入 API Key；GET /user/balance（Bearer 认证），返回可用状态与各币种余额明细。
+/// 这是 DeepSeek 公开 API 唯一的账户信息接口，没有用户名等更多资料。
+pub async fn get_user_balance(api_key: &str) -> Result<UserBalance, DeepSeekError> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(DeepSeekError::Http)?;
+    let response = client
+        .get("https://api.deepseek.com/user/balance")
+        .bearer_auth(api_key)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(classify_api_error(status, &body));
+    }
+    let value = response.json::<serde_json::Value>().await?;
+    parse_user_balance(&value)
+}
+
+/// 把 /user/balance 的原始 JSON（snake_case）解析为 UserBalance，缺失字段安全降级。
+fn parse_user_balance(value: &serde_json::Value) -> Result<UserBalance, DeepSeekError> {
+    let is_available = value
+        .get("is_available")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let balance_infos = value
+        .get("balance_infos")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| BalanceInfo {
+                    currency: item.get("currency").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    total_balance: item.get("total_balance").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                    granted_balance: item.get("granted_balance").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                    topped_up_balance: item.get("topped_up_balance").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(UserBalance { is_available, balance_infos })
+}
+
 /// 将服务端 usage JSON 解析为 RawUsage。
 ///
 /// 输入 usage 字段的 serde_json::Value 和原始 JSON 字符串，输出标准化结构；
@@ -498,6 +563,32 @@ mod tests {
         assert_eq!(parsed["path"], "helloworld.txt");
         assert_eq!(parsed["oldText"], "helloworld");
         assert_eq!(parsed["newText"], "123456");
+    }
+
+    #[test]
+    fn parses_user_balance_response() {
+        let raw = serde_json::json!({
+            "is_available": true,
+            "balance_infos": [{
+                "currency": "CNY",
+                "total_balance": "110.00",
+                "granted_balance": "10.00",
+                "topped_up_balance": "100.00"
+            }]
+        });
+        let balance = parse_user_balance(&raw).expect("should parse");
+        assert!(balance.is_available);
+        assert_eq!(balance.balance_infos.len(), 1);
+        assert_eq!(balance.balance_infos[0].currency, "CNY");
+        assert_eq!(balance.balance_infos[0].total_balance, "110.00");
+        assert_eq!(balance.balance_infos[0].topped_up_balance, "100.00");
+    }
+
+    #[test]
+    fn parses_user_balance_with_missing_fields() {
+        let balance = parse_user_balance(&serde_json::json!({})).expect("should parse empty");
+        assert!(!balance.is_available);
+        assert!(balance.balance_infos.is_empty());
     }
 
     #[test]

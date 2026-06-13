@@ -1222,6 +1222,45 @@ h1 {
   font-size: 12px;
 }
 
+.balance-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--brand-tint);
+}
+
+.balance-card__total {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.balance-card__amount {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--brand);
+  font-variant-numeric: tabular-nums;
+}
+
+.balance-card__currency {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.balance-card__detail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--text-2);
+  text-align: right;
+}
+
 .settings-section {
   margin-top: 10px;
   padding-top: 8px;

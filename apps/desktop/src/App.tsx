@@ -74,6 +74,20 @@ type FileCheckpoint = {
 
 type AppInfo = { version: string; dataDir: string };
 
+/** DeepSeek 账户余额（官方 /user/balance，唯一账户信息来源） */
+type BalanceInfo = {
+  currency: string;
+  totalBalance: string;
+  grantedBalance: string;
+  toppedUpBalance: string;
+};
+type UserBalance = { isAvailable: boolean; balanceInfos: BalanceInfo[] };
+type BalanceState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "ok"; data: UserBalance }
+  | { status: "error"; message: string };
+
 /** MCP server 配置与连接状态 */
 type McpServer = {
   id: string;
@@ -208,6 +222,7 @@ export function App() {
   const [checkpoints, setCheckpoints] = useState<FileCheckpoint[]>([]);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+  const [balance, setBalance] = useState<BalanceState>({ status: "idle" });
   const [theme, setTheme] = useState<"light" | "dark">("light");
   // @文件引用补全
   const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
@@ -867,11 +882,22 @@ export function App() {
     setMcpServers(list);
   }
 
+  async function refreshBalance() {
+    setBalance({ status: "loading" });
+    try {
+      const data = await invoke<UserBalance>("get_account_balance");
+      setBalance({ status: "ok", data });
+    } catch (err) {
+      setBalance({ status: "error", message: humanizeError(String(err)) });
+    }
+  }
+
   async function openSettings() {
     const info = await invoke<AppInfo>("get_app_info").catch(() => null);
     setAppInfo(info);
     await refreshMcpServers();
     setShowSettings(true);
+    refreshBalance();
   }
 
   async function handleAddMcpServer(name: string, command: string) {
@@ -1356,6 +1382,8 @@ export function App() {
         <SettingsModal
           appInfo={appInfo}
           apiKeyLabel={getApiKeyStatusLabel(apiKeyStatus)}
+          balance={balance}
+          onRefreshBalance={refreshBalance}
           model={model}
           permissionMode={permissionMode}
           mcpServers={mcpServers}
@@ -1454,6 +1482,8 @@ function ChangesModal({
 function SettingsModal({
   appInfo,
   apiKeyLabel,
+  balance,
+  onRefreshBalance,
   model,
   permissionMode,
   mcpServers,
@@ -1468,6 +1498,8 @@ function SettingsModal({
 }: {
   appInfo: AppInfo | null;
   apiKeyLabel: string;
+  balance: BalanceState;
+  onRefreshBalance: () => void;
   model: DeepSeekModelId;
   permissionMode: PermissionMode;
   mcpServers: McpServer[];
@@ -1490,6 +1522,50 @@ function SettingsModal({
           <span className="settings-row__label">DeepSeek API Key</span>
           <span className="settings-row__value">{apiKeyLabel}</span>
         </div>
+
+        {/* 账户余额（DeepSeek /user/balance，唯一账户信息接口） */}
+        <div className="settings-section">
+          <div className="settings-section__head">
+            <span>账户余额</span>
+            <button
+              className="changes-row__revert"
+              type="button"
+              onClick={onRefreshBalance}
+              disabled={balance.status === "loading"}
+            >
+              {balance.status === "loading" ? "查询中…" : "刷新"}
+            </button>
+          </div>
+          {balance.status === "error" && (
+            <p className="settings-row__value" style={{ color: "var(--danger)" }}>{balance.message}</p>
+          )}
+          {balance.status === "ok" && (
+            <>
+              <div className="settings-row">
+                <span className="settings-row__label">状态</span>
+                <span className="settings-row__value" style={{ color: balance.data.isAvailable ? "var(--success)" : "var(--danger)" }}>
+                  {balance.data.isAvailable ? "余额充足，可正常调用" : "余额不足"}
+                </span>
+              </div>
+              {balance.data.balanceInfos.length === 0 && (
+                <p className="settings-row__value">未返回余额明细</p>
+              )}
+              {balance.data.balanceInfos.map((b) => (
+                <div key={b.currency} className="balance-card">
+                  <div className="balance-card__total">
+                    <span className="balance-card__amount">{b.totalBalance}</span>
+                    <span className="balance-card__currency">{b.currency}</span>
+                  </div>
+                  <div className="balance-card__detail">
+                    <span>充值 {b.toppedUpBalance}</span>
+                    <span>赠送 {b.grantedBalance}</span>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+
         <div className="settings-row">
           <span className="settings-row__label">默认模型</span>
           <select
