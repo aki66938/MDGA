@@ -20,6 +20,9 @@ use mdga_storage::{
     set_conversation_pinned, set_mcp_server_enabled, update_title, ActivityEventRecord,
     Conversation, FileCheckpoint, StoredMessage, Workspace,
 };
+use mdga_storage::{
+    delete_model_provider, get_setting, set_setting, upsert_model_provider, ModelProvider,
+};
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
@@ -36,6 +39,76 @@ pub(crate) fn get_deepseek_api_key_status(state: State<AppState>) -> ApiKeyStatu
         .and_then(|db| get_model_provider(&db, "main").ok().flatten().map(|p| p.api_key))
         .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok());
     detect_api_key_status(key.as_deref())
+}
+
+// ── 模型供应商（Plan17）─────────────────────────────────────────────────────
+
+/// 按角色读取 provider（main / vision）。api_key 脱敏为空：仅表明已配置 + 回传非密字段。
+#[tauri::command]
+pub(crate) fn get_model_provider_config(
+    state: State<AppState>,
+    role: String,
+) -> Result<Option<ModelProvider>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut provider = get_model_provider(&db, &role).map_err(|e| e.to_string())?;
+    if let Some(p) = provider.as_mut() {
+        p.api_key = String::new(); // 不回显明文 key（Plan17 §6.2）
+    }
+    Ok(provider)
+}
+
+/// 保存（upsert）某角色的 provider。base_url 留空＝用 preset 官方端点。
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub(crate) fn save_model_provider(
+    state: State<AppState>,
+    role: String,
+    preset: Option<String>,
+    label: Option<String>,
+    base_url: Option<String>,
+    api_key: String,
+    model_id: String,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    upsert_model_provider(
+        &db,
+        &role,
+        preset.as_deref(),
+        label.as_deref(),
+        base_url.as_deref().filter(|s| !s.trim().is_empty()),
+        api_key.trim(),
+        model_id.trim(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 删除某角色的 provider（如关闭模态扩展时移除视觉 provider）。
+#[tauri::command]
+pub(crate) fn remove_model_provider(state: State<AppState>, role: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    delete_model_provider(&db, &role).map_err(|e| e.to_string())
+}
+
+/// 读取一个应用设置（如 modality_extended 开关）。
+#[tauri::command]
+pub(crate) fn get_app_setting(
+    state: State<AppState>,
+    key: String,
+) -> Result<Option<String>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    get_setting(&db, &key).map_err(|e| e.to_string())
+}
+
+/// 写入一个应用设置。
+#[tauri::command]
+pub(crate) fn set_app_setting(
+    state: State<AppState>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    set_setting(&db, &key, &value).map_err(|e| e.to_string())
 }
 
 // ── 会话管理 ──────────────────────────────────────────────────────────────
