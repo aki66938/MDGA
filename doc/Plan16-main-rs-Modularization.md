@@ -80,6 +80,30 @@
 
 ---
 
+## 5.5 执行进度与剩余计划（2026-06 实测）
+
+**已抽出并入库（7 模块，main.rs 4589 → 3251，−29%）**：`state` / `web` / `command_run` / `hooks` / `compaction` / `mcp` / `permissions`。每个均 `cargo test -p mdga-desktop` 14 passed、零警告；被测私有函数随测试迁入对应模块。
+
+**已确立的抽取范式（后续模块照此执行）**：
+1. 新建 `<模块>.rs`，对外被引用的项标 `pub(crate)`，模块内部项保持私有。
+2. 把代码整段搬入新文件；main.rs 原位置替换为 `mod <模块>; use <模块>::{...};`。
+3. 调用方需要的常量/函数升 `pub(crate)`（如 `record_tool_event`、`COMPACTED_TOOL_STUB`）。
+4. 引用了私有函数的测试，连同测试一起迁入模块的 `#[cfg(test)] mod tests`。
+5. `cargo test -p mdga-desktop` 必须 **14 passed、0 warnings**；清理失效 `use`。
+6. 该模块通过后单独 `refactor` 提交并 push main（**不打 tag、不升版本号**）。
+
+**剩余 6 模块（按依赖顺序，agent_loop 最后）**：
+| 模块 | 迁入内容 |
+|---|---|
+| `checkpoint.rs` | CheckpointCapture、CHECKPOINT_MAX_SNAPSHOT_BYTES、safe_workspace_join、capture_checkpoint_before、compute_line_diff、post_execution_diff、persist_checkpoint、apply_checkpoint_revert |
+| `chat.rs` | chat_completion_with_retry、fallback_model_for、stream_round_with_retry、recover_tool_calls_from_content、assistant_message_for_tool_calls、chat_messages_to_wire |
+| `tools.rs` | all_builtin_tool_schemas、file_tool_schema、execute_builtin_tool_call、execute_create_file_tool_call、execute_remember、execute_todo_write、execute_load_skill、load_workspace_skills、PARALLEL_READONLY_TOOLS、execute_readonly_call |
+| `subagent.rs` | SUBTASK_MAX_ROUNDS、read_only_tool_schemas、execute_run_subtask、run_subtask_loop、execute_bg_task_tool（依赖 chat + tools，故在其后）|
+| `commands.rs` | 除 send_message 外的全部 `#[tauri::command]` + 仅命令用到的小工具（parse_command_frontmatter、extract_docx_text、workspace_name_from_path、permission_mode_from_str 等）|
+| `agent_loop.rs` | send_message、chat_with_builtin_tools、messages_with_workspace_context、read_workspace_memory（依赖前面所有模块，**最后抽**）|
+
+> 依赖以 cargo 报错为准动态解决：缺啥就把调用方的项升 `pub(crate)`、删失效 `use`。真正全局共享的小工具（如 `record_tool_event`）可暂留 main.rs。目标：main.rs 收敛为薄入口（main() + setup + invoke_handler + mod 声明）。
+
 ## 6. 验收标准（必须全部满足）
 
 - `cargo test --workspace`、`cargo check`、`cargo check --no-default-features`、`npm run typecheck` 全绿。
