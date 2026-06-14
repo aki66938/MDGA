@@ -68,19 +68,15 @@ pub(crate) async fn send_message(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "会话不存在".to_string())?;
         let rules = list_permission_rules(&db).unwrap_or_default();
-        // 主模型 provider（Plan17）：base_url/api_key 从 DB 取；为空时解析 preset 官方端点。
-        // 过渡期：DB 无主 provider 时回退 DEEPSEEK_API_KEY + 官方端点；前端 provider 配置 UI 落地后按 D3 删除此回退。
+        // 主模型 provider（Plan17 D3）：base_url/api_key 一律从 DB 取；base_url 为空时解析 preset 官方端点。
+        // DB 无主 provider 即报错引导去设置页，不再回退环境变量。
         let (base_url, api_key) = match get_model_provider(&db, "main") {
             Ok(Some(p)) => {
                 let bu = resolve_base_url(p.base_url.as_deref(), p.preset.as_deref())
-                    .unwrap_or_else(|| "https://api.deepseek.com".to_string());
+                    .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
                 (bu, p.api_key)
             }
-            _ => {
-                let key = std::env::var("DEEPSEEK_API_KEY")
-                    .map_err(|_| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
-                ("https://api.deepseek.com".to_string(), key)
-            }
+            _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
         };
         (conversation, rules, base_url, api_key)
     };

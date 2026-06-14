@@ -2,7 +2,7 @@
 
 **Make DeepSeek Great Again** — Windows 桌面端 DeepSeek 本地客户端
 
-基于 Tauri 2 + Rust + React 构建，本地优先，无云账号，无数据上传。API Key 只从系统环境变量读取，不在应用内保存。
+基于 Tauri 2 + Rust + React 构建，本地优先，无云账号，无数据上传。API Key 由用户在应用「设置 → 模型供应商」中配置，存于本地，不上传云端。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -15,19 +15,19 @@
 - `.msi` — 推荐，Windows Installer 标准格式
 - `.exe` — NSIS 安装程序
 
-安装后**无需任何账号**，配置好环境变量即可直接使用。
+安装后**无需任何账号**，在应用内配置好模型供应商即可直接使用。
 
 ---
 
 ## 使用前提
 
-在 Windows 系统环境变量中添加 `DEEPSEEK_API_KEY`：
+首次启动后，在应用内打开「**设置 → 模型供应商**」配置主模型：
 
-1. 右键「此电脑」→「属性」→「高级系统设置」→「环境变量」
-2. 在「系统变量」中新建变量名 `DEEPSEEK_API_KEY`，值为你的 API Key
-3. 确认保存后**重新启动应用**
+1. 选择供应商预设（DeepSeek / 智谱 GLM / 月之暗面 Kimi / 通义 / 自定义）
+2. 填入该供应商的 API Key 与模型 ID（Base URL 留空走官方端点，自托管/代理可在高级设置里覆盖）
+3. 点击「保存」即可开始对话
 
-API Key 可在 [DeepSeek 开放平台](https://platform.deepseek.com) 获取。
+DeepSeek 的 API Key 可在 [DeepSeek 开放平台](https://platform.deepseek.com) 获取。Key 存于本地数据库，不上传云端。
 
 ---
 

@@ -31,13 +31,12 @@ use tauri_plugin_updater::UpdaterExt;
 
 #[tauri::command]
 pub(crate) fn get_deepseek_api_key_status(state: State<AppState>) -> ApiKeyStatus {
-    // Plan17 D3：以 DB 主 provider 是否已配置为准；过渡期 DB 无 provider 时回退 env（前端配置 UI 落地后删）。
+    // Plan17 D3：纯以 DB 主 provider 是否已配置为准，不再读环境变量。
     let key = state
         .db
         .lock()
         .ok()
-        .and_then(|db| get_model_provider(&db, "main").ok().flatten().map(|p| p.api_key))
-        .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok());
+        .and_then(|db| get_model_provider(&db, "main").ok().flatten().map(|p| p.api_key));
     detect_api_key_status(key.as_deref())
 }
 
@@ -225,11 +224,17 @@ pub(crate) fn pin_conversation(
     set_conversation_pinned(&db, &conversation_id, pinned).map_err(|e| e.to_string())
 }
 
-/// 查询 DeepSeek 账户余额，供设置页展示。从环境变量读取 API Key，不缓存、不持久化。
+/// 查询 DeepSeek 账户余额，供设置页展示。Plan17 D3：从 DB 主 provider 取 Key（仅 deepseek 预设有意义），不再读环境变量。
 #[tauri::command]
-pub(crate) async fn get_account_balance() -> Result<UserBalance, String> {
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .map_err(|_| "DEEPSEEK_API_KEY 未配置".to_string())?;
+pub(crate) async fn get_account_balance(state: State<'_, AppState>) -> Result<UserBalance, String> {
+    let api_key = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        get_model_provider(&db, "main")
+            .map_err(|e| e.to_string())?
+            .map(|p| p.api_key)
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?
+    };
     get_user_balance(&api_key).await.map_err(|e| e.to_string())
 }
 
@@ -318,18 +323,14 @@ pub(crate) async fn compact_history(
 ) -> Result<(), String> {
     let (base_url, api_key, messages) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        // 主模型 provider（Plan17）：过渡期 DB 无主 provider 时回退 env + 官方端点。
+        // 主模型 provider（Plan17 D3）：一律从 DB 取，无主 provider 即报错引导去设置页。
         let (base_url, api_key) = match get_model_provider(&db, "main") {
             Ok(Some(p)) => {
                 let bu = resolve_base_url(p.base_url.as_deref(), p.preset.as_deref())
-                    .unwrap_or_else(|| "https://api.deepseek.com".to_string());
+                    .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
                 (bu, p.api_key)
             }
-            _ => {
-                let key = std::env::var("DEEPSEEK_API_KEY")
-                    .map_err(|_| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
-                ("https://api.deepseek.com".to_string(), key)
-            }
+            _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
         };
         let messages = get_messages(&db, &conversation_id).map_err(|e| e.to_string())?;
         (base_url, api_key, messages)
