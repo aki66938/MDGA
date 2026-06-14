@@ -34,15 +34,15 @@ use mdga_tool_runtime::{
 /// DeepSeek V4 Flash / Pro 官方标称 1M 上下文，故取 800K：在接近上限前压缩，
 /// 留约 200K headroom 给模型输出与当轮工具结果，避免顶满 1M 触发服务端退化。
 /// 可用环境变量 MDGA_CONTEXT_SOFT_LIMIT 覆盖（便于低阈值压测验证压缩机制）。
-const CONTEXT_SOFT_LIMIT_TOKENS: u64 = 800_000;
+pub(crate) const CONTEXT_SOFT_LIMIT_TOKENS: u64 = 800_000;
 /// 摘要压缩时保留最近 N 条 wire 消息原文，更早的历史压缩成任务进度摘要。
-const KEEP_RECENT_WIRE_MESSAGES: usize = 8;
+pub(crate) const KEEP_RECENT_WIRE_MESSAGES: usize = 8;
 /// 压缩时保留最近 N 次工具结果全文，更早的大体积结果替换为短桩。
 const KEEP_RECENT_TOOL_RESULTS: usize = 3;
 /// 仅压缩正文超过该字符数的旧工具结果；小结果不动，避免无谓信息损失。
 const TOOL_RESULT_STUB_THRESHOLD: usize = 1_500;
 /// 工具结果被压缩后替换成的短桩内容。
-const COMPACTED_TOOL_STUB: &str =
+pub(crate) const COMPACTED_TOOL_STUB: &str =
     "{\"ok\":true,\"note\":\"[此前的工具结果已省略以节省上下文；如需该文件/目录/命令的最新内容，请重新调用对应工具读取]\"}";
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -51,70 +51,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::oneshot;
 
-/// 审批请求自增序号，用于生成唯一 action_id。
-static APPROVAL_SEQ: AtomicU64 = AtomicU64::new(1);
-/// ask_user 结构化提问自增序号，生成唯一 question_id。
-static QUESTION_SEQ: AtomicU64 = AtomicU64::new(1);
-
-// ── 应用状态 ──────────────────────────────────────────────────────────────
-
-struct AppState {
-    db: Mutex<rusqlite::Connection>,
-    /// 正在运行的 Agent 会话取消标志，按 conversation_id 索引。用户点击停止时置 true，
-    /// 工具循环在轮次之间和工具执行前检查并安全收尾。
-    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    /// 等待用户审批的高风险动作，按 action_id 索引，附带该动作对应的「总是允许」规则串。
-    /// respond_approval 命令收到前端决定后，通过 oneshot 通道唤醒正在 await 的工具循环；
-    /// 用户勾选记住时把规则写入 permission_rules 表。
-    approvals: Mutex<HashMap<String, (oneshot::Sender<bool>, String)>>,
-    /// 等待用户回答的 ask_user 结构化提问，按 question_id 索引。respond_ask_user 命令收到
-    /// 前端选择后，通过 oneshot 通道把答案 JSON 回送给正在 await 的工具循环。
-    ask_questions: Mutex<HashMap<String, oneshot::Sender<String>>>,
-    /// 已连接的 MCP server 客户端，按配置 id 索引。Arc 包裹以便在锁外调用。
-    mcp: Mutex<HashMap<String, Arc<McpClient>>>,
-    /// Steering：用户在 Agent 运行中排队的插话消息，按 conversation_id 索引。
-    /// 工具循环在每轮开始时取出并作为 user 消息注入，实现「运行中纠偏」。
-    steering: Mutex<HashMap<String, Vec<String>>>,
-    /// repo map 按会话缓存：避免每轮重新遍历工作区，并让 system 前缀字节稳定，
-    /// 最大化 DeepSeek prompt 缓存命中（缓存友好上下文）。
-    repo_maps: Mutex<HashMap<String, String>>,
-    /// 托管后台 shell：background=true 启动的命令，按 shell_id 索引，可轮询输出 / 杀进程。
-    bg_shells: Mutex<HashMap<String, BgShell>>,
-    /// 后台子代理任务：run_subtask background=true 启动的探索代理，按 task_id 索引，
-    /// 可用 get_task_output 轮询报告/状态、kill_task 终止；完成时 usage 由首次 get_task_output 结算进账本。
-    bg_tasks: Mutex<HashMap<String, BgTask>>,
-    /// 命令沙箱开关（默认开）：前台 run_command 是否在受限令牌沙箱中执行。
-    command_sandbox: AtomicBool,
-    /// 单次任务 token 预算（累计 total_tokens 上限）；0 = 不限。超出则暂停工具循环。
-    task_token_budget: AtomicU64,
-}
-
-/// 一个托管的后台 shell 进程状态。
-#[derive(Clone)]
-struct BgShell {
-    command: String,
-    output: Arc<Mutex<String>>,
-    status: Arc<Mutex<String>>, // running | done | killed | error
-    cancel: Arc<AtomicBool>,
-}
-
-/// 后台 shell 自增序号，生成唯一 shell_id。
-static BG_SHELL_SEQ: AtomicU64 = AtomicU64::new(1);
-
-/// 一个后台子代理任务的共享状态（仿 BgShell）。
-#[derive(Clone)]
-struct BgTask {
-    description: String,
-    report: Arc<Mutex<String>>,
-    status: Arc<Mutex<String>>, // running | done | killed | error
-    usage: Arc<Mutex<Option<mdga_shared::RawUsage>>>,
-    /// usage 是否已被某次 get_task_output 结算进会话账本，避免重复计费。
-    settled: Arc<AtomicBool>,
-    cancel: Arc<AtomicBool>,
-}
-
-/// 后台子代理任务自增序号，生成唯一 task_id。
-static BG_TASK_SEQ: AtomicU64 = AtomicU64::new(1);
+mod state;
+use state::{AppState, BgTask, APPROVAL_SEQ, BG_TASK_SEQ, QUESTION_SEQ};
 
 /// MCP 工具与模型函数名的绑定关系，按 send 周期收集后传入工具循环。
 #[derive(Clone)]
@@ -1819,166 +1757,8 @@ fn apply_checkpoint_revert(workspace: &str, checkpoint: &FileCheckpoint) -> Resu
 
 // ── Hooks 生命周期系统 ──────────────────────────────────────────────────
 //
-// 从工作区 .mdga/hooks.json 读取用户定义的生命周期钩子。PreToolUse 在工具执行前运行，
-// 退出码非 0 则阻断该工具（stdout/stderr 作为原因回灌模型）；PostToolUse 在工具成功后运行（信息性）。
-// 钩子命令经 PowerShell 执行，工具的 { tool, arguments } 以 JSON 从 stdin 传入。
-
-#[derive(serde::Deserialize)]
-struct HookEntry {
-    matcher: String,
-    command: String,
-}
-
-#[derive(serde::Deserialize, Default)]
-struct HooksConfig {
-    #[serde(rename = "PreToolUse", default)]
-    pre_tool_use: Vec<HookEntry>,
-    #[serde(rename = "PostToolUse", default)]
-    post_tool_use: Vec<HookEntry>,
-}
-
-/// 读取工作区 .mdga/diagnostics 的诊断命令（首个非空非注释行）；不存在则 None。
-/// 例：写入 `cargo check` 或 `npm run typecheck`，Agent 改完代码收尾前自动跑、有错则修。
-fn read_diagnostics_command(workspace: &str) -> Option<String> {
-    let path = std::path::Path::new(workspace).join(".mdga").join("diagnostics");
-    let content = std::fs::read_to_string(path).ok()?;
-    content
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_string)
-}
-
-fn load_hooks(workspace: &str) -> HooksConfig {
-    let path = std::path::Path::new(workspace).join(".mdga").join("hooks.json");
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-/// matcher 匹配工具名：`*` 匹配全部，否则按 `,` 或 `|` 分隔的工具名列表精确匹配。
-fn hook_matcher_matches(matcher: &str, tool_name: &str) -> bool {
-    let m = matcher.trim();
-    m == "*"
-        || m.split([',', '|'])
-            .any(|t| t.trim() == tool_name)
-}
-
-/// 运行一条钩子命令：JSON 从 stdin 传入，30s 超时，返回 (是否成功, 输出文本)。
-fn run_hook_command(workspace: &str, command: &str, stdin_json: &str) -> (bool, String) {
-    use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
-    let mut child = match Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", command])
-        .current_dir(workspace)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return (false, format!("钩子启动失败: {e}")),
-    };
-    if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(stdin_json.as_bytes());
-    }
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let so = std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(mut p) = stdout_pipe {
-            let _ = p.read_to_string(&mut s);
-        }
-        s
-    });
-    let se = std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(mut p) = stderr_pipe {
-            let _ = p.read_to_string(&mut s);
-        }
-        s
-    });
-    let start = std::time::Instant::now();
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) => {
-                if start.elapsed() > std::time::Duration::from_secs(30) {
-                    let _ = child.kill();
-                    timed_out = true;
-                    break None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(40));
-            }
-            Err(_) => break None,
-        }
-    };
-    let out = so.join().unwrap_or_default();
-    let err = se.join().unwrap_or_default();
-    let text = format!("{out}{err}").trim().to_string();
-    if timed_out {
-        return (false, "钩子执行超时（30s）".to_string());
-    }
-    let ok = status.map(|s| s.success()).unwrap_or(false);
-    (ok, text)
-}
-
-/// 运行匹配的 PreToolUse 钩子；任一钩子退出码非 0 则返回 Some(阻断原因)。
-fn run_pre_tool_hooks(workspace: &str, tool_name: &str, arguments: &str) -> Option<String> {
-    let cfg = load_hooks(workspace);
-    if cfg.pre_tool_use.is_empty() {
-        return None;
-    }
-    let args_val: serde_json::Value =
-        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
-    let payload =
-        serde_json::json!({ "hook": "PreToolUse", "tool": tool_name, "arguments": args_val })
-            .to_string();
-    for hook in &cfg.pre_tool_use {
-        if hook_matcher_matches(&hook.matcher, tool_name) {
-            let (ok, text) = run_hook_command(workspace, &hook.command, &payload);
-            if !ok {
-                let reason = if text.is_empty() {
-                    "被 PreToolUse 钩子阻断".to_string()
-                } else {
-                    format!("被 PreToolUse 钩子阻断：{text}")
-                };
-                return Some(reason);
-            }
-        }
-    }
-    None
-}
-
-/// 运行匹配的 PostToolUse 钩子（信息性，不阻断），把输出作为 activity 事件展示。
-fn run_post_tool_hooks(app: &AppHandle, workspace: &str, tool_name: &str, arguments: &str) {
-    let cfg = load_hooks(workspace);
-    if cfg.post_tool_use.is_empty() {
-        return;
-    }
-    let args_val: serde_json::Value =
-        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
-    let payload =
-        serde_json::json!({ "hook": "PostToolUse", "tool": tool_name, "arguments": args_val })
-            .to_string();
-    for hook in &cfg.post_tool_use {
-        if hook_matcher_matches(&hook.matcher, tool_name) {
-            let (ok, text) = run_hook_command(workspace, &hook.command, &payload);
-            let _ = app.emit(
-                "tool-event",
-                serde_json::json!({
-                    "toolName": format!("hook:{tool_name}"),
-                    "status": if ok { "succeeded" } else { "failed" },
-                    "inputJson": serde_json::json!({ "command": hook.command }).to_string(),
-                    "outputJson": serde_json::Value::Null,
-                    "errorMessage": if ok || text.is_empty() { None } else { Some(text) },
-                }),
-            );
-        }
-    }
-}
+mod hooks;
+use hooks::{read_diagnostics_command, run_post_tool_hooks, run_pre_tool_hooks};
 
 /// remember 工具：把一条值得跨会话记住的事实追加到工作区 MDGA.md 的「自动记忆」区。
 ///
@@ -2034,57 +1814,8 @@ fn execute_todo_write(app: &AppHandle, arguments: &str) -> Result<serde_json::Va
     }))
 }
 
-/// 把 HTML 粗略转为可读纯文本：去掉 script/style 整块，剥离标签，解码实体，压缩空白。
-/// UTF-8 安全：按字符处理，不按字节，避免多字节中文被破坏。
-fn html_to_text(html: &str) -> String {
-    let mut s = html.to_string();
-    // 移除 script / style 整块（每轮重算 lower，保证偏移与 s 同步）
-    for tag in ["script", "style"] {
-        let open = format!("<{tag}");
-        let close = format!("</{tag}>");
-        loop {
-            let lower = s.to_lowercase();
-            let Some(start) = lower.find(&open) else { break };
-            match lower[start..].find(&close) {
-                Some(rel) => {
-                    let end = start + rel + close.len();
-                    s.replace_range(start..end, " ");
-                }
-                None => {
-                    s.replace_range(start.., " ");
-                    break;
-                }
-            }
-        }
-    }
-    // 按字符剥离标签
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => {
-                in_tag = true;
-                out.push(' ');
-            }
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    let decoded = out
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ");
-    decoded
-        .lines()
-        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+mod web;
+use web::{execute_web_fetch, execute_web_search};
 
 /// 可并行执行的只读工具集合（无副作用，并发安全）。
 const PARALLEL_READONLY_TOOLS: &[&str] =
@@ -2101,140 +1832,6 @@ async fn execute_readonly_call(
         "web_search" => execute_web_search(arguments).await,
         _ => execute_builtin_tool_call(security_context, tool_name, arguments),
     }
-}
-
-/// web_fetch 工具：抓取一个 URL 并提取可读正文（截断防膨胀）。仅允许 http/https。
-async fn execute_web_fetch(arguments: &str) -> Result<serde_json::Value, String> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(arguments).map_err(|e| format!("工具参数解析失败: {e}"))?;
-    let url = parsed.get("url").and_then(|v| v.as_str()).ok_or("web_fetch 缺少 url")?;
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err("仅支持 http/https URL".to_string());
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .user_agent("MDGA/1.0 (+https://github.com/aki66938/MDGA)")
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().await.map_err(|e| format!("抓取失败: {e}"))?;
-    let status = resp.status();
-    let ctype = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let body = resp.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
-    let text = if ctype.contains("html") || body.trim_start().starts_with('<') {
-        html_to_text(&body)
-    } else {
-        body
-    };
-    let capped: String = text.chars().take(40_000).collect();
-    Ok(serde_json::json!({
-        "url": url,
-        "status": status.as_u16(),
-        "text": capped
-    }))
-}
-
-/// web_search 工具：通过 DuckDuckGo HTML 端点搜索，返回标题 / 链接 / 摘要列表（无需 API Key）。
-async fn execute_web_search(arguments: &str) -> Result<serde_json::Value, String> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(arguments).map_err(|e| format!("工具参数解析失败: {e}"))?;
-    let query = parsed.get("query").and_then(|v| v.as_str()).ok_or("web_search 缺少 query")?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .user_agent("Mozilla/5.0 (compatible; MDGA/1.0)")
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .post("https://html.duckduckgo.com/html/")
-        .form(&[("q", query)])
-        .send()
-        .await
-        .map_err(|e| format!("搜索失败: {e}"))?;
-    let html = resp.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
-    let results = parse_ddg_results(&html, 8);
-    if results.is_empty() {
-        return Ok(serde_json::json!({
-            "query": query,
-            "results": [],
-            "note": "未解析到结果（搜索页结构可能变化），可改用 web_fetch 直接抓取已知 URL。"
-        }));
-    }
-    Ok(serde_json::json!({ "query": query, "results": results }))
-}
-
-/// 从 DuckDuckGo HTML 结果页解析前 limit 条 { title, url, snippet }。
-fn parse_ddg_results(html: &str, limit: usize) -> Vec<serde_json::Value> {
-    let mut results = Vec::new();
-    // 结果链接锚点：class="result__a" href="..."；摘要：class="result__snippet"
-    for chunk in html.split("result__a").skip(1) {
-        if results.len() >= limit {
-            break;
-        }
-        let Some(href_pos) = chunk.find("href=\"") else { continue };
-        let after = &chunk[href_pos + 6..];
-        let Some(end) = after.find('"') else { continue };
-        let raw_url = &after[..end];
-        let url = decode_ddg_url(raw_url);
-        // 标题：href 标签 > 之后到 </a>
-        let title = after
-            .find('>')
-            .and_then(|gt| after[gt + 1..].find("</a>").map(|e| &after[gt + 1..gt + 1 + e]))
-            .map(|t| html_to_text(t))
-            .unwrap_or_default();
-        let snippet = chunk
-            .find("result__snippet")
-            .and_then(|p| chunk[p..].find('>').map(|gt| &chunk[p + gt + 1..]))
-            .and_then(|s| s.find("</a>").map(|e| &s[..e]))
-            .map(|s| html_to_text(s))
-            .unwrap_or_default();
-        if url.starts_with("http") && !title.is_empty() {
-            results.push(serde_json::json!({
-                "title": title,
-                "url": url,
-                "snippet": snippet.chars().take(300).collect::<String>()
-            }));
-        }
-    }
-    results
-}
-
-/// DuckDuckGo 跳转链接 `//duckduckgo.com/l/?uddg=<编码真实URL>` 解码为真实 URL。
-fn decode_ddg_url(raw: &str) -> String {
-    let target = if let Some(pos) = raw.find("uddg=") {
-        let enc = &raw[pos + 5..];
-        let enc = enc.split('&').next().unwrap_or(enc);
-        percent_decode(enc)
-    } else {
-        raw.to_string()
-    };
-    if target.starts_with("//") {
-        format!("https:{target}")
-    } else {
-        target
-    }
-}
-
-/// 最小 percent-decode（仅用于 DDG 跳转 URL 还原）。
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
 }
 
 /// add_mcp_server 工具：让 Agent 用 MDGA 真正的机制注册并连接一个 MCP 服务器
@@ -2281,140 +1878,8 @@ fn execute_mcp_tool(
     Ok(serde_json::json!({ "content": capped }))
 }
 
-/// 构造把命令输出逐行推送到前端的回调（"command-output" 事件）。
-fn command_line_callback(app: &AppHandle) -> mdga_tool_runtime::CommandLineCallback {
-    let app = app.clone();
-    std::sync::Arc::new(move |line: String| {
-        let _ = app.emit("command-output", line);
-    })
-}
-
-/// run_command 工具的桌面端执行：前台流式输出；background=true 时立即返回、
-/// 后台线程跑完后通过 "background-command-done" 事件通知。
-fn execute_run_command_tool(
-    app: &AppHandle,
-    security_context: &SessionSecurityContext,
-    arguments: &str,
-) -> Result<serde_json::Value, String> {
-    let request = serde_json::from_str::<RunCommandRequest>(arguments)
-        .map_err(|e| format!("工具参数解析失败: {e}"))?;
-    let workspace = security_context.workspace_root.clone();
-
-    if request.background {
-        let shell_id = format!("sh-{}", BG_SHELL_SEQ.fetch_add(1, Ordering::SeqCst));
-        let output = Arc::new(Mutex::new(String::new()));
-        let status = Arc::new(Mutex::new("running".to_string()));
-        let cancel = Arc::new(AtomicBool::new(false));
-        // 注册到 AppState，供 get_shell_output / kill_shell / list_shells 访问。
-        {
-            let st = app.state::<AppState>();
-            let mut shells = st.bg_shells.lock().expect("bg_shells mutex poisoned");
-            shells.insert(
-                shell_id.clone(),
-                BgShell {
-                    command: request.command.clone(),
-                    output: output.clone(),
-                    status: status.clone(),
-                    cancel: cancel.clone(),
-                },
-            );
-        }
-        let app_bg = app.clone();
-        let command_label = request.command.clone();
-        let out_buf = output.clone();
-        let cancel_thread = cancel.clone();
-        std::thread::spawn(move || {
-            // 输出逐行累积到共享缓冲（尾部截断 32K），供轮询；同时实时推前端。
-            let app_line = app_bg.clone();
-            let cb: mdga_tool_runtime::CommandLineCallback = std::sync::Arc::new(move |line: String| {
-                if let Ok(mut buf) = out_buf.lock() {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                    let len = buf.chars().count();
-                    if len > 32_000 {
-                        *buf = buf.chars().skip(len - 32_000).collect();
-                    }
-                }
-                let _ = app_line.emit("command-output", line);
-            });
-            // 后台命令暂不沙箱化（沙箱路径不支持轮询/kill），M8.2 再统一。
-            let outcome = mdga_tool_runtime::run_command_streaming(
-                &workspace,
-                RunCommandRequest { background: false, ..request },
-                Some(cb),
-                Some(cancel_thread.clone()),
-                false,
-            );
-            let final_status = if cancel_thread.load(Ordering::SeqCst) {
-                "killed"
-            } else if outcome.is_err() {
-                "error"
-            } else {
-                "done"
-            };
-            if let Ok(mut s) = status.lock() {
-                *s = final_status.to_string();
-            }
-            let _ = app_bg.emit(
-                "background-command-done",
-                serde_json::json!({ "command": command_label, "status": final_status }),
-            );
-        });
-        return Ok(serde_json::json!({
-            "background": true,
-            "shellId": shell_id,
-            "note": "命令已在后台启动。用 get_shell_output 轮询输出、kill_shell 终止；你无需等待，继续后续步骤。"
-        }));
-    }
-
-    // 前台命令：按设置决定是否在受限令牌沙箱中执行。
-    let sandbox = app.state::<AppState>().command_sandbox.load(Ordering::SeqCst);
-    let cb = command_line_callback(app);
-    serde_json::to_value(
-        mdga_tool_runtime::run_command_streaming(&workspace, request, Some(cb), None, sandbox)
-            .map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())
-}
-
-/// 后台 shell 工具：get_shell_output / kill_shell / list_shells。从 AppState 注册表读取/控制。
-fn execute_bg_shell_tool(
-    app: &AppHandle,
-    tool_name: &str,
-    arguments: &str,
-) -> Result<serde_json::Value, String> {
-    let st = app.state::<AppState>();
-    let shells = st.bg_shells.lock().map_err(|e| e.to_string())?;
-    match tool_name {
-        "list_shells" => {
-            let list: Vec<serde_json::Value> = shells
-                .iter()
-                .map(|(id, sh)| {
-                    serde_json::json!({
-                        "shellId": id,
-                        "command": sh.command,
-                        "status": sh.status.lock().map(|s| s.clone()).unwrap_or_default(),
-                    })
-                })
-                .collect();
-            Ok(serde_json::json!({ "shells": list }))
-        }
-        "get_shell_output" | "kill_shell" => {
-            let parsed: serde_json::Value =
-                serde_json::from_str(arguments).map_err(|e| format!("工具参数解析失败: {e}"))?;
-            let id = parsed.get("shellId").and_then(|v| v.as_str()).ok_or("缺少 shellId")?;
-            let sh = shells.get(id).ok_or("shellId 不存在")?;
-            if tool_name == "kill_shell" {
-                sh.cancel.store(true, Ordering::SeqCst);
-                return Ok(serde_json::json!({ "shellId": id, "note": "已请求终止该后台命令" }));
-            }
-            let output = sh.output.lock().map(|o| o.clone()).unwrap_or_default();
-            let status = sh.status.lock().map(|s| s.clone()).unwrap_or_default();
-            Ok(serde_json::json!({ "shellId": id, "status": status, "output": output }))
-        }
-        other => Err(format!("未知后台 shell 工具: {other}")),
-    }
-}
+mod command_run;
+use command_run::{execute_bg_shell_tool, execute_run_command_tool};
 
 /// 子任务探索代理可用的只读工具集合。
 fn read_only_tool_schemas() -> Vec<serde_json::Value> {
@@ -2832,203 +2297,17 @@ async fn execute_bg_task_tool(
     }
 }
 
-/// 工具结果过大时落盘到 .mdga/tool-results/<seq>.txt，返回给模型的省流摘要（含相对路径 + 开头预览，
-/// 完整内容可用 read_file 分页读取）；未超阈值则原样返回。落盘失败退回原文，绝不丢内容。
-fn maybe_persist_large_output(workspace_path: &str, output_str: &str) -> String {
-    const LARGE_OUTPUT_THRESHOLD: usize = 16_000;
-    if output_str.chars().count() <= LARGE_OUTPUT_THRESHOLD {
-        return output_str.to_string();
-    }
-    let seq = LARGE_OUTPUT_SEQ.fetch_add(1, Ordering::SeqCst);
-    let rel = format!(".mdga/tool-results/{seq}.txt");
-    let dir = std::path::Path::new(workspace_path).join(".mdga").join("tool-results");
-    let full = dir.join(format!("{seq}.txt"));
-    let bytes = output_str.len();
-    let head: String = output_str.chars().take(2_000).collect();
-    if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&full, output_str).is_ok() {
-        serde_json::json!({
-            "ok": true,
-            "note": format!("工具输出过大（约 {bytes} 字节），已落盘以节省上下文。如需完整内容，用 read_file 读取 persistedPath（支持 offset/limit 分页）。"),
-            "persistedPath": rel,
-            "bytes": bytes,
-            "head": head
-        })
-        .to_string()
-    } else {
-        output_str.to_string()
-    }
-}
-
-/// 大工具输出落盘自增序号。
-static LARGE_OUTPUT_SEQ: AtomicU64 = AtomicU64::new(1);
-
-/// 读取上下文压缩软上限：优先取环境变量 MDGA_CONTEXT_SOFT_LIMIT（便于低阈值压测），否则用默认值。
-fn context_soft_limit_tokens() -> u64 {
-    std::env::var("MDGA_CONTEXT_SOFT_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CONTEXT_SOFT_LIMIT_TOKENS)
-}
-
-/// 计算摘要压缩的切分点：返回（开头连续 system 消息数, 摘要区终点）。
-///
-/// 开头的 system 消息（工作区上下文/工具规则/repo map/长期记忆）永不压缩；
-/// 末尾保留 keep_recent 条原文；切分点不允许落在 tool 结果上（向前回退，保证
-/// assistant 的 tool_calls 与其 tool 结果不被拆散）。历史不够长时返回 None。
-fn summary_split_points(
-    wire: &[serde_json::Value],
-    keep_recent: usize,
-) -> Option<(usize, usize)> {
-    let first_non_system = wire
-        .iter()
-        .position(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
-        .unwrap_or(wire.len());
-    if wire.len().saturating_sub(first_non_system) <= keep_recent {
-        return None;
-    }
-    let mut cut = wire.len() - keep_recent;
-    while cut > first_non_system
-        && wire[cut].get("role").and_then(|r| r.as_str()) == Some("tool")
-    {
-        cut -= 1;
-    }
-    if cut <= first_non_system {
-        return None;
-    }
-    Some((first_non_system, cut))
-}
-
-/// 把单条 wire 消息渲染成供摘要模型阅读的紧凑单行文本（角色 + 截断正文 + 工具调用名）。
-fn render_wire_message_for_summary(message: &serde_json::Value) -> String {
-    const MAX_CHARS: usize = 600;
-    let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-    let mut body = message
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
-    if let Some(calls) = message.get("tool_calls").and_then(|c| c.as_array()) {
-        let names: Vec<String> = calls
-            .iter()
-            .map(|call| {
-                let name = call
-                    .pointer("/function/name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let args: String = call
-                    .pointer("/function/arguments")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .chars()
-                    .take(120)
-                    .collect();
-                format!("{name}({args})")
-            })
-            .collect();
-        body = format!("{body} [调用工具: {}]", names.join(", "));
-    }
-    let truncated: String = body.chars().take(MAX_CHARS).collect();
-    format!("[{role}] {truncated}")
-}
-
-/// 跨轮摘要压缩（auto-compact）：把较早的对话历史压缩成任务进度摘要，替换原文继续任务。
-///
-/// 这是 Claude Code / Codex 同款思路：摘要式而非删除式。保留开头 system 消息与最近
-/// KEEP_RECENT_WIRE_MESSAGES 条原文，中间历史经一次无工具模型调用压缩为
-/// 「目标/已完成/关键决策/文件改动/下一步」备忘录，以 system 消息插回，保证任务方向不丢。
-/// 返回压缩后的消息序列与摘要调用消耗的 usage；历史太短时原样返回。
-async fn summarize_wire_history(
-    api_key: &str,
-    model: &str,
-    wire_messages: Vec<serde_json::Value>,
-    app: &AppHandle,
-) -> Result<(Vec<serde_json::Value>, Option<mdga_shared::RawUsage>), String> {
-    let Some((first_non_system, cut)) =
-        summary_split_points(&wire_messages, KEEP_RECENT_WIRE_MESSAGES)
-    else {
-        return Ok((wire_messages, None));
-    };
-
-    let transcript: String = wire_messages[first_non_system..cut]
-        .iter()
-        .map(render_wire_message_for_summary)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let prompt = format!(
-        "你是对话压缩器。请把下面这段 AI Agent 的历史对话压缩成简明的中文任务备忘录，\
-用于替换原始历史、让 Agent 继续执行任务。备忘录必须包含：\
-1）用户的总体目标；2）已完成的事项；3）关键决策与原因；\
-4）已创建/修改/删除的文件清单；5）当前进度与下一步计划。只输出备忘录本身，不要寒暄。\n\n\
-=== 历史对话开始 ===\n{transcript}\n=== 历史对话结束 ==="
-    );
-
-    let result = chat_completion_with_retry(
-        api_key,
-        vec![serde_json::json!({ "role": "user", "content": prompt })],
-        model,
-        None,
-        app,
-    )
-    .await?;
-    let summary = result.content.unwrap_or_default();
-
-    let mut compacted: Vec<serde_json::Value> = wire_messages[..first_non_system].to_vec();
-    compacted.push(serde_json::json!({
-        "role": "system",
-        "content": format!(
-            "早前对话已自动压缩。以下是任务进度摘要，请严格按其继续推进，不要偏离原始目标：\n{summary}"
-        )
-    }));
-    compacted.extend_from_slice(&wire_messages[cut..]);
-    Ok((compacted, result.usage))
-}
-
-/// 压缩 wire_messages 中较早的大体积工具结果，保留最近 keep_recent 个全文。
-///
-/// 输入构建中的 wire 消息序列；把除最近 keep_recent 个之外、正文超过 stub_threshold 字符的
-/// `role==tool` 消息正文替换为短桩，返回被压缩的条数。只动工具结果正文，**不动** assistant 的
-/// 工具调用与叙述，因此模型的推理链路和任务方向保持完整，只是丢弃了可重新获取的大体积数据。
-/// 幂等：已是短桩的消息会跳过。
-fn compact_tool_outputs(
-    wire_messages: &mut [serde_json::Value],
-    keep_recent: usize,
-    stub_threshold: usize,
-) -> usize {
-    let tool_indices: Vec<usize> = wire_messages
-        .iter()
-        .enumerate()
-        .filter(|(_, msg)| msg.get("role").and_then(|r| r.as_str()) == Some("tool"))
-        .map(|(idx, _)| idx)
-        .collect();
-    if tool_indices.len() <= keep_recent {
-        return 0;
-    }
-    let cutoff = tool_indices.len() - keep_recent;
-    let mut compacted = 0;
-    for &idx in &tool_indices[..cutoff] {
-        let content = wire_messages[idx]
-            .get("content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-        if content.len() <= stub_threshold || content == COMPACTED_TOOL_STUB {
-            continue;
-        }
-        if let Some(obj) = wire_messages[idx].as_object_mut() {
-            obj.insert(
-                "content".to_string(),
-                serde_json::Value::String(COMPACTED_TOOL_STUB.to_string()),
-            );
-            compacted += 1;
-        }
-    }
-    compacted
-}
+mod compaction;
+use compaction::{
+    compact_tool_outputs, context_soft_limit_tokens, maybe_persist_large_output,
+    summarize_wire_history,
+};
 
 /// 带退避重试的 chat_completion，容忍偶发网络抖动 / 5xx / 限流，避免一次瞬时失败打断整轮长任务。
 ///
 /// 可重试错误（网络收发失败、服务端错误、429）按 0.5s→1s→2s 退避重试，最多 4 次；
 /// 确定性错误（认证、余额、参数、上下文超限）立即返回不重试。重试时向前端推送提示。
-async fn chat_completion_with_retry(
+pub(crate) async fn chat_completion_with_retry(
     api_key: &str,
     messages: Vec<serde_json::Value>,
     model: &str,
@@ -4202,40 +3481,6 @@ mod tests {
         assert_eq!(injected[3].role, "user");
     }
 
-    #[test]
-    fn compact_tool_outputs_stubs_old_large_results_keeps_recent() {
-        let big = "x".repeat(5_000);
-        let small = "{\"ok\":true}".to_string();
-        let mut wire = vec![
-            serde_json::json!({ "role": "system", "content": "sys" }),
-            serde_json::json!({ "role": "user", "content": "do it" }),
-            serde_json::json!({ "role": "tool", "tool_call_id": "1", "content": big.clone() }), // old big -> stub
-            serde_json::json!({ "role": "tool", "tool_call_id": "2", "content": small.clone() }), // old small -> kept
-            serde_json::json!({ "role": "tool", "tool_call_id": "3", "content": big.clone() }), // recent -> kept
-            serde_json::json!({ "role": "tool", "tool_call_id": "4", "content": big.clone() }), // recent -> kept
-            serde_json::json!({ "role": "tool", "tool_call_id": "5", "content": big.clone() }), // recent -> kept
-        ];
-
-        let compacted = compact_tool_outputs(&mut wire, 3, 1_500);
-
-        assert_eq!(compacted, 1, "只压缩 1 条较早的大结果");
-        assert_eq!(wire[2]["content"], COMPACTED_TOOL_STUB); // 老的大结果被压缩
-        assert_eq!(wire[3]["content"], small); // 老的小结果不动
-        assert_eq!(wire[5]["content"], big); // 最近的保留全文
-        // 非工具消息不受影响
-        assert_eq!(wire[0]["content"], "sys");
-
-        // 幂等：再压一次不应重复处理
-        assert_eq!(compact_tool_outputs(&mut wire, 3, 1_500), 0);
-    }
-
-    #[test]
-    fn hook_matcher_matches_tool_lists() {
-        assert!(hook_matcher_matches("*", "write_file"));
-        assert!(hook_matcher_matches("write_file|edit_file", "edit_file"));
-        assert!(hook_matcher_matches("write_file, run_command", "run_command"));
-        assert!(!hook_matcher_matches("write_file|edit_file", "read_file"));
-    }
 
     #[test]
     fn glob_match_handles_wildcards() {
@@ -4274,22 +3519,6 @@ mod tests {
             permission_rules_decision(&["cmd:git push".to_string()], "run_command", "{\"command\":\"git push origin\"}"),
             Some(true)
         );
-    }
-
-    #[test]
-    fn html_to_text_strips_tags_and_scripts() {
-        let html = "<html><head><style>.a{color:red}</style></head><body><h1>标题</h1><script>alert(1)</script><p>正文 &amp; 内容</p></body></html>";
-        let text = html_to_text(html);
-        assert!(text.contains("标题"));
-        assert!(text.contains("正文 & 内容"));
-        assert!(!text.contains("alert"));
-        assert!(!text.contains("color:red"));
-        assert!(!text.contains('<'));
-    }
-
-    #[test]
-    fn percent_decode_restores_url() {
-        assert_eq!(percent_decode("https%3A%2F%2Fa.com%2Fx"), "https://a.com/x");
     }
 
     #[test]
@@ -4337,53 +3566,6 @@ mod tests {
         assert_eq!(injected[3].role, "system");
         assert!(injected[3].content.contains("项目长期记忆"));
         assert!(injected[3].content.contains("做一个计算器"));
-    }
-
-    #[test]
-    fn summary_split_keeps_systems_and_recent_without_breaking_tool_pairs() {
-        // systems(2) + 10 条历史；保留最近 3 条时切点落在 tool 结果上，
-        // 应回退到它的 assistant 调用者，保证 tool_calls 与 tool 结果不被拆散。
-        let mut wire = vec![
-            serde_json::json!({ "role": "system", "content": "ws" }),
-            serde_json::json!({ "role": "system", "content": "rules" }),
-        ];
-        for i in 0..6 {
-            wire.push(serde_json::json!({ "role": "user", "content": format!("u{i}") }));
-        }
-        wire.push(serde_json::json!({ "role": "assistant", "content": "", "tool_calls": [] })); // idx 8 调用者
-        wire.push(serde_json::json!({ "role": "tool", "tool_call_id": "1", "content": "r1" })); // idx 9
-        wire.push(serde_json::json!({ "role": "tool", "tool_call_id": "2", "content": "r2" })); // idx 10
-        wire.push(serde_json::json!({ "role": "assistant", "content": "done" })); // idx 11
-
-        // keep_recent=3 时原始切点是 idx9（tool 结果），应回退到 idx8 的 assistant 调用者。
-        let (first_non_system, cut) =
-            summary_split_points(&wire, 3).expect("should split");
-
-        assert_eq!(first_non_system, 2);
-        assert_eq!(cut, 8, "切分点应回退跳过 tool 结果，落在其 assistant 调用者上");
-        assert_ne!(wire[cut]["role"], "tool");
-
-        // 历史太短时不切分
-        let short = vec![
-            serde_json::json!({ "role": "system", "content": "ws" }),
-            serde_json::json!({ "role": "user", "content": "hi" }),
-        ];
-        assert!(summary_split_points(&short, 4).is_none());
-    }
-
-    #[test]
-    fn renders_wire_message_with_tool_calls_for_summary() {
-        let msg = serde_json::json!({
-            "role": "assistant",
-            "content": "我来读取文件",
-            "tool_calls": [{
-                "function": { "name": "read_file", "arguments": "{\"path\":\"a.txt\"}" }
-            }]
-        });
-        let line = render_wire_message_for_summary(&msg);
-        assert!(line.starts_with("[assistant]"));
-        assert!(line.contains("我来读取文件"));
-        assert!(line.contains("read_file"));
     }
 
     #[test]
