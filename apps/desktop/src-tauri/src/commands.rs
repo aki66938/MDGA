@@ -75,13 +75,25 @@ pub(crate) fn save_model_provider(
     let db = state.db.lock().map_err(|e| e.to_string())?;
     // api_format 仅视觉 provider 有意义（openai|anthropic），主模型恒 openai；缺省落回 openai。
     let api_format = api_format.as_deref().unwrap_or("openai");
+    // F1（Plan22）：密钥留空＝保留该 role 已存的 key，不覆盖为空。
+    // UI 占位「已配置 ••••（如需更换请重新输入）」暗示"留空即保留"，此前 upsert 直接写空会清掉凭据，
+    // 导致"不重输 key 再保存一次就失效"。无既有 provider（首次配置）时留空仍为空（前端已拦首配空 key）。
+    let api_key = if api_key.trim().is_empty() {
+        get_model_provider(&db, &role)
+            .ok()
+            .flatten()
+            .map(|p| p.api_key)
+            .unwrap_or_default()
+    } else {
+        api_key.trim().to_string()
+    };
     upsert_model_provider(
         &db,
         &role,
         preset.as_deref(),
         label.as_deref(),
         base_url.as_deref().filter(|s| !s.trim().is_empty()),
-        api_key.trim(),
+        &api_key,
         model_id.trim(),
         api_format,
     )

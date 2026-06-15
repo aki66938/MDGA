@@ -1159,6 +1159,30 @@ export function App() {
     await invoke("respond_ask_user", { questionId, answer }).catch(() => {});
   }
 
+  // F3：Esc 关闭/取消当前弹窗。用 ref 镜像最新状态与处理函数，
+  // 监听器只注册一次也能读到最新值，规避闭包陈旧问题。
+  const escState = useRef({
+    approval, askUser, showChanges, showSettings,
+    respondApproval, respondAskUser, setShowChanges, setShowSettings,
+  });
+  escState.current = {
+    approval, askUser, showChanges, showSettings,
+    respondApproval, respondAskUser, setShowChanges, setShowSettings,
+  };
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      const s = escState.current;
+      // 优先级：审批 → 提问 → 变更 → 设置（审批/提问 Esc=拒绝/取消）。
+      if (s.approval) { s.respondApproval(false); return; }
+      if (s.askUser) { s.respondAskUser(""); return; }
+      if (s.showChanges) { s.setShowChanges(false); return; }
+      if (s.showSettings) { s.setShowSettings(false); return; }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   async function openChangesPanel() {
     if (!activeConvId) return;
     const list = await invoke<FileCheckpoint[]>("get_checkpoints", {
@@ -2046,8 +2070,14 @@ function ChangesModal({
   onClose: () => void;
 }) {
   return (
-    <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="文件变更记录">
-      <div className="approval-card panel-card">
+    <div
+      className="approval-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="文件变更记录"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="approval-card panel-card" onClick={(e) => e.stopPropagation()}>
         <p className="approval-card__title">文件变更记录</p>
         {checkpoints.length === 0 ? (
           <p className="approval-card__hint">本会话还没有文件变更。</p>
@@ -2117,6 +2147,11 @@ function ProviderCard({
   // 已配置但用户尚未在本次会话改动 key 时，占位显示「已配置 ••••」而非空密码框。
   const [keyTouched, setKeyTouched] = useState(false);
   const [saving, setSaving] = useState(false);
+  // F2 保存成功反馈：置 true 后数秒自动复位，按钮区显示「已保存 ✓」。
+  const [saved, setSaved] = useState(false);
+  // 保存成功提示的自动复位定时器；再次保存或组件卸载时清理，避免闭包泄漏。
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimer.current) clearTimeout(savedTimer.current); }, []);
   const [error, setError] = useState<string | null>(null);
   // 测试连接（Plan19 P2a）：就地显示结果，不跳主界面。null=未测、ok=成功（绿）、err=失败（红）。
   const [testing, setTesting] = useState(false);
@@ -2144,6 +2179,7 @@ function ProviderCard({
   }, [role]);
 
   function handlePresetChange(next: string) {
+    setTestResult(null); // F4：改配置后清旧测试结果，避免误导
     setPreset(next);
     const meta = PROVIDER_PRESETS.find((p) => p.id === next);
     // 切换预设给出合理默认 modelId 占位（视觉块用识图模型表）。
@@ -2195,6 +2231,10 @@ function ProviderCard({
       setConfigured(true);
       setKeyTouched(false);
       setApiKey("");
+      // F2：保存成功显示「已保存 ✓」，数秒后自动复位（重存时先清旧定时器）。
+      if (savedTimer.current) clearTimeout(savedTimer.current);
+      setSaved(true);
+      savedTimer.current = setTimeout(() => setSaved(false), 2600);
       onSaved?.();
     } catch (err) {
       setError(humanizeError(String(err)));
@@ -2268,7 +2308,7 @@ function ProviderCard({
             type="text"
             value={modelId}
             placeholder={presetMeta.defaultModelId || "model-id"}
-            onChange={(e) => setModelId(e.target.value)}
+            onChange={(e) => { setModelId(e.target.value); setTestResult(null); }}
           />
         </label>
 
@@ -2280,7 +2320,7 @@ function ProviderCard({
               type={showKey ? "text" : "password"}
               value={apiKey}
               placeholder={keyPlaceholder}
-              onChange={(e) => { setApiKey(e.target.value); setKeyTouched(true); }}
+              onChange={(e) => { setApiKey(e.target.value); setKeyTouched(true); setTestResult(null); }}
             />
             <button
               type="button"
@@ -2299,7 +2339,7 @@ function ProviderCard({
             <select
               className="model-select"
               value={apiFormat}
-              onChange={(e) => setApiFormat(e.target.value === "anthropic" ? "anthropic" : "openai")}
+              onChange={(e) => { setApiFormat(e.target.value === "anthropic" ? "anthropic" : "openai"); setTestResult(null); }}
             >
               <option value="openai">OpenAI 格式（/chat/completions）</option>
               <option value="anthropic">Anthropic 格式（/v1/messages）</option>
@@ -2325,7 +2365,7 @@ function ProviderCard({
                 type="text"
                 value={baseUrl}
                 placeholder={presetMeta.baseUrl ?? "https://your-endpoint/v1"}
-                onChange={(e) => setBaseUrl(e.target.value)}
+                onChange={(e) => { setBaseUrl(e.target.value); setTestResult(null); }}
               />
               <p className="settings-desc" style={{ marginTop: 4 }}>
                 {isCustom
@@ -2345,6 +2385,11 @@ function ProviderCard({
       )}
 
       <div className="provider-card__actions">
+        {saved && (
+          <span className="provider-saved" role="status" style={{ color: "var(--success)" }}>
+            已保存 ✓
+          </span>
+        )}
         <button type="button" className="approval-card__btn" onClick={handleTest} disabled={testing || saving}>
           {testing ? "测试中…" : "测试连接"}
         </button>
@@ -2479,8 +2524,14 @@ function SettingsModal({
   ];
 
   return (
-    <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="设置">
-      <div className="approval-card panel-card settings-modal">
+    <div
+      className="approval-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="设置"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="approval-card panel-card settings-modal" onClick={(e) => e.stopPropagation()}>
         <nav className="settings-nav" aria-label="设置分类">
           <p className="settings-nav__title">设置</p>
           {NAV.map((n) => (

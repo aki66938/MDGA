@@ -2421,3 +2421,41 @@ h1 {
 @media (prefers-reduced-motion: reduce) {
   .toast { animation: none; }
 }
+
+/* ── F5 按钮按下反馈（Plan22）── */
+/* 主要可点按钮按下时轻微缩放 + 变暗，给出即时触感；保存提示文案与其它按钮同排对齐。 */
+.provider-saved {
+  align-self: center;
+  margin-right: auto;
+  font-size: 13px;
+  font-weight: 600;
+}
+.approval-card__btn:active:not(:disabled),
+.control-toggle:active:not(:disabled),
+.composer__send:active:not(:disabled),
+.composer__attach:active:not(:disabled),
+.model-pill:active:not(:disabled),
+.sidebar-footer__btn:active:not(:disabled),
+.settings-nav__item:active:not(:disabled),
+.changes-row__revert:active:not(:disabled),
+.askuser-option:active:not(:disabled),
+.provider-advanced-toggle:active:not(:disabled),
+.provider-key__eye:active:not(:disabled) {
+  transform: scale(0.98);
+  filter: brightness(0.94);
+}
+@media (prefers-reduced-motion: reduce) {
+  .approval-card__btn:active:not(:disabled),
+  .control-toggle:active:not(:disabled),
+  .composer__send:active:not(:disabled),
+  .composer__attach:active:not(:disabled),
+  .model-pill:active:not(:disabled),
+  .sidebar-footer__btn:active:not(:disabled),
+  .settings-nav__item:active:not(:disabled),
+  .changes-row__revert:active:not(:disabled),
+  .askuser-option:active:not(:disabled),
+  .provider-advanced-toggle:active:not(:disabled),
+  .provider-key__eye:active:not(:disabled) {
+    transform: none;
+  }
+}
