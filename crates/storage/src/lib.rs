@@ -207,6 +207,9 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     add_column_if_missing(&conn, "conversations", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(&conn, "conversations", "archived", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(&conn, "mcp_servers", "auth_token", "TEXT")?;
+    // Plan18 M18.1：视觉 provider 的 API 格式（'openai' | 'anthropic'），默认 openai。
+    // 决定 analyze_image 走哪种端点/鉴权/消息结构（见 Plan18 §4 双格式对照表）。
+    add_column_if_missing(&conn, "model_providers", "api_format", "TEXT NOT NULL DEFAULT 'openai'")?;
     Ok(conn)
 }
 
@@ -606,6 +609,9 @@ pub struct ModelProvider {
     pub base_url: Option<String>,
     pub api_key: String,
     pub model_id: String,
+    /// 视觉 provider 的 API 格式：'openai' | 'anthropic'（Plan18 §4）。主模型恒为 openai 兼容，
+    /// 此字段对其无意义；视觉调用据此分支端点/鉴权/消息结构。默认 'openai'。
+    pub api_format: String,
     pub enabled: bool,
     pub updated_at: Option<i64>,
 }
@@ -623,15 +629,18 @@ pub fn upsert_model_provider(
     base_url: Option<&str>,
     api_key: &str,
     model_id: &str,
+    api_format: &str,
 ) -> SqlResult<ModelProvider> {
     let id = Uuid::new_v4().to_string();
     let now = now_ts();
+    // 归一化 api_format：仅 'anthropic' | 'openai'，未知值落回 'openai'（主模型也走 openai）。
+    let api_format = if api_format == "anthropic" { "anthropic" } else { "openai" };
     conn.execute("DELETE FROM model_providers WHERE role = ?1", params![role])?;
     conn.execute(
         "INSERT INTO model_providers
-         (id, role, preset, label, base_url, api_key, model_id, enabled, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8)",
-        params![id, role, preset, label, base_url, api_key, model_id, now],
+         (id, role, preset, label, base_url, api_key, model_id, api_format, enabled, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)",
+        params![id, role, preset, label, base_url, api_key, model_id, api_format, now],
     )?;
     Ok(ModelProvider {
         id,
@@ -641,6 +650,7 @@ pub fn upsert_model_provider(
         base_url: base_url.map(str::to_string),
         api_key: api_key.to_string(),
         model_id: model_id.to_string(),
+        api_format: api_format.to_string(),
         enabled: true,
         updated_at: Some(now),
     })
@@ -649,7 +659,7 @@ pub fn upsert_model_provider(
 /// 按角色读取 provider（main / vision），未配置返回 None。
 pub fn get_model_provider(conn: &Connection, role: &str) -> SqlResult<Option<ModelProvider>> {
     let mut stmt = conn.prepare(
-        "SELECT id, role, preset, label, base_url, api_key, model_id, enabled, updated_at
+        "SELECT id, role, preset, label, base_url, api_key, model_id, api_format, enabled, updated_at
          FROM model_providers
          WHERE role = ?1
          ORDER BY updated_at DESC
@@ -665,8 +675,9 @@ pub fn get_model_provider(conn: &Connection, role: &str) -> SqlResult<Option<Mod
             base_url: row.get(4)?,
             api_key: row.get(5)?,
             model_id: row.get(6)?,
-            enabled: row.get::<_, i64>(7)? != 0,
-            updated_at: row.get(8)?,
+            api_format: row.get(7)?,
+            enabled: row.get::<_, i64>(8)? != 0,
+            updated_at: row.get(9)?,
         }))
     } else {
         Ok(None)
@@ -676,7 +687,7 @@ pub fn get_model_provider(conn: &Connection, role: &str) -> SqlResult<Option<Mod
 /// 列出全部 provider 配置（含全部角色）。
 pub fn list_model_providers(conn: &Connection) -> SqlResult<Vec<ModelProvider>> {
     let mut stmt = conn.prepare(
-        "SELECT id, role, preset, label, base_url, api_key, model_id, enabled, updated_at
+        "SELECT id, role, preset, label, base_url, api_key, model_id, api_format, enabled, updated_at
          FROM model_providers
          ORDER BY role ASC",
     )?;
@@ -689,8 +700,9 @@ pub fn list_model_providers(conn: &Connection) -> SqlResult<Vec<ModelProvider>> 
             base_url: row.get(4)?,
             api_key: row.get(5)?,
             model_id: row.get(6)?,
-            enabled: row.get::<_, i64>(7)? != 0,
-            updated_at: row.get(8)?,
+            api_format: row.get(7)?,
+            enabled: row.get::<_, i64>(8)? != 0,
+            updated_at: row.get(9)?,
         })
     })?;
     rows.collect()
@@ -996,18 +1008,19 @@ mod tests {
         let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
         let conn = init_db(&db_path).expect("db should initialize");
 
-        // 首次配置主 provider（base_url 留空走官方）。
+        // 首次配置主 provider（base_url 留空走官方；主模型恒为 openai 格式）。
         let p1 = upsert_model_provider(
-            &conn, "main", Some("deepseek"), Some("DeepSeek"), None, "sk-1", "deepseek-v4-pro",
+            &conn, "main", Some("deepseek"), Some("DeepSeek"), None, "sk-1", "deepseek-v4-pro", "openai",
         )
         .expect("upsert main");
         assert_eq!(p1.role, "main");
         assert_eq!(p1.base_url, None);
+        assert_eq!(p1.api_format, "openai");
 
         // 再次 upsert 同 role 覆盖（验证唯一性：只保留一条）。
         let p2 = upsert_model_provider(
             &conn, "main", Some("custom"), Some("自托管"), Some("https://proxy.local/v1"),
-            "sk-2", "my-model",
+            "sk-2", "my-model", "openai",
         )
         .expect("upsert main again");
         assert_eq!(p2.api_key, "sk-2");
@@ -1020,11 +1033,23 @@ mod tests {
         // 仅一条 main，vision 未配。
         assert!(get_model_provider(&conn, "vision").expect("query").is_none());
 
-        // 配 vision provider，列表含两角色。
+        // 配 vision provider（anthropic 格式），列表含两角色，api_format 正确存取。
         upsert_model_provider(
-            &conn, "vision", Some("zhipu"), Some("GLM-4V"), None, "sk-v", "glm-4v",
+            &conn, "vision", Some("custom"), Some("Claude Vision"), Some("https://api.anthropic.com"),
+            "sk-v", "claude-3-5-sonnet", "anthropic",
         )
         .expect("upsert vision");
+        let vision = get_model_provider(&conn, "vision").expect("query").expect("exists");
+        assert_eq!(vision.api_format, "anthropic");
+        // 未知 api_format 归一化为 openai。
+        upsert_model_provider(
+            &conn, "vision", Some("zhipu"), Some("GLM-4V"), None, "sk-v2", "glm-4v", "bogus",
+        )
+        .expect("upsert vision openai");
+        assert_eq!(
+            get_model_provider(&conn, "vision").expect("query").expect("exists").api_format,
+            "openai"
+        );
         let all = list_model_providers(&conn).expect("list");
         assert_eq!(all.len(), 2);
 

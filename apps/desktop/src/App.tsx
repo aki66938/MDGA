@@ -118,7 +118,10 @@ type AskUserRequest = { questionId: string; questions: AskQuestion[] };
 /** 系统通知卡片：上下文压缩等用户需要感知的运行时事件，内联显示在对话流中 */
 type NoticePart = { type: "notice"; text: string };
 
-type MessagePart = TextPart | ToolPart | NoticePart;
+/** 用户消息中附带的图片（Plan18 M18.1）：mediaType + base64，渲染为缩略图；持久化进 partsJson。 */
+type ImagePart = { type: "image"; mediaType: string; base64: string; name?: string };
+
+type MessagePart = TextPart | ToolPart | NoticePart | ImagePart;
 
 type Message = {
   role: "user" | "assistant";
@@ -226,6 +229,8 @@ type ProviderConfig = {
   baseUrl?: string | null;
   apiKey: string;
   modelId: string;
+  /** 视觉 provider 的 API 格式（openai|anthropic）；主模型恒 openai。 */
+  apiFormat?: string | null;
   enabled: boolean;
   updatedAt?: number | null;
 };
@@ -290,6 +295,8 @@ export function App() {
   // @文件引用补全
   const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
   const [fileMention, setFileMention] = useState<string | null>(null);
+  // 待发送的附图（Plan18 M18.1）：📎 选图后暂存，发送时随 send_message 上送，发送框上方显示缩略图。
+  const [pendingImages, setPendingImages] = useState<ImagePart[]>([]);
   // 上下文用量（上次请求 prompt_tokens / 压缩阈值），常驻状态栏
   const [ctxUsage, setCtxUsage] = useState<{ promptTokens: number; softLimit: number } | null>(null);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
@@ -676,6 +683,10 @@ export function App() {
   async function sendText(text: string) {
     if (!text || sending) return;
 
+    // 快照本轮附图并清空暂存（Plan18 M18.1）：随消息上送视觉模型，并入用户消息 parts 持久化展示。
+    const outImages = pendingImages;
+    setPendingImages([]);
+
     let convId = activeConvId;
     if (!convId) {
       const conv = await invoke<Conversation>("new_conversation_with_workspace", {
@@ -691,11 +702,17 @@ export function App() {
       setWorkspaceError(null);
     }
 
+    // 用户消息 parts：文字 + 附图缩略图。content 仅存文字（供模型上下文），partsJson 含图片引用（供刷新后还原展示）。
+    const userParts: MessagePart[] = [
+      { type: "text", content: text },
+      ...outImages,
+    ];
     await invoke("persist_message", {
       conversationId: convId,
       role: "user",
       content: text,
       usageJson: null,
+      partsJson: outImages.length > 0 ? JSON.stringify(userParts) : null,
     }).catch(() => {});
 
     const currentConv = conversations.find((c) => c.id === convId);
@@ -707,8 +724,8 @@ export function App() {
       );
     }
 
-    // 构建发给后端的纯文字消息（parts 中只取 text 块）
-    const outgoing: Message[] = [...messages, { role: "user", parts: [{ type: "text", content: text }] }];
+    // 构建发给后端的消息：用户消息 parts 含文字 + 附图缩略图（图片仅前端展示，后端按 images 参数单独识图）。
+    const outgoing: Message[] = [...messages, { role: "user", parts: userParts }];
     setMessages([...outgoing, { role: "assistant", parts: [] }]);
     setInput("");
     setSending(true);
@@ -915,6 +932,8 @@ export function App() {
         model,
         permissionMode,
         planMode,
+        // 本轮附图（Plan18 M18.1）：后端据此走「自动初看」识图并注入主 agent。
+        images: outImages.map((img) => ({ mediaType: img.mediaType, base64: img.base64 })),
       });
     } catch (err) {
       setMessages((prev) => {
@@ -1092,9 +1111,16 @@ export function App() {
           appendNoticeToLastMessage("当前未配置视觉模型，无法导入图片。需在 设置 → 模型供应商 → 扩展 agent 的模态 里配置视觉模型。");
           return;
         }
-        // 有 vision provider：本阶段仅放开图像选择入口，识图推理留待后续 Plan。
-        const fileName = selected.split(/[\\/]/).pop() ?? selected;
-        appendNoticeToLastMessage(`已选择图片《${fileName}》。视觉识图能力即将上线，本版本暂只放开图像入口，尚未进行识图推理。`);
+        // 有 vision provider（Plan18 M18.1）：读图为 base64 + media_type，暂存到输入框上方缩略图预览，
+        // 随下一次发送上送视觉模型识图。
+        const img = await invoke<{ name: string; mediaType: string; base64: string }>(
+          "read_image_base64",
+          { path: selected }
+        );
+        setPendingImages((prev) => [
+          ...prev,
+          { type: "image", mediaType: img.mediaType, base64: img.base64, name: img.name },
+        ]);
         return;
       }
       const result = await invoke<{ name: string; text: string; truncated: boolean }>(
@@ -1524,12 +1550,35 @@ export function App() {
             </select>
           </div>
 
+          {/* 附图预览（Plan18 M18.1）：📎 选中的图片在发送前显示缩略图，可逐个移除 */}
+          {pendingImages.length > 0 && (
+            <div className="image-tray" aria-label="待发送图片">
+              {pendingImages.map((img, i) => (
+                <span key={i} className="image-tray__item" title={img.name}>
+                  <img
+                    className="image-tray__thumb"
+                    src={`data:${img.mediaType};base64,${img.base64}`}
+                    alt={img.name ?? "待发送图片"}
+                  />
+                  <button
+                    type="button"
+                    className="image-tray__remove"
+                    aria-label="移除图片"
+                    onClick={() => setPendingImages((prev) => prev.filter((_, j) => j !== i))}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+
           <div className="composer">
             <button
               type="button"
               className="composer__attach"
-              title="导入本地文档（txt/md/csv/pdf/docx），总结并问答"
-              aria-label="导入文档"
+              title="导入本地文档（txt/md/csv/pdf/docx）或图片（需配置视觉模型）"
+              aria-label="导入文档或图片"
               onClick={handleImportFile}
               disabled={sending}
             >
@@ -1708,6 +1757,8 @@ function ProviderCard({
     role === "vision" ? VISION_PRESET_MODEL.deepseek : "deepseek-v4-pro",
   );
   const [baseUrl, setBaseUrl] = useState("");
+  // API 格式（Plan18 §4）：仅视觉 provider 暴露选择（openai|anthropic）；主模型恒 openai。
+  const [apiFormat, setApiFormat] = useState<"openai" | "anthropic">("openai");
   const [showKey, setShowKey] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   // 已配置：挂载回填到 true，或保存成功后置 true。controls 状态徽标 + key 占位文案。
@@ -1730,6 +1781,7 @@ function ProviderCard({
         setPreset(p);
         setModelId(cfg.modelId || (presetModel ? presetModel[p] ?? "" : PROVIDER_PRESETS.find((x) => x.id === p)?.defaultModelId ?? ""));
         setBaseUrl(cfg.baseUrl ?? "");
+        setApiFormat(cfg.apiFormat === "anthropic" ? "anthropic" : "openai");
         setConfigured(true);
         if (cfg.baseUrl || p === "custom") setAdvancedOpen(true);
       })
@@ -1784,6 +1836,7 @@ function ProviderCard({
         baseUrl: baseUrl.trim() || null,
         apiKey: apiKey.trim(),
         modelId: modelId.trim(),
+        apiFormat: role === "vision" ? apiFormat : "openai",
       });
       setConfigured(true);
       setKeyTouched(false);
@@ -1849,6 +1902,20 @@ function ProviderCard({
           </span>
         </label>
 
+        {role === "vision" && (
+          <label className="provider-field provider-field--full">
+            <span className="provider-field__label">API 格式</span>
+            <select
+              className="model-select"
+              value={apiFormat}
+              onChange={(e) => setApiFormat(e.target.value === "anthropic" ? "anthropic" : "openai")}
+            >
+              <option value="openai">OpenAI 格式（/chat/completions）</option>
+              <option value="anthropic">Anthropic 格式（/v1/messages）</option>
+            </select>
+          </label>
+        )}
+
         <div className="provider-field--full">
           <button
             type="button"
@@ -1871,7 +1938,7 @@ function ProviderCard({
               />
               <p className="settings-desc" style={{ marginTop: 4 }}>
                 {isCustom
-                  ? "自定义供应商必须填写 Base URL（自托管/代理）。"
+                  ? "自定义供应商必须填写 Base URL（自托管/代理）。基址或完整端点均可，照 API 文档粘贴即可，不会重复拼接路径。"
                   : `留空即使用 ${presetMeta.label} 官方端点；自托管/代理可填。`}
               </p>
             </div>
@@ -2443,7 +2510,7 @@ function AskUserModal({
 
 /** 渲染块：单个非工具 part，或一段连续的工具调用（聚合为可折叠组） */
 type RenderBlock =
-  | { kind: "part"; part: TextPart | NoticePart; index: number }
+  | { kind: "part"; part: TextPart | NoticePart | ImagePart; index: number }
   | { kind: "tools"; parts: ToolPart[]; index: number };
 
 function MessageContent({ msg }: { msg: Message }) {
@@ -2493,6 +2560,17 @@ function MessageContent({ msg }: { msg: Message }) {
             >
               {part.content}
             </ReactMarkdown>
+          );
+        }
+        if (part.type === "image") {
+          return (
+            <img
+              key={index}
+              className="msg-image"
+              src={`data:${part.mediaType};base64,${part.base64}`}
+              alt={part.name ?? "上传的图片"}
+              title={part.name}
+            />
           );
         }
         return (

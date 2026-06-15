@@ -2416,6 +2416,7 @@ dependencies = [
 name = "mdga-desktop"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "futures-util",
  "mdga-deepseek-client",
  "mdga-mcp-client",

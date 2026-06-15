@@ -30,7 +30,7 @@ use crate::tools::{
 };
 use crate::web::{execute_web_fetch, execute_web_search};
 use crate::{commands::permission_mode_from_str, merge_usage, record_tool_event};
-use mdga_deepseek_client::{chat_stream, resolve_base_url, ChatMessage};
+use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMessage};
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
 use mdga_shared::PermissionMode;
 use mdga_storage::{get_conversation, get_model_provider, list_permission_rules};
@@ -39,6 +39,17 @@ use mdga_tool_runtime::RunCommandRequest;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// 前端随消息上送的一张图片：媒体类型（如 "image/png"）+ base64（不含 data: 前缀）。
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InboundImage {
+    pub media_type: String,
+    pub base64: String,
+}
+
+/// 视觉桥接的 system 提示词（Plan18 §3 桥接提示词设计）：意图驱动、要点化、供看不到图的文本模型用。
+const VISION_BRIDGE_SYSTEM: &str = "你是视觉分析助手。根据给定的用户需求，仔细观察图片，提取与该需求直接相关的所有信息（布局 / 文字 / 数据 / 颜色 / 尺寸 / 结构 / 报错内容 / 代码等），以要点化、信息密集的中文输出，供一个看不到图片的文本模型据此完成需求。只描述与需求相关的内容，不泛泛而谈、不寒暄。";
 
 /// 压缩时保留最近 N 次工具结果全文，更早的大体积结果替换为短桩。
 const KEEP_RECENT_TOOL_RESULTS: usize = 3;
@@ -60,9 +71,11 @@ pub(crate) async fn send_message(
     model: String,
     permission_mode: String,
     plan_mode: Option<bool>,
+    images: Option<Vec<InboundImage>>,
 ) -> Result<(), String> {
     let plan_mode = plan_mode.unwrap_or(false);
-    let (conversation, permission_rules, base_url, api_key) = {
+    let images = images.unwrap_or_default();
+    let (conversation, permission_rules, base_url, api_key, vision_provider) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let conversation = get_conversation(&db, &conversation_id)
             .map_err(|e| e.to_string())?
@@ -78,7 +91,61 @@ pub(crate) async fn send_message(
             }
             _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
         };
-        (conversation, rules, base_url, api_key)
+        // 视觉 provider（Plan18）：仅在本轮带图时才需要；未配置则下方走「拒图」降级。
+        let vision_provider = if images.is_empty() {
+            None
+        } else {
+            get_model_provider(&db, "vision").ok().flatten()
+        };
+        (conversation, rules, base_url, api_key, vision_provider)
+    };
+
+    // ── 自动初看（Plan18 §3 ①）：带意图把图片过一遍视觉模型，产出文本分析注入主 agent ──
+    // 仅当本轮带图时进入。无视觉 provider 时注入提示而非中断（前端门禁已先拦，这里是后端兜底）。
+    let vision_injection: Option<String> = if images.is_empty() {
+        None
+    } else if let Some(vp) = vision_provider {
+        // 视觉 base_url 直接用用户自填值（视觉不强制走 preset 官方端点）。
+        let vbase = vp.base_url.clone().unwrap_or_default();
+        // 本轮用户消息文本作为「看什么」的方向盘（取最后一条 user 消息）。
+        let intent = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let user_text = format!("用户需求：{intent}");
+        let imgs: Vec<mdga_deepseek_client::VisionImage> = images
+            .iter()
+            .map(|i| (i.media_type.clone(), i.base64.clone()))
+            .collect();
+        let _ = app.emit("agent-status", serde_json::json!({ "state": "analyzing_image" }));
+        match analyze_image(
+            &vbase,
+            &vp.api_key,
+            &vp.model_id,
+            &vp.api_format,
+            VISION_BRIDGE_SYSTEM,
+            &user_text,
+            &imgs,
+        )
+        .await
+        {
+            Ok(analysis) => Some(format!(
+                "[视觉分析] 用户上传了 {} 张图片，针对其需求，视觉模型识别如下：\n{analysis}\n请据此与用户需求继续。",
+                images.len()
+            )),
+            // 容错：视觉失败注入提示但不中断主流程，让主 agent 知道图没看成。
+            Err(e) => Some(format!(
+                "[视觉分析] 用户上传了 {} 张图片，但视觉分析失败：{e}。请据可见的文本需求尽力继续，必要时请用户用文字补充图片内容。",
+                images.len()
+            )),
+        }
+    } else {
+        Some(format!(
+            "[视觉分析] 用户上传了 {} 张图片，但当前未配置视觉模型，无法识图。请提示用户在 设置 → 模型供应商 → 扩展 agent 的模态 配置视觉模型。",
+            images.len()
+        ))
     };
     // 工作区已绑定时生成 repo map 与长期记忆，注入项目结构摘要和持久约定供模型开局认知。
     // repo map 按会话缓存：首轮生成后复用，保持 system 前缀字节稳定以提升 prompt 缓存命中。
@@ -109,6 +176,17 @@ pub(crate) async fn send_message(
         workspace_memory.as_deref(),
         &skills,
     );
+    // 视觉分析注入（Plan18 §3 ②）：把「图的文本化」作为 system 消息放在用户消息之前，
+    // 让主 agent 一开局就知道图里与需求相关的内容。放在 workspace context 之后、最末，
+    // 紧贴最后的 user 消息，避免被前缀的工作区/技能说明冲淡。
+    if let Some(injection) = vision_injection {
+        // 插在末尾 user 消息之前：找到最后一个 user 消息的下标。
+        let insert_at = messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(messages.len());
+        messages.insert(insert_at, ChatMessage { role: "system".to_string(), content: injection });
+    }
     // 计划模式：要求模型只产出分步计划并等待确认，本轮不提供工具。
     if plan_mode {
         messages.insert(0, ChatMessage {

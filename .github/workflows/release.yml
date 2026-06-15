@@ -64,7 +64,7 @@ jobs:
 
             Windows 桌面安装包，下载 `.msi`（推荐）或 `.exe` 安装即可。
 
-            **使用前提**：在 Windows 系统环境变量中配置 `DEEPSEEK_API_KEY`，应用启动后自动识别。
+            **使用前提**：安装后在应用内「设置 → 模型供应商」填写 API Key 与模型即可开始对话（不再依赖系统环境变量）。
 
             完整更新记录见 [doc/history.md](https://github.com/aki66938/MDGA/blob/main/doc/history.md)
           releaseDraft: false

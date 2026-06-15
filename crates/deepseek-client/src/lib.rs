@@ -4,6 +4,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod vision;
+pub use vision::{analyze_image, VisionImage};
+
 #[derive(Debug, Error)]
 pub enum DeepSeekError {
     #[error("DEEPSEEK_API_KEY 未配置")]
@@ -54,9 +57,19 @@ pub fn resolve_base_url(base_url: Option<&str>, preset: Option<&str>) -> Option<
         .map(|url| url.trim_end_matches('/').to_string())
 }
 
-/// 拼接 base_url 与 /chat/completions（base_url 已去尾斜杠）。
-fn chat_completions_url(base_url: &str) -> String {
-    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+/// 解析最终 chat/completions 端点：兼容用户填「基址」或「完整端点」两种输入，避免重复拼接路径。
+///
+/// 各平台 API 文档给的端点写法不一：有的给基址（`https://api.deepseek.com`），有的给完整端点
+/// （`https://api.siliconflow.cn/v1/chat/completions`）。用户照文档整段粘贴时若仍盲目追加，会拼成
+/// `…/chat/completions/chat/completions` 导致 404/参数错误。故：已以 `/chat/completions` 结尾就原样用，
+/// 否则才追加。
+pub(crate) fn chat_completions_url(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{base}/chat/completions")
+    }
 }
 
 impl DeepSeekError {
@@ -115,7 +128,7 @@ pub fn detect_api_key_status(api_key: Option<&str>) -> ApiKeyStatus {
 ///
 /// 输入状态码和原始响应文本，输出分类错误；
 /// 本方法不重试，重试策略由调用方决定。
-fn classify_api_error(status: u16, body: &str) -> DeepSeekError {
+pub(crate) fn classify_api_error(status: u16, body: &str) -> DeepSeekError {
     match status {
         401 => DeepSeekError::Unauthorized,
         402 => DeepSeekError::InsufficientBalance,

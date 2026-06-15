@@ -67,8 +67,11 @@ pub(crate) fn save_model_provider(
     base_url: Option<String>,
     api_key: String,
     model_id: String,
+    api_format: Option<String>,
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
+    // api_format 仅视觉 provider 有意义（openai|anthropic），主模型恒 openai；缺省落回 openai。
+    let api_format = api_format.as_deref().unwrap_or("openai");
     upsert_model_provider(
         &db,
         &role,
@@ -77,6 +80,7 @@ pub(crate) fn save_model_provider(
         base_url.as_deref().filter(|s| !s.trim().is_empty()),
         api_key.trim(),
         model_id.trim(),
+        api_format,
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -679,6 +683,42 @@ pub(crate) fn import_file_text(path: String) -> Result<serde_json::Value, String
     let truncated = text.chars().count() > MAX_IMPORT_CHARS;
     let capped: String = text.chars().take(MAX_IMPORT_CHARS).collect();
     Ok(serde_json::json!({ "name": name, "text": capped, "truncated": truncated }))
+}
+
+/// 读取本地图片并返回 base64 + media_type（Plan18 M18.1：composer 附图）。
+///
+/// 输入图片路径；校验为支持的图像扩展名（png/jpg/jpeg/gif/webp），读字节并 base64 编码，
+/// 返回 { name, mediaType, base64 }。限制 ~10MB，避免超大图撑爆请求体与 SQLite。
+#[tauri::command]
+pub(crate) fn read_image_base64(path: String) -> Result<serde_json::Value, String> {
+    use base64::Engine as _;
+    const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+    let file_path = std::path::Path::new(&path);
+    if !file_path.is_file() {
+        return Err("图片不存在".to_string());
+    }
+    let name = file_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = file_path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let media_type = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        other => return Err(format!("不支持的图片格式 .{other}（支持 png/jpg/jpeg/gif/webp）")),
+    };
+    let meta = std::fs::metadata(file_path).map_err(|e| format!("读取图片失败: {e}"))?;
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err("图片过大（上限 10MB），请压缩后再上传".to_string());
+    }
+    let bytes = std::fs::read(file_path).map_err(|e| format!("读取图片失败: {e}"))?;
+    let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(serde_json::json!({ "name": name, "mediaType": media_type, "base64": base64 }))
 }
 
 /// 从 .docx（zip 内 word/document.xml）抽取纯文本：拼接所有 <w:t> 文本节点，段落换行。

@@ -910,6 +910,61 @@ h1 {
   color: var(--text-3);
 }
 
+/* ── 消息内图片（Plan18 M18.1）── */
+
+.msg-image {
+  display: block;
+  max-width: 320px;
+  max-height: 240px;
+  margin: 6px 0;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  object-fit: contain;
+}
+
+/* ── 附图预览托盘（composer 上方）── */
+
+.image-tray {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 4px 2px;
+}
+
+.image-tray__item {
+  position: relative;
+  display: inline-flex;
+}
+
+.image-tray__thumb {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.image-tray__remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  line-height: 16px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.image-tray__remove:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
 /* ── Diff 块与变更汇总 ── */
 
 .tool-inline-wrap {

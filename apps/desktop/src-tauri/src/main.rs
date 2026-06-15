@@ -1,3 +1,7 @@
+// release 构建以 Windows GUI 子系统运行，避免双击安装版时弹出空白命令行黑框；
+// debug 构建保留控制台，便于开发期看日志。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use mdga_storage::{init_db, list_mcp_servers, record_activity_event};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -26,6 +30,7 @@ use commands::{
     get_app_info, get_checkpoints, get_command_sandbox, get_conversation_events, get_conversations,
     get_deepseek_api_key_status, get_mcp_servers, get_permission_rules, get_task_budget,
     get_workspace, import_file_text, install_update, list_custom_commands, list_workspace_files,
+    read_image_base64,
     load_messages, new_conversation, new_conversation_with_workspace, persist_message,
     pin_conversation, queue_steering, remove_conversation, rename_conversation, respond_approval,
     respond_ask_user, revert_to_checkpoint, set_command_sandbox, set_task_budget, set_workspace_path,
@@ -191,6 +196,7 @@ fn main() {
             clear_all_conversations,
             list_custom_commands,
             import_file_text,
+            read_image_base64,
             get_conversation_events,
             cancel_agent,
             queue_steering,
