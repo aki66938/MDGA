@@ -37,7 +37,7 @@ pub(crate) fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability
         | "get_shell_output" | "kill_shell" | "get_task_output" | "kill_task" | "list_tasks" => {
             Ok(ToolCapability::FileRead)
         }
-        "create_file" | "write_file" | "edit_file" | "make_dir" | "move_path" => {
+        "create_file" | "write_file" | "edit_file" | "apply_patch" | "make_dir" | "move_path" => {
             Ok(ToolCapability::FileWrite)
         }
         "delete_file" | "delete_dir" => Ok(ToolCapability::FileDelete),

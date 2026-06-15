@@ -58,6 +58,12 @@ const KEEP_RECENT_TOOL_RESULTS: usize = 3;
 /// 仅压缩正文超过该字符数的旧工具结果；小结果不动，避免无谓信息损失。
 const TOOL_RESULT_STUB_THRESHOLD: usize = 1_500;
 
+/// 卡死检测阈值（Plan25 #5③）：连续「无成功工具且无新叙述」轮数，或「同一工具+同参连续失败」
+/// 次数达到该值，判定为卡死/打转，emit 通知并暂停，提示用户介入。
+const STUCK_THRESHOLD: usize = 3;
+/// 验证回路最多自纠轮数（Plan25 #7）：写类操作后自动跑构建/测试，失败回灌让模型修复，超此轮数放弃。
+const VERIFY_MAX_ROUNDS: usize = 2;
+
 // ── DeepSeek ──────────────────────────────────────────────────────────────
 
 /// 发起流式聊天请求。
@@ -73,9 +79,12 @@ pub(crate) async fn send_message(
     model: String,
     permission_mode: String,
     plan_mode: Option<bool>,
+    execute_plan: Option<bool>,
     images: Option<Vec<InboundImage>>,
 ) -> Result<(), String> {
     let plan_mode = plan_mode.unwrap_or(false);
+    // Plan25 C-4：「批准并执行」时为 true，本轮装配阶段注入「严格按上一条计划执行 + 先建 todo」system。
+    let execute_plan = execute_plan.unwrap_or(false);
     let images = images.unwrap_or_default();
     let (conversation, permission_rules, base_url, api_key, model_id, vision_provider) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -228,6 +237,17 @@ pub(crate) async fn send_message(
             role: "system".to_string(),
             content: "用户开启了计划模式：请基于需求给出清晰的分步执行计划（目标、步骤、涉及文件、风险点），然后停止并等待用户确认。本轮不要执行任何实际操作。".to_string(),
         });
+    } else if execute_plan {
+        // Plan25 C-4「批准并执行」：用户已批准上一条分步计划。注入到末尾 user 消息之前，
+        // 紧贴本轮「按计划执行」指令，要求严格照计划走并先用 todo_write 建清单随进度更新。
+        let insert_at = messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(messages.len());
+        messages.insert(insert_at, ChatMessage {
+            role: "system".to_string(),
+            content: "用户已批准你上一条给出的分步计划。请严格按该计划执行，开工前先用 todo_write 建立任务清单并随进度更新状态（同一时刻只有一项 in_progress），不要重新规划或偏离已批准的方案。".to_string(),
+        });
     }
     let permission = permission_mode_from_str(&permission_mode);
 
@@ -318,14 +338,13 @@ fn messages_with_workspace_context(
     let name = workspace_name
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("未命名工作区");
-    let mut injected = Vec::with_capacity(messages.len() + 2);
+    let mut injected = Vec::with_capacity(messages.len() + 4);
+    // 不可变核心原则（Plan25 #1，动静分离）：身份锚定 / 工具纪律 / 行为准则全部引用 agent_prompt 常量，
+    // 单点维护、字节稳定以提升 prompt 缓存命中。动态的工作区路径 / 记忆 / 技能仍在下方内联拼接。
     // 身份锚定：明确 MDGA 不是 Claude Code，配置在 .mdga/，防止模型沿用 .claude 等训练记忆里的约定。
     injected.push(ChatMessage {
         role: "system".to_string(),
-        content: "你是 MDGA（Make DeepSeek Great Again）桌面 Agent 的内置助手，运行在 MDGA 应用里。\
-你不是 Claude Code，也不是 Codex，不要沿用它们的约定：本应用的配置目录是工作区下的 .mdga/（不是 .claude/，MDGA 没有也不读取 .claude 目录及其中的 settings.json）。\
-MDGA 的可扩展配置都在 .mdga/ 下：技能 .mdga/skills/<名>/SKILL.md，钩子 .mdga/hooks.json，自定义斜杠命令 .mdga/commands/<名>.md，自定义子代理 .mdga/agents/<类型>.md，诊断命令 .mdga/diagnostics；项目长期记忆是工作区根目录的 MDGA.md。\
-安装/配置 MCP 服务器不是通过编辑任何配置文件——请调用 add_mcp_server 工具注册（它会写入 MDGA 的服务器表并立即连接、其工具随后即可调用），或让用户在「设置 → MCP 服务器」添加。绝不要去查找或编辑 .claude/settings.json 之类文件，那对 MDGA 完全无效。".to_string(),
+        content: crate::agent_prompt::IDENTITY_ANCHOR.to_string(),
     });
     injected.push(ChatMessage {
         role: "system".to_string(),
@@ -340,7 +359,13 @@ create_file、write_file 或 delete_file 工具完成真实本地操作；不要
     });
     injected.push(ChatMessage {
         role: "system".to_string(),
-        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。若某次工具调用失败，请阅读返回的 error，判断是参数、路径还是环境问题，调整后重试或换用其他工具，不要原样重复同一次失败调用。对于多步骤任务，请先调用 todo_write 列出步骤清单并随进度更新状态（同一时刻只有一项 in_progress），让用户实时看到进度。当需求确实含糊、且靠读文件或运行工具也无法判断、继续就会做错方向时，用 ask_user 给出 1-4 个结构化选项让用户选择，而不是擅自假设；能自己查清的事不要问。需要在大型代码库做只读调查（找实现、理结构、读懂模块）时，优先调用 run_subtask 委托独立子代理，避免主对话上下文膨胀。长时间运行的命令（启动服务、watch 等）用 run_command 的 background=true，它会立即返回 shellId；之后用 get_shell_output 轮询其输出与状态、用 kill_shell 终止、用 list_shells 查看所有后台进程。用户消息中的 @相对路径 表示工作区文件引用，直接用 read_file 读取即可。需要查阅在线文档、报错信息或你不确定的最新资料时，用 web_search 搜索、再用 web_fetch 抓取相关 URL 的正文，不要凭记忆臆测。遇到值得跨会话记住的项目约定、关键路径或踩过的坑，用 remember 写入项目长期记忆（精炼、可复用的事实才记，临时细节不要记）。".to_string(),
+        content: crate::agent_prompt::TOOL_DISCIPLINE.to_string(),
+    });
+    // 行为准则（Plan25 #1 新增）：不可变工作风格——简洁、改前先读、优先 edit/apply_patch、
+    // 能查清不提问、写完必验证、不可逆操作谨慎、达成即停。
+    injected.push(ChatMessage {
+        role: "system".to_string(),
+        content: crate::agent_prompt::CODE_OF_CONDUCT.to_string(),
     });
     // repo map：开局注入工作区结构摘要，让模型无需逐层 list_dir 就了解项目骨架。
     if let Some(map) = repo_map.filter(|map| !map.trim().is_empty()) {
@@ -380,6 +405,83 @@ create_file、write_file 或 delete_file 工具完成真实本地操作；不要
     injected
 }
 
+/// 把 todo 清单（todo_write 的 items 数组）压成轻量文本，供每轮回灌提醒（Plan25 #5①）。
+/// 每项取 status 与 content/title，未完成项优先呈现；整体截断防膨胀。
+fn summarize_todos(items: &[serde_json::Value]) -> String {
+    let mut lines: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+        let text = item
+            .get("content")
+            .or_else(|| item.get("title"))
+            .or_else(|| item.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("(未命名步骤)");
+        // 用符号标注状态，便于模型一眼分辨已完成/进行中/待办。
+        let mark = match status {
+            "completed" | "done" => "[x]",
+            "in_progress" | "in-progress" => "[~]",
+            _ => "[ ]",
+        };
+        lines.push(format!("{mark} {text}"));
+    }
+    let joined = lines.join("\n");
+    joined.chars().take(2_000).collect()
+}
+
+/// 探测本工作区可用的「写后验证」命令（Plan25 #7）：优先用户显式配置的 .mdga/diagnostics，
+/// 否则按工作区可识别的构建/测试约定推断。探测不到则返回 None（跳过验证回路）。
+///
+/// 推断优先级：Cargo.toml → `cargo check`；package.json 含 scripts.test → `npm test`，
+/// 否则含 scripts.build → `npm run build`。其它生态暂不推断（避免误跑昂贵/有副作用命令）。
+fn detect_verification_command(workspace: &str) -> Option<String> {
+    // 显式诊断命令最高优先：用户已声明权威验证手段。
+    if let Some(cmd) = read_diagnostics_command(workspace) {
+        return Some(cmd);
+    }
+    let root = std::path::Path::new(workspace);
+    if root.join("Cargo.toml").is_file() {
+        return Some("cargo check".to_string());
+    }
+    if let Ok(text) = std::fs::read_to_string(root.join("package.json")) {
+        if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&text) {
+            let scripts = pkg.get("scripts");
+            let has = |name: &str| {
+                scripts
+                    .and_then(|s| s.get(name))
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+            };
+            if has("test") {
+                return Some("npm test".to_string());
+            }
+            if has("build") {
+                return Some("npm run build".to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 把 todo 清单落盘到 <workspace>/.mdga/tasks/current.json（Plan25 #5②）。失败忽略，不阻塞主链路。
+fn persist_current_todos(workspace: &str, items: &[serde_json::Value]) {
+    let dir = std::path::Path::new(workspace).join(".mdga").join("tasks");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "updatedAt": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "items": items,
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&payload) {
+        let _ = std::fs::write(dir.join("current.json"), text);
+    }
+}
+
 /// 读取工作区根目录的 MDGA.md 作为项目长期记忆；不存在或为空时返回 None。
 /// 上限 16K 字符，防止超大记忆文件挤占上下文。
 fn read_workspace_memory(workspace_root: &str) -> Option<String> {
@@ -414,7 +516,8 @@ async fn chat_with_builtin_tools(
 ) -> Result<Option<mdga_shared::RawUsage>, String> {
     let security_context = session_security_context(
         workspace_path.to_string(),
-        permission_mode,
+        // Plan25 C-3：clone 后再交给安全上下文，保留 permission_mode 供 run_subtask 调用点回传子代理。
+        permission_mode.clone(),
         NetworkMode::Disabled,
     )
     .map_err(|e| e.to_string())?;
@@ -428,9 +531,16 @@ async fn chat_with_builtin_tools(
     let mut usage: Option<mdga_shared::RawUsage> = initial_usage;
     // 上一次响应返回的 prompt_tokens，作为当前上下文体积的真实信号，驱动轮内压缩。
     let mut last_prompt_tokens: u64 = 0;
-    // 诊断反馈环：记录本轮是否发生文件改动 + 是否已跑过诊断（最多一轮，防循环）。
+    // 验证回路（Plan25 #7）：记录是否发生过写类工具改动 + 已进行的验证自纠轮数（上限 VERIFY_MAX_ROUNDS）。
     let mut edits_made = false;
-    let mut diagnostics_ran = false;
+    let mut verify_rounds: usize = 0;
+    // 长任务跟踪（Plan25 #5①②）：维护最近一次 todo_write 的清单，每轮在 wire 末尾 user 之前注入轻量提醒，
+    // 并在每次 todo_write 成功后落盘 <workspace>/.mdga/tasks/current.json。
+    let mut current_todos: Option<Vec<serde_json::Value>> = None;
+    // 卡死检测（Plan25 #5③）：连续「无成功工具且无新叙述」轮数，与「同一工具+同参连续失败」计数。
+    let mut no_progress_rounds: usize = 0;
+    let mut last_failure_signature: Option<String> = None;
+    let mut repeated_failure_count: usize = 0;
 
     let mut round: usize = 0;
     loop {
@@ -493,9 +603,25 @@ async fn chat_with_builtin_tools(
             serde_json::json!({ "state": "thinking", "round": round }),
         );
 
+        // 长任务清单回灌（Plan25 #5①）：若已有 todo 清单，本轮临时在 wire 末尾追加一条轻量 system 提醒，
+        // 让模型聚焦未完成项。只作用于本轮请求、不写入持久 wire_messages（避免逐轮累积冗余）。
+        let request_messages = if let Some(items) = current_todos.as_ref() {
+            let mut req = wire_messages.clone();
+            req.push(serde_json::json!({
+                "role": "system",
+                "content": format!(
+                    "当前任务清单（请聚焦未完成项，完成一项即用 todo_write 更新其状态，同一时刻只保留一项 in_progress）：\n{}",
+                    summarize_todos(items)
+                )
+            }));
+            req
+        } else {
+            wire_messages.clone()
+        };
+
         // 流式获取本轮结果：叙述 token 边流边显（内置标记防泄漏守卫），同时累积 tool_calls。
         let completion =
-            stream_round_with_retry(base_url, api_key, wire_messages.clone(), model, tool_schemas.clone(), app)
+            stream_round_with_retry(base_url, api_key, request_messages, model, tool_schemas.clone(), app)
                 .await?;
         usage = merge_usage(usage, completion.usage.clone());
         // 成本预算：累计 total_tokens 超过预算则暂停（防失控烧 token）。
@@ -536,15 +662,25 @@ async fn chat_with_builtin_tools(
                 .map(recover_tool_calls_from_content)
                 .unwrap_or_default()
         };
+        // 卡死检测（Plan25 #5③）：本轮是否产生了新叙述文本——把「无成功工具」与之结合判断打转。
+        // 注意：若正文被兜底解析为 tool_calls，则不算「叙述」（它本质是工具调用）。
+        let had_assistant_text = tool_calls.is_empty()
+            && completion
+                .content
+                .as_deref()
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false);
 
-        // 模型不再调用工具：本轮叙述即最终回复。收尾前若发生过改动且配置了诊断命令，
-        // 自动跑一次（typecheck/lint）；有错则回灌让 agent 修复后再收尾（最多一轮）。
+        // 模型不再调用工具：本轮叙述即最终回复。收尾前进入验证回路（Plan25 #7）：
+        // 若本轮链路发生过写类工具改动、且能探测到验证手段（.mdga/diagnostics 或 cargo/npm 等），
+        // 自动跑一次；失败则把输出作为新一轮 user 回灌让模型自纠（最多 VERIFY_MAX_ROUNDS 轮），
+        // 通过 / 放弃后结束。验证回路用独立计数 verify_rounds，不与卡死检测（#5③）共用打转判断。
         if tool_calls.is_empty() {
-            if edits_made && !diagnostics_ran {
-                if let Some(cmd) = read_diagnostics_command(workspace_path) {
-                    diagnostics_ran = true;
+            if edits_made && verify_rounds < VERIFY_MAX_ROUNDS {
+                if let Some(cmd) = detect_verification_command(workspace_path) {
+                    verify_rounds += 1;
                     let _ = app.emit("agent-status", serde_json::json!({ "state": "thinking", "round": round }));
-                    let _ = app.emit("chat-chunk", "\n\n（正在运行诊断检查…）\n\n".to_string());
+                    let _ = app.emit("chat-chunk", format!("\n\n（正在运行验证：`{cmd}`…）\n\n"));
                     if let Ok(result) = mdga_tool_runtime::run_command(
                         workspace_path,
                         RunCommandRequest { command: cmd.clone(), timeout_secs: Some(180), background: false },
@@ -553,9 +689,11 @@ async fn chat_with_builtin_tools(
                         if failed {
                             let out: String = format!("{}\n{}", result.stdout, result.stderr)
                                 .chars().take(6000).collect();
+                            // 重置写改标记：下一轮只有再次发生写改才会再次触发验证，避免空转。
+                            edits_made = false;
                             wire_messages.push(serde_json::json!({
                                 "role": "user",
-                                "content": format!("诊断命令 `{cmd}` 报告了问题，请修复后再结束：\n{out}")
+                                "content": format!("验证命令 `{cmd}` 报告了问题，请定位并修复后再结束：\n{out}")
                             }));
                             continue; // 回到循环让 agent 修
                         }
@@ -569,6 +707,10 @@ async fn chat_with_builtin_tools(
             completion.assistant_message,
             &tool_calls,
         ));
+
+        // 卡死检测（Plan25 #5③）本轮状态：是否有任意工具成功执行 + 本轮最后一次失败的「工具+参数」签名。
+        let mut round_had_success = false;
+        let mut round_failure_signature: Option<String> = None;
 
         // 并行快路径：当本轮多个调用全部是「自动放行的只读工具」时并发执行（读多文件 / 抓多 URL 提速）。
         let all_parallel_readonly = tool_calls.len() > 1
@@ -619,9 +761,28 @@ async fn chat_with_builtin_tools(
                     &call.function.name, status, &call.function.arguments,
                     Some(&output_str), error.as_deref(), workspace_path,
                 );
+                if result.is_ok() {
+                    round_had_success = true;
+                } else {
+                    round_failure_signature =
+                        Some(format!("{}|{}", call.function.name, call.function.arguments));
+                }
                 wire_messages.push(serde_json::json!({
                     "role": "tool", "tool_call_id": call.id, "content": maybe_persist_large_output(workspace_path, &output_str)
                 }));
+            }
+            // 卡死检测（Plan25 #5③）：并行只读批次同样纳入「打转」判断，命中即暂停。
+            if detect_and_emit_stuck(
+                app,
+                conversation_id,
+                had_assistant_text,
+                round_had_success,
+                &round_failure_signature,
+                &mut no_progress_rounds,
+                &mut last_failure_signature,
+                &mut repeated_failure_count,
+            ) {
+                return Ok(usage);
             }
             continue;
         }
@@ -748,6 +909,7 @@ async fn chat_with_builtin_tools(
                         "agent-status",
                         serde_json::json!({ "state": "thinking", "round": round }),
                     );
+                    // Plan25 C-3：补传本轮权限模式与权限规则,供可写子代理(mode="write")复用主链路门控/检查点。
                     let (sub_result, sub_usage) = execute_run_subtask(
                         base_url,
                         api_key,
@@ -756,6 +918,8 @@ async fn chat_with_builtin_tools(
                         &arguments,
                         app,
                         conversation_id,
+                        permission_mode.clone(),
+                        permission_rules.clone(),
                     )
                     .await;
                     usage = merge_usage(usage, sub_usage);
@@ -776,10 +940,22 @@ async fn chat_with_builtin_tools(
 
             let (output, status, error) = match &result {
                 Ok(value) => {
+                    // 卡死检测（Plan25 #5③）：有工具成功即视为本轮有进展。
+                    round_had_success = true;
                     let mut out = serde_json::json!({ "ok": true, "result": value });
-                    // 标记本轮发生过文件改动（驱动收尾前的诊断检查）。
+                    // 标记本轮发生过文件改动（驱动收尾前的验证回路 #7）。
                     if capture.is_some() {
                         edits_made = true;
+                    }
+                    // 长任务跟踪（Plan25 #5①②）：todo_write 成功后更新内存清单并落盘 current.json（失败忽略）。
+                    if tool_name == "todo_write" {
+                        if let Some(items) = serde_json::from_str::<serde_json::Value>(&arguments)
+                            .ok()
+                            .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
+                        {
+                            persist_current_todos(workspace_path, &items);
+                            current_todos = Some(items);
+                        }
                     }
                     // 文本写类工具：附加行级 diff 供 UI 展示，并把回退快照落库。
                     if let Some(cap) = capture.as_ref() {
@@ -794,15 +970,20 @@ async fn chat_with_builtin_tools(
                     }
                     (out, "succeeded", None)
                 }
-                Err(message) => (
-                    serde_json::json!({
-                        "ok": false,
-                        "error": message,
-                        "hint": "工具执行失败。请阅读 error 判断是参数错误、路径不存在还是命令/环境问题，据此调整后重试或改用其他工具/写法；不要原样重复同一次失败的调用。"
-                    }),
-                    "failed",
-                    Some(message.clone()),
-                ),
+                Err(message) => {
+                    // 卡死检测（Plan25 #5③）：记录本轮最后一次失败的「工具+参数」签名，
+                    // 用于判断「同一工具+同参连续失败」打转。
+                    round_failure_signature = Some(format!("{tool_name}|{arguments}"));
+                    (
+                        serde_json::json!({
+                            "ok": false,
+                            "error": message,
+                            "hint": "工具执行失败。请阅读 error 判断是参数错误、路径不存在还是命令/环境问题，据此调整后重试或改用其他工具/写法；不要原样重复同一次失败的调用。"
+                        }),
+                        "failed",
+                        Some(message.clone()),
+                    )
+                }
             };
             let output_str = output.to_string();
             record_tool_event(
@@ -828,7 +1009,84 @@ async fn chat_with_builtin_tools(
                 run_post_tool_hooks(app, workspace_path, &tool_name, &arguments);
             }
         }
+
+        // 卡死检测（Plan25 #5③）：本轮全部工具处理完后评估「打转」，命中即 emit 通知并暂停。
+        if detect_and_emit_stuck(
+            app,
+            conversation_id,
+            had_assistant_text,
+            round_had_success,
+            &round_failure_signature,
+            &mut no_progress_rounds,
+            &mut last_failure_signature,
+            &mut repeated_failure_count,
+        ) {
+            return Ok(usage);
+        }
     }
+}
+
+/// 卡死检测核心（Plan25 #5③）：基于本轮「是否有成功工具 / 是否有新叙述 / 失败签名」更新两个累计计数，
+/// 任一计数达到 [`STUCK_THRESHOLD`] 即 emit 一条 `agent-stuck` 通知事件并向前端发暂停提示，返回 true 表示应暂停。
+///
+/// 两条独立判据：
+/// ① 连续「无成功工具且无新叙述」轮数 —— 模型空转、既不推进也不交付。
+/// ② 同一「工具+参数」连续失败次数 —— 原样重复同一次失败调用（撞墙）。
+#[allow(clippy::too_many_arguments)]
+fn detect_and_emit_stuck(
+    app: &AppHandle,
+    conversation_id: &str,
+    had_assistant_text: bool,
+    round_had_success: bool,
+    round_failure_signature: &Option<String>,
+    no_progress_rounds: &mut usize,
+    last_failure_signature: &mut Option<String>,
+    repeated_failure_count: &mut usize,
+) -> bool {
+    // ① 无进展轮数：本轮既无工具成功、也无新叙述则累加，否则清零。
+    if round_had_success || had_assistant_text {
+        *no_progress_rounds = 0;
+    } else {
+        *no_progress_rounds += 1;
+    }
+    // ② 同一工具+同参连续失败：与上一轮失败签名相同则累加，否则以本轮签名重置为 1（无失败则清零）。
+    match round_failure_signature {
+        Some(sig) => {
+            if last_failure_signature.as_deref() == Some(sig.as_str()) {
+                *repeated_failure_count += 1;
+            } else {
+                *last_failure_signature = Some(sig.clone());
+                *repeated_failure_count = 1;
+            }
+        }
+        None => {
+            *last_failure_signature = None;
+            *repeated_failure_count = 0;
+        }
+    }
+
+    let stuck_no_progress = *no_progress_rounds >= STUCK_THRESHOLD;
+    let stuck_repeated_failure = *repeated_failure_count >= STUCK_THRESHOLD;
+    if stuck_no_progress || stuck_repeated_failure {
+        let reason = if stuck_repeated_failure {
+            "同一工具调用连续多次以相同参数失败"
+        } else {
+            "连续多轮无任何工具成功且无新进展"
+        };
+        let _ = app.emit(
+            "agent-stuck",
+            serde_json::json!({
+                "conversationId": conversation_id,
+                "reason": reason,
+            }),
+        );
+        let _ = app.emit(
+            "chat-chunk",
+            format!("\n\n（检测到任务疑似卡住：{reason}，已暂停以等待你介入。可调整需求或提供更多信息后让我继续。）"),
+        );
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -867,7 +1125,11 @@ mod tests {
         assert_eq!(injected[2].role, "system");
         assert!(injected[2].content.contains("edit_file"));
         assert!(injected[2].content.contains("search_text"));
-        assert_eq!(injected[3].role, "user");
+        // injected[3] 是行为准则（Plan25 #1 新增）。
+        assert_eq!(injected[3].role, "system");
+        assert!(injected[3].content.contains("行为准则"));
+        assert!(injected[3].content.contains("改动前先读"));
+        assert_eq!(injected[4].role, "user");
     }
 
 
@@ -887,12 +1149,12 @@ mod tests {
             &[],
         );
 
-        // sys(身份) + sys(workspace) + sys(tools) + sys(repo map) + user
-        assert_eq!(injected.len(), 5);
-        assert_eq!(injected[3].role, "system");
-        assert!(injected[3].content.contains("工作区结构摘要"));
-        assert!(injected[3].content.contains("main.rs"));
-        assert_eq!(injected[4].role, "user");
+        // sys(身份) + sys(workspace) + sys(tools) + sys(行为准则) + sys(repo map) + user
+        assert_eq!(injected.len(), 6);
+        assert_eq!(injected[4].role, "system");
+        assert!(injected[4].content.contains("工作区结构摘要"));
+        assert!(injected[4].content.contains("main.rs"));
+        assert_eq!(injected[5].role, "user");
     }
 
     #[test]
@@ -911,11 +1173,11 @@ mod tests {
             &[],
         );
 
-        // sys(身份) + sys(workspace) + sys(tools) + sys(memory) + user
-        assert_eq!(injected.len(), 5);
-        assert_eq!(injected[3].role, "system");
-        assert!(injected[3].content.contains("项目长期记忆"));
-        assert!(injected[3].content.contains("做一个计算器"));
+        // sys(身份) + sys(workspace) + sys(tools) + sys(行为准则) + sys(memory) + user
+        assert_eq!(injected.len(), 6);
+        assert_eq!(injected[4].role, "system");
+        assert!(injected[4].content.contains("项目长期记忆"));
+        assert!(injected[4].content.contains("做一个计算器"));
     }
 
     #[test]

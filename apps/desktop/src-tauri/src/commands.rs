@@ -9,7 +9,8 @@ use crate::checkpoint::apply_checkpoint_revert;
 use crate::mcp::spawn_mcp_connect;
 use crate::state::AppState;
 use mdga_deepseek_client::{
-    detect_api_key_status, get_user_balance, resolve_base_url, test_connection, UserBalance,
+    detect_api_key_status, get_user_balance, probe_tool_call, resolve_base_url, test_connection,
+    UserBalance,
 };
 use mdga_shared::{ApiKeyStatus, PermissionMode};
 use mdga_storage::{
@@ -160,6 +161,62 @@ pub(crate) async fn test_provider_connection(
     test_connection(&resolved_base, &key, &model, &api_format)
         .await
         .map(|_| "连接成功".to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// 对某 role 的供应商做一次「工具调用冒烟探测」（Plan25 C-1，#3）：发一个极小请求并提供一个
+/// trivial 函数工具，判断该模型在当前端点能否返回 tool_call（原生 tool_calls 或正文被兜底
+/// 恢复出 tool_call 均算成功）。返回 true=支持工具调用，false=不支持。
+///
+/// 字段回退逻辑与 [`test_provider_connection`] 完全一致：任一入参为空则回退 DB 已存 provider，
+/// base_url 留空走 preset 官方端点；便于「已配状态下不重输 Key 直接测试」。
+#[tauri::command]
+pub(crate) async fn smoke_test_tool_call(
+    state: State<'_, AppState>,
+    role: String,
+    base_url: String,
+    api_key: String,
+    model: String,
+    api_format: String,
+) -> Result<bool, String> {
+    // 读已存 provider 作为各字段的回退来源。
+    let stored = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        get_model_provider(&db, &role).ok().flatten()
+    };
+    // base_url：优先用入参；为空则用已存 base_url/preset 解析官方端点。
+    let resolved_base = {
+        let explicit = base_url.trim();
+        if !explicit.is_empty() {
+            explicit.trim_end_matches('/').to_string()
+        } else if let Some(p) = &stored {
+            resolve_base_url(p.base_url.as_deref(), p.preset.as_deref()).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+    // api_key / model / api_format：入参为空则回退已存值。
+    let key = if api_key.trim().is_empty() {
+        stored.as_ref().map(|p| p.api_key.clone()).unwrap_or_default()
+    } else {
+        api_key
+    };
+    let model = if model.trim().is_empty() {
+        stored.as_ref().map(|p| p.model_id.clone()).unwrap_or_default()
+    } else {
+        model
+    };
+    let api_format = if api_format.trim().is_empty() {
+        stored
+            .as_ref()
+            .map(|p| p.api_format.clone())
+            .unwrap_or_else(|| "openai".to_string())
+    } else {
+        api_format
+    };
+
+    probe_tool_call(&resolved_base, &key, &model, &api_format)
+        .await
         .map_err(|e| e.to_string())
 }
 

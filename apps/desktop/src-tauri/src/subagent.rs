@@ -6,6 +6,10 @@
 use crate::chat::{
     assistant_message_for_tool_calls, chat_completion_with_retry, recover_tool_calls_from_content,
 };
+use crate::checkpoint::{capture_checkpoint_before, persist_checkpoint};
+use crate::permissions::{
+    feed_tool_denial, gate_tool_decision, request_tool_approval, ToolGate,
+};
 use crate::state::{AppState, BgTask, BG_TASK_SEQ};
 use crate::tools::{all_builtin_tool_schemas, execute_builtin_tool_call};
 use crate::{merge_usage, record_tool_event};
@@ -16,25 +20,67 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
-/// 子任务探索代理可用的只读工具集合。
+/// 子代理只读探索工具名单（read 模式 / write 模式共享的只读部分）。
+const SUBTASK_READ_ONLY_TOOLS: &[&str] =
+    &["list_dir", "read_file", "search_text", "glob_files", "stat_path"];
+
+/// write 模式子代理额外开放的写 / 编辑 / 命令工具名单。
+const SUBTASK_WRITE_TOOLS: &[&str] = &[
+    "create_file",
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "make_dir",
+    "move_path",
+    "delete_file",
+    "delete_dir",
+    "run_command",
+];
+
+/// 子任务探索代理可用的只读工具集合（read 模式）。
 fn read_only_tool_schemas() -> Vec<serde_json::Value> {
-    const READ_ONLY: &[&str] = &["list_dir", "read_file", "search_text", "glob_files", "stat_path"];
+    tool_schemas_for_names(SUBTASK_READ_ONLY_TOOLS)
+}
+
+/// write 模式子代理工具集：只读工具 + 写 / 编辑 / 命令工具。
+fn writable_tool_schemas() -> Vec<serde_json::Value> {
+    let allowed: Vec<&str> = SUBTASK_READ_ONLY_TOOLS
+        .iter()
+        .chain(SUBTASK_WRITE_TOOLS.iter())
+        .copied()
+        .collect();
+    tool_schemas_for_names(&allowed)
+}
+
+/// 从全部内建 schema 中筛出给定工具名集合的 schema。
+fn tool_schemas_for_names(names: &[&str]) -> Vec<serde_json::Value> {
     all_builtin_tool_schemas()
         .into_iter()
         .filter(|schema| {
             schema
                 .pointer("/function/name")
                 .and_then(|n| n.as_str())
-                .map(|name| READ_ONLY.contains(&name))
+                .map(|name| names.contains(&name))
                 .unwrap_or(false)
         })
         .collect()
 }
 
+/// 是否需要门控 + 检查点保护：写 / 删 / 命令类工具（write 模式下逐次审批与快照）。
+fn is_guarded_write_tool(name: &str) -> bool {
+    SUBTASK_WRITE_TOOLS.contains(&name)
+}
+
 const SUBTASK_MAX_ROUNDS: usize = 15;
 
-/// run_subtask 工具：用独立上下文跑一个只读探索子代理，返回简明报告与消耗的 usage。
-/// 子代理只能 list/read/search/stat，工具事件以 `sub:` 前缀推给前端展示。
+/// run_subtask 工具：用独立上下文跑一个探索 / 工作子代理，返回简明报告与消耗的 usage。
+///
+/// read 模式（默认）：子代理只能 list/read/search/stat，强制 Restricted + 断网。
+/// write 模式（Plan25 C-3）：子代理额外可写 / 编辑 / 跑命令，继承主链路传入的 `permission`，
+/// 每次写 / 删 / 命令类调用都复用主链路的门控（`gate_tool_decision` + `request_tool_approval`）与
+/// 检查点（`capture_checkpoint_before` / `persist_checkpoint`），绝不绕过权限。
+/// 工具事件以 `sub:` 前缀推给前端展示。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_run_subtask(
     base_url: &str,
     api_key: &str,
@@ -43,6 +89,8 @@ pub(crate) async fn execute_run_subtask(
     arguments: &str,
     app: &AppHandle,
     conversation_id: &str,
+    permission: mdga_shared::PermissionMode,
+    permission_rules: Vec<String>,
 ) -> (Result<serde_json::Value, String>, Option<mdga_shared::RawUsage>) {
     let parsed: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(value) => value,
@@ -51,6 +99,8 @@ pub(crate) async fn execute_run_subtask(
     let Some(description) = parsed.get("description").and_then(|v| v.as_str()) else {
         return (Err("run_subtask 缺少 description".to_string()), None);
     };
+    // mode：read（默认）只读探索；write 可写 / 跑命令（受权限与检查点保护）。
+    let write_mode = matches!(parsed.get("mode").and_then(|v| v.as_str()), Some("write"));
     // 自定义子代理类型：agentType 指向 .mdga/agents/<type>.md，其内容作为子代理 system prompt。
     let custom_agent = parsed
         .get("agentType")
@@ -62,16 +112,29 @@ pub(crate) async fn execute_run_subtask(
             )
             .ok()
         });
-    let system_prompt = match custom_agent {
-        Some(def) => format!(
-            "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、glob_files、stat_path 这些只读工具，禁止写入或命令执行。以下是你的角色定义：\n{def}\n完成后输出简明中文报告。"
-        ),
-        None => format!(
-            "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、glob_files、stat_path 这些只读工具调查代码与文件，禁止任何写入或命令执行。完成调查后，输出一份简明、信息密度高的中文报告，直接回答委托内容，不要寒暄。"
-        ),
+    let system_prompt = if write_mode {
+        match custom_agent {
+            Some(def) => format!(
+                "你是一个可写工作子代理，工作区路径是 {workspace_path}。除只读工具（list_dir、read_file、search_text、glob_files、stat_path）外，你还可以使用 create_file、write_file、edit_file、apply_patch、make_dir、move_path、delete_file、delete_dir、run_command 来真正改动文件或执行命令——但每次写 / 删 / 命令操作都会经过用户权限门控与检查点保护，请只在被委托的范围内动手、改前先读、优先精确编辑。以下是你的角色定义：\n{def}\n完成后输出简明中文报告，说明你做了哪些改动。"
+            ),
+            None => format!(
+                "你是一个可写工作子代理，工作区路径是 {workspace_path}。除只读工具（list_dir、read_file、search_text、glob_files、stat_path）外，你还可以使用 create_file、write_file、edit_file、apply_patch、make_dir、move_path、delete_file、delete_dir、run_command 来真正改动文件或执行命令。每次写 / 删 / 命令操作都会经过用户权限门控与检查点保护，可能需要用户审批。请严格聚焦被委托的范围、改前先读、优先用 edit_file/apply_patch 做精确修改，不要做范围外的改动。完成后输出一份简明、信息密度高的中文报告，说明你做了哪些改动，不要寒暄。"
+            ),
+        }
+    } else {
+        match custom_agent {
+            Some(def) => format!(
+                "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、glob_files、stat_path 这些只读工具，禁止写入或命令执行。以下是你的角色定义：\n{def}\n完成后输出简明中文报告。"
+            ),
+            None => format!(
+                "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、glob_files、stat_path 这些只读工具调查代码与文件，禁止任何写入或命令执行。完成调查后，输出一份简明、信息密度高的中文报告，直接回答委托内容，不要寒暄。"
+            ),
+        }
     };
 
-    let background = parsed.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+    // 后台模式只允许 read：写模式忽略 background 强制前台，避免无人审批的后台写（Plan25 C-3）。
+    let background =
+        parsed.get("background").and_then(|v| v.as_bool()).unwrap_or(false) && !write_mode;
     if background {
         // 注册后台任务并 spawn 独立 loop；立即返回 taskId，主循环不等待。
         let task_id = format!("task-{}", BG_TASK_SEQ.fetch_add(1, Ordering::SeqCst));
@@ -103,6 +166,7 @@ pub(crate) async fn execute_run_subtask(
         let app_bg = app.clone();
         let task_id_done = task_id.clone();
         tauri::async_runtime::spawn(async move {
+            // 后台子代理恒为 read 模式（write 已在上面被强制前台），无需门控权限上下文。
             let (text, sub_usage) = run_subtask_loop(
                 &base_url,
                 &api_key,
@@ -113,6 +177,9 @@ pub(crate) async fn execute_run_subtask(
                 &app_bg,
                 &conversation_owned,
                 Some(cancel.clone()),
+                false,
+                PermissionMode::Restricted,
+                &[],
             )
             .await;
             let final_status = if cancel.load(Ordering::SeqCst) { "killed" } else { "done" };
@@ -141,6 +208,7 @@ pub(crate) async fn execute_run_subtask(
     }
 
     // 前台：同步等待子代理 loop 完成，usage 并入当轮账本。
+    // write 模式继承主链路 permission 与 permission_rules，门控 + 检查点在 loop 内逐次执行。
     let (report, usage) = run_subtask_loop(
         base_url,
         api_key,
@@ -151,12 +219,21 @@ pub(crate) async fn execute_run_subtask(
         app,
         conversation_id,
         None,
+        write_mode,
+        permission,
+        &permission_rules,
     )
     .await;
     (Ok(serde_json::json!({ "report": report })), usage)
 }
 
 /// 子代理工具循环主体（前台/后台共用）。后台模式下每轮检查 cancel 以支持 kill_task。
+///
+/// `write_mode=false`（read）：强制 Restricted + 断网 + 只读工具白名单，工具直接执行。
+/// `write_mode=true`（Plan25 C-3，仅前台）：用传入的 `permission` 建安全上下文（继承主链路权限），
+/// 工具集含写 / 编辑 / 命令工具；每次写 / 删 / 命令类调用前复用主链路门控
+/// （`gate_tool_decision` + `request_tool_approval`，Deny / 拒绝则 `feed_tool_denial` 回灌不执行）
+/// 与检查点（`capture_checkpoint_before` / `persist_checkpoint`）；只读工具仍直接执行。
 #[allow(clippy::too_many_arguments)]
 async fn run_subtask_loop(
     base_url: &str,
@@ -168,14 +245,25 @@ async fn run_subtask_loop(
     app: &AppHandle,
     conversation_id: &str,
     cancel: Option<Arc<AtomicBool>>,
+    write_mode: bool,
+    permission: PermissionMode,
+    permission_rules: &[String],
 ) -> (String, Option<mdga_shared::RawUsage>) {
+    // read 模式恒为 Restricted + 断网；write 模式继承主链路 permission（网络与主链路一致为 Disabled）。
+    let permission_mode = if write_mode { permission } else { PermissionMode::Restricted };
     let security_context = match session_security_context(
         workspace_path.to_string(),
-        PermissionMode::Restricted,
+        permission_mode,
         NetworkMode::Disabled,
     ) {
         Ok(ctx) => ctx,
         Err(e) => return (format!("子代理初始化失败: {e}"), None),
+    };
+
+    let tool_schemas = if write_mode {
+        writable_tool_schemas()
+    } else {
+        read_only_tool_schemas()
     };
 
     let mut wire = vec![
@@ -194,7 +282,7 @@ async fn run_subtask_loop(
             api_key,
             wire.clone(),
             model,
-            Some(read_only_tool_schemas()),
+            Some(tool_schemas.clone()),
             app,
         )
         .await
@@ -229,32 +317,102 @@ async fn run_subtask_loop(
         ));
         for call in &tool_calls {
             let name = call.function.name.as_str();
+            let args = call.function.arguments.as_str();
             let display_name = format!("sub:{name}");
+
+            // 工具准入：read 模式只放只读工具；write 模式放只读 + 写/编辑/命令工具。
+            let tool_allowed = SUBTASK_READ_ONLY_TOOLS.contains(&name)
+                || (write_mode && SUBTASK_WRITE_TOOLS.contains(&name));
+            if !tool_allowed {
+                let reason = if write_mode {
+                    "该工具不在可写子代理的工具集内"
+                } else {
+                    "子任务仅允许只读工具"
+                };
+                feed_tool_denial(
+                    app,
+                    conversation_id,
+                    &display_name,
+                    args,
+                    workspace_path,
+                    reason,
+                    &call.id,
+                    &mut wire,
+                );
+                continue;
+            }
+
+            // write 模式下的写 / 删 / 命令类工具：先快照、再门控（Deny/拒绝回灌不执行），与主链路一致。
+            let guarded = write_mode && is_guarded_write_tool(name);
+            let capture = if guarded {
+                capture_checkpoint_before(workspace_path, name, args)
+            } else {
+                None
+            };
+            if guarded {
+                let decision = gate_tool_decision(&security_context, name, args, permission_rules);
+                let proceed = match decision {
+                    ToolGate::Allow => true,
+                    ToolGate::Deny(reason) => {
+                        feed_tool_denial(
+                            app,
+                            conversation_id,
+                            &display_name,
+                            args,
+                            workspace_path,
+                            &reason,
+                            &call.id,
+                            &mut wire,
+                        );
+                        false
+                    }
+                    ToolGate::Ask => {
+                        let approved = request_tool_approval(app, name, args, false).await;
+                        if !approved {
+                            feed_tool_denial(
+                                app,
+                                conversation_id,
+                                &display_name,
+                                args,
+                                workspace_path,
+                                "用户拒绝了该操作",
+                                &call.id,
+                                &mut wire,
+                            );
+                        }
+                        approved
+                    }
+                };
+                if !proceed {
+                    continue;
+                }
+            }
+
             record_tool_event(
                 app,
                 conversation_id,
                 "tool_started",
                 &display_name,
                 "running",
-                &call.function.arguments,
+                args,
                 None,
                 None,
                 workspace_path,
             );
-            let result = if matches!(
-                name,
-                "list_dir" | "read_file" | "search_text" | "glob_files" | "stat_path"
-            ) {
-                execute_builtin_tool_call(&security_context, name, &call.function.arguments)
-            } else {
-                Err("子任务仅允许只读工具".to_string())
-            };
+            // 只读工具与已放行的写工具统一走内建执行器（execute_builtin_tool_call 内部再做工具名校验）。
+            let result = execute_builtin_tool_call(&security_context, name, args);
             let (output, status, error) = match &result {
-                Ok(value) => (
-                    serde_json::json!({ "ok": true, "result": value }),
-                    "succeeded",
-                    None,
-                ),
+                Ok(value) => {
+                    // 写工具成功后落检查点（同主链路），供后续回退。
+                    if let Some(cap) = capture.as_ref() {
+                        persist_checkpoint(app, conversation_id, name, cap);
+                    }
+                    (
+                        serde_json::json!({ "ok": true, "result": value }),
+                        "succeeded",
+                        None,
+                    )
+                }
                 Err(message) => (
                     serde_json::json!({ "ok": false, "error": message }),
                     "failed",
@@ -268,7 +426,7 @@ async fn run_subtask_loop(
                 if status == "succeeded" { "tool_succeeded" } else { "tool_failed" },
                 &display_name,
                 status,
-                &call.function.arguments,
+                args,
                 Some(&output_str),
                 error.as_deref(),
                 workspace_path,

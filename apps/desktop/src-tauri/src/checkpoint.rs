@@ -52,7 +52,9 @@ pub(crate) fn capture_checkpoint_before(
                 revertible: true,
             })
         }
-        "write_file" | "edit_file" => {
+        // apply_patch（Plan25 C-2）：同一文件多处编辑，语义同 write_file/edit_file——
+        // 取 path、快照原文，文件存在但快照失败时不可回退。
+        "write_file" | "edit_file" | "apply_patch" => {
             let rel = args.get("path")?.as_str()?;
             let prev = read_prev(rel);
             let existed = safe_workspace_join(workspace, rel)
@@ -143,7 +145,8 @@ pub(crate) fn post_execution_diff(
             let new = args.get("content")?.as_str()?;
             Some(compute_line_diff(prev, new))
         }
-        "edit_file" => {
+        // edit_file / apply_patch（Plan25 C-2）：均为原地编辑、无 content 入参，新内容从磁盘回读。
+        "edit_file" | "apply_patch" => {
             let path = safe_workspace_join(workspace, &capture.rel_path)?;
             let new = std::fs::read_to_string(path).ok()?;
             Some(compute_line_diff(prev, &new))
@@ -195,7 +198,8 @@ pub(crate) fn apply_checkpoint_revert(
             }
             Ok(())
         }
-        "write_file" | "edit_file" => {
+        // apply_patch（Plan25 C-2）：原地多处编辑，回退即把原文写回（同 write_file/edit_file）。
+        "write_file" | "edit_file" | "apply_patch" => {
             let path = safe_workspace_join(workspace, &checkpoint.rel_path)
                 .ok_or("路径不安全")?;
             match checkpoint.prev_content.as_deref() {

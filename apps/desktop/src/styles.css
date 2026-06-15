@@ -278,56 +278,6 @@ h1 {
 
 /* ── 新对话工作区选择 ── */
 
-.workspace-picker {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  width: min(760px, 100%);
-  color: var(--text-2);
-  font-size: 13px;
-}
-
-.workspace-picker button {
-  border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  background: var(--surface);
-  color: var(--text);
-  cursor: pointer;
-  padding: 9px 12px;
-}
-
-.workspace-picker__selected {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 8px;
-}
-
-.workspace-picker__selected strong {
-  color: var(--text);
-}
-
-.workspace-picker__selected span {
-  overflow: hidden;
-  max-width: 420px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.workspace-picker p,
-.workspace-picker__error {
-  margin: 0;
-}
-
-.workspace-picker__error {
-  width: 100%;
-  color: var(--danger);
-  text-align: center;
-  font-size: 12px;
-}
-
 /* ── 空状态 ── */
 
 .hero-panel {
@@ -447,23 +397,25 @@ h1 {
   justify-content: flex-end;
 }
 
+/* 仅图标：去掉框与底色，纯图标按钮，hover 时图标变深 + 极淡底色。 */
 .message-actions__btn {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface);
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  background: transparent;
   color: var(--text-3);
-  font-size: 11.5px;
-  padding: 3px 8px;
+  border-radius: 7px;
+  padding: 0;
   cursor: pointer;
-  transition: color .12s, border-color .12s;
+  transition: color .12s, background .12s;
 }
 
 .message-actions__btn:hover:not(:disabled) {
   color: var(--text);
-  border-color: var(--text-3);
+  background: var(--surface-3);
 }
 
 .message-actions__btn:disabled {
@@ -476,13 +428,13 @@ h1 {
   white-space: pre-wrap;
 }
 
-/* 用户消息：右侧深色气泡 */
+/* 用户消息：右侧气泡保留，圆润一些，底色用项目品牌浅色（融入整体配色）。 */
 .message--user {
   align-self: flex-end;
-  background: var(--brand-tint-strong);
+  background: var(--brand-tint);
   color: var(--text);
-  border-radius: 12px;
-  padding: 12px 16px;
+  border-radius: 16px;
+  padding: 10px 15px;
 }
 
 /* assistant 消息：无背景，内容直接融入页面 */
@@ -828,34 +780,6 @@ h1 {
 }
 .workspace-menu__item:hover { background: var(--surface-3); }
 .workspace-menu__item svg { flex-shrink: 0; color: var(--text-3); }
-
-/* ── MVP 卡片 ── */
-
-.mvp-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 16px;
-  width: min(760px, 100%);
-}
-
-.mvp-grid article {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface);
-  padding: 16px;
-}
-
-.mvp-grid h3 {
-  margin-bottom: 8px;
-  font-size: 16px;
-}
-
-.mvp-grid p {
-  margin-bottom: 0;
-  color: var(--text-2);
-  font-size: 14px;
-  line-height: 1.6;
-}
 
 /* ── 未配模型首屏引导 CTA（Plan19 P0a）── */
 
@@ -1506,6 +1430,56 @@ h1 {
   font-size: 11.5px;
   color: var(--text-3);
 }
+
+/* ── C-4 计划闭环「批准并执行」横幅 ──
+   计划模式产出后浮现于 composer 上方；醒目主色 CTA，与深浅主题协调。 */
+.plan-approval {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  width: min(760px, 100%);
+  align-self: center;
+  margin-bottom: 8px;
+  padding: 10px 14px;
+  background: var(--brand-tint);
+  border: 1px solid var(--brand-tint-strong);
+  border-radius: 12px;
+  animation: provider-fade-in 0.25s ease;
+}
+
+.plan-approval__text {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.plan-approval__icon {
+  color: var(--brand);
+  flex-shrink: 0;
+}
+
+.plan-approval__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  border: 1px solid var(--brand);
+  border-radius: 9px;
+  background: var(--brand);
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 14px;
+  transition: filter .14s, transform .08s;
+}
+
+.plan-approval__btn:hover { filter: brightness(1.06); }
+.plan-approval__btn:active { transform: translateY(1px); }
 
 /* ── Composer 扩展（计划模式 / 斜杠菜单） ── */
 
@@ -2455,10 +2429,6 @@ h1 {
   .topbar {
     flex-direction: column;
     align-items: flex-start;
-  }
-
-  .mvp-grid {
-    grid-template-columns: 1fr;
   }
 }
 

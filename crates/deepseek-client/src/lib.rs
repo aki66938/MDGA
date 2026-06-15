@@ -151,6 +151,141 @@ pub async fn test_connection(
     }
 }
 
+/// 对供应商做一次「工具调用」冒烟探测（Plan25 契约 C-1 / #3）。
+///
+/// 输入 base_url、api_key、model、api_format（openai|anthropic）；发一个极小请求，提供一个
+/// trivial 函数工具（name="ping"，无必填参数），`max_tokens` 取小。判定逻辑：
+/// **成功 = 响应里出现原生 tool_calls，或正文能被兜底解析（`parse_dsml_tool_calls`，含本 Plan
+/// 新增的泄漏格式）恢复出至少一个 tool_call** → 返回 Ok(true)；模型只回文本、不调用工具 →
+/// 返回 Ok(false)；网络/鉴权/参数等错误 → 返回 Err（用 [`classify_api_error`] 人话化）。
+///
+/// openai 格式走 `/chat/completions`（messages + tools 字段 + tool_choice="auto"，Bearer 鉴权），
+/// anthropic 走 `/v1/messages`（tools 字段为 Anthropic schema，x-api-key + anthropic-version 鉴权）。
+/// base_url 复用既有 [`chat_completions_url`] / [`anthropic_messages_url`] 容错拼接。本方法不重试、不流式。
+pub async fn probe_tool_call(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    api_format: &str,
+) -> Result<bool, DeepSeekError> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err(DeepSeekError::BadRequest(
+            "Base URL 未配置：请填写供应商端点".to_string(),
+        ));
+    }
+    if api_key.trim().is_empty() {
+        return Err(DeepSeekError::MissingApiKey);
+    }
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(DeepSeekError::Http)?;
+
+    // 引导模型「无脑」调用 ping：尽量逼出 tool_call，降低只回文本的概率。
+    let prompt = "Call the `ping` tool now. Do not reply with text.";
+
+    let value = if api_format == "anthropic" {
+        // Anthropic：tools 用 input_schema（JSON Schema），max_tokens 必填、取小；tool_choice 让其优先调用。
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{ "role": "user", "content": prompt }],
+            "tools": [{
+                "name": "ping",
+                "description": "A trivial no-op probe tool. Call it to acknowledge.",
+                "input_schema": { "type": "object", "properties": {} }
+            }]
+        });
+        let response = client
+            .post(anthropic_messages_url(base))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Err(classify_api_error(status, &text));
+        }
+        let value = response.json::<serde_json::Value>().await?;
+        return Ok(anthropic_response_has_tool_call(&value));
+    } else {
+        // OpenAI 兼容：tools 用 function schema，tool_choice="auto"，max_tokens 取小。
+        let body = serde_json::json!({
+            "model": model,
+            "stream": false,
+            "max_tokens": 64,
+            "messages": [{ "role": "user", "content": prompt }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "ping",
+                    "description": "A trivial no-op probe tool. Call it to acknowledge.",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }],
+            "tool_choice": "auto"
+        });
+        let response = client
+            .post(chat_completions_url(base))
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Err(classify_api_error(status, &text));
+        }
+        response.json::<serde_json::Value>().await?
+    };
+
+    Ok(openai_response_has_tool_call(&value))
+}
+
+/// 判断 OpenAI 兼容响应是否「调用了工具」：先看原生 `choices[0].message.tool_calls`，
+/// 再退回正文 `choices[0].message.content` 走兜底解析恢复。
+fn openai_response_has_tool_call(value: &serde_json::Value) -> bool {
+    if value
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    value
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .map(|c| !parse_dsml_tool_calls(c).is_empty())
+        .unwrap_or(false)
+}
+
+/// 判断 Anthropic 响应是否「调用了工具」：先看 `content` 数组里是否含 `type=="tool_use"` 块，
+/// 再把其中的文本块拼起来走兜底解析恢复（兼容把工具调用泄漏进文本的情况）。
+fn anthropic_response_has_tool_call(value: &serde_json::Value) -> bool {
+    let Some(blocks) = value.get("content").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    let mut text = String::new();
+    for block in blocks {
+        match block.get("type").and_then(|v| v.as_str()) {
+            Some("tool_use") => return true,
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                    text.push_str(t);
+                    text.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+    !parse_dsml_tool_calls(&text).is_empty()
+}
+
 impl DeepSeekError {
     /// 判断该错误是否为瞬时、可重试的错误。
     ///
@@ -682,13 +817,255 @@ pub fn parse_dsml_tool_calls(raw_content: &str) -> Vec<ToolCall> {
     if !calls.is_empty() {
         return calls;
     }
-    parse_markup_tool_calls(
+    let calls = parse_markup_tool_calls(
         &content,
         "<ToolCall name=\"",
         "</ToolCall>",
         "<parameter name=\"",
         "</parameter>",
-    )
+    );
+    if !calls.is_empty() {
+        return calls;
+    }
+    // DSML / <ToolCall> 都未命中时，再尝试「函数调用泄漏到正文」的常见宽松格式
+    //（代码块 JSON、<tool_call>{json}</tool_call>、<function=NAME>{json}</function>）。
+    // 此处用原始正文而非去竖线后的串：这些格式不含全角竖线，且 JSON 值里的竖线应原样保留。
+    parse_leaked_tool_calls(raw_content)
+}
+
+/// 宽松识别「函数调用泄漏到正文」的常见格式并恢复为 ToolCall（Plan25 #3 兜底泛化）。
+///
+/// 在原生 tool_calls 与 DSML/`<ToolCall>` 路径都落空后兜底，支持三类格式：
+/// ① Markdown 代码块 JSON（` ```json {...} ``` ` 或无语言标注的 ``` 围栏）：
+///    单个 `{"name":..,"arguments":..}`、`{"name":..,"parameters":..}`、`{"function":{...}}`，
+///    或 OpenAI 风格 `{"tool_calls":[{...}]}`；
+/// ② `<tool_call>{json}</tool_call>`（json 同 ① 的单调用形态）；
+/// ③ `<function=NAME>{json args}</function>`（标签名即工具名，体为参数对象）。
+///
+/// arguments 既支持对象（序列化为紧凑 JSON 串）也支持字符串（已是 JSON 串则原样透传）。
+/// 任一格式恢复出 ≥1 个调用即返回，互不破坏：先扫描显式标签，再扫描代码块/裸 JSON。
+pub fn parse_leaked_tool_calls(content: &str) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+
+    // ② <tool_call>{json}</tool_call>
+    extract_tagged_json(content, "<tool_call>", "</tool_call>", |json, calls| {
+        push_calls_from_json(json, calls);
+    }, &mut calls);
+
+    // ③ <function=NAME>{json args}</function>
+    parse_function_tag_calls(content, &mut calls);
+
+    if !calls.is_empty() {
+        return calls;
+    }
+
+    // ① 代码块围栏内的 JSON：```json ... ``` 或裸 ``` ... ```
+    for block in extract_code_block_jsons(content) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(block.trim()) {
+            push_calls_from_value(&value, &mut calls);
+        }
+    }
+    if !calls.is_empty() {
+        return calls;
+    }
+
+    // 兜底的兜底：正文里没有围栏，但夹着一段裸 JSON 对象（含 name/tool_calls）。
+    for json in extract_bare_json_objects(content) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+            push_calls_from_value(&value, &mut calls);
+            if !calls.is_empty() {
+                break;
+            }
+        }
+    }
+
+    calls
+}
+
+/// 解析 `<function=NAME>{json args}</function>` 形态：标签 `=` 后到 `>` 之间是工具名，体是参数对象。
+fn parse_function_tag_calls(content: &str, calls: &mut Vec<ToolCall>) {
+    const OPEN: &str = "<function=";
+    const CLOSE: &str = "</function>";
+    let mut cursor = 0;
+    while let Some(offset) = content[cursor..].find(OPEN) {
+        let name_start = cursor + offset + OPEN.len();
+        let Some(gt_offset) = content[name_start..].find('>') else {
+            break;
+        };
+        let name = content[name_start..name_start + gt_offset].trim();
+        let body_start = name_start + gt_offset + 1;
+        let Some(close_offset) = content[body_start..].find(CLOSE) else {
+            break;
+        };
+        let body = content[body_start..body_start + close_offset].trim();
+        if !name.is_empty() {
+            let arguments = json_args_to_string(body);
+            calls.push(make_recovered_call(calls.len(), name, arguments));
+        }
+        cursor = body_start + close_offset + CLOSE.len();
+    }
+}
+
+/// 扫描所有 `<open>...</close>` 区段，对每段内容回调；用于 `<tool_call>{json}</tool_call>`。
+fn extract_tagged_json(
+    content: &str,
+    open: &str,
+    close: &str,
+    mut on_body: impl FnMut(&str, &mut Vec<ToolCall>),
+    calls: &mut Vec<ToolCall>,
+) {
+    let mut cursor = 0;
+    while let Some(offset) = content[cursor..].find(open) {
+        let body_start = cursor + offset + open.len();
+        let Some(close_offset) = content[body_start..].find(close) else {
+            break;
+        };
+        let body = &content[body_start..body_start + close_offset];
+        on_body(body.trim(), calls);
+        cursor = body_start + close_offset + close.len();
+    }
+}
+
+/// 从 JSON 文本里恢复调用（用于 `<tool_call>` 体）。
+fn push_calls_from_json(json: &str, calls: &mut Vec<ToolCall>) {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+        push_calls_from_value(&value, calls);
+    }
+}
+
+/// 从一个 JSON 值里恢复调用，识别以下形态并归一为 ToolCall：
+/// - `{"tool_calls":[{...}, ...]}`：逐个递归处理数组元素；
+/// - `{"function":{"name":..,"arguments"/"parameters":..}}`（OpenAI 单调用对象）；
+/// - `{"name":..,"arguments"/"parameters":..}`（裸函数调用）。
+fn push_calls_from_value(value: &serde_json::Value, calls: &mut Vec<ToolCall>) {
+    // OpenAI 风格批量：{"tool_calls":[...]}
+    if let Some(arr) = value.get("tool_calls").and_then(|v| v.as_array()) {
+        for item in arr {
+            push_calls_from_value(item, calls);
+        }
+        return;
+    }
+    // 单调用对象，name 可能在顶层或嵌套在 function 里。
+    let func = value.get("function").unwrap_or(value);
+    let Some(name) = func.get("name").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    // arguments 优先，其次 parameters（不同模型/封装命名不一）。
+    let args_value = func
+        .get("arguments")
+        .or_else(|| func.get("parameters"))
+        .or_else(|| func.get("args"));
+    let arguments = match args_value {
+        Some(serde_json::Value::String(s)) => json_args_to_string(s),
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()),
+        None => "{}".to_string(),
+    };
+    calls.push(make_recovered_call(calls.len(), name, arguments));
+}
+
+/// 把「参数体文本」归一为 JSON 串：若本身是合法 JSON（对象/串等）则压缩重序列化，
+/// 否则按字符串字面量包装（极少见，保证下游 `serde_json::from_str` 不致 panic）。
+fn json_args_to_string(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "{}".to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        // 已是合法 JSON：若为字符串值则原样取出（它本身可能就是 JSON 串），否则压缩重序列化。
+        Ok(serde_json::Value::String(s)) => s,
+        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| trimmed.to_string()),
+        Err(_) => serde_json::Value::String(trimmed.to_string()).to_string(),
+    }
+}
+
+/// 构造一个「兜底恢复」的 ToolCall，id 以 leak_call_N 区分于原生/DSML 路径。
+fn make_recovered_call(index: usize, name: &str, arguments: String) -> ToolCall {
+    ToolCall {
+        id: format!("leak_call_{index}"),
+        kind: "function".to_string(),
+        function: ToolFunctionCall {
+            name: name.to_string(),
+            arguments,
+        },
+    }
+}
+
+/// 抽出所有 Markdown 代码块围栏（```lang ... ```）内部文本，按出现顺序返回。
+/// 兼容 ```json、```JSON、无语言标注的裸 ``` 三种围栏；不要求闭合（截断响应也尽量恢复）。
+fn extract_code_block_jsons(content: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut cursor = 0;
+    while let Some(offset) = content[cursor..].find("```") {
+        let after_fence = cursor + offset + 3;
+        // 跳过围栏后到行尾的语言标注（json / JSON / 空）。
+        let line_end = content[after_fence..]
+            .find('\n')
+            .map(|p| after_fence + p + 1)
+            .unwrap_or(content.len());
+        let body_start = line_end;
+        // 找闭合围栏；没有则取到结尾（容忍截断）。
+        let (body_end, next) = match content[body_start..].find("```") {
+            Some(p) => (body_start + p, body_start + p + 3),
+            None => (content.len(), content.len()),
+        };
+        if body_end > body_start {
+            blocks.push(content[body_start..body_end].to_string());
+        }
+        cursor = next;
+    }
+    blocks
+}
+
+/// 从正文里粗略切出顶层 `{...}` JSON 对象片段（按花括号配对，跳过字符串内的括号）。
+/// 仅用于「正文夹裸 JSON」的最后兜底，返回所有平衡的顶层对象文本。
+fn extract_bare_json_objects(content: &str) -> Vec<String> {
+    let bytes = content.as_bytes();
+    let mut objects = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // 从此处开始做花括号配对扫描。
+            let start = i;
+            let mut depth = 0usize;
+            let mut in_str = false;
+            let mut escaped = false;
+            let mut j = i;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if in_str {
+                    if escaped {
+                        escaped = false;
+                    } else if c == b'\\' {
+                        escaped = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        b'"' => in_str = true,
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                objects.push(content[start..=j].to_string());
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    objects
 }
 
 /// 通用的「标记式工具调用」解析器：按给定的 invoke/parameter 起止标记从正文恢复 ToolCall。
@@ -964,5 +1341,210 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].function.name, "read_file");
         assert_eq!(calls[1].function.name, "delete_file");
+    }
+
+    // ===== Plan25 #3 兜底泛化：泄漏格式恢复单测 =====
+
+    #[test]
+    fn recovers_code_block_json_with_object_arguments() {
+        // ```json {"name":..,"arguments":{对象}} ```：arguments 为对象。
+        let content = "我来读取文件：\n\n```json\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}\n```";
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args should be json");
+        assert_eq!(parsed["path"], "a.txt");
+    }
+
+    #[test]
+    fn recovers_code_block_json_with_string_arguments() {
+        // ```json {"name":..,"arguments":"{json串}"} ```：arguments 为字符串（内含 JSON）。
+        let content =
+            "```json\n{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"b.txt\\\",\\\"content\\\":\\\"hi\\\"}\"}\n```";
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args should be json");
+        assert_eq!(parsed["path"], "b.txt");
+        assert_eq!(parsed["content"], "hi");
+    }
+
+    #[test]
+    fn recovers_code_block_openai_tool_calls_envelope() {
+        // ```json {"tool_calls":[{...}]} ```：OpenAI 批量信封。
+        let content = "```json\n{\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"list_dir\",\"arguments\":{\"path\":\".\"}}},{\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"x\"}}}]}\n```";
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "list_dir");
+        assert_eq!(calls[1].function.name, "read_file");
+    }
+
+    #[test]
+    fn recovers_code_block_without_lang_tag() {
+        // 裸 ``` 围栏（无 json 语言标注）也应恢复。
+        let content = "```\n{\"name\":\"ping\",\"arguments\":{}}\n```";
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "ping");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn recovers_tool_call_tag_with_object_arguments() {
+        // <tool_call>{json}</tool_call>：arguments 为对象。
+        let content = "好的。<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"c.txt\"}}</tool_call>";
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args should be json");
+        assert_eq!(parsed["path"], "c.txt");
+    }
+
+    #[test]
+    fn recovers_tool_call_tag_with_string_arguments() {
+        // <tool_call>{json}</tool_call>：arguments 为字符串形态。
+        let content = "<tool_call>{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"d.txt\\\"}\"}</tool_call>";
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args should be json");
+        assert_eq!(parsed["path"], "d.txt");
+    }
+
+    #[test]
+    fn recovers_function_tag_with_object_args() {
+        // <function=NAME>{json args}</function>：体即参数对象。
+        let content = "调用：<function=read_file>{\"path\":\"e.txt\"}</function>";
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args should be json");
+        assert_eq!(parsed["path"], "e.txt");
+    }
+
+    #[test]
+    fn recovers_function_tag_with_empty_args() {
+        // <function=NAME></function>：空体应归一为空对象参数。
+        let content = "<function=ping></function>";
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "ping");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn recovers_function_tag_with_string_arg_body() {
+        // <function=NAME>"{json串}"</function>：体是被引号包裹的 JSON 串（字符串形态）。
+        let content = "<function=write_file>\"{\\\"path\\\":\\\"f.txt\\\"}\"</function>";
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args should be json");
+        assert_eq!(parsed["path"], "f.txt");
+    }
+
+    #[test]
+    fn recovers_bare_json_object_without_fence() {
+        // 正文夹裸 JSON（无围栏、无标签）的最后兜底。
+        let content = "这是结果 {\"name\":\"delete_file\",\"arguments\":{\"path\":\"g.txt\"}} 完成。";
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "delete_file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args should be json");
+        assert_eq!(parsed["path"], "g.txt");
+    }
+
+    #[test]
+    fn native_and_dsml_paths_take_precedence_over_leaked() {
+        // DSML 路径命中时不应再走泄漏兜底（优先级：原生 > DSML/ToolCall > 泄漏格式）。
+        // 这里构造同时含 DSML 与代码块 JSON 的正文，断言只恢复出 DSML 的那一个。
+        let content = "<｜｜DSML｜｜invoke name=\"dsml_win\"><｜｜DSML｜｜parameter name=\"path\" string=\"true\">a.txt</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>\n```json\n{\"name\":\"leaked_lose\",\"arguments\":{}}\n```";
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "dsml_win");
+    }
+
+    #[test]
+    fn plain_text_yields_no_leaked_calls() {
+        // 纯文本不应误恢复出任何调用。
+        let content = "这只是一段普通文本，提到 read_file 但没有调用结构。";
+        assert!(parse_dsml_tool_calls(content).is_empty());
+    }
+
+    // ===== Plan25 C-1 probe 判定逻辑单测（纯解析，不打网络） =====
+
+    #[test]
+    fn openai_probe_detects_native_tool_calls() {
+        let value = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "c1", "type": "function",
+                        "function": { "name": "ping", "arguments": "{}" }
+                    }]
+                }
+            }]
+        });
+        assert!(openai_response_has_tool_call(&value));
+    }
+
+    #[test]
+    fn openai_probe_recovers_from_leaked_content() {
+        let value = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "```json\n{\"name\":\"ping\",\"arguments\":{}}\n```"
+                }
+            }]
+        });
+        assert!(openai_response_has_tool_call(&value));
+    }
+
+    #[test]
+    fn openai_probe_text_only_is_false() {
+        let value = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "pong，我不会调用工具。" }
+            }]
+        });
+        assert!(!openai_response_has_tool_call(&value));
+    }
+
+    #[test]
+    fn anthropic_probe_detects_tool_use_block() {
+        let value = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "ok" },
+                { "type": "tool_use", "id": "t1", "name": "ping", "input": {} }
+            ]
+        });
+        assert!(anthropic_response_has_tool_call(&value));
+    }
+
+    #[test]
+    fn anthropic_probe_recovers_from_leaked_text() {
+        let value = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "<tool_call>{\"name\":\"ping\",\"arguments\":{}}</tool_call>" }
+            ]
+        });
+        assert!(anthropic_response_has_tool_call(&value));
+    }
+
+    #[test]
+    fn anthropic_probe_text_only_is_false() {
+        let value = serde_json::json!({
+            "content": [ { "type": "text", "text": "我只回文本。" } ]
+        });
+        assert!(!anthropic_response_has_tool_call(&value));
     }
 }

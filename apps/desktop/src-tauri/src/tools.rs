@@ -158,6 +158,35 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
             "Edit an existing UTF-8 text file by replacing oldText with newText. Prefer this for code or text modifications.",
             &["path", "oldText", "newText"],
         ),
+        // apply_patch（Plan25 C-2）：对同一文件按顺序做多处精确替换，优于多次 edit_file。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Apply multiple precise text replacements to a SINGLE file in order. Each edit's oldText must match exactly once in the (current) file content; if any oldText is empty, missing, or matches more than once, the whole patch fails and nothing is written. Use this for several edits to one file at once — it is better than calling edit_file repeatedly.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path of the existing file inside the workspace." },
+                        "edits": {
+                            "type": "array",
+                            "description": "Ordered list of replacements applied one after another to the file content.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "oldText": { "type": "string", "description": "Exact existing text to replace. Must be uniquely present in the current content at the time this edit runs." },
+                                    "newText": { "type": "string", "description": "Replacement text." }
+                                },
+                                "required": ["oldText", "newText"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["path", "edits"],
+                    "additionalProperties": false
+                }
+            }
+        }),
         serde_json::json!({
             "type": "function",
             "function": {
@@ -457,13 +486,14 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "run_subtask",
-                "description": "Delegate a focused READ-ONLY exploration subtask (e.g. 'find where X is implemented', 'summarize how module Y works') to a sub-agent with its own fresh context. The sub-agent can only list/read/search files and returns a concise text report. Use this to investigate large codebases without bloating the main conversation. Optionally set agentType to use a custom agent role from .mdga/agents/<type>.md. Set background=true to run it asynchronously: it returns a taskId immediately so you can keep working; poll progress with get_task_output and stop it with kill_task.",
+                "description": "Delegate a focused subtask to a sub-agent with its own fresh context, returning a concise text report. Use mode='read' (default) for READ-ONLY investigation (e.g. 'find where X is implemented') — the sub-agent can only list/read/search files. Use mode='write' to delegate actual work (editing files, running commands) within the SAME permission and checkpoint protection as the main agent: every write/delete/command goes through user approval gating and is checkpointed. Use this to keep large investigations or self-contained work off the main conversation. Optionally set agentType to use a custom agent role from .mdga/agents/<type>.md. background=true runs asynchronously (returns a taskId; poll with get_task_output, stop with kill_task) and is only supported for mode='read' (a write subtask always runs in the foreground so its actions can be approved).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "description": { "type": "string", "description": "Clear, self-contained description of what to investigate and what the report should contain." },
+                        "description": { "type": "string", "description": "Clear, self-contained description of what to do and what the report should contain." },
+                        "mode": { "type": "string", "enum": ["read", "write"], "description": "'read' (default) = read-only exploration; 'write' = may edit files / run commands under the main agent's permission and checkpoint protection." },
                         "agentType": { "type": "string", "description": "Optional custom agent type name (loads .mdga/agents/<type>.md as the sub-agent role)." },
-                        "background": { "type": "boolean", "description": "Run asynchronously: return a taskId immediately instead of blocking. Poll with get_task_output, stop with kill_task. Default false." }
+                        "background": { "type": "boolean", "description": "Run asynchronously: return a taskId immediately instead of blocking. Poll with get_task_output, stop with kill_task. Only honored for mode='read'. Default false." }
                     },
                     "required": ["description"],
                     "additionalProperties": false
@@ -618,6 +648,7 @@ pub(crate) fn execute_builtin_tool_call(
             serde_json::to_value(edit_file(workspace_path, request).map_err(|err| err.to_string())?)
                 .map_err(|err| err.to_string())
         }
+        "apply_patch" => execute_apply_patch(workspace_path, arguments),
         "read_file" => {
             let request = serde_json::from_str::<ReadFileRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
@@ -690,4 +721,108 @@ pub(crate) fn execute_create_file_tool_call(
         .map_err(|err| format!("工具参数解析失败: {err}"))?;
     let result = create_file(workspace_path, request).map_err(|err| err.to_string())?;
     serde_json::to_value(result).map_err(|err| err.to_string())
+}
+
+/// apply_patch 工具（Plan25 C-2）：对同一文件按 edits 顺序做多处「唯一匹配」精确替换。
+///
+/// 语义（全有或全无）：先把原文整字节读入内存（保留行尾/末尾换行，不经分页规整），
+/// 按顺序对每条 edit 校验 oldText 在当前内容中 **恰好命中一次**
+/// （空串 / 未命中 / 多处命中 → 整体失败、不写盘，错误标明第几条与原因），
+/// 全部成功后一次性写回文件。返回 `{ ok, path, applied }`。
+/// 路径安全：读取自做安全拼接（拒绝绝对路径 / `..` / 越界，且目标须为工作区内已存在文件），
+/// 写回复用 `write_file` 的越界校验，与其它写工具保持一致。
+fn execute_apply_patch(workspace_path: &str, arguments: &str) -> Result<serde_json::Value, String> {
+    #[derive(serde::Deserialize)]
+    struct PatchEdit {
+        #[serde(rename = "oldText", default)]
+        old_text: String,
+        #[serde(rename = "newText", default)]
+        new_text: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct ApplyPatchRequest {
+        path: String,
+        edits: Vec<PatchEdit>,
+    }
+
+    let request = serde_json::from_str::<ApplyPatchRequest>(arguments)
+        .map_err(|err| format!("工具参数解析失败: {err}"))?;
+    if request.edits.is_empty() {
+        return Err("apply_patch 的 edits 不能为空".to_string());
+    }
+
+    // 整字节读取原文（与 edit_file 一致，保留原始行尾与末尾换行）。
+    let mut content = read_existing_text_for_patch(workspace_path, &request.path)?;
+
+    // 按顺序在内容串上做唯一匹配替换：任一条失败立即整体返回错误（不写盘）。
+    for (idx, edit) in request.edits.iter().enumerate() {
+        let no = idx + 1; // 面向模型用 1 基序号
+        if edit.old_text.is_empty() {
+            return Err(format!("第 {no} 条 edit 的 oldText 为空"));
+        }
+        let count = content.matches(&edit.old_text).count();
+        if count == 0 {
+            return Err(format!("第 {no} 条 edit 的 oldText 在（当前）文件中未命中"));
+        }
+        if count > 1 {
+            return Err(format!(
+                "第 {no} 条 edit 的 oldText 在（当前）文件中匹配到 {count} 处，必须唯一，请补充上下文使其唯一"
+            ));
+        }
+        content = content.replacen(&edit.old_text, &edit.new_text, 1);
+    }
+
+    // 全部校验通过，一次性写回（write_file 复用越界校验，与其它写工具一致）。
+    write_file(
+        workspace_path,
+        WriteFileRequest {
+            path: request.path.clone(),
+            content,
+        },
+    )
+    .map_err(|err| err.to_string())?;
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "path": request.path,
+        "applied": request.edits.len()
+    }))
+}
+
+/// 为 apply_patch 整字节读取工作区内已存在的 UTF-8 文本文件（保留原始字节，不经 read_file 分页规整）。
+///
+/// 路径安全规则对齐 tool-runtime 的 resolve_existing_path：拒绝绝对路径与含 `..` 的相对路径，
+/// 拼接后须落在工作区内、且目标确为已存在文件；超过 1 MiB 视为过大，建议改用 edit_file。
+fn read_existing_text_for_patch(workspace_path: &str, rel: &str) -> Result<String, String> {
+    const MAX_PATCH_BYTES: u64 = 1024 * 1024;
+    let trimmed = rel.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return Err("apply_patch 需要一个具体的文件路径".to_string());
+    }
+    let candidate = std::path::Path::new(trimmed);
+    if candidate.is_absolute() || candidate.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("路径必须是工作区内的相对路径，且不能包含 ..".to_string());
+    }
+    let workspace = std::path::Path::new(workspace_path)
+        .canonicalize()
+        .map_err(|e| format!("工作区路径无效: {e}"))?;
+    let target = workspace.join(candidate);
+    if !target.exists() {
+        return Err(format!("文件不存在: {trimmed}"));
+    }
+    let target = target
+        .canonicalize()
+        .map_err(|e| format!("路径解析失败: {e}"))?;
+    if !target.starts_with(&workspace) {
+        return Err("路径越出工作区范围".to_string());
+    }
+    if !target.is_file() {
+        return Err(format!("不是文件: {trimmed}"));
+    }
+    let meta = std::fs::metadata(&target).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_PATCH_BYTES {
+        return Err("文件过大（超过 1 MiB），apply_patch 暂不支持，请改用 edit_file 分段处理".to_string());
+    }
+    let bytes = std::fs::read(&target).map_err(|e| e.to_string())?;
+    String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())
 }

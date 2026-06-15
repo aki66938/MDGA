@@ -319,6 +319,12 @@ export function App() {
   const [todos, setTodos] = useState<TodoItem[]>([]);
   // 计划模式：先出计划等确认，本轮不执行工具
   const [planMode, setPlanMode] = useState(false);
+  // C-4 计划闭环：上一轮以计划模式产出了助手回复，等待用户「批准并执行」。
+  // chat-done 成功收尾时置 true（仅当该轮为计划轮）；新建/切换会话、下一次普通发送时清除。
+  const [awaitingPlanApproval, setAwaitingPlanApproval] = useState(false);
+  // 标记「本轮发送是计划轮」：发送时按 planMode 写入，chat-done 据此决定是否进入待批准态。
+  // 用 ref 而非 state——chat-done 回调注册一次，闭包内需读到本轮最新值，规避陈旧。
+  const planRoundRef = useRef(false);
   // 设置面板 / 变更记录面板
   const [showSettings, setShowSettings] = useState(false);
   // 打开设置面板时初始定位的分类（首屏 CTA 可直接跳到「模型供应商」）。
@@ -689,6 +695,9 @@ export function App() {
     setPlanMode(false);
     setQueuedSteering([]);
     setWorkspaceMenuOpen(false);
+    // C-4：跨会话清除待批准态与本轮计划标记，避免上一会话的计划闭环残留到新会话。
+    setAwaitingPlanApproval(false);
+    planRoundRef.current = false;
   }
 
   async function handleDeleteConversation(e: React.MouseEvent, id: string) {
@@ -872,9 +881,18 @@ export function App() {
     await sendText(text);
   }
 
-  /** 发送一段文本（供输入框与文件导入复用）。 */
-  async function sendText(text: string) {
+  /**
+   * 发送一段文本（供输入框与文件导入复用）。
+   * @param executePlan C-4：true 时透传 send_message 的 executePlan，让后端注入「严格按上一条计划执行」语义；
+   *                    普通发送省略或传 false。仅「批准并执行计划」按钮会传 true。
+   */
+  async function sendText(text: string, executePlan: boolean = false) {
     if (!text || sending) return;
+
+    // C-4：记录本轮是否为计划轮（仅 planMode 为真且非执行计划时算计划轮，供 chat-done 决定是否进入待批准）；
+    // 任何一次新发送都先清掉上一轮的待批准态（点「批准并执行」的发送也会先清，再由本轮结果重置）。
+    planRoundRef.current = planMode && !executePlan;
+    setAwaitingPlanApproval(false);
 
     // 快照本轮附图并清空暂存（Plan18 M18.1）：随消息上送视觉模型，并入用户消息 parts 持久化展示。
     const outImages = pendingImages;
@@ -1126,6 +1144,13 @@ export function App() {
         partsJson,
       }).catch(() => {});
 
+      // C-4 计划闭环：本轮为计划轮且成功产出了助手回复（有非空正文）→ 进入待批准态，
+      // 在回复下方显示「批准并执行计划」按钮。下一次发送（含批准执行）会先清掉它。
+      if (planRoundRef.current && streamingTextRef.current.trim().length > 0) {
+        setAwaitingPlanApproval(true);
+      }
+      planRoundRef.current = false;
+
       const list = await invoke<Conversation[]>("get_conversations").catch(() => []);
       setConversations(list);
     });
@@ -1140,6 +1165,8 @@ export function App() {
         model,
         permissionMode,
         planMode,
+        // C-4：批准并执行计划时透传 true，后端注入「严格按上一条计划执行 + 先建 todo 清单」语义；普通发送为 false。
+        executePlan,
         // 本轮附图（Plan18 M18.1）：后端据此走「自动初看」识图并注入主 agent。
         images: outImages.map((img) => ({ mediaType: img.mediaType, base64: img.base64 })),
       });
@@ -1189,6 +1216,17 @@ export function App() {
     const text = messageText(msg);
     if (!text) return;
     await sendText(text);
+  }
+
+  /**
+   * C-4「批准并执行计划」：以 planMode=false + executePlan=true 走发送路径，
+   * 让后端据上一条计划注入「严格按计划执行 + 先建 todo 清单」语义。
+   * 关掉计划模式（避免又出一份计划），发送固定文本「按上述计划执行」，随后清待批准态（sendText 内已清）。
+   */
+  async function approveAndExecutePlan() {
+    if (sending || !awaitingPlanApproval) return;
+    setPlanMode(false);
+    await sendText("按上述计划执行", true);
   }
 
   async function handleStop() {
@@ -1832,6 +1870,24 @@ export function App() {
           </div>
         )}
 
+        {/* C-4 计划闭环「批准并执行」：上一轮计划模式成功产出后、且当前未在发送时，
+            在 composer 上方显示醒目按钮；点击以 planMode=false + executePlan=true 发送「按上述计划执行」。 */}
+        {awaitingPlanApproval && !sending && (
+          <div className="plan-approval" role="region" aria-label="批准并执行计划">
+            <div className="plan-approval__text">
+              <ListChecks size={15} className="plan-approval__icon" />
+              <span>计划已就绪。确认后将关闭计划模式并严格按上述计划执行。</span>
+            </div>
+            <button
+              type="button"
+              className="plan-approval__btn"
+              onClick={approveAndExecutePlan}
+            >
+              <Check size={15} /> 批准并执行计划
+            </button>
+          </div>
+        )}
+
         <div className="composer-area">
           {/* 斜杠命令菜单 */}
           {input.startsWith("/") && !input.includes(" ") && !sending && (
@@ -2223,6 +2279,10 @@ function ProviderCard({
   // 测试连接（Plan19 P2a）：就地显示结果，不跳主界面。null=未测、ok=成功（绿）、err=失败（红）。
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  // C-1 工具调用冒烟（Plan25 #3）：就地显示该供应商工具调用兼容性。
+  // null=未测；kind="ok" 绿（可用）、"weak" 橙（模型未返回工具调用，可能不支持/较弱）、"error" 红（报错）。
+  const [smokeTesting, setSmokeTesting] = useState(false);
+  const [smokeResult, setSmokeResult] = useState<{ kind: "ok" | "weak" | "error"; message: string } | null>(null);
 
   const presetMeta = PROVIDER_PRESETS.find((p) => p.id === preset) ?? PROVIDER_PRESETS[0];
   const isCustom = preset === "custom";
@@ -2247,6 +2307,7 @@ function ProviderCard({
 
   function handlePresetChange(next: string) {
     setTestResult(null); // F4：改配置后清旧测试结果，避免误导
+    setSmokeResult(null); // C-1：同步清工具调用冒烟结果
     setPreset(next);
     const meta = PROVIDER_PRESETS.find((p) => p.id === next);
     // 切换预设给出合理默认 modelId 占位（视觉块用识图模型表）。
@@ -2347,6 +2408,48 @@ function ProviderCard({
     }
   }
 
+  /**
+   * 测试工具调用（C-1 / Plan25 #3）：用当前表单做一次最小工具调用冒烟探测。
+   * key 透传规则与 handleTest 一致——改过才传新 key，否则传空串（命令内回退 DB 既有 key）。
+   * 返回 true=该供应商工具调用可用（原生或兜底恢复均算）；false=模型未返回工具调用（可能不支持/较弱）。
+   */
+  async function handleSmokeTest() {
+    setSmokeResult(null);
+    if (isCustom && !baseUrl.trim()) {
+      setSmokeResult({ kind: "error", message: "自定义供应商必须填写 Base URL" });
+      setAdvancedOpen(true);
+      return;
+    }
+    if (!modelId.trim()) {
+      setSmokeResult({ kind: "error", message: "请填写模型 ID" });
+      return;
+    }
+    // 未配置且未输入 key：前端先拦截不调用。
+    if (!configured && !apiKey.trim()) {
+      setSmokeResult({ kind: "error", message: "请先填写 API Key" });
+      return;
+    }
+    setSmokeTesting(true);
+    try {
+      const ok = await invoke<boolean>("smoke_test_tool_call", {
+        role,
+        baseUrl: baseUrl.trim(),
+        apiKey: keyTouched ? apiKey.trim() : "",
+        model: modelId.trim(),
+        apiFormat: role === "vision" ? apiFormat : "openai",
+      });
+      setSmokeResult(
+        ok
+          ? { kind: "ok", message: "工具调用可用" }
+          : { kind: "weak", message: "该模型未返回工具调用（可能不支持/较弱）" },
+      );
+    } catch (err) {
+      setSmokeResult({ kind: "error", message: humanizeError(String(err)) });
+    } finally {
+      setSmokeTesting(false);
+    }
+  }
+
   // 密码框：已配置且本次未改动 → 占位「已配置 ••••」（只读感）；用户聚焦输入即视为改动。
   const keyPlaceholder = configured && !keyTouched ? "已配置 ••••（如需更换请重新输入）" : "sk-...";
 
@@ -2375,7 +2478,7 @@ function ProviderCard({
             type="text"
             value={modelId}
             placeholder={presetMeta.defaultModelId || "model-id"}
-            onChange={(e) => { setModelId(e.target.value); setTestResult(null); }}
+            onChange={(e) => { setModelId(e.target.value); setTestResult(null); setSmokeResult(null); }}
           />
         </label>
 
@@ -2387,7 +2490,7 @@ function ProviderCard({
               type={showKey ? "text" : "password"}
               value={apiKey}
               placeholder={keyPlaceholder}
-              onChange={(e) => { setApiKey(e.target.value); setKeyTouched(true); setTestResult(null); }}
+              onChange={(e) => { setApiKey(e.target.value); setKeyTouched(true); setTestResult(null); setSmokeResult(null); }}
             />
             <button
               type="button"
@@ -2406,7 +2509,7 @@ function ProviderCard({
             <select
               className="model-select"
               value={apiFormat}
-              onChange={(e) => { setApiFormat(e.target.value === "anthropic" ? "anthropic" : "openai"); setTestResult(null); }}
+              onChange={(e) => { setApiFormat(e.target.value === "anthropic" ? "anthropic" : "openai"); setTestResult(null); setSmokeResult(null); }}
             >
               <option value="openai">OpenAI 格式（/chat/completions）</option>
               <option value="anthropic">Anthropic 格式（/v1/messages）</option>
@@ -2432,7 +2535,7 @@ function ProviderCard({
                 type="text"
                 value={baseUrl}
                 placeholder={presetMeta.baseUrl ?? "https://your-endpoint/v1"}
-                onChange={(e) => { setBaseUrl(e.target.value); setTestResult(null); }}
+                onChange={(e) => { setBaseUrl(e.target.value); setTestResult(null); setSmokeResult(null); }}
               />
               <p className="settings-desc" style={{ marginTop: 4 }}>
                 {isCustom
@@ -2450,6 +2553,23 @@ function ProviderCard({
           {testResult.ok ? "✓ " : "✗ "}{testResult.message}
         </p>
       )}
+      {/* C-1 工具调用冒烟结果（Plan25 #3）：与测试连接同区展示——可用绿、未返回工具调用橙、报错红。 */}
+      {smokeResult && (
+        <p
+          className="settings-row__value"
+          style={{
+            color:
+              smokeResult.kind === "ok"
+                ? "var(--success)"
+                : smokeResult.kind === "weak"
+                ? "var(--warning)"
+                : "var(--danger)",
+          }}
+        >
+          {smokeResult.kind === "ok" ? "✓ " : smokeResult.kind === "weak" ? "⚠ " : "✗ "}
+          {smokeResult.message}
+        </p>
+      )}
 
       <div className="provider-card__actions">
         {saved && (
@@ -2457,8 +2577,12 @@ function ProviderCard({
             已保存 ✓
           </span>
         )}
-        <button type="button" className="approval-card__btn" onClick={handleTest} disabled={testing || saving}>
+        <button type="button" className="approval-card__btn" onClick={handleTest} disabled={testing || smokeTesting || saving}>
           {testing ? "测试中…" : "测试连接"}
+        </button>
+        {/* C-1：测试工具调用（Plan25 #3），结果就地显示在上方测试区。 */}
+        <button type="button" className="approval-card__btn" onClick={handleSmokeTest} disabled={testing || smokeTesting || saving}>
+          <Plug size={14} /> {smokeTesting ? "探测中…" : "测试工具调用"}
         </button>
         <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={handleSave} disabled={saving}>
           {saving ? "保存中…" : "保存"}
@@ -3165,8 +3289,14 @@ function MessageActions({
 
   return (
     <div className={`message-actions message-actions--${msg.role}`} aria-label="消息操作">
-      <button type="button" className="message-actions__btn" title="复制整条消息" onClick={handleCopy}>
-        {copied ? <><Check size={13} /> 已复制</> : <><Copy size={13} /> 复制</>}
+      <button
+        type="button"
+        className="message-actions__btn"
+        title={copied ? "已复制" : "复制整条消息"}
+        aria-label={copied ? "已复制" : "复制整条消息"}
+        onClick={handleCopy}
+      >
+        {copied ? <Check size={14} /> : <Copy size={14} />}
       </button>
       {msg.role === "user" && (
         <>
@@ -3174,19 +3304,21 @@ function MessageActions({
             type="button"
             className="message-actions__btn"
             title="重新发送这条消息"
+            aria-label="重新发送这条消息"
             onClick={onResend}
             disabled={disabled}
           >
-            <RefreshCw size={13} /> 重发
+            <RefreshCw size={14} />
           </button>
           <button
             type="button"
             className="message-actions__btn"
             title="把这条消息回填到输入框，修改后再发送"
+            aria-label="编辑重试"
             onClick={onEditRetry}
             disabled={disabled}
           >
-            <Pencil size={13} /> 编辑重试
+            <Pencil size={14} />
           </button>
         </>
       )}

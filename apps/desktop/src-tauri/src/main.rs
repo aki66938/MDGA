@@ -38,8 +38,10 @@ use commands::{
 };
 use commands::{
     get_app_setting, get_model_provider_config, remove_model_provider, save_model_provider,
-    set_app_setting, test_provider_connection,
+    set_app_setting, smoke_test_tool_call, test_provider_connection,
 };
+
+mod agent_prompt;
 
 mod agent_loop;
 use agent_loop::send_message;
@@ -212,6 +214,7 @@ fn main() {
             save_model_provider,
             remove_model_provider,
             test_provider_connection,
+            smoke_test_tool_call,
             get_app_setting,
             set_app_setting,
         ])
