@@ -25,12 +25,10 @@ function BrandMark({ size = 24 }: { size?: number }) {
   );
 }
 import {
-  DEEPSEEK_MODELS,
   DEFAULT_DEEPSEEK_MODEL_ID,
   getApiKeyStatusLabel,
   getPermissionModeLabel,
   type ApiKeyStatus,
-  type DeepSeekModelId,
   type PermissionMode,
 } from "@mdga/ui";
 import "./styles.css";
@@ -120,6 +118,9 @@ type AskUserRequest = { questionId: string; questions: AskQuestion[] };
 
 /** 系统通知卡片：上下文压缩等用户需要感知的运行时事件，内联显示在对话流中 */
 type NoticePart = { type: "notice"; text: string };
+
+/** 全局 toast（Plan20 🔴2）：右下角堆叠的瞬时通知，不依赖消息列表，承载用户主动操作的即时成败。 */
+type Toast = { id: number; kind: "error" | "info"; text: string };
 
 /** 用户消息中附带的图片（Plan18 M18.1）：mediaType + base64，渲染为缩略图；持久化进 partsJson。 */
 type ImagePart = { type: "image"; mediaType: string; base64: string; name?: string };
@@ -270,7 +271,7 @@ const SLASH_COMMANDS: Array<{ cmd: string; desc: string }> = [
   { cmd: "/clear", desc: "开启一个全新会话" },
   { cmd: "/init", desc: "让 Agent 分析项目并生成 MDGA.md 长期记忆" },
   { cmd: "/rewind", desc: "打开文件变更记录，可回退改动" },
-  { cmd: "/model", desc: "切换模型，例如 /model deepseek-v4-pro" },
+  { cmd: "/model", desc: "打开 设置 → 模型供应商，修改主模型" },
 ];
 
 /** /init 发送的固定提示词（对标 CC 的 /init 生成 CLAUDE.md） */
@@ -286,7 +287,12 @@ export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
-  const [model, setModel] = useState<DeepSeekModelId>(DEFAULT_DEEPSEEK_MODEL_ID);
+  // 主模型 id（Plan20 🔴1）：单一真相源 = 主 provider 的 model_id（设置→模型供应商配）。
+  // 类型放宽为 string 以容纳任意供应商模型名；初始化为默认 DeepSeek 值仅作兜底占位，
+  // 挂载/配置后用 get_model_provider_config('main').modelId 覆盖。后端忽略此入参选模型。
+  const [model, setModel] = useState<string>(DEFAULT_DEEPSEEK_MODEL_ID);
+  // 控制行只读「当前模型」胶囊展示用：主 provider 的 model_id（未配时为空）。
+  const [mainModelId, setMainModelId] = useState<string>("");
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("workspace_auto");
   const [draftWorkspace, setDraftWorkspace] = useState<DraftWorkspace | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
@@ -333,6 +339,11 @@ export function App() {
   // 上下文用量（上次请求 prompt_tokens / 压缩阈值），常驻状态栏
   const [ctxUsage, setCtxUsage] = useState<{ promptTokens: number; softLimit: number } | null>(null);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
+  // 全局 toast（Plan20 🔴2）：不依赖消息列表的右下角通知，承载用户主动操作的即时成败。
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  // 粘底滚动（Plan20 🟠4）：贴底时才自动跟随；非贴底显示「跳到最新」并暂停跟随。
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const messageListRef = useRef<HTMLElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const streamingTextRef = useRef(""); // 只累积纯文字内容，用于 chat-done 持久化（供模型上下文）
   const streamingPartsRef = useRef<MessagePart[]>([]); // 跟踪当前 assistant 的完整 parts，用于持久化交错的工具卡片
@@ -351,26 +362,52 @@ export function App() {
   }, []);
 
   // 挂载时查主模型是否已配（Plan19 P0a）：未配则首屏给「去 设置 → 模型供应商」CTA。
+  // 同时取主 provider 的 model_id（Plan20 🔴1）作控制行只读胶囊展示与透传 send_message 的值。
   useEffect(() => {
-    invoke<ProviderConfig | null>("get_model_provider_config", { role: "main" })
-      .then((cfg) => setMainConfigured(!!cfg))
-      .catch(() => setMainConfigured(false));
+    void refreshMainModel();
   }, []);
+
+  /** 拉取主 provider 配置（Plan20 🔴1）：刷新 mainConfigured 与 mainModelId，并把 model 透传值同步为 model_id。 */
+  async function refreshMainModel() {
+    const cfg = await invoke<ProviderConfig | null>("get_model_provider_config", { role: "main" })
+      .catch(() => null);
+    setMainConfigured(!!cfg);
+    const id = cfg?.modelId?.trim() ?? "";
+    setMainModelId(id);
+    if (id) setModel(id);
+  }
 
   useEffect(() => {
     loadConversations();
   }, []);
 
   useEffect(() => {
+    setIsAtBottom(true); // 切换会话回到贴底跟随（Plan20 🟠4）
     if (!activeConvId) { setMessages([]); return; }
     invoke<StoredMessage[]>("load_messages", { conversationId: activeConvId })
       .then((stored) => setMessages(stored.map(storedToMessage)))
       .catch(() => setMessages([]));
   }, [activeConvId]);
 
+  // 粘底滚动（Plan20 🟠4）：仅当用户当前贴底时才跟随到最新；上滚查看历史时不强拽。
   useEffect(() => {
+    if (isAtBottom) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages, isAtBottom]);
+
+  // 监听消息列表滚动：距底 < 80px 视为贴底，控制是否跟随与「跳到最新」按钮显隐。
+  function handleMessageListScroll(e: React.UIEvent<HTMLElement>) {
+    const el = e.currentTarget;
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setIsAtBottom(dist < 80);
+  }
+
+  /** 点击「跳到最新」（Plan20 🟠4）：回到底部并恢复跟随。 */
+  function jumpToLatest() {
+    setIsAtBottom(true);
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }
 
   // 持续监听高风险动作审批请求，弹出确认框
   useEffect(() => {
@@ -419,12 +456,9 @@ export function App() {
     localStorage.setItem("mdga.theme", theme);
   }, [theme]);
 
-  // 启动时恢复默认模型与权限模式（localStorage 持久化）
+  // 启动时恢复默认权限模式（localStorage 持久化）。
+  // Plan20 🔴1：模型不再从 localStorage 快切恢复，唯一真相源为主 provider 的 model_id。
   useEffect(() => {
-    const savedModel = localStorage.getItem("mdga.defaultModel");
-    if (savedModel && DEEPSEEK_MODELS.some((m) => m.id === savedModel)) {
-      setModel(savedModel as DeepSeekModelId);
-    }
     const savedMode = localStorage.getItem("mdga.defaultPermissionMode");
     if (savedMode && PERMISSION_MODES.includes(savedMode as PermissionMode)) {
       setPermissionMode(savedMode as PermissionMode);
@@ -538,6 +572,21 @@ export function App() {
       .catch(() => setCustomCommands([]));
   }, [activeConvId]);
 
+  /** 弹出全局 toast（Plan20 🔴2）：右下角堆叠，数秒后自动消失；error 略长于 info。 */
+  function pushToast(kind: Toast["kind"], text: string) {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, { id, kind, text }]);
+    const ttl = kind === "error" ? 6000 : 4000;
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, ttl);
+  }
+
+  /** 手动关闭某条 toast。 */
+  function dismissToast(id: number) {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }
+
   /** 向当前最后一条 assistant 消息追加通知卡片 */
   function appendNoticeToLastMessage(text: string) {
     setMessages((prev) => {
@@ -611,6 +660,7 @@ export function App() {
     setInput("");
     setDraftWorkspace(null);
     setWorkspaceError(null);
+    resetPerConversationState();
   }
 
   async function handleSelectConversation(id: string) {
@@ -618,10 +668,23 @@ export function App() {
     setActiveConvId(id);
     setDraftWorkspace(null);
     setWorkspaceError(null);
+    resetPerConversationState();
+  }
+
+  /** 跨会话状态重置（Plan20 🟠6）：新建/切换会话时清掉上一会话残留的附图、计划模式与排队插话。
+      （todos/workspaceFiles 已在 activeConvId effect 中清，故此处不重复。） */
+  function resetPerConversationState() {
+    setPendingImages([]);
+    setPlanMode(false);
+    setQueuedSteering([]);
   }
 
   async function handleDeleteConversation(e: React.MouseEvent, id: string) {
     e.stopPropagation();
+    // 删除二次确认（Plan20 🔴3）：与「清除所有会话」一致策略，文案带会话标题。
+    const conv = conversations.find((c) => c.id === id);
+    const title = conv?.title ?? "该会话";
+    if (!window.confirm(`确定删除会话「${title}」？此操作不可撤销。`)) return;
     await invoke("remove_conversation", { conversationId: id }).catch(() => {});
     setConversations((prev) => prev.filter((c) => c.id !== id));
     if (activeConvId === id) {
@@ -692,13 +755,10 @@ export function App() {
         await openChangesPanel();
         return true;
       case "/model": {
-        const target = rest.join(" ").trim();
-        const found = DEEPSEEK_MODELS.find((m) => m.id === target);
+        // Plan20 🔴1：模型唯一真相源 = 主 provider 的 model_id。/model 不再切 DeepSeek 清单，
+        // 直接打开 设置 → 模型供应商，由用户在那里改 model_id。
         setInput("");
-        if (found) {
-          setModel(found.id);
-          localStorage.setItem("mdga.defaultModel", found.id);
-        }
+        await openSettings("provider");
         return true;
       }
       case "/compact": {
@@ -713,7 +773,8 @@ export function App() {
           });
           setMessages(stored.map(storedToMessage));
         } catch (err) {
-          appendNoticeToLastMessage(humanizeError(String(err)));
+          // 用户主动 /compact 的即时失败（Plan20 🔴2）→ 全局 toast，不依赖消息列表。
+          pushToast("error", humanizeError(String(err)));
         } finally {
           setSending(false);
         }
@@ -947,25 +1008,40 @@ export function App() {
       unlistenDone();
 
       // 兜底清洗：模型可能把工具调用标记直接吐进正文（纯聊天会话尤其常见——没有工具
-      // 时模型会幻觉 <ToolCall>/DSML 语法）。截断标记、保留叙述，并提示用户原因。
+      // 时模型会幻觉 <ToolCall>/DSML 语法）。
+      // Plan20 🟠7：只截断 streamingPartsRef 中【最后一个 text part】的泄漏内容并在其后追加 notice，
+      // 保留前面的 tool/vision part，不再用 [text, notice] 整体覆盖（否则含工具调用的回复卡片会丢）。
       const leakIdx = findToolMarkupIndex(streamingTextRef.current);
       if (leakIdx >= 0) {
-        const sanitized = streamingTextRef.current.slice(0, leakIdx).trimEnd();
-        streamingTextRef.current = sanitized;
         const conv = conversations.find((c) => c.id === finalConvId);
         const noticeText = conv?.workspacePath
           ? "已清理模型输出中的内部工具标记"
           : "本会话未绑定工作区，Agent 无法执行本地文件操作。请点击「+ 新对话」并选择工作区后再试。";
-        const sanitizedParts: MessagePart[] = [
-          ...(sanitized ? [{ type: "text", content: sanitized } as MessagePart] : []),
-          { type: "notice", text: noticeText },
-        ];
-        streamingPartsRef.current = sanitizedParts;
+        // content（供模型上下文）仍按全文截断到泄漏处。
+        streamingTextRef.current = streamingTextRef.current.slice(0, leakIdx).trimEnd();
+        // parts：定位最后一个 text part，对其内容单独做泄漏截断，再插入 notice。
+        const parts = [...streamingPartsRef.current];
+        let lastTextIdx = -1;
+        for (let i = parts.length - 1; i >= 0; i--) {
+          if (parts[i].type === "text") { lastTextIdx = i; break; }
+        }
+        if (lastTextIdx >= 0) {
+          const text = (parts[lastTextIdx] as TextPart).content;
+          const localLeak = findToolMarkupIndex(text);
+          const cleaned = (localLeak >= 0 ? text.slice(0, localLeak) : text).trimEnd();
+          if (cleaned) {
+            parts[lastTextIdx] = { type: "text", content: cleaned };
+          } else {
+            parts.splice(lastTextIdx, 1); // 整段都是泄漏标记则移除空 text part
+          }
+        }
+        parts.push({ type: "notice", text: noticeText });
+        streamingPartsRef.current = parts;
         setMessages((prev) => {
           const updated = [...prev];
           const lastIdx = updated.length - 1;
           if (updated[lastIdx]?.role === "assistant") {
-            updated[lastIdx] = { ...updated[lastIdx], parts: sanitizedParts };
+            updated[lastIdx] = { ...updated[lastIdx], parts };
           }
           return updated;
         });
@@ -1011,6 +1087,8 @@ export function App() {
         };
         return updated;
       });
+      // 发送失败恢复附图（Plan20 🟠5）：把本轮已快照清空的附图还原回托盘，避免用户重选。
+      if (outImages.length > 0) setPendingImages(outImages);
       setSending(false);
       unlistenChunk();
       unlistenTool();
@@ -1088,10 +1166,10 @@ export function App() {
         conversationId: activeConvId,
         checkpointId,
       });
-      appendNoticeToLastMessage(`已回退 ${count} 处文件变更`);
+      appendNoticeToLastMessage(`已回退 ${count} 处文件变更`); // 过程性通知保留内联（Plan20 🔴2）
       await openChangesPanel(); // 刷新列表状态
     } catch (err) {
-      appendNoticeToLastMessage(humanizeError(String(err)));
+      pushToast("error", humanizeError(String(err))); // 回退失败属即时操作失败 → toast
     }
   }
 
@@ -1139,13 +1217,13 @@ export function App() {
     if (!activeConvId) return;
     const path = await save({ defaultPath: "conversation.md", filters: [{ name: "Markdown", extensions: ["md"] }] }).catch(() => null);
     if (!path) return;
-    await invoke("export_conversation", { conversationId: activeConvId, path }).catch((e) => appendNoticeToLastMessage(humanizeError(String(e))));
+    await invoke("export_conversation", { conversationId: activeConvId, path }).catch((e) => pushToast("error", humanizeError(String(e))));
   }
 
   async function handleExportLedger() {
     const path = await save({ defaultPath: "mdga-token-ledger.csv", filters: [{ name: "CSV", extensions: ["csv"] }] }).catch(() => null);
     if (!path) return;
-    await invoke("export_token_ledger", { path }).catch((e) => appendNoticeToLastMessage(humanizeError(String(e))));
+    await invoke("export_token_ledger", { path }).catch((e) => pushToast("error", humanizeError(String(e))));
   }
 
   async function handleClearData() {
@@ -1170,7 +1248,7 @@ export function App() {
 
   async function handleAddMcpServer(name: string, command: string, authToken?: string) {
     await invoke("create_mcp_server", { name, command, authToken: authToken || null }).catch((err) => {
-      appendNoticeToLastMessage(humanizeError(String(err)));
+      pushToast("error", humanizeError(String(err))); // MCP 添加失败属即时操作失败 → toast（Plan20 🔴2）
     });
     await refreshMcpServers();
   }
@@ -1202,7 +1280,7 @@ export function App() {
       const ext = selected.split(".").pop()?.toLowerCase() ?? "";
       if (IMAGE_EXTENSIONS.includes(ext)) {
         if (!hasVision) {
-          appendNoticeToLastMessage("当前未配置视觉模型，无法导入图片。需在 设置 → 模型供应商 → 扩展 agent 的模态 里配置视觉模型。");
+          pushToast("error", "当前未配置视觉模型，无法导入图片。需在 设置 → 模型供应商 → 扩展 agent 的模态 里配置视觉模型。");
           return;
         }
         // 有 vision provider（Plan18 M18.1）：读图为 base64 + media_type，暂存到输入框上方缩略图预览，
@@ -1226,7 +1304,7 @@ export function App() {
       setInput(prepared.slice(0, 200) + (prepared.length > 200 ? "…" : ""));
       await sendText(prepared);
     } catch (err) {
-      appendNoticeToLastMessage(humanizeError(String(err)));
+      pushToast("error", humanizeError(String(err))); // 导入失败属即时操作失败 → toast（Plan20 🔴2）
     }
   }
 
@@ -1240,7 +1318,7 @@ export function App() {
     // 模态门禁：无视觉 provider 时拒绝，提示与 📎 入口一致。
     const visionCfg = await invoke<ProviderConfig | null>("get_model_provider_config", { role: "vision" }).catch(() => null);
     if (!visionCfg) {
-      appendNoticeToLastMessage("当前未配置视觉模型，无法导入图片。需在 设置 → 模型供应商 → 扩展 agent 的模态 里配置视觉模型。");
+      pushToast("error", "当前未配置视觉模型，无法导入图片。需在 设置 → 模型供应商 → 扩展 agent 的模态 里配置视觉模型。");
       return;
     }
     const MAX_BYTES = 10 * 1024 * 1024; // 10MB 上限
@@ -1249,11 +1327,11 @@ export function App() {
       const subtype = file.type.slice("image/".length).toLowerCase();
       const okType = ["png", "jpeg", "jpg", "gif", "webp"].includes(subtype);
       if (!okType) {
-        appendNoticeToLastMessage(`不支持的图片格式：${file.type || "未知"}（仅支持 png/jpg/jpeg/gif/webp）`);
+        pushToast("error", `不支持的图片格式：${file.type || "未知"}（仅支持 png/jpg/jpeg/gif/webp）`);
         continue;
       }
       if (file.size > MAX_BYTES) {
-        appendNoticeToLastMessage(`图片过大（${(file.size / 1024 / 1024).toFixed(1)}MB），上限 10MB`);
+        pushToast("error", `图片过大（${(file.size / 1024 / 1024).toFixed(1)}MB），上限 10MB`);
         continue;
       }
       const base64 = await new Promise<string | null>((resolve) => {
@@ -1268,7 +1346,7 @@ export function App() {
         reader.readAsDataURL(file);
       });
       if (!base64) {
-        appendNoticeToLastMessage("读取图片失败，请重试");
+        pushToast("error", "读取图片失败，请重试");
         continue;
       }
       const mediaType = subtype === "jpg" ? "image/jpeg" : file.type;
@@ -1303,11 +1381,6 @@ export function App() {
     if (!Array.from(e.dataTransfer?.items ?? []).some((it) => it.kind === "file")) return;
     e.preventDefault();
     setDragOver(true);
-  }
-
-  function handleModelChange(next: DeepSeekModelId) {
-    setModel(next);
-    localStorage.setItem("mdga.defaultModel", next);
   }
 
   function handlePermissionModeChange(next: PermissionMode) {
@@ -1572,7 +1645,12 @@ export function App() {
         </header>
 
         {hasMessages ? (
-          <section className="message-list" aria-label="Conversation">
+          <section
+            className="message-list"
+            aria-label="Conversation"
+            ref={messageListRef}
+            onScroll={handleMessageListScroll}
+          >
             {messages.map((msg, i) => (
               <div key={i} className="message-row">
                 <div className={`message message--${msg.role}`}>
@@ -1598,6 +1676,18 @@ export function App() {
               </div>
             )}
             <div ref={messagesEndRef} />
+            {/* 跳到最新（Plan20 🟠4）：非贴底时浮现，点击回底并恢复跟随。 */}
+            {!isAtBottom && (
+              <button
+                type="button"
+                className="jump-latest"
+                onClick={jumpToLatest}
+                aria-label="跳到最新"
+                title="跳到最新"
+              >
+                <ChevronDown size={16} /> 跳到最新
+              </button>
+            )}
           </section>
         ) : (
           <section className="hero-panel" aria-label="New conversation">
@@ -1677,7 +1767,7 @@ export function App() {
                     key={c.cmd}
                     className="slash-menu__item"
                     type="button"
-                    onClick={() => setInput(c.cmd === "/model" ? "/model " : c.cmd)}
+                    onClick={() => setInput(c.cmd)}
                   >
                     <span className="slash-menu__cmd">{c.cmd}</span>
                     <span className="slash-menu__desc">{c.desc}</span>
@@ -1729,17 +1819,18 @@ export function App() {
                 <ListChecks size={14} /> 计划
               </button>
             </div>
-            <select
-              className="control-select"
-              value={model}
-              onChange={(e) => handleModelChange(e.target.value as DeepSeekModelId)}
-              aria-label="模型选择"
-              title={sending ? "切换将在当前回复结束后的下一轮生效" : DEEPSEEK_MODELS.find((item) => item.id === model)?.description}
+            {/* 当前模型只读胶囊（Plan20 🔴1）：展示主 provider 的 model_id，点击进 设置 → 模型供应商。
+                模型唯一真相源在那里配；控制行不再是第二真相源。 */}
+            <button
+              type="button"
+              className="model-pill"
+              onClick={() => openSettings("provider")}
+              aria-label="当前模型，点击修改"
+              title={mainModelId ? `当前模型：${mainModelId}（点击进 设置 → 模型供应商 修改）` : "尚未配置主模型，点击去配置"}
             >
-              {DEEPSEEK_MODELS.map((item) => (
-                <option key={item.id} value={item.id}>{item.label}</option>
-              ))}
-            </select>
+              <Gauge size={13} className="model-pill__icon" />
+              <span className="model-pill__id">{mainModelId || "未配置模型"}</span>
+            </button>
           </div>
 
           {/* 附图预览（Plan18 M18.1）：📎 选中的图片在发送前显示缩略图，可逐个移除 */}
@@ -1833,7 +1924,11 @@ export function App() {
       {showSettings && (
         <SettingsModal
           initialSection={settingsSection}
-          onMainConfiguredChange={setMainConfigured}
+          onMainConfiguredChange={(configured) => {
+            setMainConfigured(configured);
+            // 配置/更新主 provider 后重新拉取 model_id（Plan20 🔴1），刷新控制行胶囊与透传值。
+            void refreshMainModel();
+          }}
           appInfo={appInfo}
           apiKeyLabel={getApiKeyStatusLabel(apiKeyStatus)}
           balance={balance}
@@ -1859,6 +1954,26 @@ export function App() {
           onUpdateAvailable={(v) => setUpdate({ status: "available", version: v })}
           onClose={() => setShowSettings(false)}
         />
+      )}
+
+      {/* 全局 toast（Plan20 🔴2）：右下角堆叠、自动消失、可手动关，不依赖消息列表。 */}
+      {toasts.length > 0 && (
+        <div className="toast-stack" role="region" aria-label="通知">
+          {toasts.map((t) => (
+            <div key={t.id} className={`toast toast--${t.kind}`} role={t.kind === "error" ? "alert" : "status"}>
+              {t.kind === "error" ? <Ban size={15} className="toast__icon" /> : <Info size={15} className="toast__icon" />}
+              <span className="toast__text">{t.text}</span>
+              <button
+                type="button"
+                className="toast__close"
+                aria-label="关闭通知"
+                onClick={() => dismissToast(t.id)}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
       )}
     </main>
   );

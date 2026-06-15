@@ -77,7 +77,7 @@ pub(crate) async fn send_message(
 ) -> Result<(), String> {
     let plan_mode = plan_mode.unwrap_or(false);
     let images = images.unwrap_or_default();
-    let (conversation, permission_rules, base_url, api_key, vision_provider) = {
+    let (conversation, permission_rules, base_url, api_key, model_id, vision_provider) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let conversation = get_conversation(&db, &conversation_id)
             .map_err(|e| e.to_string())?
@@ -85,11 +85,13 @@ pub(crate) async fn send_message(
         let rules = list_permission_rules(&db).unwrap_or_default();
         // 主模型 provider（Plan17 D3）：base_url/api_key 一律从 DB 取；base_url 为空时解析 preset 官方端点。
         // DB 无主 provider 即报错引导去设置页，不再回退环境变量。
-        let (base_url, api_key) = match get_model_provider(&db, "main") {
+        // Plan20 🔴1：model_id 一并取出，作为本轮唯一权威模型名——主链路 chat 与计价均以它为准，
+        // 不再用入参 model（前端控制行写死的 DeepSeek 清单）决定模型，否则配非 DeepSeek 主供应商必失败。
+        let (base_url, api_key, model_id) = match get_model_provider(&db, "main") {
             Ok(Some(p)) => {
                 let bu = resolve_base_url(p.base_url.as_deref(), p.preset.as_deref())
                     .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
-                (bu, p.api_key)
+                (bu, p.api_key, p.model_id)
             }
             _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
         };
@@ -99,8 +101,10 @@ pub(crate) async fn send_message(
         } else {
             get_model_provider(&db, "vision").ok().flatten()
         };
-        (conversation, rules, base_url, api_key, vision_provider)
+        (conversation, rules, base_url, api_key, model_id, vision_provider)
     };
+    // 入参 model 保留以不破坏前端命令签名，但本轮已不再用它决定模型（权威源为 model_id）。
+    let _ = &model;
 
     // ── 自动初看（Plan18 §3 ①）：带意图把图片过一遍视觉模型，产出文本分析注入主 agent ──
     // 仅当本轮带图时进入。无视觉 provider 时注入提示而非中断（前端门禁已先拦，这里是后端兜底）。
@@ -231,7 +235,7 @@ pub(crate) async fn send_message(
 
     let result = if plan_mode {
         // 计划模式走纯流式（无工具），让模型把计划直接流给用户审阅。
-        chat_stream(&base_url, &api_key, messages, &model, |chunk| {
+        chat_stream(&base_url, &api_key, messages, &model_id, |chunk| {
             let _ = app.emit("chat-chunk", chunk);
         })
         .await
@@ -242,7 +246,7 @@ pub(crate) async fn send_message(
             &base_url,
             &api_key,
             messages,
-            &model,
+            &model_id,
             workspace_path,
             permission,
             &conversation_id,
@@ -253,7 +257,7 @@ pub(crate) async fn send_message(
         )
         .await
     } else {
-        chat_stream(&base_url, &api_key, messages, &model, |chunk| {
+        chat_stream(&base_url, &api_key, messages, &model_id, |chunk| {
             let _ = app.emit("chat-chunk", chunk);
         })
         .await
@@ -273,7 +277,7 @@ pub(crate) async fn send_message(
     let raw_usage = result?;
 
     if let Some(raw) = raw_usage {
-        let summary = compute_cost_summary(&raw, &deepseek_pricing_for_model(&model));
+        let summary = compute_cost_summary(&raw, &deepseek_pricing_for_model(&model_id));
         let _ = app.emit("chat-usage", summary);
     }
 
