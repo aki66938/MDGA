@@ -178,6 +178,15 @@ pub(crate) fn gate_tool_decision(
         return ToolGate::Deny("已被用户的拒绝规则阻止".to_string());
     }
 
+    // 只读联网工具（web_search / web_fetch）在默认模式下自动放行（Plan21 #8）：
+    // 仅检索/抓取、无本地副作用，无需每次打断用户。放在 deny 检查之后、能力矩阵裁决之前。
+    // 注意：MCP 工具 / list_mcp_resources / read_mcp_resource 不在此列，仍按能力矩阵走审批。
+    if matches!(tool_name, "web_search" | "web_fetch")
+        && matches!(context.permission_mode, mdga_shared::PermissionMode::WorkspaceAuto)
+    {
+        return ToolGate::Allow;
+    }
+
     // 低风险命令白名单：Workspace Auto 下免审批直接执行常见检查 / 构建 / 测试命令。
     if tool_name == "run_command"
         && matches!(context.permission_mode, mdga_shared::PermissionMode::WorkspaceAuto)
@@ -206,7 +215,16 @@ pub(crate) fn gate_tool_decision(
 ///
 /// 生成唯一 action_id，注册 oneshot 通道（附「总是允许」规则串），emit "approval-request"，
 /// 然后 await 前端通过 respond_approval 命令送回的结果。通道异常时默认拒绝（安全优先）。
-pub(crate) async fn request_tool_approval(app: &AppHandle, tool_name: &str, arguments: &str) -> bool {
+///
+/// `irreversible == true`（Plan21 #2b）表示该次写/删操作快照失败、无法回退：在事件里带上
+/// `irreversible` 标志，并在 preview 顶部前置「⚠ 此操作不可回退」提示，确保用户即使在不识别
+/// 该标志的前端上也能看到风险。
+pub(crate) async fn request_tool_approval(
+    app: &AppHandle,
+    tool_name: &str,
+    arguments: &str,
+    irreversible: bool,
+) -> bool {
     let action_id = format!("act-{}", APPROVAL_SEQ.fetch_add(1, Ordering::SeqCst));
     let rule = permission_rule_for(tool_name, arguments);
     let (sender, receiver) = oneshot::channel::<bool>();
@@ -216,13 +234,24 @@ pub(crate) async fn request_tool_approval(app: &AppHandle, tool_name: &str, argu
         approvals.insert(action_id.clone(), (sender, rule));
     }
 
+    let mut preview = approval_preview(tool_name, arguments);
+    if irreversible {
+        // 前置不可回退提示，与下方正文用空行隔开；preview 为空时也单独成段。
+        preview = if preview.is_empty() {
+            "⚠ 此操作不可回退（无法快照原内容，撤销后无法恢复）。".to_string()
+        } else {
+            format!("⚠ 此操作不可回退（无法快照原内容，撤销后无法恢复）。\n\n{preview}")
+        };
+    }
+
     let _ = app.emit(
         "approval-request",
         serde_json::json!({
             "actionId": action_id,
             "toolName": tool_name,
             "target": approval_target(arguments),
-            "preview": approval_preview(tool_name, arguments),
+            "preview": preview,
+            "irreversible": irreversible,
         }),
     );
 

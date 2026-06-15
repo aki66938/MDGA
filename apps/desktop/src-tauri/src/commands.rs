@@ -291,11 +291,18 @@ pub(crate) fn pin_conversation(
 pub(crate) async fn get_account_balance(state: State<'_, AppState>) -> Result<UserBalance, String> {
     let api_key = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        get_model_provider(&db, "main")
+        let provider = get_model_provider(&db, "main")
             .map_err(|e| e.to_string())?
-            .map(|p| p.api_key)
-            .filter(|k| !k.trim().is_empty())
-            .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?
+            .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
+        // Plan21 #5：余额查询仅 DeepSeek 端点支持。非 deepseek 主供应商直接门禁返回，
+        // 不去打 DeepSeek 端点（用别家 Key 查只会拿到误导/失败结果）。
+        if provider.preset.as_deref() != Some("deepseek") {
+            return Err("当前主供应商不提供余额查询（仅 DeepSeek 支持）".to_string());
+        }
+        if provider.api_key.trim().is_empty() {
+            return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string());
+        }
+        provider.api_key
     };
     get_user_balance(&api_key).await.map_err(|e| e.to_string())
 }

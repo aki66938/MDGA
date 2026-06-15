@@ -522,6 +522,12 @@ h1 {
   font-variant-numeric: tabular-nums;
 }
 
+/* 成本金额不可估算占位（Plan21 #5）：非 DeepSeek 主供应商无价表,金额位以「—」弱化展示。 */
+.usage-cost--na {
+  color: var(--text-3);
+  cursor: help;
+}
+
 /* 会话级 token 汇总：贴近输入区，作为账本入口而不是主内容卡片 */
 .conversation-usage {
   display: flex;
@@ -799,6 +805,28 @@ h1 {
   font-size: 11.5px;
   color: var(--danger);
   margin-left: 4px;
+}
+
+/* 已回退的 diff 卡片（Plan21 #3）：整行置灰并加删除线,与「已回退」角标配合标识变更已撤销。
+   用 CSS 变量,深浅主题自动协调。 */
+.tool-inline--reverted {
+  opacity: 0.55;
+}
+
+.tool-inline--reverted .tool-inline__target {
+  text-decoration: line-through;
+  text-decoration-color: var(--text-3);
+}
+
+.tool-inline__reverted-badge {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  line-height: 1.4;
+  padding: 0 6px;
+  border-radius: 999px;
+  color: var(--text-2);
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
 }
 
 /* ── 会话搜索与管理动作 ── */
@@ -1364,6 +1392,21 @@ h1 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 与内置命令同名的自定义命令（Plan21 #9）：内置优先,自定义被忽略,故置灰禁用 + 小字标注。 */
+.slash-menu__item--conflict {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.slash-menu__item--conflict:hover {
+  background: none;
+}
+
+.slash-menu__conflict {
+  color: var(--warning);
+  font-size: 11px;
 }
 
 /* ── Topbar 按钮 / 设置面板 / 变更面板 ── */

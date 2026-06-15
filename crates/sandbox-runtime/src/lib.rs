@@ -103,8 +103,9 @@ pub fn decide_tool_access(
         PermissionMode::WorkspaceAuto => match capability {
             ToolCapability::FileList
             | ToolCapability::FileRead
-            | ToolCapability::FileWrite
-            | ToolCapability::FileDelete => ToolDecision::Allow,
+            | ToolCapability::FileWrite => ToolDecision::Allow,
+            // 删除不可逆、风险高于写入，默认模式下也逐次审批（Plan21 #2a）。
+            ToolCapability::FileDelete => ToolDecision::AskUser,
             // 命令与网络默认需审批；命令是否属于低风险白名单由调用方结合命令串进一步判断。
             ToolCapability::CommandRun | ToolCapability::NetworkAccess => ToolDecision::AskUser,
         },
@@ -199,9 +200,10 @@ mod tests {
             decide_tool_access(&context, ToolCapability::FileWrite),
             ToolDecision::Allow
         );
+        // 默认模式下删除改为逐次审批（Plan21 #2a）。
         assert_eq!(
             decide_tool_access(&context, ToolCapability::FileDelete),
-            ToolDecision::Allow
+            ToolDecision::AskUser
         );
     }
 

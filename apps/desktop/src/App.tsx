@@ -51,6 +51,8 @@ type ToolPart = {
   removed?: number;
   /** run_command 运行中的实时输出（行累积，截断保留尾部） */
   liveOutput?: string;
+  /** 已被回退（Plan21 #3）：handleRevert 成功后给现存 diff 卡片打标，渲染置灰并加「已回退」角标。 */
+  reverted?: boolean;
 };
 
 /** Agent 自维护的任务清单项（todo_write 工具） */
@@ -293,6 +295,11 @@ export function App() {
   const [model, setModel] = useState<string>(DEFAULT_DEEPSEEK_MODEL_ID);
   // 控制行只读「当前模型」胶囊展示用：主 provider 的 model_id（未配时为空）。
   const [mainModelId, setMainModelId] = useState<string>("");
+  // 主 provider 预设（Plan21 #5）：决定余额查询门禁与成本金额展示。
+  // 取自 get_model_provider_config('main').preset；未配或缺省视为 deepseek（与后端 preset 默认一致），不误伤默认 DeepSeek 用户。
+  const [mainPreset, setMainPreset] = useState<string>("deepseek");
+  // 主 provider 是否 DeepSeek：成本金额位与余额查询的统一门禁（Plan21 #5）。
+  const isDeepseekMain = mainPreset === "deepseek";
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("workspace_auto");
   const [draftWorkspace, setDraftWorkspace] = useState<DraftWorkspace | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
@@ -375,6 +382,8 @@ export function App() {
     const id = cfg?.modelId?.trim() ?? "";
     setMainModelId(id);
     if (id) setModel(id);
+    // 缓存主 provider 预设（Plan21 #5）：未配/缺省回落 deepseek，供余额门禁与成本金额位判断。
+    setMainPreset((cfg?.preset ?? "deepseek") || "deepseek");
   }
 
   useEffect(() => {
@@ -1167,6 +1176,18 @@ export function App() {
         checkpointId,
       });
       appendNoticeToLastMessage(`已回退 ${count} 处文件变更`); // 过程性通知保留内联（Plan20 🔴2）
+      // Plan21 #3：回退成功后,把对话流里现存的 tool 类 diff 卡片标记 reverted（简化:全部 diff 卡片打标），
+      // 渲染时置灰并加「已回退」角标,与「已回退 N 处」通知并存。
+      setMessages((prev) =>
+        prev.map((m) => ({
+          ...m,
+          parts: m.parts.map((p) =>
+            p.type === "tool" && typeof p.diff === "string" && p.diff.trim().length > 0
+              ? { ...p, reverted: true }
+              : p
+          ),
+        }))
+      );
       await openChangesPanel(); // 刷新列表状态
     } catch (err) {
       pushToast("error", humanizeError(String(err))); // 回退失败属即时操作失败 → toast
@@ -1243,7 +1264,9 @@ export function App() {
     setCommandSandbox(await invoke<boolean>("get_command_sandbox").catch(() => true));
     setTaskBudget(await invoke<number>("get_task_budget").catch(() => 0));
     setShowSettings(true);
-    refreshBalance();
+    // 余额查询门禁（Plan21 #5）：仅 DeepSeek 主供应商才打余额端点，
+    // 非 DeepSeek 时后端会返回 Err，且余额区改为提示文案，无需发起请求。
+    if (isDeepseekMain) refreshBalance();
   }
 
   async function handleAddMcpServer(name: string, command: string, authToken?: string) {
@@ -1664,7 +1687,7 @@ export function App() {
                   onEditRetry={() => editRetryMessage(msg)}
                 />
                 {msg.role === "assistant" && msg.usage && (
-                  <UsageBadge usage={msg.usage} />
+                  <UsageBadge usage={msg.usage} showCost={isDeepseekMain} />
                 )}
               </div>
             ))}
@@ -1740,7 +1763,7 @@ export function App() {
         )}
 
         {conversationUsage && (
-          <ConversationUsageSummary usage={conversationUsage} />
+          <ConversationUsageSummary usage={conversationUsage} showCost={isDeepseekMain} />
         )}
 
         {todos.length > 0 && <TodoPanel items={todos} />}
@@ -1760,17 +1783,30 @@ export function App() {
           {/* 斜杠命令菜单 */}
           {input.startsWith("/") && !input.includes(" ") && !sending && (
             <div className="slash-menu" role="menu">
-              {[...SLASH_COMMANDS, ...customCommands.map((c) => ({ cmd: c.name, desc: c.description || "自定义命令" }))]
+              {/* Plan21 #9：内置命令优先,与内置同名的自定义命令在 handleSlashCommand 里被忽略,
+                  菜单条目据此标注「与内置命令冲突,已被忽略」并置灰。 */}
+              {[
+                ...SLASH_COMMANDS.map((c) => ({ cmd: c.cmd, desc: c.desc, conflict: false })),
+                ...customCommands.map((c) => ({
+                  cmd: c.name,
+                  desc: c.description || "自定义命令",
+                  conflict: SLASH_COMMANDS.some((b) => b.cmd === c.name),
+                })),
+              ]
                 .filter((c) => c.cmd.startsWith(input))
-                .map((c) => (
+                .map((c, i) => (
                   <button
-                    key={c.cmd}
-                    className="slash-menu__item"
+                    key={`${c.cmd}-${i}`}
+                    className={`slash-menu__item${c.conflict ? " slash-menu__item--conflict" : ""}`}
                     type="button"
-                    onClick={() => setInput(c.cmd)}
+                    disabled={c.conflict}
+                    onClick={() => !c.conflict && setInput(c.cmd)}
                   >
                     <span className="slash-menu__cmd">{c.cmd}</span>
-                    <span className="slash-menu__desc">{c.desc}</span>
+                    <span className="slash-menu__desc">
+                      {c.desc}
+                      {c.conflict && <span className="slash-menu__conflict"> · 与内置命令冲突，已被忽略</span>}
+                    </span>
                   </button>
                 ))}
             </div>
@@ -2472,6 +2508,17 @@ function SettingsModal({
               </div>
               <p className="settings-desc">API Key 在「<b>模型供应商</b>」选项卡中配置，存于本地，不上传云端。</p>
 
+              {/* 余额查询门禁（Plan21 #5）：仅 DeepSeek 主供应商支持余额查询；
+                  其他供应商后端会返回 Err，此处直接以提示替代，不触发刷新。 */}
+              {!mainIsDeepseek && (
+                <>
+                  <div className="settings-section__head" style={{ marginTop: 16 }}>
+                    <span>账户余额</span>
+                  </div>
+                  <p className="settings-desc">该供应商不提供余额查询（仅 DeepSeek 支持）。</p>
+                </>
+              )}
+
               {mainIsDeepseek && (
                 <>
                   <div className="settings-section__head" style={{ marginTop: 16 }}>
@@ -2594,7 +2641,7 @@ function SettingsModal({
               </p>
 
               <div className="settings-row" style={{ marginTop: 16 }}>
-                <span className="settings-row__label">单任务 token 预算</span>
+                <span className="settings-row__label">单轮 token 上限（超出即暂停本轮）</span>
                 <span style={{ display: "flex", gap: 6 }}>
                   <input
                     className="conv-search"
@@ -2607,7 +2654,8 @@ function SettingsModal({
                   />
                 </span>
               </div>
-              <p className="settings-desc">单次任务累计 token 超过此值时自动暂停，防止失控烧 token（0 = 不限）。当前 {taskBudget === 0 ? "不限" : taskBudget.toLocaleString()}。</p>
+              {/* Plan21 #4：正名为「单轮上限」，消除「任务级累计」误解；说明含视觉调用开销。 */}
+              <p className="settings-desc">本轮(单次发送)累计 token 超过此值时自动暂停本轮，防止失控烧 token。该上限按每轮独立计算，<b>含本轮视觉识图等调用的 token 开销</b>（0 = 不限）。当前 {taskBudget === 0 ? "不限" : taskBudget.toLocaleString()}。</p>
             </>
           )}
 
@@ -3131,7 +3179,7 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 // ── ToolInlineRow ───────────────────────────────────────────────────────────
 
 function ToolInlineRow({ part }: { part: ToolPart }) {
-  const { toolName, target, status, error, diff, added, removed, liveOutput } = part;
+  const { toolName, target, status, error, diff, added, removed, liveOutput, reverted } = part;
   const [showDiff, setShowDiff] = useState(false);
   const icon =
     status === "running" ? <span className="star-spin tool-inline__star" aria-hidden="true">✦</span> :
@@ -3141,14 +3189,16 @@ function ToolInlineRow({ part }: { part: ToolPart }) {
   return (
     <div className="tool-inline-wrap">
       <div
-        className={`tool-inline tool-inline--${status}${hasDiff ? " tool-inline--clickable" : ""}`}
-        aria-label={`${toolName} ${status}`}
+        className={`tool-inline tool-inline--${status}${hasDiff ? " tool-inline--clickable" : ""}${reverted ? " tool-inline--reverted" : ""}`}
+        aria-label={`${toolName} ${status}${reverted ? " 已回退" : ""}`}
         onClick={hasDiff ? () => setShowDiff((v) => !v) : undefined}
         role={hasDiff ? "button" : undefined}
       >
         <span className="tool-inline__icon" aria-hidden="true">{icon}</span>
         <span className="tool-inline__name">{toolName}</span>
         {target && <span className="tool-inline__target">{target}</span>}
+        {/* Plan21 #3：回退后角标,与置灰样式配合标识该变更已撤销。 */}
+        {reverted && <span className="tool-inline__reverted-badge">已回退</span>}
         {(added !== undefined || removed !== undefined) && (
           <span className="tool-inline__stats">
             {added ? <span className="diff-added">+{added}</span> : null}
@@ -3201,7 +3251,9 @@ function DiffBlock({ diff }: { diff: string }) {
 
 // ── UsageBadge ────────────────────────────────────────────────────────────
 
-function UsageBadge({ usage }: { usage: UsageSummary }) {
+// showCost（Plan21 #5）：非 DeepSeek 主供应商时按 DeepSeek 价表算出的金额会误导，
+// 此时金额位以「—」占位（token 数照常展示）。
+function UsageBadge({ usage, showCost }: { usage: UsageSummary; showCost: boolean }) {
   const costStr = formatUsd(usage.estimatedCostUsd);
   const isEstimate = usage.usageSource !== "deepseek_usage";
 
@@ -3220,7 +3272,7 @@ function UsageBadge({ usage }: { usage: UsageSummary }) {
       )}
       <span className="usage-sep">·</span>
       <span className="usage-cost">
-        {costStr}{isEstimate && " (估算)"}
+        {showCost ? <>{costStr}{isEstimate && " (估算)"}</> : <span className="usage-cost--na" title="该供应商暂无成本价表，金额不可估算">—</span>}
       </span>
     </div>
   );
@@ -3228,7 +3280,7 @@ function UsageBadge({ usage }: { usage: UsageSummary }) {
 
 // ── ConversationUsageSummary ───────────────────────────────────────────────
 
-function ConversationUsageSummary({ usage }: { usage: UsageSummary }) {
+function ConversationUsageSummary({ usage, showCost }: { usage: UsageSummary; showCost: boolean }) {
   return (
     <div className="conversation-usage" aria-label="Conversation token summary">
       <span className="conversation-usage__label">会话累计</span>
@@ -3250,7 +3302,9 @@ function ConversationUsageSummary({ usage }: { usage: UsageSummary }) {
         </>
       )}
       <span className="usage-sep">·</span>
-      <span className="usage-cost">{formatUsd(usage.estimatedCostUsd)}</span>
+      <span className="usage-cost">
+        {showCost ? formatUsd(usage.estimatedCostUsd) : <span className="usage-cost--na" title="该供应商暂无成本价表，金额不可估算">—</span>}
+      </span>
     </div>
   );
 }

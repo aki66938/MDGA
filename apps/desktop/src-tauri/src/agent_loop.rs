@@ -106,6 +106,9 @@ pub(crate) async fn send_message(
     // 入参 model 保留以不破坏前端命令签名，但本轮已不再用它决定模型（权威源为 model_id）。
     let _ = &model;
 
+    // Plan21 #4：自动初看的视觉 usage 需并入工具预算累计起点。在记账前 clone 一份留到这里，
+    // 后续作为 initial_usage 传入有工作区分支的 chat_with_builtin_tools。
+    let mut vision_usage: Option<mdga_shared::RawUsage> = None;
     // ── 自动初看（Plan18 §3 ①）：带意图把图片过一遍视觉模型，产出文本分析注入主 agent ──
     // 仅当本轮带图时进入。无视觉 provider 时注入提示而非中断（前端门禁已先拦，这里是后端兜底）。
     let vision_injection: Option<String> = if images.is_empty() {
@@ -149,6 +152,8 @@ pub(crate) async fn send_message(
                         "usage": usage_val,
                     }),
                 );
+                // Plan21 #4：记账前留存一份视觉 usage，供并入工具预算累计起点。
+                vision_usage = usage.clone();
                 // 视觉 usage 单独记账（与主模型分开）：写入 token_ledger，kind="vision"，保证 CSV 导出含视觉开销。
                 if let Some(u) = &usage {
                     if let Ok(db) = state.db.lock() {
@@ -254,6 +259,8 @@ pub(crate) async fn send_message(
             cancel_token.clone(),
             permission_rules,
             mcp_bindings,
+            // Plan21 #4：把自动初看的视觉 usage 作为工具预算累计起点传入。
+            vision_usage,
         )
         .await
     } else {
@@ -401,6 +408,9 @@ async fn chat_with_builtin_tools(
     cancel: Arc<AtomicBool>,
     permission_rules: Vec<String>,
     mcp_bindings: Vec<McpBinding>,
+    // Plan21 #4：本轮在进入工具循环前已产生的 usage（如自动初看的视觉开销），作为预算累计起点，
+    // 使下方预算判断（:491-503）覆盖视觉/前置开销，而不仅是主循环内的 token。
+    initial_usage: Option<mdga_shared::RawUsage>,
 ) -> Result<Option<mdga_shared::RawUsage>, String> {
     let security_context = session_security_context(
         workspace_path.to_string(),
@@ -414,7 +424,8 @@ async fn chat_with_builtin_tools(
         .chain(mcp_bindings.iter().map(|b| b.schema.clone()))
         .collect();
     let mut wire_messages = chat_messages_to_wire(messages);
-    let mut usage: Option<mdga_shared::RawUsage> = None;
+    // 以传入的前置 usage 为初值（Plan21 #4），后续 merge_usage 在其上累加。
+    let mut usage: Option<mdga_shared::RawUsage> = initial_usage;
     // 上一次响应返回的 prompt_tokens，作为当前上下文体积的真实信号，驱动轮内压缩。
     let mut last_prompt_tokens: u64 = 0;
     // 诊断反馈环：记录本轮是否发生文件改动 + 是否已跑过诊断（最多一轮，防循环）。
@@ -624,11 +635,40 @@ async fn chat_with_builtin_tools(
             let tool_name = call.function.name.clone();
             let arguments = call.function.arguments.clone();
 
+            // 写类工具执行前捕获回退快照（rewind 用），必须先于执行。提前到门控前，
+            // 以便据 capture.revertible 判断是否触发「不可回退强制审批」（Plan21 #2b）。
+            let capture = capture_checkpoint_before(workspace_path, &tool_name, &arguments);
+            // 该次是否为「写/删类且快照失败（不可回退）」：用于强制审批与审批文案标注。
+            let irreversible = capture.as_ref().map(|c| !c.revertible).unwrap_or(false);
+
             // 权限门控：白名单命令与「总是允许」规则直接放行，否则按权限模式放行 / 审批 / 拒绝。
             let decision =
                 gate_tool_decision(&security_context, &tool_name, &arguments, &permission_rules);
             let proceed = match decision {
-                ToolGate::Allow => true,
+                ToolGate::Allow => {
+                    // Plan21 #2b：即便门控放行（如默认模式自动放行的写入），若本次不可回退
+                    //（目标超大/二进制致快照失败、删目录等），也必须先发审批并标注不可回退；
+                    //  放在 gate 之后、真正执行之前，覆盖 #2a 漏掉的「自动放行的不可回退覆盖」场景。
+                    if irreversible {
+                        let approved =
+                            request_tool_approval(app, &tool_name, &arguments, true).await;
+                        if !approved {
+                            feed_tool_denial(
+                                app,
+                                conversation_id,
+                                &tool_name,
+                                &arguments,
+                                workspace_path,
+                                "用户拒绝了该操作（不可回退，已取消）",
+                                &call.id,
+                                &mut wire_messages,
+                            );
+                        }
+                        approved
+                    } else {
+                        true
+                    }
+                }
                 ToolGate::Deny(reason) => {
                     feed_tool_denial(
                         app,
@@ -643,8 +683,9 @@ async fn chat_with_builtin_tools(
                     false
                 }
                 ToolGate::Ask => {
+                    // 需审批时一并把不可回退标志传给审批弹窗，让用户在审批界面即看到风险。
                     let approved =
-                        request_tool_approval(app, &tool_name, &arguments).await;
+                        request_tool_approval(app, &tool_name, &arguments, irreversible).await;
                     if !approved {
                         feed_tool_denial(
                             app,
@@ -684,9 +725,6 @@ async fn chat_with_builtin_tools(
                 None,
                 workspace_path,
             );
-
-            // 写类工具执行前捕获回退快照（rewind 用），必须先于执行。
-            let capture = capture_checkpoint_before(workspace_path, &tool_name, &arguments);
 
             // 特殊工具走专用执行器：MCP 外部工具 / todo / 技能 / 子任务 / 命令（流式 + 后台）。
             let mcp_binding = mcp_bindings.iter().find(|b| b.fn_name == tool_name);
