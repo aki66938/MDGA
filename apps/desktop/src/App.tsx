@@ -3,9 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { useEffect, useRef, useState } from "react";
 import {
-  SquarePen, Search, Pin, Archive, ArchiveRestore, Trash2, Settings2,
-  ListChecks, Square, ArrowUp, GitCompare, Sun, Moon,
-  Check, X, Ban, Info, ChevronRight,
+  Settings2,
+  ListChecks, Square, ArrowUp, GitCompare,
+  Check, X, Ban, Info,
   ChevronDown, FolderOpen, Gauge, AtSign, CornerDownRight,
   Plus, MessageCircle, Cpu,
 } from "lucide-react";
@@ -32,7 +32,6 @@ import {
   type McpServer,
   type ApprovalRequest,
   type AskUserRequest,
-  type Toast,
   type ImagePart,
   type RawUsageWire,
   type ReasoningPart,
@@ -43,7 +42,6 @@ import {
   type StoredMessage,
   type ToolEvent,
   type DraftWorkspace,
-  type UpdateState,
   type ProviderConfig,
   type SettingsSection,
 } from "./types";
@@ -62,7 +60,6 @@ import {
   ConversationUsageSummary,
 } from "./components/messages";
 import {
-  BrandMark,
   ChangesModal,
   ApprovalModal,
   AskUserModal,
@@ -70,6 +67,8 @@ import {
   HelpModal,
 } from "./components/dialogs";
 import { SettingsModal } from "./components/settings";
+import { Sidebar } from "./components/Sidebar";
+import { useTheme, useToasts, useUpdate, useKeyboardShortcuts } from "./hooks";
 
 // 类型与常量已抽至 ./types；本文件仅保留 App 组件与子组件实现。
 
@@ -136,7 +135,7 @@ export function App() {
   const [customCommands, setCustomCommands] = useState<Array<{ name: string; description: string; body: string }>>([]);
   // Steering：运行中已排队但尚未被注入的插话消息
   const [queuedSteering, setQueuedSteering] = useState<string[]>([]);
-  const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [theme, setTheme] = useTheme();
   // @文件引用补全
   const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
   const [fileMention, setFileMention] = useState<string | null>(null);
@@ -153,9 +152,9 @@ export function App() {
   const [ctxUsage, setCtxUsage] = useState<{ promptTokens: number; softLimit: number } | null>(null);
   // 上下文指示器弹层开关（Plan26）。
   const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false);
-  const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
+  const { update, setUpdate, handleInstallUpdate } = useUpdate();
   // 全局 toast（Plan20 🔴2）：不依赖消息列表的右下角通知，承载用户主动操作的即时成败。
-  const [toasts, setToasts] = useState<Toast[]>([]);
+  const { toasts, pushToast, dismissToast } = useToasts();
   // 粘底滚动（Plan20 🟠4）：贴底时才自动跟随；非贴底显示「跳到最新」并暂停跟随。
   const [isAtBottom, setIsAtBottom] = useState(true);
   // 长会话分段渲染（Plan27 #8）：仅渲染最近 visibleCount 条，顶部「加载更早」逐段放开，
@@ -296,18 +295,6 @@ export function App() {
     return () => clearInterval(timer);
   }, [sending]);
 
-  // 主题：启动时从 localStorage 恢复（默认跟随系统），并同步到 <html data-theme>
-  useEffect(() => {
-    const saved = localStorage.getItem("mdga.theme") as "light" | "dark" | null;
-    const initial =
-      saved ?? (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-    setTheme(initial);
-  }, []);
-  useEffect(() => {
-    document.documentElement.setAttribute("data-theme", theme);
-    localStorage.setItem("mdga.theme", theme);
-  }, [theme]);
-
   // 启动时恢复默认权限模式（localStorage 持久化）。
   // Plan20 🔴1：模型不再从 localStorage 快切恢复，唯一真相源为主 provider 的 model_id。
   useEffect(() => {
@@ -424,21 +411,6 @@ export function App() {
       .catch(() => setCustomCommands([]));
   }, [activeConvId]);
 
-  /** 弹出全局 toast（Plan20 🔴2）：右下角堆叠，数秒后自动消失；error 略长于 info。 */
-  function pushToast(kind: Toast["kind"], text: string) {
-    const id = Date.now() + Math.random();
-    setToasts((prev) => [...prev, { id, kind, text }]);
-    const ttl = kind === "error" ? 6000 : 4000;
-    window.setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, ttl);
-  }
-
-  /** 手动关闭某条 toast。 */
-  function dismissToast(id: number) {
-    setToasts((prev) => prev.filter((t) => t.id !== id));
-  }
-
   /** 向当前最后一条 assistant 消息追加通知卡片 */
   function appendNoticeToLastMessage(text: string) {
     setMessages((prev) => {
@@ -452,21 +424,6 @@ export function App() {
       return updated;
     });
   }
-
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      invoke<string | null>("check_update")
-        .then((v) => { if (v) setUpdate({ status: "available", version: v }); })
-        .catch(() => {});
-    }, 3000);
-    const unlistenProgress = listen<number>("update-progress", (e) => {
-      setUpdate({ status: "downloading", progress: e.payload });
-    });
-    return () => {
-      clearTimeout(timer);
-      unlistenProgress.then((fn) => fn());
-    };
-  }, []);
 
   // ── 工具函数 ────────────────────────────────────────────────────────────
 
@@ -1192,29 +1149,12 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  // 全局快捷键（Plan27 #3a）：Ctrl/Cmd+N 新对话、Ctrl/Cmd+K 命令面板、Ctrl/Cmd+, 设置。
-  // 同样用 ref 镜像处理函数，规避闭包陈旧；只注册一次。
-  const shortcutState = useRef({ handleNewConversation, openSettings, setShowCommandPalette });
-  shortcutState.current = { handleNewConversation, openSettings, setShowCommandPalette };
-  useEffect(() => {
-    function onKeyDown(e: KeyboardEvent) {
-      if (!(e.metaKey || e.ctrlKey)) return;
-      const s = shortcutState.current;
-      const key = e.key.toLowerCase();
-      if (key === "n") {
-        e.preventDefault();
-        void s.handleNewConversation();
-      } else if (key === "k") {
-        e.preventDefault();
-        s.setShowCommandPalette(true);
-      } else if (e.key === ",") {
-        e.preventDefault();
-        void s.openSettings();
-      }
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  // 全局快捷键（Plan27 #3a）：Ctrl/Cmd+N 新对话、Ctrl/Cmd+K 命令面板、Ctrl/Cmd+, 设置。已抽至 useKeyboardShortcuts。
+  useKeyboardShortcuts({
+    onNewConversation: handleNewConversation,
+    onOpenPalette: () => setShowCommandPalette(true),
+    onOpenSettings: () => openSettings(),
+  });
 
   async function openChangesPanel() {
     if (!activeConvId) return;
@@ -1572,15 +1512,6 @@ export function App() {
     });
   }
 
-  async function handleInstallUpdate() {
-    setUpdate({ status: "downloading", progress: 0 });
-    try {
-      await invoke("install_update");
-    } catch (err) {
-      setUpdate({ status: "error", message: String(err) });
-    }
-  }
-
   const hasMessages = messages.length > 0;
   // 最后一条助手消息下标（Plan27 #1b）：仅它显示「重新生成」按钮。-1 表示无助手消息。
   let lastAssistantIdx = -1;
@@ -1628,167 +1559,38 @@ export function App() {
   const visibleConversations = filteredConversations.filter((c) => !c.archived);
   const archivedConversations = filteredConversations.filter((c) => c.archived);
 
-  function renderConvItem(conv: Conversation) {
-    return (
-      <div
-        key={conv.id}
-        className={`conv-item${conv.id === activeConvId ? " conv-item--active" : ""}`}
-        onClick={() => handleSelectConversation(conv.id)}
-        role="button"
-        tabIndex={0}
-        onKeyDown={(e) => e.key === "Enter" && handleSelectConversation(conv.id)}
-      >
-        {editingConvId === conv.id ? (
-          <input
-            className="conv-item__rename"
-            value={editingTitle}
-            autoFocus
-            onChange={(e) => setEditingTitle(e.target.value)}
-            onClick={(e) => e.stopPropagation()}
-            onBlur={commitRename}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") commitRename();
-              if (e.key === "Escape") setEditingConvId(null);
-            }}
-          />
-        ) : (
-          <span
-            className="conv-item__title"
-            onDoubleClick={(e) => startRename(e, conv)}
-            title="双击重命名"
-          >
-            {conv.pinned && <Pin size={11} className="conv-item__pin-mark" />}
-            {conv.title}
-          </span>
-        )}
-        <span className="conv-item__actions">
-          <button
-            className="conv-item__action"
-            type="button"
-            aria-label={conv.pinned ? "取消置顶" : "置顶"}
-            title={conv.pinned ? "取消置顶" : "置顶"}
-            onClick={(e) => handleTogglePin(e, conv)}
-          >
-            <Pin size={14} />
-          </button>
-          <button
-            className="conv-item__action"
-            type="button"
-            aria-label={conv.archived ? "取消归档" : "归档"}
-            title={conv.archived ? "取消归档" : "归档"}
-            onClick={(e) => handleToggleArchive(e, conv)}
-          >
-            {conv.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
-          </button>
-          <button
-            className="conv-item__delete"
-            type="button"
-            aria-label="删除会话"
-            title="删除"
-            onClick={(e) => handleDeleteConversation(e, conv.id)}
-          >
-            <Trash2 size={14} />
-          </button>
-        </span>
-      </div>
-    );
-  }
-
   // ── UI ──────────────────────────────────────────────────────────────────
 
   return (
     <main className="app-shell">
-      {/* 侧边栏 */}
-      <aside className="sidebar" aria-label="MDGA navigation">
-        <div className="brand-row">
-          <BrandMark size={22} />
-          <span className="brand-row__name">MDGA</span>
-        </div>
-        <button className="new-chat" type="button" onClick={handleNewConversation}>
-          <SquarePen size={16} /> 新对话
-        </button>
-
-        {conversations.length > 0 && (
-          <nav className="conv-list" aria-label="会话列表">
-            <div className="conv-search-wrap">
-              <Search size={14} className="conv-search-wrap__icon" />
-              <input
-                className="conv-search"
-                type="search"
-                placeholder="搜索会话…"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                aria-label="搜索会话"
-              />
-            </div>
-            <p className="nav-label">历史对话</p>
-            {visibleConversations.map(renderConvItem)}
-            {archivedConversations.length > 0 && (
-              <>
-                <button
-                  className="archived-toggle"
-                  type="button"
-                  onClick={() => setShowArchived((v) => !v)}
-                >
-                  {showArchived ? <ChevronDown size={13} /> : <ChevronRight size={13} />} 已归档（{archivedConversations.length}）
-                </button>
-                {showArchived && archivedConversations.map(renderConvItem)}
-              </>
-            )}
-          </nav>
-        )}
-
-        {update.status === "available" && (
-          <div className="update-banner">
-            <p className="update-banner__title">发现新版本</p>
-            <p className="update-banner__version">v{update.version}</p>
-            <div className="update-banner__actions">
-              <button className="update-banner__btn update-banner__btn--primary" type="button" onClick={handleInstallUpdate}>
-                立即更新
-              </button>
-              <button className="update-banner__btn" type="button" onClick={() => setUpdate({ status: "idle" })}>
-                稍后
-              </button>
-            </div>
-          </div>
-        )}
-
-        {update.status === "downloading" && (
-          <div className="update-banner">
-            <p className="update-banner__title">正在下载更新…</p>
-            <div className="update-banner__progress-bar">
-              <div className="update-banner__progress-fill" style={{ width: `${update.progress}%` }} />
-            </div>
-            <p className="update-banner__version">{update.progress}%</p>
-          </div>
-        )}
-
-        {update.status === "error" && (
-          <div className="update-banner update-banner--error">
-            <p className="update-banner__title">更新失败</p>
-            <p className="update-banner__version">{update.message}</p>
-            <button className="update-banner__btn" type="button" onClick={() => setUpdate({ status: "idle" })}>
-              关闭
-            </button>
-          </div>
-        )}
-
-        {/* 侧边栏底部 footer：设置 + 主题切换 */}
-        <div className="sidebar-footer">
-          <button className="sidebar-footer__btn" type="button" onClick={() => openSettings()}>
-            <Settings2 size={16} /> 设置
-          </button>
-          <button
-            className="sidebar-footer__icon"
-            type="button"
-            aria-label={theme === "dark" ? "切换到亮色" : "切换到深色"}
-            title={theme === "dark" ? "切换到亮色" : "切换到深色「深海」"}
-            onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-          >
-            {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
-          </button>
-        </div>
-      </aside>
+      {/* 侧边栏（Task B：抽至 ./components/Sidebar，状态留 App、只传 props） */}
+      <Sidebar
+        conversations={conversations}
+        visibleConversations={visibleConversations}
+        archivedConversations={archivedConversations}
+        activeConvId={activeConvId}
+        searchQuery={searchQuery}
+        onSearchChange={setSearchQuery}
+        showArchived={showArchived}
+        onToggleArchived={() => setShowArchived((v) => !v)}
+        editingConvId={editingConvId}
+        editingTitle={editingTitle}
+        onEditingTitleChange={setEditingTitle}
+        onCommitRename={commitRename}
+        onCancelRename={() => setEditingConvId(null)}
+        onStartRename={startRename}
+        onNewConversation={handleNewConversation}
+        onSelectConversation={handleSelectConversation}
+        onDeleteConversation={handleDeleteConversation}
+        onTogglePin={handleTogglePin}
+        onToggleArchive={handleToggleArchive}
+        theme={theme}
+        onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+        onOpenSettings={() => openSettings()}
+        update={update}
+        onInstallUpdate={handleInstallUpdate}
+        onDismissUpdate={() => setUpdate({ status: "idle" })}
+      />
 
       {/* 工作区 */}
       <section className="workspace" aria-label="MDGA workspace">
