@@ -332,6 +332,48 @@ h1 {
   line-height: 1.6;
 }
 
+/* ── 消息级操作条（Plan19 P1a）：默认隐藏，hover 整行时淡入 ── */
+
+.message-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  opacity: 0;
+  transition: opacity .12s;
+}
+
+.message-row:hover .message-actions {
+  opacity: 1;
+}
+
+.message-actions--user {
+  justify-content: flex-end;
+}
+
+.message-actions__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-3);
+  font-size: 11.5px;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: color .12s, border-color .12s;
+}
+
+.message-actions__btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-3);
+}
+
+.message-actions__btn:disabled {
+  opacity: .4;
+  cursor: not-allowed;
+}
+
 .message p {
   margin: 0;
   white-space: pre-wrap;
@@ -526,6 +568,12 @@ h1 {
   line-height: 1.5;
 }
 
+/* 拖拽图片悬停高亮（Plan19 P0b）：边框与背景提示「松手即可添加」 */
+.composer--dragover {
+  border-color: var(--brand);
+  background: var(--brand-tint);
+}
+
 /* 左侧附件（文档导入）图标按钮 */
 .composer__attach {
   flex-shrink: 0;
@@ -575,6 +623,56 @@ h1 {
   color: var(--text-2);
   font-size: 14px;
   line-height: 1.6;
+}
+
+/* ── 未配模型首屏引导 CTA（Plan19 P0a）── */
+
+.onboarding-cta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: min(760px, 100%);
+  padding: 14px 16px;
+  border: 1px solid var(--brand-tint-strong);
+  border-radius: 10px;
+  background: var(--brand-tint);
+}
+
+.onboarding-cta__text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.onboarding-cta__text strong {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.onboarding-cta__text span {
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+.onboarding-cta__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 8px;
+  background: var(--brand);
+  color: var(--on-brand);
+  font-size: 13px;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background .14s;
+}
+
+.onboarding-cta__btn:hover {
+  background: var(--brand-hover);
 }
 
 /* ── 会话列表 ── */
@@ -908,6 +1006,66 @@ h1 {
   border-radius: 0 6px 6px 0;
   font-size: 12.5px;
   color: var(--text-3);
+}
+
+/* ── 视觉分析可折叠卡片（Plan19 C-B）── */
+
+.vision-card {
+  margin: 6px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.vision-card__summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 8px 10px;
+  color: var(--text-2);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.vision-card__summary:hover {
+  color: var(--text);
+}
+
+.vision-card__caret {
+  display: inline-flex;
+  width: 14px;
+  color: var(--text-3);
+}
+
+.vision-card__title {
+  flex: 1;
+}
+
+.vision-card__usage {
+  font-size: 11.5px;
+  color: var(--brand);
+  background: var(--brand-tint);
+  border: 1px solid var(--brand-tint-strong);
+  border-radius: 6px;
+  padding: 2px 7px;
+  font-variant-numeric: tabular-nums;
+}
+
+.vision-card__body {
+  padding: 0 12px 10px;
+  border-top: 1px solid var(--border);
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.vision-card__body > *:first-child {
+  margin-top: 10px;
 }
 
 /* ── 消息内图片（Plan18 M18.1）── */
@@ -1609,6 +1767,7 @@ h1 {
 .provider-card__actions {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin-top: 14px;
 }
 
@@ -1756,6 +1915,24 @@ h1 {
   margin: 0;
   font-size: 13px;
   color: var(--text-2);
+}
+
+/* ── 审批动作内容预览（Plan19 C-C）：等宽、可滚动 ── */
+
+.approval-preview {
+  margin: 10px 0 0;
+  max-height: 280px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-3);
+  color: var(--text);
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .approval-card__actions {

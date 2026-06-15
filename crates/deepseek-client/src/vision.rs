@@ -6,7 +6,8 @@
 //!
 //! base_url 一律用用户在视觉 provider 里自填的值（视觉不强制走 preset 官方端点）。
 
-use crate::DeepSeekError;
+use crate::{anthropic_messages_url, parse_raw_usage, DeepSeekError};
+use mdga_shared::RawUsage;
 use reqwest::Client;
 
 /// 单张图片：媒体类型（如 "image/png"）+ base64 编码（不含 data: 前缀）。
@@ -15,22 +16,12 @@ pub type VisionImage = (String, String);
 /// Anthropic 格式必填的 max_tokens 默认值（视觉分析输出通常不长，2048 足够要点化总结）。
 const ANTHROPIC_MAX_TOKENS: u32 = 2048;
 
-/// 解析 Anthropic messages 端点：与 [`crate::chat_completions_url`] 同理，兼容「基址 / 含 /v1 / 完整端点」三种输入，
-/// 避免把 `https://api.anthropic.com/v1/messages` 拼成 `…/v1/messages/v1/messages`，或把 `…/v1` 拼成 `…/v1/v1/messages`。
-fn anthropic_messages_url(base: &str) -> String {
-    let base = base.trim().trim_end_matches('/');
-    if base.ends_with("/messages") {
-        base.to_string()
-    } else {
-        // 去掉可能已带的尾部 /v1，再统一补 /v1/messages。
-        format!("{}/v1/messages", base.trim_end_matches("/v1"))
-    }
-}
-
-/// 把图片 + 意图发给视觉模型，返回文本分析。
+/// 把图片 + 意图发给视觉模型，返回文本分析与可选的 token 用量（Plan19 C-B 单独记账）。
 ///
 /// 输入视觉 provider 的 base_url（用户自填，为空报错）、api_key、model、api_format（openai|anthropic），
-/// 以及桥接提示词的 system / user_text 与图片列表；按格式构造请求体、解析响应，返回模型文本。
+/// 以及桥接提示词的 system / user_text 与图片列表；按格式构造请求体、解析响应，返回 (模型文本, usage)。
+/// usage：OpenAI 取响应 `usage`（prompt/completion/total），Anthropic 取 `usage`（input_tokens→prompt、
+/// output_tokens→completion、二者之和→total）归一到 RawUsage；缺失则 None。
 /// 不重试（上层 send_message 容错降级），错误分类复用 DeepSeekError。
 pub async fn analyze_image(
     base_url: &str,
@@ -40,7 +31,7 @@ pub async fn analyze_image(
     system_prompt: &str,
     user_text: &str,
     images: &[VisionImage],
-) -> Result<String, DeepSeekError> {
+) -> Result<(String, Option<RawUsage>), DeepSeekError> {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err(DeepSeekError::BadRequest(
@@ -69,7 +60,8 @@ pub async fn analyze_image(
             return Err(crate::classify_api_error(status, &text));
         }
         let value = response.json::<serde_json::Value>().await?;
-        parse_anthropic_response(&value)
+        let text = parse_anthropic_response(&value)?;
+        Ok((text, parse_anthropic_usage(&value)))
     } else {
         let url = crate::chat_completions_url(base);
         let body = build_openai_body(model, system_prompt, user_text, images);
@@ -85,8 +77,34 @@ pub async fn analyze_image(
             return Err(crate::classify_api_error(status, &text));
         }
         let value = response.json::<serde_json::Value>().await?;
-        parse_openai_response(&value)
+        let text = parse_openai_response(&value)?;
+        Ok((text, parse_openai_usage(&value)))
     }
+}
+
+/// 从 OpenAI 视觉响应取 `usage`（prompt/completion/total），复用主路径的 [`parse_raw_usage`]；缺失则 None。
+fn parse_openai_usage(value: &serde_json::Value) -> Option<RawUsage> {
+    value
+        .get("usage")
+        .filter(|u| !u.is_null())
+        .map(|u| parse_raw_usage(u, &u.to_string()))
+}
+
+/// 从 Anthropic 视觉响应取 `usage`：input_tokens→prompt、output_tokens→completion、二者之和→total，
+/// 归一到 RawUsage（无 cache/reasoning 细分，置 0）；raw_json 保留原始 usage JSON 供审计。缺失则 None。
+fn parse_anthropic_usage(value: &serde_json::Value) -> Option<RawUsage> {
+    let usage = value.get("usage").filter(|u| !u.is_null())?;
+    let prompt = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let completion = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    Some(RawUsage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt + completion,
+        prompt_cache_hit_tokens: 0,
+        prompt_cache_miss_tokens: 0,
+        reasoning_tokens: 0,
+        raw_json: usage.to_string(),
+    })
 }
 
 /// 构造 OpenAI 格式视觉请求体：messages content 用 text + image_url(data: URI)。
@@ -253,19 +271,49 @@ mod tests {
     fn anthropic_url_handles_base_v1_and_full_endpoint() {
         // 仅基址 → /v1/messages。
         assert_eq!(
-            anthropic_messages_url("https://api.anthropic.com"),
+            crate::anthropic_messages_url("https://api.anthropic.com"),
             "https://api.anthropic.com/v1/messages"
         );
         // 完整端点 → 原样用。
         assert_eq!(
-            anthropic_messages_url("https://api.anthropic.com/v1/messages"),
+            crate::anthropic_messages_url("https://api.anthropic.com/v1/messages"),
             "https://api.anthropic.com/v1/messages"
         );
         // 含 /v1 → 不重复拼成 /v1/v1/messages。
         assert_eq!(
-            anthropic_messages_url("https://proxy.example.com/v1"),
+            crate::anthropic_messages_url("https://proxy.example.com/v1"),
             "https://proxy.example.com/v1/messages"
         );
+    }
+
+    #[test]
+    fn parses_openai_usage_from_response() {
+        // OpenAI usage：prompt/completion/total 直取。
+        let v = serde_json::json!({
+            "choices": [{ "message": { "content": "x" } }],
+            "usage": { "prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150 }
+        });
+        let usage = parse_openai_usage(&v).expect("usage present");
+        assert_eq!(usage.prompt_tokens, 120);
+        assert_eq!(usage.completion_tokens, 30);
+        assert_eq!(usage.total_tokens, 150);
+        // 缺失 usage → None。
+        assert!(parse_openai_usage(&serde_json::json!({ "choices": [] })).is_none());
+    }
+
+    #[test]
+    fn parses_anthropic_usage_from_response() {
+        // Anthropic usage：input_tokens→prompt、output_tokens→completion、和→total。
+        let v = serde_json::json!({
+            "content": [{ "type": "text", "text": "x" }],
+            "usage": { "input_tokens": 200, "output_tokens": 45 }
+        });
+        let usage = parse_anthropic_usage(&v).expect("usage present");
+        assert_eq!(usage.prompt_tokens, 200);
+        assert_eq!(usage.completion_tokens, 45);
+        assert_eq!(usage.total_tokens, 245);
+        // 缺失 usage → None。
+        assert!(parse_anthropic_usage(&serde_json::json!({ "content": [] })).is_none());
     }
 
     #[tokio::test]

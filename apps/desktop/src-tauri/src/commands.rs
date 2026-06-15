@@ -8,12 +8,15 @@ use crate::chat::chat_completion_with_retry;
 use crate::checkpoint::apply_checkpoint_revert;
 use crate::mcp::spawn_mcp_connect;
 use crate::state::AppState;
-use mdga_deepseek_client::{detect_api_key_status, get_user_balance, resolve_base_url, UserBalance};
+use mdga_deepseek_client::{
+    detect_api_key_status, get_user_balance, resolve_base_url, test_connection, UserBalance,
+};
 use mdga_shared::{ApiKeyStatus, PermissionMode};
 use mdga_storage::{
     add_mcp_server, add_permission_rule, clear_active_workspace, create_conversation,
     create_conversation_with_workspace, delete_conversation, delete_messages, get_active_workspace,
-    get_activity_events, get_conversation, get_messages, get_model_provider, list_conversations,
+    get_activity_events, get_conversation, get_messages, get_model_provider,
+    get_token_ledger_entries, list_conversations,
     list_file_checkpoints,
     list_mcp_servers, list_permission_rules, mark_checkpoint_reverted, remove_mcp_server,
     remove_permission_rule, save_active_workspace, save_message, set_conversation_archived,
@@ -91,6 +94,61 @@ pub(crate) fn save_model_provider(
 pub(crate) fn remove_model_provider(state: State<AppState>, role: String) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     delete_model_provider(&db, &role).map_err(|e| e.to_string())
+}
+
+/// 对某 role 的供应商做一次「测试连接」（Plan19 C-A）：用极小请求探测端点连通与鉴权是否可用。
+///
+/// 入参为前端表单的当前值;任一项为空则回退到 DB 已存 provider（支持「已配状态下不重输 Key 直接测试」，
+/// 以及 base_url 留空走 preset 官方端点）。成功返回「连接成功」，失败返回人话化错误文案。
+#[tauri::command]
+pub(crate) async fn test_provider_connection(
+    state: State<'_, AppState>,
+    role: String,
+    base_url: String,
+    api_key: String,
+    model: String,
+    api_format: String,
+) -> Result<String, String> {
+    // 读已存 provider 作为各字段的回退来源。
+    let stored = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        get_model_provider(&db, &role).ok().flatten()
+    };
+    // base_url：优先用入参；为空则用已存 base_url/preset 解析官方端点。
+    let resolved_base = {
+        let explicit = base_url.trim();
+        if !explicit.is_empty() {
+            explicit.trim_end_matches('/').to_string()
+        } else if let Some(p) = &stored {
+            resolve_base_url(p.base_url.as_deref(), p.preset.as_deref()).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+    // api_key / model / api_format：入参为空则回退已存值。
+    let key = if api_key.trim().is_empty() {
+        stored.as_ref().map(|p| p.api_key.clone()).unwrap_or_default()
+    } else {
+        api_key
+    };
+    let model = if model.trim().is_empty() {
+        stored.as_ref().map(|p| p.model_id.clone()).unwrap_or_default()
+    } else {
+        model
+    };
+    let api_format = if api_format.trim().is_empty() {
+        stored
+            .as_ref()
+            .map(|p| p.api_format.clone())
+            .unwrap_or_else(|| "openai".to_string())
+    } else {
+        api_format
+    };
+
+    test_connection(&resolved_base, &key, &model, &api_format)
+        .await
+        .map(|_| "连接成功".to_string())
+        .map_err(|e| e.to_string())
 }
 
 /// 读取一个应用设置（如 modality_extended 开关）。
@@ -512,6 +570,18 @@ pub(crate) fn export_token_ledger(state: State<AppState>, path: String) -> Resul
                 "{},{},{},{},{},{},{:.6},{}\n",
                 conv.id, title, m.role, g("totalTokens"), g("promptTokens"),
                 g("completionTokens"), cost, m.created_at
+            ));
+        }
+        // 独立账本条目（如视觉调用 kind="vision"，Plan19 C-B）：usage_json 为 RawUsage（snake_case），
+        // role 列写 kind 以便与主模型消息区分；视觉供应商定价不一,成本列暂记 0。
+        let title = conv.title.replace([',', '\n', '"'], " ");
+        for entry in get_token_ledger_entries(&db, &conv.id).unwrap_or_default() {
+            let v: serde_json::Value = serde_json::from_str(&entry.usage_json).unwrap_or_default();
+            let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+            csv.push_str(&format!(
+                "{},{},{},{},{},{},{:.6},{}\n",
+                conv.id, title, entry.kind, g("total_tokens"), g("prompt_tokens"),
+                g("completion_tokens"), 0.0, entry.created_at
             ));
         }
     }

@@ -38,7 +38,7 @@ use commands::{
 };
 use commands::{
     get_app_setting, get_model_provider_config, remove_model_provider, save_model_provider,
-    set_app_setting,
+    set_app_setting, test_provider_connection,
 };
 
 mod agent_loop;
@@ -210,6 +210,7 @@ fn main() {
             get_model_provider_config,
             save_model_provider,
             remove_model_provider,
+            test_provider_connection,
             get_app_setting,
             set_app_setting,
         ])

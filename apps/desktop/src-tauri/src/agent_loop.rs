@@ -33,7 +33,9 @@ use crate::{commands::permission_mode_from_str, merge_usage, record_tool_event};
 use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMessage};
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
 use mdga_shared::PermissionMode;
-use mdga_storage::{get_conversation, get_model_provider, list_permission_rules};
+use mdga_storage::{
+    get_conversation, get_model_provider, list_permission_rules, save_token_ledger_entry,
+};
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use mdga_tool_runtime::RunCommandRequest;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,10 +133,34 @@ pub(crate) async fn send_message(
         )
         .await
         {
-            Ok(analysis) => Some(format!(
-                "[视觉分析] 用户上传了 {} 张图片，针对其需求，视觉模型识别如下：\n{analysis}\n请据此与用户需求继续。",
-                images.len()
-            )),
+            Ok((analysis, usage)) => {
+                // 视觉分析对用户可见（Plan19 C-B）：emit 事件，前端据此在发送中即时插入「视觉分析」卡片。
+                let usage_val = serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null);
+                let _ = app.emit(
+                    "vision-analysis",
+                    serde_json::json!({
+                        "conversationId": &conversation_id,
+                        "count": images.len(),
+                        "analysis": &analysis,
+                        "usage": usage_val,
+                    }),
+                );
+                // 视觉 usage 单独记账（与主模型分开）：写入 token_ledger，kind="vision"，保证 CSV 导出含视觉开销。
+                if let Some(u) = &usage {
+                    if let Ok(db) = state.db.lock() {
+                        let _ = save_token_ledger_entry(
+                            &db,
+                            &conversation_id,
+                            "vision",
+                            &serde_json::to_string(u).unwrap_or_default(),
+                        );
+                    }
+                }
+                Some(format!(
+                    "[视觉分析] 用户上传了 {} 张图片，针对其需求，视觉模型识别如下：\n{analysis}\n请据此与用户需求继续。",
+                    images.len()
+                ))
+            }
             // 容错：视觉失败注入提示但不中断主流程，让主 agent 知道图没看成。
             Err(e) => Some(format!(
                 "[视觉分析] 用户上传了 {} 张图片，但视觉分析失败：{e}。请据可见的文本需求尽力继续，必要时请用户用文字补充图片内容。",

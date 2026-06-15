@@ -11,6 +11,7 @@ import {
   Paperclip, ListChecks, Square, ArrowUp, GitCompare, Plug, Sun, Moon,
   Check, X, Ban, Info, CircleDot, CheckSquare, ChevronRight,
   ChevronDown, FolderOpen, Gauge, AtSign, CornerDownRight, Eye, EyeOff, Lock,
+  Copy, RefreshCw, Pencil,
 } from "lucide-react";
 
 /** MDGA 品牌标识：深海声纳波纹（致敬 DeepSeek 的「deep」，非官方鲸鱼 logo） */
@@ -103,6 +104,8 @@ type ApprovalRequest = {
   actionId: string;
   toolName: string;
   target: string;
+  /** 动作内容预览（Plan19 C-C）：命令全文 / 文件内容前若干行 / diff；空串表示无预览。 */
+  preview?: string;
 };
 
 /** ask_user 结构化提问：Agent 在需求含糊时主动发起，前端弹选择卡片 */
@@ -121,7 +124,28 @@ type NoticePart = { type: "notice"; text: string };
 /** 用户消息中附带的图片（Plan18 M18.1）：mediaType + base64，渲染为缩略图；持久化进 partsJson。 */
 type ImagePart = { type: "image"; mediaType: string; base64: string; name?: string };
 
-type MessagePart = TextPart | ToolPart | NoticePart | ImagePart;
+/**
+ * 后端 RawUsage 的线上形状（Plan19 C-B）：serde 默认 snake_case。
+ * 视觉分析的 usage 由后端归一为该结构，前端只取 total_tokens 做小徽标展示。
+ */
+type RawUsageWire = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+};
+
+/**
+ * 视觉分析卡片块（Plan19 C-B）：自动初看完成后，作为助手消息 parts_json 的首个 part 持久化；
+ * 发送中亦由 "vision-analysis" 事件即时插入。默认折叠，展开见 analysis 文本。
+ */
+type VisionPart = {
+  type: "vision";
+  count: number;
+  analysis: string;
+  usage?: RawUsageWire | null;
+};
+
+type MessagePart = TextPart | ToolPart | NoticePart | ImagePart | VisionPart;
 
 type Message = {
   role: "user" | "assistant";
@@ -237,6 +261,9 @@ type ProviderConfig = {
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"];
 
+/** 设置弹窗的分类标识；提到顶层以便首屏 CTA 指定初始分类（Plan19 P0a）。 */
+type SettingsSection = "account" | "provider" | "permission" | "rules" | "mcp" | "data" | "about";
+
 /** 斜杠命令清单：输入框以 / 开头时弹出 */
 const SLASH_COMMANDS: Array<{ cmd: string; desc: string }> = [
   { cmd: "/compact", desc: "把当前会话历史压缩为摘要，释放上下文" },
@@ -279,6 +306,10 @@ export function App() {
   const [planMode, setPlanMode] = useState(false);
   // 设置面板 / 变更记录面板
   const [showSettings, setShowSettings] = useState(false);
+  // 打开设置面板时初始定位的分类（首屏 CTA 可直接跳到「模型供应商」）。
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("account");
+  // 主模型是否已配（Plan19 P0a）：未配则首屏给「去配置」引导。
+  const [mainConfigured, setMainConfigured] = useState<boolean | null>(null);
   const [showChanges, setShowChanges] = useState(false);
   const [checkpoints, setCheckpoints] = useState<FileCheckpoint[]>([]);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
@@ -297,6 +328,8 @@ export function App() {
   const [fileMention, setFileMention] = useState<string | null>(null);
   // 待发送的附图（Plan18 M18.1）：📎 选图后暂存，发送时随 send_message 上送，发送框上方显示缩略图。
   const [pendingImages, setPendingImages] = useState<ImagePart[]>([]);
+  // 拖拽图片悬停高亮（Plan19 P0b）：dragenter/over 置 true，drop/leave 置 false。
+  const [dragOver, setDragOver] = useState(false);
   // 上下文用量（上次请求 prompt_tokens / 压缩阈值），常驻状态栏
   const [ctxUsage, setCtxUsage] = useState<{ promptTokens: number; softLimit: number } | null>(null);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
@@ -315,6 +348,13 @@ export function App() {
         setApiKeyStatus({ state });
       })
       .catch(() => setApiKeyStatus({ state: "missing" }));
+  }, []);
+
+  // 挂载时查主模型是否已配（Plan19 P0a）：未配则首屏给「去 设置 → 模型供应商」CTA。
+  useEffect(() => {
+    invoke<ProviderConfig | null>("get_model_provider_config", { role: "main" })
+      .then((cfg) => setMainConfigured(!!cfg))
+      .catch(() => setMainConfigured(false));
   }, []);
 
   useEffect(() => {
@@ -396,6 +436,33 @@ export function App() {
     const unlisten = listen<TodoItem[]>("todo-update", (e) => {
       setTodos(Array.isArray(e.payload) ? e.payload : []);
     });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // 视觉分析事件（Plan19 C-B）：自动初看完成后即时把「视觉分析」卡片插到当前回复流首位。
+  // 与持久化 vision part 二选一：实时事件用于发送中即时显示；重载后用持久化 part（storedToMessage）。
+  useEffect(() => {
+    const unlisten = listen<{ conversationId: string; count: number; analysis: string; usage?: RawUsageWire | null }>(
+      "vision-analysis",
+      (e) => {
+        const { count, analysis, usage } = e.payload;
+        setMessages((prev) => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          const last = updated[lastIdx];
+          if (!last || last.role !== "assistant") return prev;
+          // 防重：本轮已插入过 vision 卡片则跳过。
+          if (last.parts.some((p) => p.type === "vision")) return prev;
+          // 视觉卡片排在助手回复最前（与后端持久化「parts 首个 part」一致）。
+          const parts: MessagePart[] = [{ type: "vision", count, analysis, usage }, ...last.parts];
+          updated[lastIdx] = { ...last, parts };
+          streamingPartsRef.current = parts;
+          return updated;
+        });
+      },
+    );
     return () => {
       unlisten.then((fn) => fn());
     };
@@ -955,6 +1022,32 @@ export function App() {
     }
   }
 
+  /** 把一条消息的全部文字提取为纯文本（用于复制 / 重发 / 编辑回填）。 */
+  function messageText(msg: Message): string {
+    return msg.parts
+      .filter((p): p is TextPart => p.type === "text")
+      .map((p) => p.content)
+      .join("")
+      .trim();
+  }
+
+  /** 编辑重试（Plan19 P1a）：把该用户消息文字回填到输入框，供修改后再次发送。 */
+  function editRetryMessage(msg: Message) {
+    if (sending) return;
+    const text = messageText(msg);
+    if (!text) return;
+    setInput(text);
+    updateFileMention(text);
+  }
+
+  /** 重发（Plan19 P1a）：直接以该用户消息的文字再发一次（复用 sendText / handleSend 路径）。 */
+  async function resendMessage(msg: Message) {
+    if (sending) return;
+    const text = messageText(msg);
+    if (!text) return;
+    await sendText(text);
+  }
+
   async function handleStop() {
     // 若有挂起的审批请求，先拒绝它，避免后端工具循环卡在等待中
     if (approval) {
@@ -1063,7 +1156,8 @@ export function App() {
     setMessages([]);
   }
 
-  async function openSettings() {
+  async function openSettings(section: SettingsSection = "account") {
+    setSettingsSection(section);
     const info = await invoke<AppInfo>("get_app_info").catch(() => null);
     setAppInfo(info);
     await refreshMcpServers();
@@ -1134,6 +1228,81 @@ export function App() {
     } catch (err) {
       appendNoticeToLastMessage(humanizeError(String(err)));
     }
+  }
+
+  /**
+   * 粘贴/拖拽图片入托盘（Plan19 P0b）：读 Blob 为 base64（去 data: 前缀）→ 校验类型与大小 →
+   * push 进 pendingImages（复用现有缩略图托盘）。门禁与 📎 一致：仅在已配视觉模型时接受。
+   */
+  async function ingestImageBlobs(files: File[]) {
+    const images = files.filter((f) => f.type.startsWith("image/"));
+    if (images.length === 0) return;
+    // 模态门禁：无视觉 provider 时拒绝，提示与 📎 入口一致。
+    const visionCfg = await invoke<ProviderConfig | null>("get_model_provider_config", { role: "vision" }).catch(() => null);
+    if (!visionCfg) {
+      appendNoticeToLastMessage("当前未配置视觉模型，无法导入图片。需在 设置 → 模型供应商 → 扩展 agent 的模态 里配置视觉模型。");
+      return;
+    }
+    const MAX_BYTES = 10 * 1024 * 1024; // 10MB 上限
+    for (const file of images) {
+      // mediaType 取 image/png|jpeg|gif|webp；jpg 归一为 jpeg。
+      const subtype = file.type.slice("image/".length).toLowerCase();
+      const okType = ["png", "jpeg", "jpg", "gif", "webp"].includes(subtype);
+      if (!okType) {
+        appendNoticeToLastMessage(`不支持的图片格式：${file.type || "未知"}（仅支持 png/jpg/jpeg/gif/webp）`);
+        continue;
+      }
+      if (file.size > MAX_BYTES) {
+        appendNoticeToLastMessage(`图片过大（${(file.size / 1024 / 1024).toFixed(1)}MB），上限 10MB`);
+        continue;
+      }
+      const base64 = await new Promise<string | null>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = typeof reader.result === "string" ? reader.result : "";
+          // FileReader 读到的是 data:URL，去掉 data: 前缀只留 base64 主体。
+          const comma = result.indexOf(",");
+          resolve(comma >= 0 ? result.slice(comma + 1) : null);
+        };
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(file);
+      });
+      if (!base64) {
+        appendNoticeToLastMessage("读取图片失败，请重试");
+        continue;
+      }
+      const mediaType = subtype === "jpg" ? "image/jpeg" : file.type;
+      setPendingImages((prev) => [
+        ...prev,
+        { type: "image", mediaType, base64, name: file.name || undefined },
+      ]);
+    }
+  }
+
+  /** composer 粘贴：截取剪贴板里的 image 项，走统一入托盘逻辑（Plan19 P0b）。 */
+  function handleComposerPaste(e: React.ClipboardEvent) {
+    const files = Array.from(e.clipboardData?.items ?? [])
+      .filter((it) => it.kind === "file" && it.type.startsWith("image/"))
+      .map((it) => it.getAsFile())
+      .filter((f): f is File => !!f);
+    if (files.length === 0) return;
+    e.preventDefault(); // 阻止把二进制当文本粘进输入框
+    void ingestImageBlobs(files);
+  }
+
+  /** composer 拖拽放下：取拖入的 image 文件入托盘（Plan19 P0b）。 */
+  function handleComposerDrop(e: React.DragEvent) {
+    const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith("image/"));
+    if (files.length === 0) return;
+    e.preventDefault();
+    setDragOver(false);
+    void ingestImageBlobs(files);
+  }
+
+  function handleComposerDragOver(e: React.DragEvent) {
+    if (!Array.from(e.dataTransfer?.items ?? []).some((it) => it.kind === "file")) return;
+    e.preventDefault();
+    setDragOver(true);
   }
 
   function handleModelChange(next: DeepSeekModelId) {
@@ -1349,7 +1518,7 @@ export function App() {
 
         {/* 侧边栏底部 footer：设置 + 主题切换 */}
         <div className="sidebar-footer">
-          <button className="sidebar-footer__btn" type="button" onClick={openSettings}>
+          <button className="sidebar-footer__btn" type="button" onClick={() => openSettings()}>
             <Settings2 size={16} /> 设置
           </button>
           <button
@@ -1409,6 +1578,13 @@ export function App() {
                 <div className={`message message--${msg.role}`}>
                   <MessageContent msg={msg} />
                 </div>
+                <MessageActions
+                  msg={msg}
+                  disabled={sending}
+                  onCopy={() => messageText(msg)}
+                  onResend={() => resendMessage(msg)}
+                  onEditRetry={() => editRetryMessage(msg)}
+                />
                 {msg.role === "assistant" && msg.usage && (
                   <UsageBadge usage={msg.usage} />
                 )}
@@ -1440,18 +1616,34 @@ export function App() {
               )}
               {workspaceError && <p className="workspace-picker__error">{workspaceError}</p>}
             </section>
-            <section className="mvp-grid" aria-label="MVP status cards">
+            {/* 未配主模型引导（Plan19 P0a）：显著 CTA，点击直达 设置 → 模型供应商。 */}
+            {mainConfigured === false && (
+              <div className="onboarding-cta" role="status" aria-label="需要配置模型">
+                <div className="onboarding-cta__text">
+                  <strong>还没配置模型</strong>
+                  <span>先去「设置 → 模型供应商」配置主模型（填 API Key 与模型 ID），即可开始对话。</span>
+                </div>
+                <button
+                  type="button"
+                  className="onboarding-cta__btn"
+                  onClick={() => openSettings("provider")}
+                >
+                  <Settings2 size={15} /> 去配置模型
+                </button>
+              </div>
+            )}
+            <section className="mvp-grid" aria-label="能力概览">
               <article>
-                <h3>DeepSeek 连接</h3>
-                <p>只从环境变量读取 API Key，不在应用内保存。</p>
+                <h3>应用内配置供应商</h3>
+                <p>在设置内选预设、填 API Key 与模型 ID，密钥仅存本地、不上传云端；支持 OpenAI 兼容与自托管端点。</p>
               </article>
               <article>
-                <h3>Token 账本</h3>
-                <p>记录请求级 usage、缓存命中与估算费用。</p>
+                <h3>成本透明</h3>
+                <p>记录请求级 token usage、缓存命中与估算费用，可导出账本随时核对花销。</p>
               </article>
               <article>
-                <h3>权限模式</h3>
-                <p>默认受限，高风险动作进入审批与审计。</p>
+                <h3>权限分级</h3>
+                <p>默认受限，高风险动作进入审批确认与审计，看清动作内容再决定是否放行。</p>
               </article>
             </section>
           </section>
@@ -1573,7 +1765,12 @@ export function App() {
             </div>
           )}
 
-          <div className="composer">
+          <div
+            className={`composer${dragOver ? " composer--dragover" : ""}`}
+            onDrop={handleComposerDrop}
+            onDragOver={handleComposerDragOver}
+            onDragLeave={() => setDragOver(false)}
+          >
             <button
               type="button"
               className="composer__attach"
@@ -1593,6 +1790,7 @@ export function App() {
                 updateFileMention(e.target.value);
               }}
               onKeyDown={handleKeyDown}
+              onPaste={handleComposerPaste}
             />
             {sending ? (
               <button type="button" className="composer__send composer__send--stop" onClick={handleStop} aria-label="停止">
@@ -1634,6 +1832,8 @@ export function App() {
 
       {showSettings && (
         <SettingsModal
+          initialSection={settingsSection}
+          onMainConfiguredChange={setMainConfigured}
           appInfo={appInfo}
           apiKeyLabel={getApiKeyStatusLabel(apiKeyStatus)}
           balance={balance}
@@ -1767,6 +1967,9 @@ function ProviderCard({
   const [keyTouched, setKeyTouched] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 测试连接（Plan19 P2a）：就地显示结果，不跳主界面。null=未测、ok=成功（绿）、err=失败（红）。
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
 
   const presetMeta = PROVIDER_PRESETS.find((p) => p.id === preset) ?? PROVIDER_PRESETS[0];
   const isCustom = preset === "custom";
@@ -1846,6 +2049,43 @@ function ProviderCard({
       setError(humanizeError(String(err)));
     } finally {
       setSaving(false);
+    }
+  }
+
+  /**
+   * 测试连接（Plan19 P2a / C-A）：用当前表单做一次最小请求。用户输入了新 key 就传新 key，
+   * 否则传空串（命令内 key 空时从 DB 读该 role 既有 key）。结果就地显示，不跳主界面。
+   */
+  async function handleTest() {
+    setTestResult(null);
+    if (isCustom && !baseUrl.trim()) {
+      setTestResult({ ok: false, message: "自定义供应商必须填写 Base URL" });
+      setAdvancedOpen(true);
+      return;
+    }
+    if (!modelId.trim()) {
+      setTestResult({ ok: false, message: "请填写模型 ID" });
+      return;
+    }
+    // 未配置且未输入 key：前端先拦截不调用。
+    if (!configured && !apiKey.trim()) {
+      setTestResult({ ok: false, message: "请先填写 API Key" });
+      return;
+    }
+    setTesting(true);
+    try {
+      const message = await invoke<string>("test_provider_connection", {
+        role,
+        baseUrl: baseUrl.trim(),
+        apiKey: keyTouched ? apiKey.trim() : "",
+        model: modelId.trim(),
+        apiFormat: role === "vision" ? apiFormat : "openai",
+      });
+      setTestResult({ ok: true, message: message || "连接成功" });
+    } catch (err) {
+      setTestResult({ ok: false, message: humanizeError(String(err)) });
+    } finally {
+      setTesting(false);
     }
   }
 
@@ -1947,8 +2187,16 @@ function ProviderCard({
       </div>
 
       {error && <p className="settings-row__value" style={{ color: "var(--danger)" }}>{error}</p>}
+      {testResult && (
+        <p className="settings-row__value" style={{ color: testResult.ok ? "var(--success)" : "var(--danger)" }}>
+          {testResult.ok ? "✓ " : "✗ "}{testResult.message}
+        </p>
+      )}
 
       <div className="provider-card__actions">
+        <button type="button" className="approval-card__btn" onClick={handleTest} disabled={testing || saving}>
+          {testing ? "测试中…" : "测试连接"}
+        </button>
         <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={handleSave} disabled={saving}>
           {saving ? "保存中…" : "保存"}
         </button>
@@ -1960,6 +2208,8 @@ function ProviderCard({
 // ── SettingsModal ───────────────────────────────────────────────────────────
 
 function SettingsModal({
+  initialSection,
+  onMainConfiguredChange,
   appInfo,
   apiKeyLabel,
   balance,
@@ -1985,6 +2235,8 @@ function SettingsModal({
   onUpdateAvailable,
   onClose,
 }: {
+  initialSection: SettingsSection;
+  onMainConfiguredChange: (configured: boolean) => void;
   appInfo: AppInfo | null;
   apiKeyLabel: string;
   balance: BalanceState;
@@ -2040,7 +2292,7 @@ function SettingsModal({
       setCheckBusy(false);
     }, 10000);
   }
-  const [section, setSection] = useState<"account" | "provider" | "permission" | "rules" | "mcp" | "data" | "about">("account");
+  const [section, setSection] = useState<SettingsSection>(initialSection);
   const [budgetInput, setBudgetInput] = useState(String(taskBudget));
   // 「扩展 agent 的模态」开关：持久化于 settings(modality_extended)；开 → 露出视觉/音频块。
   const [modalityExtended, setModalityExtended] = useState(false);
@@ -2159,7 +2411,8 @@ function SettingsModal({
                 role="main"
                 title="主模型"
                 onSaved={() => {
-                  // 保存后刷新「DeepSeek 余额卡片是否显示」与顶栏 key 状态。
+                  // 保存后刷新「DeepSeek 余额卡片是否显示」与顶栏 key 状态，并消除首屏未配引导。
+                  onMainConfiguredChange(true);
                   invoke<ProviderConfig | null>("get_model_provider_config", { role: "main" })
                     .then((cfg) => setMainIsDeepseek((cfg?.preset ?? "deepseek") === "deepseek" && !!cfg))
                     .catch(() => {});
@@ -2359,6 +2612,9 @@ function ApprovalModal({
             <span className="approval-card__target">{approval.target}</span>
           )}
         </div>
+        {approval.preview && approval.preview.trim().length > 0 && (
+          <pre className="approval-preview" aria-label="动作内容预览">{approval.preview}</pre>
+        )}
         <p className="approval-card__hint">是否允许本次操作？「总是允许」会记住同类动作，后续免审批。</p>
         <div className="approval-card__actions">
           <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={onAllow}>
@@ -2510,7 +2766,7 @@ function AskUserModal({
 
 /** 渲染块：单个非工具 part，或一段连续的工具调用（聚合为可折叠组） */
 type RenderBlock =
-  | { kind: "part"; part: TextPart | NoticePart | ImagePart; index: number }
+  | { kind: "part"; part: TextPart | NoticePart | ImagePart | VisionPart; index: number }
   | { kind: "tools"; parts: ToolPart[]; index: number };
 
 function MessageContent({ msg }: { msg: Message }) {
@@ -2573,6 +2829,9 @@ function MessageContent({ msg }: { msg: Message }) {
             />
           );
         }
+        if (part.type === "vision") {
+          return <VisionCard key={index} part={part} />;
+        }
         return (
           <div key={index} className="notice-inline" aria-label="系统通知">
             <Info size={13} /> {part.text}
@@ -2587,6 +2846,70 @@ function MessageContent({ msg }: { msg: Message }) {
         </div>
       )}
     </>
+  );
+}
+
+// ── MessageActions（Plan19 P1a）─────────────────────────────────────────────
+
+/**
+ * 消息气泡 hover 操作条：复制（整条文本到剪贴板）；用户消息额外提供重发与编辑重试。
+ * 仅当消息含文字时显示，避免对纯图片/纯工具卡片消息出现空操作条。
+ */
+function MessageActions({
+  msg,
+  disabled,
+  onCopy,
+  onResend,
+  onEditRetry,
+}: {
+  msg: Message;
+  disabled: boolean;
+  onCopy: () => string;
+  onResend: () => void;
+  onEditRetry: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const hasText = msg.parts.some((p) => p.type === "text" && p.content.trim().length > 0);
+  if (!hasText) return null;
+
+  async function handleCopy() {
+    try {
+      await navigator.clipboard.writeText(onCopy());
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // 剪贴板不可用时静默失败
+    }
+  }
+
+  return (
+    <div className={`message-actions message-actions--${msg.role}`} aria-label="消息操作">
+      <button type="button" className="message-actions__btn" title="复制整条消息" onClick={handleCopy}>
+        {copied ? <><Check size={13} /> 已复制</> : <><Copy size={13} /> 复制</>}
+      </button>
+      {msg.role === "user" && (
+        <>
+          <button
+            type="button"
+            className="message-actions__btn"
+            title="重新发送这条消息"
+            onClick={onResend}
+            disabled={disabled}
+          >
+            <RefreshCw size={13} /> 重发
+          </button>
+          <button
+            type="button"
+            className="message-actions__btn"
+            title="把这条消息回填到输入框，修改后再发送"
+            onClick={onEditRetry}
+            disabled={disabled}
+          >
+            <Pencil size={13} /> 编辑重试
+          </button>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -2625,6 +2948,37 @@ function ToolGroup({ parts }: { parts: ToolPart[] }) {
           {visibleRows.map((p, i) => (
             <ToolInlineRow key={i} part={p} />
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── VisionCard（Plan19 C-B 前端）──────────────────────────────────────────────
+
+/** 视觉分析可折叠卡片：默认折叠，标题「🔎 视觉分析（N 张图）」，展开见 analysis；有 usage 显示 token 徽标。 */
+function VisionCard({ part }: { part: VisionPart }) {
+  const [expanded, setExpanded] = useState(false);
+  const total = part.usage?.total_tokens ?? 0;
+  return (
+    <div className="vision-card">
+      <button
+        type="button"
+        className="vision-card__summary"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+      >
+        <span className="vision-card__caret">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
+        <span className="vision-card__title">🔎 视觉分析（{part.count} 张图）</span>
+        {total > 0 && (
+          <span className="vision-card__usage">视觉 · {total.toLocaleString()} tokens</span>
+        )}
+      </button>
+      {expanded && (
+        <div className="vision-card__body">
+          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={{ pre: CodeBlock }}>
+            {part.analysis}
+          </ReactMarkdown>
         </div>
       )}
     </div>

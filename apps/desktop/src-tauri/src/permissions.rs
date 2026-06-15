@@ -222,6 +222,7 @@ pub(crate) async fn request_tool_approval(app: &AppHandle, tool_name: &str, argu
             "actionId": action_id,
             "toolName": tool_name,
             "target": approval_target(arguments),
+            "preview": approval_preview(tool_name, arguments),
         }),
     );
 
@@ -281,6 +282,56 @@ pub(crate) async fn execute_ask_user(
     let answers = serde_json::from_str::<serde_json::Value>(&answer)
         .unwrap_or(serde_json::Value::String(answer));
     Ok(serde_json::json!({ "answers": answers }))
+}
+
+/// 提取审批弹窗的「动作内容预览」（Plan19 C-C）：让用户「看清再点允许」。
+///
+/// run_command → 命令全文;write_file/create_file → 写入内容(前 40 行或 ~2KB,超出标注截断);
+/// 编辑/patch 类 → diff/patch 文本;其它工具 → 空串。
+fn approval_preview(tool_name: &str, arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return String::new();
+    };
+    let get = |key: &str| value.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let raw = match tool_name {
+        "run_command" => get("command"),
+        "write_file" | "create_file" => get("content"),
+        "apply_patch" | "edit_file" => {
+            let diff = get("diff");
+            if diff.is_empty() {
+                get("patch")
+            } else {
+                diff
+            }
+        }
+        _ => String::new(),
+    };
+    truncate_preview(&raw)
+}
+
+/// 预览体积上限:取前 40 行且不超过 ~2KB,超出在末尾标注省略。
+fn truncate_preview(text: &str) -> String {
+    const MAX_BYTES: usize = 2048;
+    const MAX_LINES: usize = 40;
+    if text.is_empty() {
+        return String::new();
+    }
+    let by_lines: String = text.lines().take(MAX_LINES).collect::<Vec<_>>().join("\n");
+    let line_truncated = text.lines().count() > MAX_LINES;
+    let (mut out, byte_truncated) = if by_lines.len() > MAX_BYTES {
+        // 按字符边界安全截断到 ~2KB。
+        let mut end = MAX_BYTES;
+        while end > 0 && !by_lines.is_char_boundary(end) {
+            end -= 1;
+        }
+        (by_lines[..end].to_string(), true)
+    } else {
+        (by_lines, false)
+    };
+    if line_truncated || byte_truncated {
+        out.push_str("\n…（内容过长，仅预览前一部分）");
+    }
+    out
 }
 
 /// 从工具参数中提取审批展示用的目标（path / from / command）。

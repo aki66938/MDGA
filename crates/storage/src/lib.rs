@@ -198,6 +198,17 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS token_ledger (
+            id              TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            kind            TEXT NOT NULL,
+            usage_json      TEXT NOT NULL,
+            created_at      INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_token_ledger_conv
+            ON token_ledger (conversation_id, created_at);
         ",
     )?;
     add_column_if_missing(&conn, "conversations", "workspace_path", "TEXT")?;
@@ -434,6 +445,64 @@ pub fn delete_messages(conn: &Connection, conv_id: &str) -> SqlResult<()> {
         params![conv_id],
     )?;
     Ok(())
+}
+
+// ── Token 账本（独立条目）─────────────────────────────────────────────────
+
+/// 账本中一条独立的 token 用量记录（Plan19 C-B：视觉等辅助调用与主助手消息分开记账）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenLedgerEntry {
+    pub id: String,
+    pub conversation_id: String,
+    /// 记账类别标记，如 'vision'；CSV 导出据此区分来源，不与主模型 usage 合并。
+    pub kind: String,
+    /// 序列化后的 CostSummary JSON（与 messages.usage_json 同形）。
+    pub usage_json: String,
+    pub created_at: i64,
+}
+
+/// 向 token 账本写入一条独立条目（不挂在任何 messages 行上，互不干扰）。
+///
+/// 输入会话 ID、类别标记（如 'vision'）、CostSummary JSON 字符串；用于把视觉等辅助调用的
+/// token 开销单独入账，保证 CSV 导出完整、又不污染助手消息的主 usage 徽标。
+pub fn save_token_ledger_entry(
+    conn: &Connection,
+    conv_id: &str,
+    kind: &str,
+    usage_json: &str,
+) -> SqlResult<()> {
+    let id = Uuid::new_v4().to_string();
+    let now = now_ts();
+    conn.execute(
+        "INSERT INTO token_ledger (id, conversation_id, kind, usage_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, conv_id, kind, usage_json, now],
+    )?;
+    Ok(())
+}
+
+/// 查询某会话的全部独立账本条目，按时间正序。
+pub fn get_token_ledger_entries(
+    conn: &Connection,
+    conv_id: &str,
+) -> SqlResult<Vec<TokenLedgerEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, conversation_id, kind, usage_json, created_at
+         FROM token_ledger
+         WHERE conversation_id = ?1
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([conv_id], |row| {
+        Ok(TokenLedgerEntry {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            kind: row.get(2)?,
+            usage_json: row.get(3)?,
+            created_at: row.get(4)?,
+        })
+    })?;
+    rows.collect()
 }
 
 // ── File Checkpoint CRUD ─────────────────────────────────────────────────

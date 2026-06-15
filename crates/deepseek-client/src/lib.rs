@@ -72,6 +72,85 @@ pub(crate) fn chat_completions_url(base_url: &str) -> String {
     }
 }
 
+/// 解析 Anthropic messages 端点：与 [`chat_completions_url`] 同理，兼容「基址 / 含 /v1 / 完整端点」三种输入，
+/// 避免把 `https://api.anthropic.com/v1/messages` 拼成 `…/v1/messages/v1/messages`，或把 `…/v1` 拼成 `…/v1/v1/messages`。
+pub(crate) fn anthropic_messages_url(base: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    if base.ends_with("/messages") {
+        base.to_string()
+    } else {
+        // 去掉可能已带的尾部 /v1，再统一补 /v1/messages。
+        format!("{}/v1/messages", base.trim_end_matches("/v1"))
+    }
+}
+
+/// 对供应商做一次最小连通性探测（Plan19 C-A「测试连接」）。
+///
+/// 输入 base_url、api_key、model、api_format（openai|anthropic）；用极小请求（prompt "ping"、
+/// max_tokens 极小）打一次端点：`anthropic` 走 `/v1/messages`（x-api-key + anthropic-version，纯文本 user 消息），
+/// 否则走 `/chat/completions`（Bearer）。base_url 复用既有的 [`chat_completions_url`] / [`anthropic_messages_url`]
+/// 容错拼接。成功（HTTP 2xx）返回 Ok(())，失败用 [`classify_api_error`] 人话化为 DeepSeekError。
+/// 本方法不重试、不流式，只判连通与鉴权是否可用。
+pub async fn test_connection(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    api_format: &str,
+) -> Result<(), DeepSeekError> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err(DeepSeekError::BadRequest(
+            "Base URL 未配置：请填写供应商端点".to_string(),
+        ));
+    }
+    if api_key.trim().is_empty() {
+        return Err(DeepSeekError::MissingApiKey);
+    }
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(DeepSeekError::Http)?;
+
+    let response = if api_format == "anthropic" {
+        // Anthropic：max_tokens 必填，取最小值 1；system 省略，纯文本 user 消息。
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "ping" }]
+        });
+        client
+            .post(anthropic_messages_url(base))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await?
+    } else {
+        // OpenAI 兼容：非流式，max_tokens 极小，纯文本 user 消息。
+        let body = serde_json::json!({
+            "model": model,
+            "stream": false,
+            "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "ping" }]
+        });
+        client
+            .post(chat_completions_url(base))
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await?
+    };
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        Err(classify_api_error(status, &text))
+    }
+}
+
 impl DeepSeekError {
     /// 判断该错误是否为瞬时、可重试的错误。
     ///
@@ -525,7 +604,7 @@ fn parse_user_balance(value: &serde_json::Value) -> Result<UserBalance, DeepSeek
 ///
 /// 输入 usage 字段的 serde_json::Value 和原始 JSON 字符串，输出标准化结构；
 /// 缺失字段保留为 0，raw_json 保存完整原始字符串供审计。
-fn parse_raw_usage(usage: &serde_json::Value, raw_data: &str) -> RawUsage {
+pub(crate) fn parse_raw_usage(usage: &serde_json::Value, raw_data: &str) -> RawUsage {
     RawUsage {
         prompt_tokens: usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
         completion_tokens: usage
