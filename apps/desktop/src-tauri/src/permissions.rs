@@ -32,8 +32,9 @@ pub(crate) fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability
     }
     match tool_name {
         // 只读或纯 UI / 后台控制类工具：自动放行，不打断用户。remember 仅追加项目记忆文件，低风险。
-        "list_dir" | "read_file" | "stat_path" | "search_text" | "glob_files" | "todo_write"
-        | "ask_user" | "run_subtask" | "load_skill" | "remember" | "list_shells"
+        // code_overview（Plan28 P0-2，Lane B 新增）只读取并统计代码结构，与 read_file / search_text 同列。
+        "list_dir" | "read_file" | "stat_path" | "search_text" | "glob_files" | "code_overview"
+        | "todo_write" | "ask_user" | "run_subtask" | "load_skill" | "remember" | "list_shells"
         | "get_shell_output" | "kill_shell" | "get_task_output" | "kill_task" | "list_tasks" => {
             Ok(ToolCapability::FileRead)
         }

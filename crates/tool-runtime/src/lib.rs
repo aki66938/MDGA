@@ -285,6 +285,75 @@ pub struct GlobFilesResult {
     pub truncated: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeOverviewRequest {
+    /// 相对工作区路径；`.` = 工作区根，可为文件或目录。
+    pub path: String,
+}
+
+/// 单种语言的聚合统计（按扩展名归类后逐文件累加）。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LanguageStat {
+    /// 该语言的文件数。
+    pub files: usize,
+    /// 该语言的总 LOC（按本结果的 loc 口径，见 CodeOverviewResult.note）。
+    pub loc: usize,
+    /// 公开/导出符号计数（按语言正则启发式，匹配不到给 0）。
+    pub symbols: usize,
+    /// 测试计数（按语言测试标记正则启发式）。
+    pub tests: usize,
+}
+
+/// 单个文件的轻量统计（仅在「最大若干文件」榜单里回传，控制体积）。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStat {
+    pub path: String,
+    pub language: String,
+    pub loc: usize,
+    pub symbols: usize,
+    pub tests: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeOverviewResult {
+    pub ok: bool,
+    /// 规范化后的相对路径。
+    pub path: String,
+    /// 目标是否为单文件（true）还是目录（false）。
+    pub is_file: bool,
+    /// 实际统计到的文件数（扫描后、上限内）。
+    pub total_files: usize,
+    /// 全部语言合计 LOC。
+    pub loc: usize,
+    /// 按语言聚合。key 为语言短名（rs/ts/js/py/go/java/c/cpp/rb/php/cs/kt/swift/other…）。
+    pub by_language: std::collections::BTreeMap<String, LanguageStat>,
+    /// 命中的构建/依赖文件相对路径（去重、排序）。
+    pub build_files: Vec<String>,
+    /// 检测到的包/crate 根：每个构建清单文件对应一个条目（路径 + 类型）。
+    pub packages: Vec<PackageEntry>,
+    /// 建议的「求真」命令字符串（按检测到的构建系统给出，仅字符串、不执行）。
+    pub suggested_verify_commands: Vec<String>,
+    /// 体积最大的前 N 个文件（LOC 降序），目录大时也只回传榜单而非逐文件全列。
+    pub largest_files: Vec<FileStat>,
+    /// 是否因文件数/字节上限触发了截断（统计为部分样本）。
+    pub truncated: bool,
+    /// 行数口径与其它说明（人读）。
+    pub note: String,
+}
+
+/// 一个检测到的包/工程根：构建清单文件的相对路径与其构建系统类型。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageEntry {
+    pub path: String,
+    /// 构建系统类型：cargo / npm / python / go / maven / gradle / dotnet / ruby / php-composer…
+    pub kind: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MovePathResult {
@@ -895,6 +964,372 @@ pub fn glob_files(
         files: hits.into_iter().map(|(_, p)| p).collect(),
         truncated,
     })
+}
+
+// ── code_overview（Plan28 P0-2，语言无关「求真」工具） ────────────────────────
+
+/// code_overview 扫描的文件数上限：超过后停止统计并标 truncated（避免巨目录卡死）。
+const OVERVIEW_MAX_FILES: usize = 4000;
+/// 单文件参与统计的字节上限：超过的文件计入 total_files 但不读内容（与 search 一致，跳过大文件）。
+const OVERVIEW_MAX_FILE_BYTES: u64 = 512 * 1024;
+/// 累计读取字节上限：所有被读文件的字节之和封顶，超过即停止并标 truncated。
+const OVERVIEW_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// largest_files 榜单长度（控制回传体积）。
+const OVERVIEW_TOP_FILES: usize = 10;
+
+/// 语言无关的代码概览：对文件或目录统计 LOC / 公开符号 / 测试数，并识别构建文件。
+///
+/// 输入工作区根与相对路径（`.` = 根，可为文件或目录）；遍历目录时复用 ignore/gitignore 引擎、
+/// 跳过隐藏与被忽略文件，与 search_text/glob_files 行为一致。按扩展名归类语言，逐文件用正则做
+/// 「公开/导出符号」与「测试标记」启发式计数（尽力而为，匹配不到给 0，不报错）。识别 Cargo.toml /
+/// package.json / pyproject.toml 等构建清单，给出建议的求真命令（仅字符串，不执行）。大目录有
+/// 文件数/字节上限，超限给出聚合 + 截断标记，不回传巨串。
+///
+/// LOC 口径：**非空行**（去掉纯空白行后的行数）。
+pub fn code_overview(
+    workspace_root: impl AsRef<Path>,
+    request: CodeOverviewRequest,
+) -> Result<CodeOverviewResult, ToolRuntimeError> {
+    let (workspace, relative, target) = resolve_existing_path(workspace_root, &request.path)?;
+    let is_file = target.is_file();
+
+    let mut by_language: std::collections::BTreeMap<String, LanguageStat> =
+        std::collections::BTreeMap::new();
+    let mut build_files: Vec<String> = Vec::new();
+    let mut packages: Vec<PackageEntry> = Vec::new();
+    let mut file_stats: Vec<FileStat> = Vec::new();
+    let mut total_files = 0usize;
+    let mut total_loc = 0usize;
+    let mut total_bytes = 0u64;
+    let mut truncated = false;
+
+    // 统计单个文件并并入聚合：识别构建文件、累加语言聚合、追加文件榜单，返回读取的字节数（未读=0）。
+    // 写成局部闭包仅借用聚合容器，预算变量（total_files/total_bytes）留在循环里判断，避免一并被借走。
+    let absorb = |rel: &str,
+                      abs: &Path,
+                      by_language: &mut std::collections::BTreeMap<String, LanguageStat>,
+                      build_files: &mut Vec<String>,
+                      packages: &mut Vec<PackageEntry>,
+                      stats: &mut Vec<FileStat>|
+     -> (usize, u64) {
+        let lang = language_for_path(rel);
+        // 构建/依赖文件识别（按文件名，归到对应构建系统）。
+        if let Some(kind) = build_file_kind(rel) {
+            build_files.push(rel.to_string());
+            packages.push(PackageEntry { path: rel.to_string(), kind: kind.to_string() });
+        }
+        let Ok(meta) = abs.metadata() else { return (0, 0) };
+        if meta.len() > OVERVIEW_MAX_FILE_BYTES {
+            // 大文件不读内容，但仍计入语言文件数（事实：存在该语言的大文件）。
+            by_language.entry(lang.to_string()).or_default().files += 1;
+            return (0, 0);
+        }
+        let Ok(content) = std::fs::read_to_string(abs) else { return (0, 0) };
+        let loc = content.lines().filter(|l| !l.trim().is_empty()).count();
+        let symbols = count_public_symbols(lang, &content);
+        let tests = count_tests(lang, &content);
+        let entry = by_language.entry(lang.to_string()).or_default();
+        entry.files += 1;
+        entry.loc += loc;
+        entry.symbols += symbols;
+        entry.tests += tests;
+        stats.push(FileStat {
+            path: rel.to_string(),
+            language: lang.to_string(),
+            loc,
+            symbols,
+            tests,
+        });
+        (loc, meta.len())
+    };
+
+    if is_file {
+        let rel = normalize_relative_path(&relative);
+        total_files = 1;
+        // 单文件分支不参与字节预算循环，丢弃返回的字节数（仅累加 LOC）。
+        let (loc, _bytes) = absorb(
+            &rel,
+            &target,
+            &mut by_language,
+            &mut build_files,
+            &mut packages,
+            &mut file_stats,
+        );
+        total_loc += loc;
+    } else {
+        let walker = ignore::WalkBuilder::new(&target)
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(false)
+            .require_git(false)
+            .parents(true)
+            .build();
+        for entry in walker.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if total_files >= OVERVIEW_MAX_FILES || total_bytes >= OVERVIEW_MAX_TOTAL_BYTES {
+                truncated = true;
+                break;
+            }
+            // 相对路径以「目标目录」为基准，与 search_text/glob_files 输出一致。
+            let rel = path
+                .strip_prefix(&target)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            total_files += 1;
+            let (loc, bytes) = absorb(
+                &rel,
+                path,
+                &mut by_language,
+                &mut build_files,
+                &mut packages,
+                &mut file_stats,
+            );
+            total_loc += loc;
+            total_bytes += bytes;
+        }
+    }
+
+    // 仓库根/大目录聚合时，向祖先方向补查根级构建清单（目标目录本身可能不含 Cargo.toml，
+    // 而其父级是 workspace 根）。仅当目标在工作区内时向上回溯到工作区根，命中即补登记。
+    detect_ancestor_build_files(&workspace, &target, &mut build_files, &mut packages);
+
+    // 去重 + 排序，保持输出稳定且不重复。
+    build_files.sort();
+    build_files.dedup();
+    packages.sort_by(|a, b| a.path.cmp(&b.path));
+    packages.dedup_by(|a, b| a.path == b.path);
+
+    // 最大文件榜（LOC 降序，取前 N）。
+    file_stats.sort_by(|a, b| b.loc.cmp(&a.loc).then_with(|| a.path.cmp(&b.path)));
+    let largest_files: Vec<FileStat> = file_stats.into_iter().take(OVERVIEW_TOP_FILES).collect();
+
+    let suggested_verify_commands = suggested_commands(&packages);
+
+    let note = format!(
+        "LOC 口径=非空行（已去空白行）。symbols/tests 为按语言正则的启发式计数（尽力而为，未匹配=0，非 AST）。\
+         目录遍历尊重 .gitignore 并跳过隐藏文件；单文件超过 {} KiB 不读内容（仅计文件数），\
+         扫描文件数上限 {} / 累计字节上限 {} MiB，超限会置 truncated。largest_files 仅列 LOC 最大的前 {} 个文件。",
+        OVERVIEW_MAX_FILE_BYTES / 1024,
+        OVERVIEW_MAX_FILES,
+        OVERVIEW_MAX_TOTAL_BYTES / (1024 * 1024),
+        OVERVIEW_TOP_FILES,
+    );
+
+    Ok(CodeOverviewResult {
+        ok: true,
+        path: normalize_relative_path(&relative),
+        is_file,
+        total_files,
+        loc: total_loc,
+        by_language,
+        build_files,
+        packages,
+        suggested_verify_commands,
+        largest_files,
+        truncated,
+        note,
+    })
+}
+
+/// 按扩展名把文件归类为语言短名；未知归 "other"。
+fn language_for_path(rel: &str) -> &'static str {
+    let ext = rel.rsplit('.').next().filter(|e| !e.contains('/')).unwrap_or("");
+    match ext.to_ascii_lowercase().as_str() {
+        "rs" => "rs",
+        "ts" | "tsx" => "ts",
+        "js" | "jsx" | "mjs" | "cjs" => "js",
+        "py" | "pyi" => "py",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "rb" => "rb",
+        "php" => "php",
+        "cs" => "cs",
+        "kt" | "kts" => "kt",
+        "swift" => "swift",
+        _ => "other",
+    }
+}
+
+/// 识别构建/依赖清单文件，返回其构建系统类型；非构建文件返回 None。
+///
+/// 按 basename 匹配（含 *.csproj 这类后缀模式），覆盖常见生态。
+fn build_file_kind(rel: &str) -> Option<&'static str> {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    match name {
+        "Cargo.toml" => Some("cargo"),
+        "package.json" => Some("npm"),
+        "pyproject.toml" | "setup.py" | "requirements.txt" | "Pipfile" => Some("python"),
+        "go.mod" => Some("go"),
+        "pom.xml" => Some("maven"),
+        "build.gradle" | "build.gradle.kts" | "settings.gradle" | "settings.gradle.kts" => {
+            Some("gradle")
+        }
+        "Gemfile" => Some("ruby"),
+        "composer.json" => Some("php-composer"),
+        _ => {
+            if name.ends_with(".csproj") || name.ends_with(".fsproj") || name.ends_with(".sln") {
+                Some("dotnet")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// 从目标路径向工作区根回溯，补登记沿途的根级构建清单（如 Cargo.toml / package.json）。
+///
+/// 仓库根聚合时，目标目录自身可能不含清单（如统计 `crates/foo/src`），但其祖先含；
+/// 把这些祖先清单一并登记，便于给出「整工程」求真命令。只看常见清单文件名，不读内容。
+fn detect_ancestor_build_files(
+    workspace: &Path,
+    target: &Path,
+    build_files: &mut Vec<String>,
+    packages: &mut Vec<PackageEntry>,
+) {
+    // 从 target（若为文件取其父目录）向上，直到 workspace（含）为止。
+    let mut dir = if target.is_file() { target.parent() } else { Some(target) };
+    const MANIFESTS: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+        "requirements.txt",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "Gemfile",
+        "composer.json",
+    ];
+    while let Some(d) = dir {
+        for m in MANIFESTS {
+            let candidate = d.join(m);
+            if candidate.is_file() {
+                if let Some(kind) = build_file_kind(m) {
+                    // 用相对工作区的路径登记，便于人读与去重。
+                    let rel = candidate
+                        .strip_prefix(workspace)
+                        .unwrap_or(&candidate)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    build_files.push(rel.clone());
+                    packages.push(PackageEntry { path: rel, kind: kind.to_string() });
+                }
+            }
+        }
+        if d == workspace {
+            break;
+        }
+        dir = d.parent();
+    }
+}
+
+/// 按检测到的构建系统集合，给出建议的「求真」命令字符串（去重、稳定顺序，仅字符串、不执行）。
+fn suggested_commands(packages: &[PackageEntry]) -> Vec<String> {
+    let mut kinds: Vec<&str> = packages.iter().map(|p| p.kind.as_str()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let mut cmds: Vec<String> = Vec::new();
+    for kind in kinds {
+        match kind {
+            "cargo" => {
+                cmds.push("cargo test --workspace".to_string());
+                cmds.push("cargo build --workspace".to_string());
+            }
+            "npm" => {
+                cmds.push("npm test".to_string());
+                cmds.push("npm run build".to_string());
+            }
+            "python" => cmds.push("pytest".to_string()),
+            "go" => {
+                cmds.push("go test ./...".to_string());
+                cmds.push("go build ./...".to_string());
+            }
+            "maven" => cmds.push("mvn test".to_string()),
+            "gradle" => cmds.push("gradle test".to_string()),
+            "dotnet" => cmds.push("dotnet test".to_string()),
+            "ruby" => cmds.push("bundle exec rake test".to_string()),
+            "php-composer" => cmds.push("composer test".to_string()),
+            _ => {}
+        }
+    }
+    cmds.dedup();
+    cmds
+}
+
+/// 公开/导出符号计数（按语言正则启发式）。逐行扫描，未知语言返回 0。
+fn count_public_symbols(lang: &str, content: &str) -> usize {
+    let pattern = match lang {
+        // Rust：pub fn/struct/enum/trait/mod/const/type（含 pub(crate) 等可见性修饰）。
+        "rs" => r"^\s*pub(\s*\([^)]*\))?\s+(fn|struct|enum|trait|mod|const|type|static|union)\b",
+        // TS/JS：export 开头，或顶层 function/class（export default 也算）。
+        "ts" | "js" => {
+            r"^\s*export\s+|^\s*export\s+default\s+|^\s*(export\s+)?(async\s+)?function\s+|^\s*(export\s+)?(abstract\s+)?class\s+"
+        }
+        // Python：顶层或缩进的 def / class。
+        "py" => r"^\s*(def|class)\s+\w",
+        // Go：func / type（Go 没有 pub 关键字，导出靠大写，这里统计全部定义作规模信号）。
+        "go" => r"^func\s+|^type\s+\w",
+        // Java/Kotlin/C#：class/interface/enum（可带 public 修饰）。
+        "java" | "kt" | "cs" => {
+            r"^\s*(public\s+|internal\s+|open\s+)?(abstract\s+|final\s+|sealed\s+)?(class|interface|enum|object)\s+"
+        }
+        // Swift：func/class/struct/enum/protocol（可带 public/open）。
+        "swift" => {
+            r"^\s*(public\s+|open\s+)?(func|class|struct|enum|protocol)\s+"
+        }
+        // Ruby：def/class/module。
+        "rb" => r"^\s*(def|class|module)\s+",
+        // PHP：function/class/interface/trait（可带 public）。
+        "php" => r"^\s*(public\s+|abstract\s+|final\s+)?(function|class|interface|trait)\s+",
+        // C/C++：函数定义启发式——形如 `type name(...) {`，行尾带 `{`，排除控制流关键字。
+        "c" | "cpp" => {
+            r"^[A-Za-z_][\w\s\*&:<>,]*\b[A-Za-z_]\w*\s*\([^;]*\)\s*(const\s*)?\{"
+        }
+        _ => return 0,
+    };
+    count_line_matches(pattern, content)
+}
+
+/// 测试计数（按语言测试标记正则启发式）。未知语言返回 0。
+fn count_tests(lang: &str, content: &str) -> usize {
+    match lang {
+        // Rust：#[test] / #[tokio::test] / #[async_std::test] 等属性。
+        "rs" => count_matches_anywhere(r"#\[\s*(\w+::)?test\b", content),
+        // JS/TS：it( / test( / describe( 调用（含 .only/.each 变体前缀）。
+        "ts" | "js" => count_matches_anywhere(r"\b(it|test|describe)\s*(\.\w+)?\s*\(", content),
+        // Python：def test_ 函数 或 class Test 开头。
+        "py" => count_line_matches(r"^\s*(def\s+test_\w*|class\s+Test\w*)", content),
+        // Go：func TestXxx(t *testing.T) —— 以 func Test 开头即计。
+        "go" => count_line_matches(r"^func\s+Test\w*\s*\(", content),
+        // Java/Kotlin/C#：@Test 注解。
+        "java" | "kt" | "cs" => count_matches_anywhere(r"@Test\b", content),
+        // Swift：XCTest 的 func testXxx。
+        "swift" => count_line_matches(r"^\s*func\s+test\w*\s*\(", content),
+        // Ruby：RSpec/minitest 的 it/describe，或 def test_。
+        "rb" => count_matches_anywhere(r"\b(it|describe)\s+|^\s*def\s+test_\w*", content),
+        // PHP：PHPUnit 的 function testXxx 或 @test 注解。
+        "php" => count_matches_anywhere(r"function\s+test\w*\s*\(|@test\b", content),
+        _ => 0,
+    }
+}
+
+/// 逐行匹配计数：每行至多计 1（按行锚定的模式用此）。正则非法时返回 0（启发式不报错）。
+fn count_line_matches(pattern: &str, content: &str) -> usize {
+    let Ok(re) = regex::Regex::new(pattern) else { return 0 };
+    content.lines().filter(|line| re.is_match(line)).count()
+}
+
+/// 全文出现次数计数：统计 pattern 的全部不重叠匹配（行内可能多次的标记/调用用此）。
+fn count_matches_anywhere(pattern: &str, content: &str) -> usize {
+    let Ok(re) = regex::Regex::new(pattern) else { return 0 };
+    re.find_iter(content).count()
 }
 
 /// 在工作区内移动或重命名文件/目录。
@@ -1914,6 +2349,147 @@ mod tests {
         )
         .expect_err("empty command should be rejected");
         assert!(matches!(err, ToolRuntimeError::EmptyCommand));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn code_overview_counts_rust_symbols_tests_and_build_files() {
+        let workspace = temp_workspace();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            // 3 个公开符号（pub fn / pub struct / pub(crate) const）、2 个测试（#[test] / #[tokio::test]）。
+            "pub fn alpha() {}\n\
+             pub struct Beta;\n\
+             pub(crate) const GAMMA: u32 = 1;\n\
+             fn private_helper() {}\n\
+             \n\
+             #[test]\n\
+             fn t1() {}\n\
+             #[tokio::test]\n\
+             async fn t2() {}\n",
+        )
+        .unwrap();
+
+        let result = code_overview(
+            &workspace,
+            CodeOverviewRequest { path: ".".to_string() },
+        )
+        .expect("overview should run");
+
+        assert!(result.ok);
+        assert!(!result.is_file);
+        let rs = result.by_language.get("rs").expect("rs language present");
+        assert_eq!(rs.symbols, 3, "pub fn/struct/const 应计 3 个公开符号");
+        assert_eq!(rs.tests, 2, "#[test] 与 #[tokio::test] 应计 2 个测试");
+        assert!(rs.loc > 0);
+        // Cargo.toml 应被识别为构建文件，并给出 cargo 求真命令。
+        assert!(result.build_files.iter().any(|f| f == "Cargo.toml"));
+        assert!(result
+            .suggested_verify_commands
+            .iter()
+            .any(|c| c == "cargo test --workspace"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn code_overview_counts_typescript_exports_and_tests() {
+        let workspace = temp_workspace();
+        std::fs::write(
+            workspace.join("package.json"),
+            "{ \"name\": \"demo\", \"scripts\": { \"test\": \"vitest\" } }",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("util.ts"),
+            // 2 个导出符号（export function / export const）；2 个测试调用（describe( / it(）。
+            "export function add(a: number, b: number) { return a + b; }\n\
+             export const NAME = \"demo\";\n\
+             function helper() {}\n\
+             describe(\"add\", () => {\n\
+               it(\"adds\", () => {});\n\
+             });\n",
+        )
+        .unwrap();
+
+        let result = code_overview(
+            &workspace,
+            CodeOverviewRequest { path: ".".to_string() },
+        )
+        .expect("overview should run");
+
+        let ts = result.by_language.get("ts").expect("ts language present");
+        assert!(ts.symbols >= 2, "export function/const 应至少计 2 个符号，实得 {}", ts.symbols);
+        assert_eq!(ts.tests, 2, "describe( 与 it( 应计 2 个测试");
+        // package.json -> npm 求真命令。
+        assert!(result.build_files.iter().any(|f| f == "package.json"));
+        assert!(result.suggested_verify_commands.iter().any(|c| c == "npm test"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn code_overview_single_file_and_gitignore_aware() {
+        let workspace = temp_workspace();
+        std::fs::write(workspace.join(".gitignore"), "ignored.rs\n").unwrap();
+        std::fs::write(workspace.join("kept.rs"), "pub fn kept() {}\n").unwrap();
+        std::fs::write(workspace.join("ignored.rs"), "pub fn ignored() {}\n").unwrap();
+
+        // 目录聚合：被 .gitignore 命中的文件不应进入统计。
+        let dir = code_overview(
+            &workspace,
+            CodeOverviewRequest { path: ".".to_string() },
+        )
+        .expect("dir overview");
+        let rs = dir.by_language.get("rs").expect("rs present");
+        assert_eq!(rs.files, 1, "ignored.rs 应被 .gitignore 跳过");
+        assert_eq!(rs.symbols, 1);
+
+        // 单文件模式：is_file=true、只统计该文件。
+        let single = code_overview(
+            &workspace,
+            CodeOverviewRequest { path: "kept.rs".to_string() },
+        )
+        .expect("single-file overview");
+        assert!(single.is_file);
+        assert_eq!(single.total_files, 1);
+        assert_eq!(single.by_language.get("rs").unwrap().symbols, 1);
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn code_overview_aggregates_multiple_packages() {
+        let workspace = temp_workspace();
+        // 两个子包：一个 Cargo crate、一个 npm 包，验证多包检测与多套求真命令聚合。
+        std::fs::create_dir_all(workspace.join("crates/core/src")).unwrap();
+        std::fs::write(workspace.join("crates/core/Cargo.toml"), "[package]\nname=\"core\"\n").unwrap();
+        std::fs::write(workspace.join("crates/core/src/lib.rs"), "pub fn x() {}\n").unwrap();
+        std::fs::create_dir_all(workspace.join("web/src")).unwrap();
+        std::fs::write(workspace.join("web/package.json"), "{ \"name\": \"web\" }").unwrap();
+        std::fs::write(workspace.join("web/src/app.ts"), "export const A = 1;\n").unwrap();
+
+        let result = code_overview(
+            &workspace,
+            CodeOverviewRequest { path: ".".to_string() },
+        )
+        .expect("repo-root overview");
+
+        // 两套构建系统都应被检测到。
+        assert!(result.packages.iter().any(|p| p.kind == "cargo"));
+        assert!(result.packages.iter().any(|p| p.kind == "npm"));
+        assert!(result.suggested_verify_commands.iter().any(|c| c == "cargo test --workspace"));
+        assert!(result.suggested_verify_commands.iter().any(|c| c == "npm test"));
+        // 两种语言都应出现在聚合里。
+        assert!(result.by_language.contains_key("rs"));
+        assert!(result.by_language.contains_key("ts"));
 
         let _ = std::fs::remove_dir_all(workspace);
     }

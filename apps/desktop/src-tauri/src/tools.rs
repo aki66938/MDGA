@@ -7,11 +7,11 @@ use crate::permissions::tool_capability_for_name;
 use crate::web::{execute_web_fetch, execute_web_search};
 use mdga_sandbox_runtime::SessionSecurityContext;
 use mdga_tool_runtime::{
-    create_file, delete_dir, delete_file, edit_file, glob_files, list_dir, make_dir, move_path,
-    read_file, run_command, search_text, stat_path, write_file, CreateFileRequest, DeleteDirRequest,
-    DeleteFileRequest, EditFileRequest, GlobFilesRequest, ListDirRequest, MakeDirRequest,
-    MovePathRequest, ReadFileRequest, RunCommandRequest, SearchTextRequest, StatPathRequest,
-    WriteFileRequest,
+    code_overview, create_file, delete_dir, delete_file, edit_file, glob_files, list_dir, make_dir,
+    move_path, read_file, run_command, search_text, stat_path, write_file, CodeOverviewRequest,
+    CreateFileRequest, DeleteDirRequest, DeleteFileRequest, EditFileRequest, GlobFilesRequest,
+    ListDirRequest, MakeDirRequest, MovePathRequest, ReadFileRequest, RunCommandRequest,
+    SearchTextRequest, StatPathRequest, WriteFileRequest,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -125,8 +125,17 @@ pub(crate) fn execute_todo_write(app: &AppHandle, arguments: &str) -> Result<ser
 }
 
 /// 可并行执行的只读工具集合（无副作用，并发安全）。
-pub(crate) const PARALLEL_READONLY_TOOLS: &[&str] =
-    &["read_file", "list_dir", "search_text", "glob_files", "stat_path", "web_fetch", "web_search"];
+/// code_overview（Plan28 P0-2）只读并统计代码结构，与 search_text 同属只读、可并行。
+pub(crate) const PARALLEL_READONLY_TOOLS: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "search_text",
+    "glob_files",
+    "stat_path",
+    "code_overview",
+    "web_fetch",
+    "web_search",
+];
 
 /// 执行一个只读工具调用（同步文件工具或异步 web 工具），供并行批量执行。
 pub(crate) async fn execute_readonly_call(
@@ -263,6 +272,22 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                         "maxResults": { "type": "integer", "description": "Cap on returned file paths." }
                     },
                     "required": ["pattern"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        // code_overview（Plan28 P0-2，Lane B）：语言无关的「求真」概览，给模型在下结论前拿事实。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "code_overview",
+                "description": "Get GROUNDED structural FACTS about a file, module, or package inside the workspace BEFORE concluding anything about it — especially before claiming it is an 'empty shell', has 'no real code', or has 'few tests'. Language-agnostic: returns lines of code, public/exported symbol counts, test counts, and detected build/dependency files, aggregated by language. For a directory or repo root it also lists detected packages/crates and suggests verify commands (e.g. 'cargo test --workspace', 'npm test', 'pytest', 'go test ./...') as STRINGS only (it does not run them). Use this instead of guessing from dependency manifests, directory listings, or file names — 'few dependencies' or 'small file' does NOT mean 'no code'. Lightweight (regex heuristics, no AST); large directories are capped and truncated.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path inside the workspace. Use \".\" for the workspace root; may be a file or a directory." }
+                    },
+                    "required": ["path"],
                     "additionalProperties": false
                 }
             }
@@ -706,6 +731,14 @@ pub(crate) fn execute_builtin_tool_call(
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
             serde_json::to_value(glob_files(workspace_path, request).map_err(|err| err.to_string())?)
                 .map_err(|err| err.to_string())
+        }
+        "code_overview" => {
+            let request = serde_json::from_str::<CodeOverviewRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(
+                code_overview(workspace_path, request).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())
         }
         "move_path" => {
             let request = serde_json::from_str::<MovePathRequest>(arguments)
