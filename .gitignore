@@ -32,3 +32,6 @@ desktop.ini
 
 # ── Claude Code local settings ──
 .claude/
+
+# Agent 运行时大输出落盘（非源码）
+.mdga/tool-results/

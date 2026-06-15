@@ -299,6 +299,20 @@ impl DeepSeekError {
     }
 }
 
+/// 流式回调推送的增量分片：区分「外显正文」与「推理过程」两类。
+///
+/// Plan27 C1（#1a 推理可见）：DeepSeek 等模型的 SSE 流里，`delta.content` 是面向用户的
+/// 最终回答正文，`delta.reasoning_content` 是模型的思考过程。二者需分流到不同的前端事件
+/// （`chat-chunk` / `chat-reasoning`），故回调形参由 `&str` 升级为本枚举携带来源标签。
+/// 借用底层缓冲区字符串切片，生命周期 `'a` 不超过单次回调调用，零拷贝。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamChunk<'a> {
+    /// 外显正文增量（仍走防泄漏守卫，剔除工具调用标记后才外显）。
+    Content(&'a str),
+    /// 推理过程增量（原样流出，不走防泄漏守卫）。
+    Reasoning(&'a str),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -362,18 +376,18 @@ pub(crate) fn classify_api_error(status: u16, body: &str) -> DeepSeekError {
 
 /// 向 OpenAI 兼容端点发起流式聊天请求，通过回调逐块推送内容，完成后返回原始 usage。
 ///
-/// 输入 base_url（已解析的官方/自定义端点）、API Key、消息列表和模型名；每收到内容 chunk
-/// 调用一次 on_chunk；流结束后返回服务端原始 usage（若缺失则返回 None）；
-/// 错误时流中断，on_chunk 不再被调用。
+/// 输入 base_url（已解析的官方/自定义端点）、API Key、消息列表和模型名；每收到分片调用一次
+/// `on_chunk`，参数为 [`StreamChunk`]：正文增量为 `Content`、推理过程增量为 `Reasoning`；
+/// 流结束后返回服务端原始 usage（若缺失则返回 None）；错误时流中断，`on_chunk` 不再被调用。
 pub async fn chat_stream<F>(
     base_url: &str,
     api_key: &str,
     messages: Vec<ChatMessage>,
     model: &str,
-    on_chunk: F,
+    mut on_chunk: F,
 ) -> Result<Option<RawUsage>, DeepSeekError>
 where
-    F: Fn(String),
+    F: FnMut(StreamChunk<'_>),
 {
     // 流式请求只限连接超时，不设总超时（长回复的流式读取可能远超固定时长）。
     let client = Client::builder()
@@ -436,13 +450,23 @@ where
                         }
                     }
 
+                    // 推理 chunk：从 choices[0].delta.reasoning_content 取文本，原样流出（不走守卫）
+                    if let Some(reasoning) = value
+                        .pointer("/choices/0/delta/reasoning_content")
+                        .and_then(|v| v.as_str())
+                    {
+                        if !reasoning.is_empty() {
+                            on_chunk(StreamChunk::Reasoning(reasoning));
+                        }
+                    }
+
                     // 内容 chunk：从 choices[0].delta.content 取文本
                     if let Some(content) = value
                         .pointer("/choices/0/delta/content")
                         .and_then(|v| v.as_str())
                     {
                         if !content.is_empty() {
-                            on_chunk(content.to_string());
+                            on_chunk(StreamChunk::Content(content));
                         }
                     }
                 }
@@ -474,18 +498,20 @@ fn tool_markup_index(content: &str) -> Option<usize> {
 /// 带工具的流式聊天：边流边把**安全的**叙述内容通过回调推送（token 级），
 /// 同时累积 delta.tool_calls，结束后返回结构化结果。
 ///
+/// 回调参数为 [`StreamChunk`]：正文增量为 `Content`、推理过程增量为 `Reasoning`。
 /// 内置防泄漏守卫：一旦检测到正文出现工具调用标记（DSML / `<ToolCall>`），停止外显后续内容，
 /// 把整段标记留给上层 DSML 兜底解析，避免标记 token 流到界面。完整 content 仍在返回值里供解析。
+/// 推理增量（`Reasoning`）原样流出，**不**走防泄漏守卫。
 pub async fn chat_stream_with_tools<F>(
     base_url: &str,
     api_key: &str,
     messages: Vec<serde_json::Value>,
     model: &str,
     tools: Vec<serde_json::Value>,
-    on_content: F,
+    mut on_content: F,
 ) -> Result<ChatCompletionResult, DeepSeekError>
 where
-    F: Fn(String),
+    F: FnMut(StreamChunk<'_>),
 {
     const GUARD: usize = 12; // 末尾保留窗口，防止正在形成的标记被提前外显
     let client = Client::builder()
@@ -566,6 +592,15 @@ where
                     }
                 }
             }
+            // 推理片段：原样外显，不走防泄漏守卫
+            if let Some(reasoning) = value
+                .pointer("/choices/0/delta/reasoning_content")
+                .and_then(|v| v.as_str())
+            {
+                if !reasoning.is_empty() {
+                    on_content(StreamChunk::Reasoning(reasoning));
+                }
+            }
             // 内容片段：守卫式外显
             if let Some(delta) = value
                 .pointer("/choices/0/delta/content")
@@ -577,7 +612,7 @@ where
                         if let Some(marker) = tool_markup_index(&content_full) {
                             // 命中标记：外显到标记前，之后停止外显
                             if marker > emitted_bytes {
-                                on_content(content_full[emitted_bytes..marker].to_string());
+                                on_content(StreamChunk::Content(&content_full[emitted_bytes..marker]));
                             }
                             emitted_bytes = content_full.len();
                             leaked = true;
@@ -585,7 +620,7 @@ where
                             // 未命中：外显到 len-GUARD（在字符边界上）
                             let safe_end = content_full.len().saturating_sub(GUARD);
                             if safe_end > emitted_bytes && content_full.is_char_boundary(safe_end) {
-                                on_content(content_full[emitted_bytes..safe_end].to_string());
+                                on_content(StreamChunk::Content(&content_full[emitted_bytes..safe_end]));
                                 emitted_bytes = safe_end;
                             }
                         }
@@ -596,7 +631,7 @@ where
     }
     // 收尾：未泄漏时把保留窗口里的安全尾巴补发
     if !leaked && content_full.len() > emitted_bytes {
-        on_content(content_full[emitted_bytes..].to_string());
+        on_content(StreamChunk::Content(&content_full[emitted_bytes..]));
     }
 
     let tool_calls: Vec<ToolCall> = tool_acc

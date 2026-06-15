@@ -4,7 +4,8 @@
 //! 从 main.rs 抽出（Plan16）：纯代码搬移，无行为变更。
 
 use mdga_deepseek_client::{
-    chat_completion, chat_stream_with_tools, parse_dsml_tool_calls, ChatMessage, ToolCall,
+    chat_completion, chat_stream_with_tools, parse_dsml_tool_calls, ChatMessage, StreamChunk,
+    ToolCall,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -78,8 +79,16 @@ pub(crate) async fn stream_round_with_retry(
             &model,
             tools.clone(),
             move |chunk| {
+                // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
                 emitted_cb.store(true, Ordering::SeqCst);
-                let _ = app_cb.emit("chat-chunk", chunk);
+                match chunk {
+                    StreamChunk::Content(c) => {
+                        let _ = app_cb.emit("chat-chunk", c.to_string());
+                    }
+                    StreamChunk::Reasoning(r) => {
+                        let _ = app_cb.emit("chat-reasoning", r.to_string());
+                    }
+                }
             },
         )
         .await;

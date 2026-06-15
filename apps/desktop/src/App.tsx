@@ -11,8 +11,24 @@ import {
   ListChecks, Square, ArrowUp, GitCompare, Plug, Sun, Moon,
   Check, X, Ban, Info, CircleDot, CheckSquare, ChevronRight,
   ChevronDown, FolderOpen, Gauge, AtSign, CornerDownRight, Eye, EyeOff, Lock,
-  Copy, RefreshCw, Pencil, Plus, MessageCircle,
+  Copy, RefreshCw, Pencil, Plus, MessageCircle, Cpu,
+  Brain, HelpCircle, CornerDownLeft,
 } from "lucide-react";
+
+/** 权限模式在底栏胶囊里的精简标签（设置页仍用完整 getPermissionModeLabel）。 */
+const PERMISSION_SHORT: Record<string, string> = {
+  restricted: "受限",
+  ask_every_time: "询问",
+  workspace_auto: "自动",
+  full_access: "完全",
+};
+
+/** token 数精简成 k/M（对标 Claude 的「576.5k / 1.0M」）。 */
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return `${n}`;
+}
 
 /** MDGA 品牌标识：深海声纳波纹（致敬 DeepSeek 的「deep」，非官方鲸鱼 logo） */
 function BrandMark({ size = 24 }: { size?: number }) {
@@ -74,6 +90,9 @@ type FileCheckpoint = {
 };
 
 type AppInfo = { version: string; dataDir: string };
+
+/** 最近被拦动作（Plan27 #9）：recent_denied_actions 返回，用于一键加规则。 */
+type DeniedAction = { toolName: string; target: string };
 
 /** DeepSeek 账户余额（官方 /user/balance，唯一账户信息来源） */
 type BalanceInfo = {
@@ -148,7 +167,13 @@ type VisionPart = {
   usage?: RawUsageWire | null;
 };
 
-type MessagePart = TextPart | ToolPart | NoticePart | ImagePart | VisionPart;
+/**
+ * 思考过程块（Plan27 #1a）：流式监听 "chat-reasoning" 累积模型 reasoning_content，
+ * 作为助手消息 parts 的一员持久化（排在 vision 之后、正文之前）。默认折叠的「🧠 思考过程」卡片。
+ */
+type ReasoningPart = { type: "reasoning"; content: string };
+
+type MessagePart = TextPart | ToolPart | NoticePart | ImagePart | VisionPart | ReasoningPart;
 
 type Message = {
   role: "user" | "assistant";
@@ -258,8 +283,19 @@ type ProviderConfig = {
   modelId: string;
   /** 视觉 provider 的 API 格式（openai|anthropic）；主模型恒 openai。 */
   apiFormat?: string | null;
+  /** 上下文窗口（tokens，可选，Plan27 #2）：后端据此推导压缩软上限；缺省回退默认值。 */
+  contextWindow?: number | null;
   enabled: boolean;
   updatedAt?: number | null;
+};
+
+/** 各预设的常见上下文窗口（tokens，Plan27 #2）：保存时可预填，留空亦可。 */
+const PRESET_CONTEXT_WINDOW: Record<string, number | null> = {
+  deepseek: 1000000,
+  zhipu: 128000,
+  moonshot: 128000,
+  qwen: 131072,
+  custom: null,
 };
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"];
@@ -274,6 +310,7 @@ const SLASH_COMMANDS: Array<{ cmd: string; desc: string }> = [
   { cmd: "/init", desc: "让 Agent 分析项目并生成 MDGA.md 长期记忆" },
   { cmd: "/rewind", desc: "打开文件变更记录，可回退改动" },
   { cmd: "/model", desc: "打开 设置 → 模型供应商，修改主模型" },
+  { cmd: "/help", desc: "查看 MDGA 能做什么（工作区、@引用、命令、快捷键等）" },
 ];
 
 /** /init 发送的固定提示词（对标 CC 的 /init 生成 CLAUDE.md） */
@@ -347,22 +384,39 @@ export function App() {
   // @文件引用补全
   const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
   const [fileMention, setFileMention] = useState<string | null>(null);
+  // 斜杠菜单 / @文件菜单的键盘高亮项（Plan27 #7）：方向键移动、Enter 选中、Esc 关。
+  const [slashActive, setSlashActive] = useState(0);
+  const [mentionActive, setMentionActive] = useState(0);
+  // 工作区胶囊菜单容器（Plan27 #7）：打开时聚焦首项 + 方向键漫游 + Esc 关。
+  const workspaceMenuRef = useRef<HTMLDivElement>(null);
   // 待发送的附图（Plan18 M18.1）：📎 选图后暂存，发送时随 send_message 上送，发送框上方显示缩略图。
   const [pendingImages, setPendingImages] = useState<ImagePart[]>([]);
   // 拖拽图片悬停高亮（Plan19 P0b）：dragenter/over 置 true，drop/leave 置 false。
   const [dragOver, setDragOver] = useState(false);
-  // 上下文用量（上次请求 prompt_tokens / 压缩阈值），常驻状态栏
+  // 上下文用量（上次请求 prompt_tokens / 压缩阈值）。移入底栏指示器（Plan26）。
   const [ctxUsage, setCtxUsage] = useState<{ promptTokens: number; softLimit: number } | null>(null);
+  // 上下文指示器弹层开关（Plan26）。
+  const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false);
   const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
   // 全局 toast（Plan20 🔴2）：不依赖消息列表的右下角通知，承载用户主动操作的即时成败。
   const [toasts, setToasts] = useState<Toast[]>([]);
   // 粘底滚动（Plan20 🟠4）：贴底时才自动跟随；非贴底显示「跳到最新」并暂停跟随。
   const [isAtBottom, setIsAtBottom] = useState(true);
+  // 长会话分段渲染（Plan27 #8）：仅渲染最近 visibleCount 条，顶部「加载更早」逐段放开，
+  // 避免数百条消息一次性渲染卡顿。切换会话时复位。
+  const MSG_WINDOW = 60; // 初始/每次加载的窗口步长
+  const [visibleCount, setVisibleCount] = useState(MSG_WINDOW);
   const messageListRef = useRef<HTMLElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const streamingTextRef = useRef(""); // 只累积纯文字内容，用于 chat-done 持久化（供模型上下文）
   const streamingPartsRef = useRef<MessagePart[]>([]); // 跟踪当前 assistant 的完整 parts，用于持久化交错的工具卡片
   const streamingUsageRef = useRef<UsageSummary | null>(null);
+  // 命令面板（Plan27 #3a）：Ctrl/Cmd+K 打开的居中浮层。
+  const [showCommandPalette, setShowCommandPalette] = useState(false);
+  // /help 能力披露面板（Plan27 #3b）：纯静态。
+  const [showHelp, setShowHelp] = useState(false);
+  // 正文搜索结果（Plan27 #6）：query 非空时改调 search_conversations，结果存此；null=用本地全量列表。
+  const [searchResults, setSearchResults] = useState<Conversation[] | null>(null);
 
   useEffect(() => {
     invoke<string>("get_deepseek_api_key_status")
@@ -398,8 +452,33 @@ export function App() {
     loadConversations();
   }, []);
 
+  // 输入变化时把斜杠/＠菜单高亮复位到首项（Plan27 #7）。
+  useEffect(() => { setSlashActive(0); }, [input]);
+  useEffect(() => { setMentionActive(0); }, [fileMention]);
+
+  // 工作区菜单打开时聚焦首个菜单项（Plan27 #7）。
+  useEffect(() => {
+    if (workspaceMenuOpen) {
+      workspaceMenuRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    }
+  }, [workspaceMenuOpen]);
+
+  // 正文搜索（Plan27 #6）：query 非空时防抖（~250ms）调 search_conversations（标题或正文命中）；
+  // 空则清结果回退本地全量列表。
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q) { setSearchResults(null); return; }
+    const timer = setTimeout(() => {
+      invoke<Conversation[]>("search_conversations", { query: q })
+        .then((list) => setSearchResults(Array.isArray(list) ? list : []))
+        .catch(() => setSearchResults([]));
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
   useEffect(() => {
     setIsAtBottom(true); // 切换会话回到贴底跟随（Plan20 🟠4）
+    setVisibleCount(MSG_WINDOW); // 切换会话复位分段渲染窗口（Plan27 #8）
     if (!activeConvId) { setMessages([]); return; }
     invoke<StoredMessage[]>("load_messages", { conversationId: activeConvId })
       .then((stored) => setMessages(stored.map(storedToMessage)))
@@ -695,6 +774,7 @@ export function App() {
     setPlanMode(false);
     setQueuedSteering([]);
     setWorkspaceMenuOpen(false);
+    setCtxPopoverOpen(false);
     // C-4：跨会话清除待批准态与本轮计划标记，避免上一会话的计划闭环残留到新会话。
     setAwaitingPlanApproval(false);
     planRoundRef.current = false;
@@ -828,6 +908,11 @@ export function App() {
         setInput("");
         await openChangesPanel();
         return true;
+      case "/help":
+        // Plan27 #3b：打开「能做什么」披露面板，纯静态。
+        setInput("");
+        setShowHelp(true);
+        return true;
       case "/model": {
         // Plan20 🔴1：模型唯一真相源 = 主 provider 的 model_id。/model 不再切 DeepSeek 清单，
         // 直接打开 设置 → 模型供应商，由用户在那里改 model_id。
@@ -937,8 +1022,23 @@ export function App() {
 
     // 构建发给后端的消息：用户消息 parts 含文字 + 附图缩略图（图片仅前端展示，后端按 images 参数单独识图）。
     const outgoing: Message[] = [...messages, { role: "user", parts: userParts }];
-    setMessages([...outgoing, { role: "assistant", parts: [] }]);
     setInput("");
+    await streamAgent(convId, outgoing, outImages, executePlan);
+  }
+
+  /**
+   * 与后端跑一轮 Agent 流式对话（Plan27 #1b 抽取自 sendText 复用）。
+   * 负责：插入空助手占位 → 注册全部流式监听 → invoke("send_message") → chat-done 收尾持久化。
+   * @param convId 目标会话；@param outgoing 发给后端的完整历史（含本轮 user，但 rerun 时末条为 user 而非新增）；
+   * @param outImages 本轮附图（rerun 传空）；@param executePlan C-4 透传。
+   */
+  async function streamAgent(
+    convId: string,
+    outgoing: Message[],
+    outImages: ImagePart[],
+    executePlan: boolean,
+  ) {
+    setMessages([...outgoing, { role: "assistant", parts: [] }]);
     setSending(true);
     streamingTextRef.current = "";
     streamingPartsRef.current = [];
@@ -960,6 +1060,32 @@ export function App() {
           parts[parts.length - 1] = { type: "text", content: tail.content + e.payload };
         } else {
           parts.push({ type: "text", content: e.payload });
+        }
+        updated[lastIdx] = { ...last, parts };
+        streamingPartsRef.current = parts;
+        return updated;
+      });
+    });
+
+    // chat-reasoning（Plan27 #1a）：累积模型 reasoning_content 增量到当前助手消息的 reasoning part。
+    // reasoning 卡片排在该助手消息最前（在 vision 卡片之后、正文之前）：若已存在则原地累积，否则新插入。
+    const unlistenReasoning = await listen<string>("chat-reasoning", (e) => {
+      setAgentStatus("正在思考…");
+      setMessages((prev) => {
+        const updated = [...prev];
+        const lastIdx = updated.length - 1;
+        const last = updated[lastIdx];
+        if (!last || last.role !== "assistant") return prev;
+        const parts = [...last.parts];
+        const existingIdx = parts.findIndex((p) => p.type === "reasoning");
+        if (existingIdx >= 0) {
+          const cur = parts[existingIdx] as ReasoningPart;
+          parts[existingIdx] = { type: "reasoning", content: cur.content + e.payload };
+        } else {
+          // 插入位置：所有前置 vision 卡片之后（vision 始终在最前），其余内容之前。
+          let insertAt = 0;
+          while (insertAt < parts.length && parts[insertAt].type === "vision") insertAt++;
+          parts.splice(insertAt, 0, { type: "reasoning", content: e.payload });
         }
         updated[lastIdx] = { ...last, parts };
         streamingPartsRef.current = parts;
@@ -1083,6 +1209,7 @@ export function App() {
       setAskUser(null);
       setQueuedSteering([]);
       unlistenChunk();
+      unlistenReasoning();
       unlistenTool();
       unlistenStatus();
       unlistenCtx();
@@ -1183,6 +1310,7 @@ export function App() {
       if (outImages.length > 0) setPendingImages(outImages);
       setSending(false);
       unlistenChunk();
+      unlistenReasoning();
       unlistenTool();
       unlistenStatus();
       unlistenCtx();
@@ -1190,6 +1318,35 @@ export function App() {
       unlistenUsage();
       unlistenDone();
     }
+  }
+
+  /**
+   * 重新生成（Plan27 #1b）：删该会话最后一条助手消息 → 从 messages 去掉它 →
+   * 以截至上一条 user 的历史重跑（不新增 user 消息，复用 streamAgent 流式流程）。
+   * 仅对「最后一条助手消息」启用；sending 中禁用。
+   */
+  async function handleRegenerate() {
+    if (sending || !activeConvId) return;
+    // 找到最后一条助手消息的下标。
+    let lastAssistantIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") { lastAssistantIdx = i; break; }
+    }
+    if (lastAssistantIdx < 0) return;
+    // 截至上一条（即助手消息之前的全部历史，末条应为 user）。
+    const history = messages.slice(0, lastAssistantIdx);
+    if (history.length === 0 || history[history.length - 1].role !== "user") return;
+    // 后端删最后一条助手消息（持久化层）；失败则中止，避免重复回复。
+    const ok = await invoke<boolean>("delete_last_assistant_message", { conversationId: activeConvId })
+      .catch(() => false);
+    if (!ok) {
+      pushToast("error", "无法删除上一条回复，重新生成已取消。");
+      return;
+    }
+    // C-4：重新生成不是计划轮；清待批准态。
+    planRoundRef.current = false;
+    setAwaitingPlanApproval(false);
+    await streamAgent(activeConvId, history, [], false);
   }
 
   /** 把一条消息的全部文字提取为纯文本（用于复制 / 重发 / 编辑回填）。 */
@@ -1256,22 +1413,48 @@ export function App() {
   // F3：Esc 关闭/取消当前弹窗。用 ref 镜像最新状态与处理函数，
   // 监听器只注册一次也能读到最新值，规避闭包陈旧问题。
   const escState = useRef({
-    approval, askUser, showChanges, showSettings,
-    respondApproval, respondAskUser, setShowChanges, setShowSettings,
+    approval, askUser, showChanges, showSettings, showHelp, showCommandPalette,
+    respondApproval, respondAskUser, setShowChanges, setShowSettings, setShowHelp, setShowCommandPalette,
   });
   escState.current = {
-    approval, askUser, showChanges, showSettings,
-    respondApproval, respondAskUser, setShowChanges, setShowSettings,
+    approval, askUser, showChanges, showSettings, showHelp, showCommandPalette,
+    respondApproval, respondAskUser, setShowChanges, setShowSettings, setShowHelp, setShowCommandPalette,
   };
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
       const s = escState.current;
-      // 优先级：审批 → 提问 → 变更 → 设置（审批/提问 Esc=拒绝/取消）。
+      // 优先级：审批 → 提问 → 命令面板 → 帮助 → 变更 → 设置（审批/提问 Esc=拒绝/取消）。
       if (s.approval) { s.respondApproval(false); return; }
       if (s.askUser) { s.respondAskUser(""); return; }
+      if (s.showCommandPalette) { s.setShowCommandPalette(false); return; }
+      if (s.showHelp) { s.setShowHelp(false); return; }
       if (s.showChanges) { s.setShowChanges(false); return; }
       if (s.showSettings) { s.setShowSettings(false); return; }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  // 全局快捷键（Plan27 #3a）：Ctrl/Cmd+N 新对话、Ctrl/Cmd+K 命令面板、Ctrl/Cmd+, 设置。
+  // 同样用 ref 镜像处理函数，规避闭包陈旧；只注册一次。
+  const shortcutState = useRef({ handleNewConversation, openSettings, setShowCommandPalette });
+  shortcutState.current = { handleNewConversation, openSettings, setShowCommandPalette };
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const s = shortcutState.current;
+      const key = e.key.toLowerCase();
+      if (key === "n") {
+        e.preventDefault();
+        void s.handleNewConversation();
+      } else if (key === "k") {
+        e.preventDefault();
+        s.setShowCommandPalette(true);
+      } else if (e.key === ",") {
+        e.preventDefault();
+        void s.openSettings();
+      }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -1543,6 +1726,56 @@ export function App() {
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    // 斜杠菜单键盘导航（Plan27 #7）：方向键移动、Enter 选中、Esc 关。
+    if (slashMenuOpen && slashMenuItems.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSlashActive((i) => Math.min(i + 1, slashMenuItems.length - 1));
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSlashActive((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        const item = slashMenuItems[Math.min(slashActive, slashMenuItems.length - 1)];
+        if (item && !item.conflict) {
+          e.preventDefault();
+          setInput(item.cmd);
+          return;
+        }
+      }
+      if (e.key === "Escape") {
+        // 退出斜杠菜单：清空 / 前缀（保留已输入内容简单起见直接清空 input）。
+        e.preventDefault();
+        setInput("");
+        return;
+      }
+    }
+    // @文件菜单键盘导航（Plan27 #7）。
+    if (mentionMenuOpen && mentionItems.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setMentionActive((i) => Math.min(i + 1, mentionItems.length - 1));
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setMentionActive((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        applyFileMention(mentionItems[Math.min(mentionActive, mentionItems.length - 1)]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setFileMention(null);
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       if (sending) {
@@ -1550,6 +1783,25 @@ export function App() {
       } else {
         handleSend();
       }
+    }
+  }
+
+  /** 弹层菜单通用键盘漫游（Plan27 #7）：方向键在菜单项间移动焦点，Esc 关闭并回退焦点。 */
+  function handleMenuKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    const container = e.currentTarget;
+    const items = Array.from(container.querySelectorAll<HTMLButtonElement>('button:not([disabled])'));
+    if (items.length === 0) return;
+    const curIdx = items.indexOf(document.activeElement as HTMLButtonElement);
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      items[Math.min(curIdx + 1, items.length - 1)]?.focus();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      items[Math.max(curIdx - 1, 0)]?.focus();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setWorkspaceMenuOpen(false);
+      setCtxPopoverOpen(false);
     }
   }
 
@@ -1574,14 +1826,49 @@ export function App() {
   }
 
   const hasMessages = messages.length > 0;
+  // 最后一条助手消息下标（Plan27 #1b）：仅它显示「重新生成」按钮。-1 表示无助手消息。
+  let lastAssistantIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant") { lastAssistantIdx = i; break; }
+  }
   const activeConversation = conversations.find((conv) => conv.id === activeConvId);
   const conversationUsage = aggregateUsage(messages);
 
-  // 侧边栏列表：按标题搜索过滤，归档的拆到独立折叠区（置顶排序由后端 SQL 保证）
-  const query = searchQuery.trim().toLowerCase();
-  const filteredConversations = conversations.filter(
-    (c) => !query || c.title.toLowerCase().includes(query)
-  );
+  // 斜杠菜单可见项（Plan27 #7：提到 render 顶层供键盘导航与 JSX 共用）。
+  const slashMenuOpen = input.startsWith("/") && !input.includes(" ") && !sending;
+  const slashMenuItems = slashMenuOpen
+    ? [
+        ...SLASH_COMMANDS.map((c) => ({ cmd: c.cmd, desc: c.desc, conflict: false })),
+        ...customCommands.map((c) => ({
+          cmd: c.name,
+          desc: c.description || "自定义命令",
+          conflict: SLASH_COMMANDS.some((b) => b.cmd === c.name),
+        })),
+      ].filter((c) => c.cmd.startsWith(input))
+    : [];
+  // 分段渲染窗口（Plan27 #8）：只渲染最近 visibleCount 条；更早的折叠到顶部「加载更早」。
+  const windowStart = Math.max(0, messages.length - visibleCount);
+  const visibleMessages = messages.slice(windowStart);
+  const hiddenCount = windowStart;
+
+  // @文件菜单可见项。
+  const mentionMenuOpen = fileMention !== null && workspaceFiles.length > 0;
+  const mentionItems = mentionMenuOpen
+    ? workspaceFiles
+        .filter((f) => f.toLowerCase().includes((fileMention ?? "").toLowerCase()))
+        .slice(0, 8)
+    : [];
+  // 上下文占用百分比（Plan26 底栏指示器）：无数据时为 null。
+  const ctxPct = ctxUsage && ctxUsage.softLimit > 0
+    ? Math.round((ctxUsage.promptTokens / ctxUsage.softLimit) * 100)
+    : null;
+
+  // 侧边栏列表（Plan27 #6）：搜索词非空时用后端正文搜索结果（searchResults，标题或正文命中），
+  // 空时回退本地全量列表；归档的拆到独立折叠区（置顶排序由后端 SQL 保证）。
+  const query = searchQuery.trim();
+  const filteredConversations = query
+    ? (searchResults ?? [])
+    : conversations;
   const visibleConversations = filteredConversations.filter((c) => !c.archived);
   const archivedConversations = filteredConversations.filter((c) => c.archived);
 
@@ -1755,15 +2042,7 @@ export function App() {
             <h1>MDGA</h1>
           </div>
           <div className="status-strip" aria-label="status">
-            {/* B3：工作区身份已由 composer 底部胶囊承载，顶栏不再重复 chip；仅保留上下文% 与「变更」。 */}
-            {ctxUsage && ctxUsage.softLimit > 0 && (
-              <span
-                className="chip chip--accent"
-                title={`上次请求 ${ctxUsage.promptTokens.toLocaleString()} tokens / 自动压缩阈值 ${ctxUsage.softLimit.toLocaleString()}`}
-              >
-                <Gauge size={13} /> {Math.round((ctxUsage.promptTokens / ctxUsage.softLimit) * 100)}%
-              </span>
-            )}
+            {/* 工作区身份由 composer 底部胶囊承载、上下文用量由底栏指示器承载（Plan26），顶栏仅保留「变更」。 */}
             {activeConvId && (
               <button
                 className="topbar-btn"
@@ -1784,23 +2063,38 @@ export function App() {
             ref={messageListRef}
             onScroll={handleMessageListScroll}
           >
-            {messages.map((msg, i) => (
-              <div key={i} className="message-row">
-                <div className={`message message--${msg.role}`}>
-                  <MessageContent msg={msg} />
+            {/* 顶部「加载更早」（Plan27 #8）：仍有更早消息未渲染时显示，点击放开一段窗口。 */}
+            {hiddenCount > 0 && (
+              <button
+                type="button"
+                className="load-earlier"
+                onClick={() => setVisibleCount((c) => c + MSG_WINDOW)}
+              >
+                <ChevronDown size={14} style={{ transform: "rotate(180deg)" }} /> 加载更早的 {Math.min(MSG_WINDOW, hiddenCount)} 条消息（还有 {hiddenCount} 条）
+              </button>
+            )}
+            {visibleMessages.map((msg, j) => {
+              const i = windowStart + j; // 原始下标，用于 key 与 lastAssistant 判定
+              return (
+                <div key={i} className="message-row">
+                  <div className={`message message--${msg.role}`}>
+                    <MessageContent msg={msg} />
+                  </div>
+                  <MessageActions
+                    msg={msg}
+                    disabled={sending}
+                    isLastAssistant={msg.role === "assistant" && i === lastAssistantIdx}
+                    onCopy={() => messageText(msg)}
+                    onResend={() => resendMessage(msg)}
+                    onEditRetry={() => editRetryMessage(msg)}
+                    onRegenerate={handleRegenerate}
+                  />
+                  {msg.role === "assistant" && msg.usage && (
+                    <UsageBadge usage={msg.usage} showCost={isDeepseekMain} />
+                  )}
                 </div>
-                <MessageActions
-                  msg={msg}
-                  disabled={sending}
-                  onCopy={() => messageText(msg)}
-                  onResend={() => resendMessage(msg)}
-                  onEditRetry={() => editRetryMessage(msg)}
-                />
-                {msg.role === "assistant" && msg.usage && (
-                  <UsageBadge usage={msg.usage} showCost={isDeepseekMain} />
-                )}
-              </div>
-            ))}
+              );
+            })}
             {sending && (
               <div className="agent-working" aria-label="Agent 工作状态">
                 <span className="star-spin" aria-hidden="true">✦</span>
@@ -1889,55 +2183,49 @@ export function App() {
         )}
 
         <div className="composer-area">
-          {/* 斜杠命令菜单 */}
-          {input.startsWith("/") && !input.includes(" ") && !sending && (
-            <div className="slash-menu" role="menu">
+          {/* 斜杠命令菜单（Plan27 #7：键盘高亮，方向键移动 + Enter 选中 + Esc 关）。 */}
+          {slashMenuOpen && slashMenuItems.length > 0 && (
+            <div className="slash-menu" role="listbox" aria-label="斜杠命令">
               {/* Plan21 #9：内置命令优先,与内置同名的自定义命令在 handleSlashCommand 里被忽略,
                   菜单条目据此标注「与内置命令冲突,已被忽略」并置灰。 */}
-              {[
-                ...SLASH_COMMANDS.map((c) => ({ cmd: c.cmd, desc: c.desc, conflict: false })),
-                ...customCommands.map((c) => ({
-                  cmd: c.name,
-                  desc: c.description || "自定义命令",
-                  conflict: SLASH_COMMANDS.some((b) => b.cmd === c.name),
-                })),
-              ]
-                .filter((c) => c.cmd.startsWith(input))
-                .map((c, i) => (
-                  <button
-                    key={`${c.cmd}-${i}`}
-                    className={`slash-menu__item${c.conflict ? " slash-menu__item--conflict" : ""}`}
-                    type="button"
-                    disabled={c.conflict}
-                    onClick={() => !c.conflict && setInput(c.cmd)}
-                  >
-                    <span className="slash-menu__cmd">{c.cmd}</span>
-                    <span className="slash-menu__desc">
-                      {c.desc}
-                      {c.conflict && <span className="slash-menu__conflict"> · 与内置命令冲突，已被忽略</span>}
-                    </span>
-                  </button>
-                ))}
+              {slashMenuItems.map((c, i) => (
+                <button
+                  key={`${c.cmd}-${i}`}
+                  className={`slash-menu__item${c.conflict ? " slash-menu__item--conflict" : ""}${i === slashActive ? " slash-menu__item--active" : ""}`}
+                  type="button"
+                  role="option"
+                  aria-selected={i === slashActive}
+                  disabled={c.conflict}
+                  onMouseEnter={() => setSlashActive(i)}
+                  onClick={() => !c.conflict && setInput(c.cmd)}
+                >
+                  <span className="slash-menu__cmd">{c.cmd}</span>
+                  <span className="slash-menu__desc">
+                    {c.desc}
+                    {c.conflict && <span className="slash-menu__conflict"> · 与内置命令冲突，已被忽略</span>}
+                  </span>
+                </button>
+              ))}
             </div>
           )}
 
-          {/* @文件引用补全 */}
-          {fileMention !== null && workspaceFiles.length > 0 && (
-            <div className="slash-menu" role="menu">
-              {workspaceFiles
-                .filter((f) => f.toLowerCase().includes(fileMention.toLowerCase()))
-                .slice(0, 8)
-                .map((f) => (
-                  <button
-                    key={f}
-                    className="slash-menu__item"
-                    type="button"
-                    onClick={() => applyFileMention(f)}
-                  >
-                    <AtSign size={14} className="slash-menu__icon" />
-                    <span className="slash-menu__cmd">{f}</span>
-                  </button>
-                ))}
+          {/* @文件引用补全（Plan27 #7：键盘高亮）。 */}
+          {mentionMenuOpen && mentionItems.length > 0 && (
+            <div className="slash-menu" role="listbox" aria-label="文件引用">
+              {mentionItems.map((f, i) => (
+                <button
+                  key={f}
+                  className={`slash-menu__item${i === mentionActive ? " slash-menu__item--active" : ""}`}
+                  type="button"
+                  role="option"
+                  aria-selected={i === mentionActive}
+                  onMouseEnter={() => setMentionActive(i)}
+                  onClick={() => applyFileMention(f)}
+                >
+                  <AtSign size={14} className="slash-menu__icon" />
+                  <span className="slash-menu__cmd">{f}</span>
+                </button>
+              ))}
             </div>
           )}
 
@@ -1985,7 +2273,7 @@ export function App() {
               </div>
             )}
 
-            {/* 底部控制行：左组 [+ 附件][工作区胶囊][权限][模型]，右组 [计划][发送/停止]。 */}
+            {/* 底部控制行（Plan26）：左组 [+ 附件][上下文][工作区][权限][计划]，右组 [模型][发送/停止]。 */}
             <div className="composer-footer">
               <div className="composer-footer__left">
                 {/* 附件「+」（B1）：原 handleImportFile，图标由 Paperclip 改为 Plus。 */}
@@ -1999,6 +2287,65 @@ export function App() {
                 >
                   <Plus size={18} />
                 </button>
+
+                {/* 上下文指示器 + 弹层（Plan26）：从顶栏移入，点击展开「上下文窗口 用量/上限」+ 简化余额。 */}
+                <div className="ctx-pill-wrap">
+                  <button
+                    type="button"
+                    className="ctx-pill"
+                    aria-haspopup="dialog"
+                    aria-expanded={ctxPopoverOpen}
+                    title="上下文用量"
+                    onClick={() => {
+                      const next = !ctxPopoverOpen;
+                      setCtxPopoverOpen(next);
+                      if (next && isDeepseekMain && balance.status === "idle") refreshBalance();
+                    }}
+                  >
+                    <span className="ctx-pill__top">
+                      <span className="ctx-pill__label">
+                        <Gauge size={12} className="ctx-pill__icon" />
+                        上下文
+                      </span>
+                      {ctxPct !== null && <span className="ctx-pill__pct">{ctxPct}%</span>}
+                    </span>
+                    <span className="ctx-pill__bar">
+                      <span className="ctx-pill__fill" style={{ width: `${ctxPct ?? 0}%` }} />
+                    </span>
+                  </button>
+                  {ctxPopoverOpen && (
+                    <>
+                      <div className="workspace-menu__backdrop" onClick={() => setCtxPopoverOpen(false)} />
+                      <div className="ctx-popover" role="dialog" aria-label="上下文用量" onKeyDown={handleMenuKeyDown}>
+                        <div className="ctx-popover__row">
+                          <span className="ctx-popover__label">上下文窗口</span>
+                          <span className="ctx-popover__nums">
+                            {ctxUsage && ctxUsage.softLimit > 0
+                              ? `${fmtTokens(ctxUsage.promptTokens)} / ${fmtTokens(ctxUsage.softLimit)} (${ctxPct}%)`
+                              : "暂无数据"}
+                          </span>
+                        </div>
+                        <span className="ctx-popover__bar">
+                          <span className="ctx-popover__fill" style={{ width: `${ctxPct ?? 0}%` }} />
+                        </span>
+                        <div className="ctx-popover__foot">
+                          <span>接近上限自动压缩</span>
+                          {isDeepseekMain && (
+                            <button
+                              type="button"
+                              className="ctx-popover__link"
+                              onClick={() => { setCtxPopoverOpen(false); openSettings("account"); }}
+                            >
+                              {balance.status === "ok" && balance.data.balanceInfos[0]
+                                ? `余额 ${balance.data.balanceInfos[0].currency} ${balance.data.balanceInfos[0].totalBalance}`
+                                : "账户余额"} →
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
 
                 {/* 工作区胶囊（B2）：点击弹出小菜单——选择/更换工作区、纯聊天。 */}
                 <div className="workspace-pill-wrap">
@@ -2017,7 +2364,7 @@ export function App() {
                     <>
                       {/* 点击遮罩关闭菜单（覆盖全屏，透明） */}
                       <div className="workspace-menu__backdrop" onClick={() => setWorkspaceMenuOpen(false)} />
-                      <div className="workspace-menu" role="menu">
+                      <div className="workspace-menu" role="menu" onKeyDown={handleMenuKeyDown} ref={workspaceMenuRef}>
                         <button type="button" className="workspace-menu__item" role="menuitem" onClick={handlePickWorkspaceFromComposer}>
                           <FolderOpen size={14} /> 选择/更换工作区…
                         </button>
@@ -2029,7 +2376,7 @@ export function App() {
                   )}
                 </div>
 
-                {/* 权限模式紧凑胶囊（B1）：仍是 select，onChange 行为不变。 */}
+                {/* 权限模式紧凑胶囊：精简标签（Plan26），onChange 行为不变。 */}
                 <select
                   className="control-select control-select--compact"
                   value={permissionMode}
@@ -2038,24 +2385,11 @@ export function App() {
                   title={sending ? "切换将在当前回复结束后的下一轮生效" : "权限模式"}
                 >
                   {PERMISSION_MODES.map((mode) => (
-                    <option key={mode} value={mode}>{getPermissionModeLabel(mode)}</option>
+                    <option key={mode} value={mode}>{PERMISSION_SHORT[mode] ?? getPermissionModeLabel(mode)}</option>
                   ))}
                 </select>
 
-                {/* 当前模型只读胶囊（Plan20 🔴1）：点击进 设置 → 模型供应商。 */}
-                <button
-                  type="button"
-                  className="model-pill"
-                  onClick={() => openSettings("provider")}
-                  aria-label="当前模型，点击修改"
-                  title={mainModelId ? `当前模型：${mainModelId}（点击进 设置 → 模型供应商 修改）` : "尚未配置主模型，点击去配置"}
-                >
-                  <Gauge size={13} className="model-pill__icon" />
-                  <span className="model-pill__id">{mainModelId || "未配置模型"}</span>
-                </button>
-              </div>
-
-              <div className="composer-footer__right">
+                {/* 计划模式 toggle（Plan26：移入左组）。 */}
                 <button
                   type="button"
                   className={`control-toggle${planMode ? " control-toggle--on" : ""}`}
@@ -2063,6 +2397,20 @@ export function App() {
                   onClick={() => setPlanMode((v) => !v)}
                 >
                   <ListChecks size={14} /> 计划
+                </button>
+              </div>
+
+              <div className="composer-footer__right">
+                {/* 当前模型只读胶囊（Plan26：移入右组、贴近发送；图标 Gauge→Cpu）。点击进 设置 → 模型供应商。 */}
+                <button
+                  type="button"
+                  className="model-pill"
+                  onClick={() => openSettings("provider")}
+                  aria-label="当前模型，点击修改"
+                  title={mainModelId ? `当前模型：${mainModelId}（点击进 设置 → 模型供应商 修改）` : "尚未配置主模型，点击去配置"}
+                >
+                  <Cpu size={13} className="model-pill__icon" />
+                  <span className="model-pill__id">{mainModelId || "未配置模型"}</span>
                 </button>
                 {sending ? (
                   <button type="button" className="composer__send composer__send--stop" onClick={handleStop} aria-label="停止">
@@ -2139,6 +2487,23 @@ export function App() {
         />
       )}
 
+      {/* 命令面板（Plan27 #3a）：Ctrl/Cmd+K 打开，搜索会话 + 跳转设置 + 触发命令。 */}
+      {showCommandPalette && (
+        <CommandPalette
+          hasActiveConv={!!activeConvId}
+          onClose={() => setShowCommandPalette(false)}
+          onNewConversation={handleNewConversation}
+          onSelectConversation={(id) => handleSelectConversation(id)}
+          onOpenSettings={(section) => openSettings(section)}
+          onOpenHelp={() => setShowHelp(true)}
+          onOpenChanges={openChangesPanel}
+          onRunSlash={(cmd) => { void handleSlashCommand(cmd); }}
+        />
+      )}
+
+      {/* /help 能力披露面板（Plan27 #3b）：纯静态。 */}
+      {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
+
       {/* 全局 toast（Plan20 🔴2）：右下角堆叠、自动消失、可手动关，不依赖消息列表。 */}
       {toasts.length > 0 && (
         <div className="toast-stack" role="region" aria-label="通知">
@@ -2192,6 +2557,7 @@ function ChangesModal({
   onRevert: (id: string) => void;
   onClose: () => void;
 }) {
+  const trapRef = useFocusTrap<HTMLDivElement>(true);
   return (
     <div
       className="approval-overlay"
@@ -2200,7 +2566,7 @@ function ChangesModal({
       aria-label="文件变更记录"
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <div className="approval-card panel-card" onClick={(e) => e.stopPropagation()}>
+      <div className="approval-card panel-card" ref={trapRef} onClick={(e) => e.stopPropagation()}>
         <p className="approval-card__title">文件变更记录</p>
         {checkpoints.length === 0 ? (
           <p className="approval-card__hint">本会话还没有文件变更。</p>
@@ -2261,6 +2627,10 @@ function ProviderCard({
     role === "vision" ? VISION_PRESET_MODEL.deepseek : "deepseek-v4-pro",
   );
   const [baseUrl, setBaseUrl] = useState("");
+  // 上下文窗口（tokens，Plan27 #2）：可选数字输入。空串=不传（后端回退默认）。预设可预填。
+  const [contextWindow, setContextWindow] = useState<string>(
+    role === "main" ? String(PRESET_CONTEXT_WINDOW.deepseek ?? "") : "",
+  );
   // API 格式（Plan18 §4）：仅视觉 provider 暴露选择（openai|anthropic）；主模型恒 openai。
   const [apiFormat, setApiFormat] = useState<"openai" | "anthropic">("openai");
   const [showKey, setShowKey] = useState(false);
@@ -2298,6 +2668,8 @@ function ProviderCard({
         setModelId(cfg.modelId || (presetModel ? presetModel[p] ?? "" : PROVIDER_PRESETS.find((x) => x.id === p)?.defaultModelId ?? ""));
         setBaseUrl(cfg.baseUrl ?? "");
         setApiFormat(cfg.apiFormat === "anthropic" ? "anthropic" : "openai");
+        // 上下文窗口回填（Plan27 #2）：有值显示，无值留空（不预填，尊重用户「未设」语义）。
+        setContextWindow(cfg.contextWindow != null ? String(cfg.contextWindow) : "");
         setConfigured(true);
         if (cfg.baseUrl || p === "custom") setAdvancedOpen(true);
       })
@@ -2312,6 +2684,11 @@ function ProviderCard({
     const meta = PROVIDER_PRESETS.find((p) => p.id === next);
     // 切换预设给出合理默认 modelId 占位（视觉块用识图模型表）。
     setModelId(presetModel ? presetModel[next] ?? "" : meta?.defaultModelId ?? "");
+    // 上下文窗口预填（Plan27 #2）：仅主模型块按预设常见值预填，custom/无值留空。
+    if (role === "main") {
+      const cw = PRESET_CONTEXT_WINDOW[next];
+      setContextWindow(cw != null ? String(cw) : "");
+    }
     // custom 自动展开高级行（base_url 必填）；非 custom 收起并清空自定义端点回到官方。
     if (next === "custom") {
       setAdvancedOpen(true);
@@ -2347,6 +2724,10 @@ function ProviderCard({
     }
     setSaving(true);
     try {
+      // 上下文窗口（Plan27 #2）：空串/非正数 → 传 null（后端回退默认）；否则传整数 tokens。
+      const cwTrim = contextWindow.trim();
+      const cwNum = cwTrim ? Math.floor(Number(cwTrim)) : NaN;
+      const contextWindowOut = cwTrim && Number.isFinite(cwNum) && cwNum > 0 ? cwNum : null;
       await invoke("save_model_provider", {
         role,
         preset,
@@ -2355,6 +2736,7 @@ function ProviderCard({
         apiKey: apiKey.trim(),
         modelId: modelId.trim(),
         apiFormat: role === "vision" ? apiFormat : "openai",
+        contextWindow: contextWindowOut,
       });
       setConfigured(true);
       setKeyTouched(false);
@@ -2517,6 +2899,21 @@ function ProviderCard({
           </label>
         )}
 
+        {/* 上下文窗口（Plan27 #2）：可选数字输入，回填 cfg.contextWindow，保存透传（空则传 null）。
+            后端据其推导压缩软上限；非 DeepSeek 小窗口模型可在此据实填写以更早压缩。 */}
+        <label className="provider-field provider-field--full">
+          <span className="provider-field__label">上下文窗口（tokens，可选）</span>
+          <input
+            className="conv-search provider-input"
+            type="number"
+            min={0}
+            value={contextWindow}
+            placeholder={PRESET_CONTEXT_WINDOW[preset] != null ? String(PRESET_CONTEXT_WINDOW[preset]) : "如 128000，留空用默认"}
+            onChange={(e) => { setContextWindow(e.target.value); setTestResult(null); setSmokeResult(null); }}
+          />
+          <span className="provider-field__hint">填写该模型的真实上下文窗口，接近上限时自动压缩。留空则用内置默认。</span>
+        </label>
+
         <div className="provider-field--full">
           <button
             type="button"
@@ -2649,10 +3046,13 @@ function SettingsModal({
   onUpdateAvailable: (version: string) => void;
   onClose: () => void;
 }) {
+  const trapRef = useFocusTrap<HTMLDivElement>(true);
   const [mcpName, setMcpName] = useState("");
   const [mcpCommand, setMcpCommand] = useState("");
   const [mcpToken, setMcpToken] = useState("");
   const [ruleInput, setRuleInput] = useState("");
+  // 最近被拦动作（Plan27 #9）：进入「权限规则」分类时拉取，每条可一键加 allow/deny 规则。
+  const [deniedActions, setDeniedActions] = useState<DeniedAction[]>([]);
   // 检查更新按钮自管理：idle → checking → result(10s) → idle，期间禁用、尺寸不变。
   const [checkLabel, setCheckLabel] = useState("检查更新");
   const [checkBusy, setCheckBusy] = useState(false);
@@ -2695,6 +3095,14 @@ function SettingsModal({
       .catch(() => {});
   }, []);
 
+  // 进入「权限规则」分类时拉取最近被拦动作（Plan27 #9）。
+  useEffect(() => {
+    if (section !== "rules") return;
+    invoke<DeniedAction[]>("recent_denied_actions")
+      .then((list) => setDeniedActions(Array.isArray(list) ? list : []))
+      .catch(() => setDeniedActions([]));
+  }, [section]);
+
   async function handleToggleModality(next: boolean) {
     setModalityExtended(next);
     await invoke("set_app_setting", { key: "modality_extended", value: next ? "1" : "" }).catch(() => {});
@@ -2722,7 +3130,7 @@ function SettingsModal({
       aria-label="设置"
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <div className="approval-card panel-card settings-modal" onClick={(e) => e.stopPropagation()}>
+      <div className="approval-card panel-card settings-modal" ref={trapRef} onClick={(e) => e.stopPropagation()}>
         <nav className="settings-nav" aria-label="设置分类">
           <p className="settings-nav__title">设置</p>
           {NAV.map((n) => (
@@ -2934,6 +3342,41 @@ function SettingsModal({
                 <input className="conv-search" placeholder="如 deny:read_file:**/.env 或 allow:cmd:git push" value={ruleInput} onChange={(e) => setRuleInput(e.target.value)} />
                 <button className="approval-card__btn" type="button" disabled={!ruleInput.trim()} onClick={() => { onAddPermRule(ruleInput.trim()); setRuleInput(""); }}>添加规则</button>
               </div>
+
+              {/* 从最近被拦动作一键加规则（Plan27 #9）：列出 recent_denied_actions，每条配「+ 允许 / + 拒绝」。 */}
+              <div className="settings-section__head" style={{ marginTop: 18 }}>
+                <span>最近被拦动作</span>
+              </div>
+              {deniedActions.length === 0 ? (
+                <p className="settings-desc">暂无被拦动作。当 Agent 的某个工具被权限拦下后，会出现在此，可一键为其加规则。</p>
+              ) : (
+                deniedActions.map((d, i) => {
+                  const rule = `tool:${d.toolName}`;
+                  return (
+                    <div key={`${d.toolName}-${d.target}-${i}`} className="changes-row">
+                      <span className="mcp-dot" aria-hidden="true">●</span>
+                      <span className="changes-row__tool">{d.toolName}</span>
+                      {d.target && <span className="changes-row__path" title={d.target}>{d.target}</span>}
+                      <button
+                        className="changes-row__revert"
+                        type="button"
+                        title={`添加规则 allow:${rule}`}
+                        onClick={() => onAddPermRule(`allow:${rule}`)}
+                      >
+                        + 允许
+                      </button>
+                      <button
+                        className="changes-row__revert"
+                        type="button"
+                        title={`添加规则 deny:${rule}`}
+                        onClick={() => onAddPermRule(`deny:${rule}`)}
+                      >
+                        + 拒绝
+                      </button>
+                    </div>
+                  );
+                })
+              )}
             </>
           )}
 
@@ -3007,9 +3450,10 @@ function ApprovalModal({
   onAlwaysAllow: () => void;
   onDeny: () => void;
 }) {
+  const trapRef = useFocusTrap<HTMLDivElement>(true);
   return (
     <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="高风险动作审批">
-      <div className="approval-card">
+      <div className="approval-card" ref={trapRef}>
         <p className="approval-card__title">Agent 请求执行高风险动作</p>
         <div className="approval-card__detail">
           <span className="approval-card__tool">{approval.toolName}</span>
@@ -3049,6 +3493,7 @@ function AskUserModal({
   onSubmit: (answer: string) => void;
   onCancel: () => void;
 }) {
+  const trapRef = useFocusTrap<HTMLDivElement>(true);
   const questions = request.questions;
   // 每题已选 label 集合；"__other__" 代表选中了自定义项。
   const [selected, setSelected] = useState<Record<number, Set<string>>>(() =>
@@ -3097,7 +3542,7 @@ function AskUserModal({
 
   return (
     <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="Agent 提问">
-      <div className="approval-card askuser-card">
+      <div className="approval-card askuser-card" ref={trapRef}>
         <p className="approval-card__title">Agent 需要你确认</p>
         <div className="askuser-questions">
           {questions.map((q, i) => {
@@ -3167,11 +3612,273 @@ function AskUserModal({
   );
 }
 
+// ── useFocusTrap（Plan27 #7）────────────────────────────────────────────────
+
+/**
+ * 模态焦点陷阱：打开时聚焦容器内首个可聚焦元素，Tab/Shift+Tab 在容器内循环。
+ * 返回挂到模态容器的 ref。配合各模态的 Esc 关闭逻辑共同满足可访问性。
+ */
+function useFocusTrap<T extends HTMLElement>(active: boolean = true) {
+  const ref = useRef<T>(null);
+  useEffect(() => {
+    if (!active) return;
+    const el = ref.current;
+    if (!el) return;
+    const SELECTOR =
+      'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const focusables = () =>
+      Array.from(el.querySelectorAll<HTMLElement>(SELECTOR)).filter(
+        (n) => n.offsetParent !== null || n === document.activeElement,
+      );
+    // 打开时聚焦首个可聚焦元素（已有 autoFocus 的元素优先保留其焦点）。
+    const prevActive = document.activeElement as HTMLElement | null;
+    const first = focusables()[0];
+    if (first && !el.contains(prevActive)) first.focus();
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Tab") return;
+      const list = focusables();
+      if (list.length === 0) return;
+      const firstEl = list[0];
+      const lastEl = list[list.length - 1];
+      const cur = document.activeElement as HTMLElement | null;
+      if (e.shiftKey) {
+        if (cur === firstEl || !el.contains(cur)) {
+          e.preventDefault();
+          lastEl.focus();
+        }
+      } else {
+        if (cur === lastEl || !el.contains(cur)) {
+          e.preventDefault();
+          firstEl.focus();
+        }
+      }
+    };
+    el.addEventListener("keydown", onKeyDown);
+    return () => {
+      el.removeEventListener("keydown", onKeyDown);
+      // 关闭时把焦点还给打开前的元素，避免焦点丢失。
+      if (prevActive && document.contains(prevActive)) prevActive.focus();
+    };
+  }, [active]);
+  return ref;
+}
+
+// ── CommandPalette（Plan27 #3a）────────────────────────────────────────────────
+
+type PaletteItem = {
+  id: string;
+  label: string;
+  hint?: string;
+  icon: React.ReactNode;
+  run: () => void;
+};
+
+/**
+ * 命令面板：居中浮层（参照 approval-overlay），输入框 + 列表。
+ * - 空查询：列出快捷动作（新对话、设置各分类、/命令、帮助、变更）。
+ * - 非空查询：防抖调 search_conversations 列出匹配会话（正文/标题命中），并保留命中名称的动作。
+ * 方向键移动、Enter 执行、Esc 关闭；每次执行后关闭面板。
+ */
+function CommandPalette({
+  hasActiveConv,
+  onClose,
+  onNewConversation,
+  onSelectConversation,
+  onOpenSettings,
+  onOpenHelp,
+  onOpenChanges,
+  onRunSlash,
+}: {
+  hasActiveConv: boolean;
+  onClose: () => void;
+  onNewConversation: () => void;
+  onSelectConversation: (id: string) => void;
+  onOpenSettings: (section: SettingsSection) => void;
+  onOpenHelp: () => void;
+  onOpenChanges: () => void;
+  onRunSlash: (cmd: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<Conversation[]>([]);
+  const [active, setActive] = useState(0);
+  const trapRef = useFocusTrap<HTMLDivElement>(true);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  // 防抖正文搜索（Plan27 #3a，复用 #6 后端命令）：query 非空时 ~200ms 后调 search_conversations。
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) { setResults([]); return; }
+    const timer = setTimeout(() => {
+      invoke<Conversation[]>("search_conversations", { query: q })
+        .then((list) => setResults(Array.isArray(list) ? list : []))
+        .catch(() => setResults([]));
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  function act(fn: () => void) {
+    onClose();
+    fn();
+  }
+
+  // 静态动作项（始终可用，按查询词模糊过滤标签）。
+  const staticActions: PaletteItem[] = [
+    { id: "new", label: "新建对话", hint: "Ctrl/Cmd+N", icon: <SquarePen size={15} />, run: () => act(onNewConversation) },
+    { id: "set-provider", label: "设置 · 模型供应商", icon: <Cpu size={15} />, run: () => act(() => onOpenSettings("provider")) },
+    { id: "set-permission", label: "设置 · 权限", icon: <Lock size={15} />, run: () => act(() => onOpenSettings("permission")) },
+    { id: "set-rules", label: "设置 · 权限规则", icon: <Lock size={15} />, run: () => act(() => onOpenSettings("rules")) },
+    { id: "set-mcp", label: "设置 · MCP 服务器", icon: <Plug size={15} />, run: () => act(() => onOpenSettings("mcp")) },
+    { id: "set-account", label: "设置 · 账户", icon: <Settings2 size={15} />, run: () => act(() => onOpenSettings("account")) },
+    { id: "set-data", label: "设置 · 数据", icon: <Settings2 size={15} />, run: () => act(() => onOpenSettings("data")) },
+    { id: "help", label: "帮助 · 能做什么", hint: "/help", icon: <HelpCircle size={15} />, run: () => act(onOpenHelp) },
+    ...(hasActiveConv
+      ? [
+          { id: "compact", label: "压缩当前会话", hint: "/compact", icon: <Gauge size={15} />, run: () => act(() => onRunSlash("/compact")) } as PaletteItem,
+          { id: "changes", label: "文件变更记录", hint: "/rewind", icon: <GitCompare size={15} />, run: () => act(onOpenChanges) } as PaletteItem,
+        ]
+      : []),
+    { id: "clear", label: "开启新会话（清空）", hint: "/clear", icon: <SquarePen size={15} />, run: () => act(() => onRunSlash("/clear")) },
+  ];
+
+  const q = query.trim().toLowerCase();
+  const filteredActions = q
+    ? staticActions.filter((a) => a.label.toLowerCase().includes(q) || (a.hint ?? "").toLowerCase().includes(q))
+    : staticActions;
+
+  // 会话结果项（仅查询非空时）。
+  const convItems: PaletteItem[] = results.map((c) => ({
+    id: `conv-${c.id}`,
+    label: c.title,
+    hint: "会话",
+    icon: <MessageCircle size={15} />,
+    run: () => act(() => onSelectConversation(c.id)),
+  }));
+
+  const items: PaletteItem[] = [...filteredActions, ...convItems];
+
+  // 查询变化时把高亮复位到首项。
+  useEffect(() => { setActive(0); }, [query, results.length]);
+
+  function onKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActive((i) => Math.min(i + 1, items.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActive((i) => Math.max(i - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      items[active]?.run();
+    }
+    // Esc 由全局 Esc 处理器关闭。
+  }
+
+  // 高亮项滚动进视口。
+  useEffect(() => {
+    const el = listRef.current?.querySelector<HTMLElement>(`[data-idx="${active}"]`);
+    el?.scrollIntoView({ block: "nearest" });
+  }, [active]);
+
+  return (
+    <div
+      className="approval-overlay command-palette-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="命令面板"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="command-palette" ref={trapRef} onKeyDown={onKeyDown}>
+        <div className="command-palette__search">
+          <Search size={16} className="command-palette__search-icon" />
+          <input
+            className="command-palette__input"
+            type="text"
+            placeholder="搜索会话、跳转设置、运行命令…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            autoFocus
+            aria-label="命令面板搜索"
+          />
+        </div>
+        <div className="command-palette__list" ref={listRef} role="listbox" aria-label="命令与结果">
+          {items.length === 0 ? (
+            <p className="command-palette__empty">无匹配项</p>
+          ) : (
+            items.map((it, i) => (
+              <button
+                key={it.id}
+                type="button"
+                data-idx={i}
+                className={`command-palette__item${i === active ? " command-palette__item--active" : ""}`}
+                role="option"
+                aria-selected={i === active}
+                onMouseEnter={() => setActive(i)}
+                onClick={it.run}
+              >
+                <span className="command-palette__item-icon">{it.icon}</span>
+                <span className="command-palette__item-label">{it.label}</span>
+                {it.hint && <span className="command-palette__item-hint">{it.hint}</span>}
+              </button>
+            ))
+          )}
+        </div>
+        <div className="command-palette__foot">
+          <span><CornerDownLeft size={12} /> 执行</span>
+          <span>↑↓ 选择</span>
+          <span>Esc 关闭</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── HelpModal（Plan27 #3b）─────────────────────────────────────────────────────
+
+/** 「能做什么」静态披露面板：简述核心能力，帮助用户发现功能。 */
+function HelpModal({ onClose }: { onClose: () => void }) {
+  const trapRef = useFocusTrap<HTMLDivElement>(true);
+  const SECTIONS: Array<{ title: string; body: string }> = [
+    { title: "工作区", body: "为会话绑定本地目录后，Agent 可读写其中文件、执行命令；不绑定则为纯聊天。在输入框下方胶囊里选择或更换。" },
+    { title: "@ 引用文件", body: "在输入框键入 @ 触发工作区文件补全，把指定文件引用进对话上下文。" },
+    { title: "/ 命令", body: "键入 / 唤出命令菜单：/compact 压缩历史、/clear 新会话、/init 生成项目记忆、/rewind 文件变更、/model 改模型、/help 本面板。工作区 .mdga/commands/*.md 可加自定义命令。" },
+    { title: "计划模式", body: "开启后 Agent 先给出分步计划、等你确认再执行，避免一上来就改动。" },
+    { title: "技能 / .mdga", body: "工作区 .mdga 目录可放长期记忆（MDGA.md）与自定义斜杠命令，作为项目级约定持续生效。" },
+    { title: "MCP", body: "在 设置 → MCP 服务器 接入外部 MCP（stdio 或 HTTP），其工具并入模型工具集，统一经权限审批。" },
+    { title: "视觉", body: "在 设置 → 模型供应商 开启「扩展模态」并配置视觉模型后，可粘贴/拖拽/导入图片让 Agent 识图。" },
+    { title: "权限模式", body: "受限 / 每次询问 / 工作区自动 / 完全访问 四档，控制 Agent 改文件、跑命令前是否需要审批。可在 设置 → 权限规则 配细粒度规则。" },
+    { title: "快捷键", body: "Ctrl/Cmd+N 新对话、Ctrl/Cmd+K 命令面板、Ctrl/Cmd+, 设置、Enter 发送、Shift+Enter 换行、Esc 关闭弹窗。" },
+  ];
+  return (
+    <div
+      className="approval-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="帮助：能做什么"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="approval-card panel-card help-modal" ref={trapRef}>
+        <p className="approval-card__title"><HelpCircle size={16} style={{ verticalAlign: "-3px", marginRight: 6 }} />MDGA 能做什么</p>
+        <div className="help-modal__body">
+          {SECTIONS.map((s) => (
+            <div className="help-section" key={s.title}>
+              <h4 className="help-section__title">{s.title}</h4>
+              <p className="help-section__body">{s.body}</p>
+            </div>
+          ))}
+        </div>
+        <div className="approval-card__actions">
+          <button type="button" className="approval-card__btn" onClick={onClose}>关闭</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── MessageContent ──────────────────────────────────────────────────────────
 
 /** 渲染块：单个非工具 part，或一段连续的工具调用（聚合为可折叠组） */
 type RenderBlock =
-  | { kind: "part"; part: TextPart | NoticePart | ImagePart | VisionPart; index: number }
+  | { kind: "part"; part: TextPart | NoticePart | ImagePart | VisionPart | ReasoningPart; index: number }
   | { kind: "tools"; parts: ToolPart[]; index: number };
 
 function MessageContent({ msg }: { msg: Message }) {
@@ -3237,6 +3944,9 @@ function MessageContent({ msg }: { msg: Message }) {
         if (part.type === "vision") {
           return <VisionCard key={index} part={part} />;
         }
+        if (part.type === "reasoning") {
+          return <ReasoningCard key={index} part={part} />;
+        }
         return (
           <div key={index} className="notice-inline" aria-label="系统通知">
             <Info size={13} /> {part.text}
@@ -3263,19 +3973,25 @@ function MessageContent({ msg }: { msg: Message }) {
 function MessageActions({
   msg,
   disabled,
+  isLastAssistant,
   onCopy,
   onResend,
   onEditRetry,
+  onRegenerate,
 }: {
   msg: Message;
   disabled: boolean;
+  /** 是否为最后一条助手消息（Plan27 #1b）：仅它显示「重新生成」。 */
+  isLastAssistant: boolean;
   onCopy: () => string;
   onResend: () => void;
   onEditRetry: () => void;
+  onRegenerate: () => void;
 }) {
   const [copied, setCopied] = useState(false);
   const hasText = msg.parts.some((p) => p.type === "text" && p.content.trim().length > 0);
-  if (!hasText) return null;
+  // 有文字才显示复制/重发/编辑；但最后一条助手消息即使无文字（纯工具）也要能「重新生成」。
+  if (!hasText && !isLastAssistant) return null;
 
   async function handleCopy() {
     try {
@@ -3289,15 +4005,30 @@ function MessageActions({
 
   return (
     <div className={`message-actions message-actions--${msg.role}`} aria-label="消息操作">
-      <button
-        type="button"
-        className="message-actions__btn"
-        title={copied ? "已复制" : "复制整条消息"}
-        aria-label={copied ? "已复制" : "复制整条消息"}
-        onClick={handleCopy}
-      >
-        {copied ? <Check size={14} /> : <Copy size={14} />}
-      </button>
+      {hasText && (
+        <button
+          type="button"
+          className="message-actions__btn"
+          title={copied ? "已复制" : "复制整条消息"}
+          aria-label={copied ? "已复制" : "复制整条消息"}
+          onClick={handleCopy}
+        >
+          {copied ? <Check size={14} /> : <Copy size={14} />}
+        </button>
+      )}
+      {/* 重新生成（Plan27 #1b）：仅最后一条助手消息显示，删旧回复后用截至上一条 user 的历史重跑。 */}
+      {msg.role === "assistant" && isLastAssistant && (
+        <button
+          type="button"
+          className="message-actions__btn"
+          title="重新生成这条回复"
+          aria-label="重新生成这条回复"
+          onClick={onRegenerate}
+          disabled={disabled}
+        >
+          <RefreshCw size={14} />
+        </button>
+      )}
       {msg.role === "user" && (
         <>
           <button
@@ -3393,6 +4124,35 @@ function VisionCard({ part }: { part: VisionPart }) {
             {part.analysis}
           </ReactMarkdown>
         </div>
+      )}
+    </div>
+  );
+}
+
+// ── ReasoningCard（Plan27 #1a）────────────────────────────────────────────────
+
+/**
+ * 思考过程可折叠卡片：默认折叠，标题「🧠 思考过程」，展开见 reasoning 文本（纯文本逐行渲染，
+ * 不走 Markdown 以保留模型推理原貌）。流式期间随增量实时增长。样式参照 vision-card。
+ */
+function ReasoningCard({ part }: { part: ReasoningPart }) {
+  const [expanded, setExpanded] = useState(false);
+  const content = part.content.trim();
+  if (!content) return null;
+  return (
+    <div className="reasoning-card">
+      <button
+        type="button"
+        className="reasoning-card__summary"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+      >
+        <span className="reasoning-card__caret">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
+        <Brain size={13} className="reasoning-card__brain" />
+        <span className="reasoning-card__title">思考过程</span>
+      </button>
+      {expanded && (
+        <pre className="reasoning-card__body">{content}</pre>
       )}
     </div>
   );

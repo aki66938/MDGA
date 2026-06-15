@@ -563,6 +563,22 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        // ask_vision（Plan27 C3 #1c）：对本会话已上传的图片做针对性追问/精读。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "ask_vision",
+                "description": "对本会话已上传图片做针对性追问/精读。当你需要图片中某个具体细节（某处文字、数据、坐标、颜色、报错、布局等）而初次视觉分析没有覆盖时，用一个明确的问题调用本工具，由视觉模型重新精读会话里的图片并回答。仅在本会话确实有用户上传过图片、且你需要图里更细的信息时使用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": { "type": "string", "description": "对会话图片的具体追问，越聚焦越好（例如「截图右下角按钮上的文字是什么」「表格第二列的数值分别是多少」）。" }
+                    },
+                    "required": ["question"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     ]
 }
 

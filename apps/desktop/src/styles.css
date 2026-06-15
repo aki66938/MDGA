@@ -1575,6 +1575,144 @@ h1 {
   height: 32px;
 }
 
+/* ── Plan26：底栏胶囊弱化（11.5px、虚化背景、细虚线边框）+ 上下文指示器/弹层 + 提示字 ── */
+/* 用 background-color（非 background 简写）以免抹掉 control-select 的下拉箭头背景图。 */
+.composer-footer .workspace-pill,
+.composer-footer .control-select--compact,
+.composer-footer .model-pill,
+.composer-footer .control-toggle,
+.composer-footer .ctx-pill {
+  font-size: 11.5px;
+  background-color: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-3);
+}
+.composer-footer .workspace-pill:hover,
+.composer-footer .control-select--compact:hover,
+.composer-footer .model-pill:hover,
+.composer-footer .control-toggle:hover,
+.composer-footer .ctx-pill:hover {
+  border-color: var(--border-strong);
+  color: var(--text-2);
+  background-color: var(--surface-3);
+}
+/* 计划开启 / 工作区已绑定：保留品牌色强调（边框仍虚线）。 */
+.composer-footer .control-toggle--on {
+  color: var(--brand);
+  border-color: var(--brand-tint-strong);
+  background-color: var(--brand-tint);
+}
+.composer-footer .workspace-pill--bound {
+  color: var(--brand);
+  border-color: var(--brand-tint-strong);
+  background-color: transparent;
+}
+/* 附件「+」并入虚化风格。 */
+.composer-footer__left .composer__attach {
+  border: 1px dashed var(--border);
+  background-color: transparent;
+  color: var(--text-3);
+}
+.composer-footer__left .composer__attach:hover:not(:disabled) {
+  border-color: var(--brand-tint-strong);
+  background-color: var(--surface-3);
+  color: var(--brand);
+}
+
+/* 上下文指示器胶囊：两行（文字在上、进度条在下，对标 widget 图2），紧凑、不拉长。 */
+.ctx-pill-wrap { position: relative; display: inline-flex; }
+/* 该胶囊是两行，需放开 .composer-footer__left > * 的 30px 强制高度，由 footer 居中对齐。 */
+.composer-footer__left > .ctx-pill-wrap { height: auto; }
+.ctx-pill {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 3px;
+  border-radius: 8px;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: all .14s;
+}
+.ctx-pill__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+.ctx-pill__label { display: inline-flex; align-items: center; gap: 5px; }
+.ctx-pill__pct { font-variant-numeric: tabular-nums; }
+.ctx-pill__icon { flex-shrink: 0; color: var(--text-3); }
+.ctx-pill__bar {
+  width: 96px;
+  height: 3px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+}
+.ctx-pill__fill { display: block; height: 100%; background: var(--brand); border-radius: 3px; }
+
+/* 上下文弹层：贴在胶囊上方（对标 Claude 图1 上半部分；MDGA 无订阅额度，只留窗口 + 余额入口）。 */
+.ctx-popover {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 61;
+  width: 270px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-pop);
+}
+.ctx-popover__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.ctx-popover__nums { color: var(--text-2); font-variant-numeric: tabular-nums; }
+.ctx-popover__bar {
+  display: block;
+  width: 100%;
+  height: 5px;
+  border-radius: 5px;
+  background: var(--border);
+  overflow: hidden;
+}
+.ctx-popover__fill { display: block; height: 100%; background: var(--brand); border-radius: 5px; }
+/* 进度条本身即分隔线，foot 不再加多余的 border-top（Plan26 微调）。 */
+.ctx-popover__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.ctx-popover__link {
+  border: none;
+  background: none;
+  color: var(--brand);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  white-space: nowrap;
+}
+.ctx-popover__link:hover { color: var(--brand-hover); }
+
+/* 输入框提示字弱化、贴合配色（Plan26）。 */
+.composer__input::placeholder {
+  color: var(--text-3);
+  font-size: 13.5px;
+}
+
 .slash-menu {
   position: absolute;
   bottom: 100%;
@@ -2680,4 +2818,231 @@ h1 {
   .provider-key__eye:active:not(:disabled) {
     transform: none;
   }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Plan27 — 体验复审（思考卡片 / 命令面板 / 帮助 / 分段渲染 / 菜单键盘可达）
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 思考过程卡片（Plan27 #1a，样式参照 vision-card）── */
+
+.reasoning-card {
+  margin: 6px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.reasoning-card__summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 8px 10px;
+  color: var(--text-2);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.reasoning-card__summary:hover { color: var(--text); }
+
+.reasoning-card__caret {
+  display: inline-flex;
+  width: 14px;
+  color: var(--text-3);
+}
+
+.reasoning-card__brain { color: var(--text-3); flex-shrink: 0; }
+
+.reasoning-card__title { flex: 1; }
+
+.reasoning-card__body {
+  margin: 0;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  max-height: 360px;
+  overflow: auto;
+}
+
+/* ── provider 字段提示（Plan27 #2 上下文窗口说明）── */
+
+.provider-field__hint {
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.4;
+}
+
+/* ── 斜杠 / @ 菜单键盘高亮（Plan27 #7）── */
+
+.slash-menu__item--active {
+  background: var(--surface-3);
+}
+
+/* ── 命令面板（Plan27 #3a）── */
+
+.command-palette-overlay {
+  align-items: flex-start;
+}
+
+.command-palette {
+  width: min(560px, 92vw);
+  margin-top: 12vh;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-pop);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.command-palette__search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.command-palette__search-icon { color: var(--text-3); flex-shrink: 0; }
+
+.command-palette__input {
+  flex: 1;
+  border: none;
+  background: none;
+  outline: none;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.command-palette__input::placeholder { color: var(--text-3); }
+
+.command-palette__list {
+  max-height: 50vh;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.command-palette__empty {
+  margin: 0;
+  padding: 18px;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 13px;
+}
+
+.command-palette__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 9px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  font-size: 13.5px;
+  color: var(--text);
+}
+
+.command-palette__item--active {
+  background: var(--brand-tint);
+}
+
+.command-palette__item-icon {
+  display: inline-flex;
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+
+.command-palette__item--active .command-palette__item-icon { color: var(--brand); }
+
+.command-palette__item-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-palette__item-hint {
+  font-size: 11.5px;
+  color: var(--text-3);
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  flex-shrink: 0;
+}
+
+.command-palette__foot {
+  display: flex;
+  gap: 16px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.command-palette__foot span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* ── 帮助面板（Plan27 #3b）── */
+
+.help-modal {
+  width: min(560px, 92vw);
+  max-height: 82vh;
+}
+
+.help-modal__body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.help-section__title {
+  margin: 0 0 4px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.help-section__body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+
+/* ── 长会话「加载更早」（Plan27 #8）── */
+
+.load-earlier {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.load-earlier:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
 }

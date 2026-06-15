@@ -40,12 +40,20 @@ pub(crate) fn maybe_persist_large_output(workspace_path: &str, output_str: &str)
     }
 }
 
-/// 读取上下文压缩软上限：优先取环境变量 MDGA_CONTEXT_SOFT_LIMIT（便于低阈值压测），否则用默认值。
-pub(crate) fn context_soft_limit_tokens() -> u64 {
-    std::env::var("MDGA_CONTEXT_SOFT_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CONTEXT_SOFT_LIMIT_TOKENS)
+/// 按主供应商上下文窗口推导压缩软上限（Plan27 C2 #2）：
+/// 优先级——环境变量 MDGA_CONTEXT_SOFT_LIMIT（压测）> 主 provider 的 context_window × 0.8（取整）>
+/// 默认 [`CONTEXT_SOFT_LIMIT_TOKENS`]。这样非 DeepSeek 的小窗口模型也能在真实上限前触发压缩。
+/// context_window 非正值（0 / 负数）视为未配置，回退默认。
+pub(crate) fn context_soft_limit_for(context_window: Option<i64>) -> u64 {
+    if let Ok(v) = std::env::var("MDGA_CONTEXT_SOFT_LIMIT") {
+        if let Ok(parsed) = v.parse::<u64>() {
+            return parsed;
+        }
+    }
+    match context_window {
+        Some(cw) if cw > 0 => (cw as u64) * 8 / 10,
+        _ => CONTEXT_SOFT_LIMIT_TOKENS,
+    }
 }
 
 /// 计算摘要压缩的切分点：返回（开头连续 system 消息数, 摘要区终点）。
@@ -203,8 +211,26 @@ pub(crate) fn compact_tool_outputs(
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_tool_outputs, render_wire_message_for_summary, summary_split_points};
-    use crate::COMPACTED_TOOL_STUB;
+    use super::{
+        compact_tool_outputs, context_soft_limit_for, render_wire_message_for_summary,
+        summary_split_points,
+    };
+    use crate::{COMPACTED_TOOL_STUB, CONTEXT_SOFT_LIMIT_TOKENS};
+
+    #[test]
+    fn soft_limit_derives_from_context_window_or_falls_back() {
+        // 仅在未设置压测 env 时校验推导逻辑，避免并行/CI 环境污染。
+        if std::env::var("MDGA_CONTEXT_SOFT_LIMIT").is_ok() {
+            return;
+        }
+        // 有 context_window：取 × 0.8（整除）。
+        assert_eq!(context_soft_limit_for(Some(128_000)), 102_400);
+        assert_eq!(context_soft_limit_for(Some(1_000_000)), 800_000);
+        // None / 非正值：回退默认软上限。
+        assert_eq!(context_soft_limit_for(None), CONTEXT_SOFT_LIMIT_TOKENS);
+        assert_eq!(context_soft_limit_for(Some(0)), CONTEXT_SOFT_LIMIT_TOKENS);
+        assert_eq!(context_soft_limit_for(Some(-5)), CONTEXT_SOFT_LIMIT_TOKENS);
+    }
 
     #[test]
     fn compact_tool_outputs_stubs_old_large_results_keeps_recent() {

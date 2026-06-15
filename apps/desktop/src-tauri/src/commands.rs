@@ -72,10 +72,13 @@ pub(crate) fn save_model_provider(
     api_key: String,
     model_id: String,
     api_format: Option<String>,
+    context_window: Option<i64>,
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     // api_format 仅视觉 provider 有意义（openai|anthropic），主模型恒 openai；缺省落回 openai。
     let api_format = api_format.as_deref().unwrap_or("openai");
+    // Plan27 C2 #2：上下文窗口（tokens，可选）。非正值视为未配置，归一为 None。
+    let context_window = context_window.filter(|&cw| cw > 0);
     // F1（Plan22）：密钥留空＝保留该 role 已存的 key，不覆盖为空。
     // UI 占位「已配置 ••••（如需更换请重新输入）」暗示"留空即保留"，此前 upsert 直接写空会清掉凭据，
     // 导致"不重输 key 再保存一次就失效"。无既有 provider（首次配置）时留空仍为空（前端已拦首配空 key）。
@@ -97,6 +100,7 @@ pub(crate) fn save_model_provider(
         &api_key,
         model_id.trim(),
         api_format,
+        context_window,
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -385,6 +389,35 @@ pub(crate) fn remove_conversation(
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     delete_conversation(&db, &conversation_id).map_err(|e| e.to_string())
+}
+
+/// 删除会话最后一条助手消息（Plan27 C4 #1b 重新生成的后端）。
+///
+/// 仅当会话最后一条消息 role='assistant' 时才删，返回是否删除。前端「重新生成」先调本命令删旧回复，
+/// 再用截至上一条 user 的历史重跑 send_message（不新增 user 消息）。
+#[tauri::command]
+pub(crate) fn delete_last_assistant_message(
+    state: State<AppState>,
+    conversation_id: String,
+) -> Result<bool, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    mdga_storage::delete_last_assistant_message(&db, &conversation_id).map_err(|e| e.to_string())
+}
+
+/// 按关键词搜索会话（Plan27 C5 #6 正文搜索）：标题或消息正文 LIKE 命中，按 updated_at 倒序。
+///
+/// query 经 trim 后为空则直接返回空列表（前端空查询应回退本地列表，不应走此命令）。
+#[tauri::command]
+pub(crate) fn search_conversations(
+    state: State<AppState>,
+    query: String,
+) -> Result<Vec<Conversation>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    mdga_storage::search_conversations(&db, trimmed).map_err(|e| e.to_string())
 }
 
 /// 设置会话置顶状态；置顶会话在列表中排在最前。
@@ -954,6 +987,73 @@ pub(crate) fn get_conversation_events(
 ) -> Result<Vec<ActivityEventRecord>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     get_activity_events(&db, &conversation_id).map_err(|e| e.to_string())
+}
+
+/// 一条最近被拦截的动作（Plan27 C6 #9）：工具名 + 其目标，供「一键加规则」UI 列出。
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeniedAction {
+    pub tool_name: String,
+    /// 动作目标：路径 / 源路径 / 命令行（按工具类型从入参提取，提取不到为空串）。
+    pub target: String,
+}
+
+/// 从工具入参 JSON 提取「目标」：优先 path，其次 from，再次 command（与前端 extractTarget 同款）。
+/// 解析失败或都不存在时返回空串。
+fn extract_denied_target(input_json: Option<&str>) -> String {
+    let Some(raw) = input_json else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return String::new();
+    };
+    for key in ["path", "from", "command"] {
+        if let Some(s) = value.get(key).and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// 列出最近被拦截/权限失败的工具动作（Plan27 C6 #9）。
+///
+/// 跨全部会话扫描 activity events，取 status 为 denied（被拒/权限失败）的工具事件，按时间倒序，
+/// 提取 toolName 与 target（path/from/command）并按 (tool, target) 去重，取最近若干条。
+/// 供设置页「权限规则」区列出，每条配「+ 允许 / + 拒绝」按钮，复用前端 handleAddPermRule 构造规则串。
+#[tauri::command]
+pub(crate) fn recent_denied_actions(state: State<AppState>) -> Result<Vec<DeniedAction>, String> {
+    const MAX_DENIED: usize = 20;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let convs = list_conversations(&db).map_err(|e| e.to_string())?;
+    // 汇总全部会话的被拒事件（每会话内 get_activity_events 为时间正序）。
+    let mut events: Vec<ActivityEventRecord> = Vec::new();
+    for conv in &convs {
+        let conv_events = get_activity_events(&db, &conv.id).unwrap_or_default();
+        events.extend(
+            conv_events
+                .into_iter()
+                .filter(|e| e.status == "denied" && e.tool_name.is_some()),
+        );
+    }
+    // 按时间倒序：最近的被拒动作排在前。
+    events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut out: Vec<DeniedAction> = Vec::new();
+    for event in events {
+        let Some(tool_name) = event.tool_name else { continue };
+        let target = extract_denied_target(event.input_json.as_deref());
+        if !seen.insert((tool_name.clone(), target.clone())) {
+            continue; // (工具, 目标) 去重
+        }
+        out.push(DeniedAction { tool_name, target });
+        if out.len() >= MAX_DENIED {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// 在 Agent 运行中排队一条插话消息（steering）。下一轮循环开始时作为 user 消息注入，

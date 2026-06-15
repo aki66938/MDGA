@@ -221,6 +221,8 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // Plan18 M18.1：视觉 provider 的 API 格式（'openai' | 'anthropic'），默认 openai。
     // 决定 analyze_image 走哪种端点/鉴权/消息结构（见 Plan18 §4 双格式对照表）。
     add_column_if_missing(&conn, "model_providers", "api_format", "TEXT NOT NULL DEFAULT 'openai'")?;
+    // Plan27 C2 #2：供应商上下文窗口（tokens，可空）。主 provider 有值时据其推导压缩软上限。
+    add_column_if_missing(&conn, "model_providers", "context_window", "INTEGER")?;
     Ok(conn)
 }
 
@@ -305,6 +307,40 @@ pub fn list_conversations(conn: &Connection) -> SqlResult<Vec<Conversation>> {
          ORDER BY pinned DESC, updated_at DESC",
     )?;
     let rows = stmt.query_map([], |row| {
+        Ok(Conversation {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            workspace_path: row.get(2)?,
+            workspace_name: row.get(3)?,
+            mode: row.get(4)?,
+            pinned: row.get::<_, i64>(5)? != 0,
+            archived: row.get::<_, i64>(6)? != 0,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 按关键词搜索会话（Plan27 C5 #6 正文搜索）：标题 LIKE 命中，或该会话存在 content LIKE 命中的消息。
+///
+/// 输入查询串（调用方应已 trim；空串语义未定义，由命令层处理）；对标题与消息正文做大小写不敏感的
+/// 子串匹配（SQLite LIKE 对 ASCII 大小写不敏感），DISTINCT 去重，按 updated_at 倒序返回。
+/// 转义 LIKE 通配符 % _ \，避免用户输入被当作通配符，statement 用 ESCAPE '\\' 声明转义符。
+pub fn search_conversations(conn: &Connection, query: &str) -> SqlResult<Vec<Conversation>> {
+    // 转义 LIKE 特殊字符，包成 %query% 子串模式。
+    let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT c.id, c.title, c.workspace_path, c.workspace_name, c.mode,
+                c.pinned, c.archived, c.created_at, c.updated_at
+         FROM conversations c
+         LEFT JOIN messages m ON m.conversation_id = c.id
+         WHERE c.title LIKE ?1 ESCAPE '\\'
+            OR m.content LIKE ?1 ESCAPE '\\'
+         ORDER BY c.updated_at DESC",
+    )?;
+    let rows = stmt.query_map([&pattern], |row| {
         Ok(Conversation {
             id: row.get(0)?,
             title: row.get(1)?,
@@ -491,6 +527,31 @@ pub fn delete_messages(conn: &Connection, conv_id: &str) -> SqlResult<()> {
         params![conv_id],
     )?;
     Ok(())
+}
+
+/// 删除该会话「最后一条」消息，且仅当其 role='assistant' 时才删（Plan27 C4 #1b 重新生成）。
+///
+/// 返回是否真的删除了一条：最后一条不是助手消息（如用户刚发完还没回复）或会话无消息，
+/// 都返回 false 且不改动数据。供「重新生成」命令先删旧助手回复、再用截至上一条 user 的历史重跑。
+pub fn delete_last_assistant_message(conn: &Connection, conv_id: &str) -> SqlResult<bool> {
+    // 取最近一条消息的 id 与 role：created_at 倒序、再以 rowid 倒序兜底同秒插入的稳定性。
+    let mut stmt = conn.prepare(
+        "SELECT id, role FROM messages
+         WHERE conversation_id = ?1
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query([conv_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(false); // 会话无消息
+    };
+    let id: String = row.get(0)?;
+    let role: String = row.get(1)?;
+    if role != "assistant" {
+        return Ok(false); // 最后一条不是助手消息，不动
+    }
+    let affected = conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+    Ok(affected > 0)
 }
 
 // ── Token 账本（独立条目）─────────────────────────────────────────────────
@@ -727,6 +788,10 @@ pub struct ModelProvider {
     /// 视觉 provider 的 API 格式：'openai' | 'anthropic'（Plan18 §4）。主模型恒为 openai 兼容，
     /// 此字段对其无意义；视觉调用据此分支端点/鉴权/消息结构。默认 'openai'。
     pub api_format: String,
+    /// 上下文窗口（tokens，可选；Plan27 C2 #2）：该供应商模型的最大上下文长度。
+    /// 主 provider 有值时，agent_loop / compaction 的软上限按 context_window × 0.8 推导，
+    /// 使非 DeepSeek 的小窗口模型也能在真实上限前触发压缩；None 表示沿用默认软上限。
+    pub context_window: Option<i64>,
     pub enabled: bool,
     pub updated_at: Option<i64>,
 }
@@ -745,6 +810,7 @@ pub fn upsert_model_provider(
     api_key: &str,
     model_id: &str,
     api_format: &str,
+    context_window: Option<i64>,
 ) -> SqlResult<ModelProvider> {
     let id = Uuid::new_v4().to_string();
     let now = now_ts();
@@ -753,9 +819,9 @@ pub fn upsert_model_provider(
     conn.execute("DELETE FROM model_providers WHERE role = ?1", params![role])?;
     conn.execute(
         "INSERT INTO model_providers
-         (id, role, preset, label, base_url, api_key, model_id, api_format, enabled, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)",
-        params![id, role, preset, label, base_url, api_key, model_id, api_format, now],
+         (id, role, preset, label, base_url, api_key, model_id, api_format, context_window, enabled, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)",
+        params![id, role, preset, label, base_url, api_key, model_id, api_format, context_window, now],
     )?;
     Ok(ModelProvider {
         id,
@@ -766,6 +832,7 @@ pub fn upsert_model_provider(
         api_key: api_key.to_string(),
         model_id: model_id.to_string(),
         api_format: api_format.to_string(),
+        context_window,
         enabled: true,
         updated_at: Some(now),
     })
@@ -774,7 +841,7 @@ pub fn upsert_model_provider(
 /// 按角色读取 provider（main / vision），未配置返回 None。
 pub fn get_model_provider(conn: &Connection, role: &str) -> SqlResult<Option<ModelProvider>> {
     let mut stmt = conn.prepare(
-        "SELECT id, role, preset, label, base_url, api_key, model_id, api_format, enabled, updated_at
+        "SELECT id, role, preset, label, base_url, api_key, model_id, api_format, context_window, enabled, updated_at
          FROM model_providers
          WHERE role = ?1
          ORDER BY updated_at DESC
@@ -791,8 +858,9 @@ pub fn get_model_provider(conn: &Connection, role: &str) -> SqlResult<Option<Mod
             api_key: row.get(5)?,
             model_id: row.get(6)?,
             api_format: row.get(7)?,
-            enabled: row.get::<_, i64>(8)? != 0,
-            updated_at: row.get(9)?,
+            context_window: row.get(8)?,
+            enabled: row.get::<_, i64>(9)? != 0,
+            updated_at: row.get(10)?,
         }))
     } else {
         Ok(None)
@@ -802,7 +870,7 @@ pub fn get_model_provider(conn: &Connection, role: &str) -> SqlResult<Option<Mod
 /// 列出全部 provider 配置（含全部角色）。
 pub fn list_model_providers(conn: &Connection) -> SqlResult<Vec<ModelProvider>> {
     let mut stmt = conn.prepare(
-        "SELECT id, role, preset, label, base_url, api_key, model_id, api_format, enabled, updated_at
+        "SELECT id, role, preset, label, base_url, api_key, model_id, api_format, context_window, enabled, updated_at
          FROM model_providers
          ORDER BY role ASC",
     )?;
@@ -816,8 +884,9 @@ pub fn list_model_providers(conn: &Connection) -> SqlResult<Vec<ModelProvider>> 
             api_key: row.get(5)?,
             model_id: row.get(6)?,
             api_format: row.get(7)?,
-            enabled: row.get::<_, i64>(8)? != 0,
-            updated_at: row.get(9)?,
+            context_window: row.get(8)?,
+            enabled: row.get::<_, i64>(9)? != 0,
+            updated_at: row.get(10)?,
         })
     })?;
     rows.collect()
@@ -1161,19 +1230,21 @@ mod tests {
         let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
         let conn = init_db(&db_path).expect("db should initialize");
 
-        // 首次配置主 provider（base_url 留空走官方；主模型恒为 openai 格式）。
+        // 首次配置主 provider（base_url 留空走官方；主模型恒为 openai 格式；context_window 显式给值）。
         let p1 = upsert_model_provider(
             &conn, "main", Some("deepseek"), Some("DeepSeek"), None, "sk-1", "deepseek-v4-pro", "openai",
+            Some(1_000_000),
         )
         .expect("upsert main");
         assert_eq!(p1.role, "main");
         assert_eq!(p1.base_url, None);
         assert_eq!(p1.api_format, "openai");
+        assert_eq!(p1.context_window, Some(1_000_000));
 
-        // 再次 upsert 同 role 覆盖（验证唯一性：只保留一条）。
+        // 再次 upsert 同 role 覆盖（验证唯一性：只保留一条；context_window 改为 None 验证可清空）。
         let p2 = upsert_model_provider(
             &conn, "main", Some("custom"), Some("自托管"), Some("https://proxy.local/v1"),
-            "sk-2", "my-model", "openai",
+            "sk-2", "my-model", "openai", None,
         )
         .expect("upsert main again");
         assert_eq!(p2.api_key, "sk-2");
@@ -1182,6 +1253,7 @@ mod tests {
         assert_eq!(loaded.api_key, "sk-2");
         assert_eq!(loaded.base_url.as_deref(), Some("https://proxy.local/v1"));
         assert_eq!(loaded.model_id, "my-model");
+        assert_eq!(loaded.context_window, None);
 
         // 仅一条 main，vision 未配。
         assert!(get_model_provider(&conn, "vision").expect("query").is_none());
@@ -1189,14 +1261,15 @@ mod tests {
         // 配 vision provider（anthropic 格式），列表含两角色，api_format 正确存取。
         upsert_model_provider(
             &conn, "vision", Some("custom"), Some("Claude Vision"), Some("https://api.anthropic.com"),
-            "sk-v", "claude-3-5-sonnet", "anthropic",
+            "sk-v", "claude-3-5-sonnet", "anthropic", Some(200_000),
         )
         .expect("upsert vision");
         let vision = get_model_provider(&conn, "vision").expect("query").expect("exists");
         assert_eq!(vision.api_format, "anthropic");
+        assert_eq!(vision.context_window, Some(200_000));
         // 未知 api_format 归一化为 openai。
         upsert_model_provider(
-            &conn, "vision", Some("zhipu"), Some("GLM-4V"), None, "sk-v2", "glm-4v", "bogus",
+            &conn, "vision", Some("zhipu"), Some("GLM-4V"), None, "sk-v2", "glm-4v", "bogus", None,
         )
         .expect("upsert vision openai");
         assert_eq!(
@@ -1231,6 +1304,65 @@ mod tests {
             get_setting(&conn, "modality_extended").expect("get").as_deref(),
             Some("false")
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn deletes_only_trailing_assistant_message() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+        let conv = create_conversation(&conn).expect("conv");
+
+        // 空会话：无消息可删。
+        assert!(!delete_last_assistant_message(&conn, &conv.id).expect("noop on empty"));
+
+        // 最后一条是 user：不删。
+        save_message(&conn, &conv.id, "user", "你好", None, None).expect("user msg");
+        assert!(!delete_last_assistant_message(&conn, &conv.id).expect("noop on user tail"));
+        assert_eq!(get_messages(&conn, &conv.id).expect("list").len(), 1);
+
+        // 末尾是 assistant：删一条，回 true，user 仍在。
+        save_message(&conn, &conv.id, "assistant", "回复", None, None).expect("assistant msg");
+        assert!(delete_last_assistant_message(&conn, &conv.id).expect("delete assistant tail"));
+        let after = get_messages(&conn, &conv.id).expect("list");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].role, "user");
+
+        // 再次调用：末尾又是 user，不删。
+        assert!(!delete_last_assistant_message(&conn, &conv.id).expect("noop again"));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn searches_conversations_by_title_or_message_body() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        // c1 标题命中。
+        let c1 = create_conversation(&conn).expect("c1");
+        update_title(&conn, &c1.id, "关于 RustLang 的讨论").expect("title");
+        // c2 仅消息正文命中。
+        let c2 = create_conversation(&conn).expect("c2");
+        save_message(&conn, &c2.id, "user", "请帮我看看 RustLang 的所有权", None, None).expect("msg");
+        // c3 不命中。
+        let c3 = create_conversation(&conn).expect("c3");
+        save_message(&conn, &c3.id, "user", "无关内容", None, None).expect("msg3");
+
+        let hits = search_conversations(&conn, "RustLang").expect("search");
+        let ids: Vec<&str> = hits.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&c1.id.as_str()));
+        assert!(ids.contains(&c2.id.as_str()));
+        assert!(!ids.contains(&c3.id.as_str()));
+        // 多条消息命中同一会话只出现一次（DISTINCT）。
+        save_message(&conn, &c2.id, "assistant", "RustLang 又一次提到", None, None).expect("msg again");
+        let hits2 = search_conversations(&conn, "RustLang").expect("search again");
+        assert_eq!(hits2.iter().filter(|c| c.id == c2.id).count(), 1);
+
+        // 通配符被转义为字面量：搜 "%" 不应匹配全部。
+        let pct = search_conversations(&conn, "%").expect("search pct");
+        assert!(pct.is_empty());
 
         let _ = std::fs::remove_file(db_path);
     }

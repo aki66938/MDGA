@@ -11,7 +11,7 @@ use crate::chat::{
 use crate::checkpoint::{capture_checkpoint_before, persist_checkpoint, post_execution_diff};
 use crate::command_run::{execute_bg_shell_tool, execute_run_command_tool};
 use crate::compaction::{
-    compact_tool_outputs, context_soft_limit_tokens, maybe_persist_large_output,
+    compact_tool_outputs, context_soft_limit_for, maybe_persist_large_output,
     summarize_wire_history,
 };
 use crate::hooks::{read_diagnostics_command, run_post_tool_hooks, run_pre_tool_hooks};
@@ -30,11 +30,12 @@ use crate::tools::{
 };
 use crate::web::{execute_web_fetch, execute_web_search};
 use crate::{commands::permission_mode_from_str, merge_usage, record_tool_event};
-use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMessage};
+use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMessage, StreamChunk};
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
 use mdga_shared::PermissionMode;
 use mdga_storage::{
-    get_conversation, get_model_provider, list_permission_rules, save_token_ledger_entry,
+    get_conversation, get_messages, get_model_provider, list_permission_rules,
+    save_token_ledger_entry,
 };
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use mdga_tool_runtime::RunCommandRequest;
@@ -86,7 +87,7 @@ pub(crate) async fn send_message(
     // Plan25 C-4：「批准并执行」时为 true，本轮装配阶段注入「严格按上一条计划执行 + 先建 todo」system。
     let execute_plan = execute_plan.unwrap_or(false);
     let images = images.unwrap_or_default();
-    let (conversation, permission_rules, base_url, api_key, model_id, vision_provider) = {
+    let (conversation, permission_rules, base_url, api_key, model_id, context_window, vision_provider) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let conversation = get_conversation(&db, &conversation_id)
             .map_err(|e| e.to_string())?
@@ -96,11 +97,12 @@ pub(crate) async fn send_message(
         // DB 无主 provider 即报错引导去设置页，不再回退环境变量。
         // Plan20 🔴1：model_id 一并取出，作为本轮唯一权威模型名——主链路 chat 与计价均以它为准，
         // 不再用入参 model（前端控制行写死的 DeepSeek 清单）决定模型，否则配非 DeepSeek 主供应商必失败。
-        let (base_url, api_key, model_id) = match get_model_provider(&db, "main") {
+        // Plan27 C2 #2：context_window 一并取出，用于推导上下文压缩软上限。
+        let (base_url, api_key, model_id, context_window) = match get_model_provider(&db, "main") {
             Ok(Some(p)) => {
                 let bu = resolve_base_url(p.base_url.as_deref(), p.preset.as_deref())
                     .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
-                (bu, p.api_key, p.model_id)
+                (bu, p.api_key, p.model_id, p.context_window)
             }
             _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
         };
@@ -110,7 +112,7 @@ pub(crate) async fn send_message(
         } else {
             get_model_provider(&db, "vision").ok().flatten()
         };
-        (conversation, rules, base_url, api_key, model_id, vision_provider)
+        (conversation, rules, base_url, api_key, model_id, context_window, vision_provider)
     };
     // 入参 model 保留以不破坏前端命令签名，但本轮已不再用它决定模型（权威源为 model_id）。
     let _ = &model;
@@ -261,7 +263,15 @@ pub(crate) async fn send_message(
     let result = if plan_mode {
         // 计划模式走纯流式（无工具），让模型把计划直接流给用户审阅。
         chat_stream(&base_url, &api_key, messages, &model_id, |chunk| {
-            let _ = app.emit("chat-chunk", chunk);
+            // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
+            match chunk {
+                StreamChunk::Content(c) => {
+                    let _ = app.emit("chat-chunk", c.to_string());
+                }
+                StreamChunk::Reasoning(r) => {
+                    let _ = app.emit("chat-reasoning", r.to_string());
+                }
+            }
         })
         .await
         .map_err(|e| e.to_string())
@@ -281,11 +291,21 @@ pub(crate) async fn send_message(
             mcp_bindings,
             // Plan21 #4：把自动初看的视觉 usage 作为工具预算累计起点传入。
             vision_usage,
+            // Plan27 C2 #2：主供应商上下文窗口，用于推导压缩软上限。
+            context_window,
         )
         .await
     } else {
         chat_stream(&base_url, &api_key, messages, &model_id, |chunk| {
-            let _ = app.emit("chat-chunk", chunk);
+            // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
+            match chunk {
+                StreamChunk::Content(c) => {
+                    let _ = app.emit("chat-chunk", c.to_string());
+                }
+                StreamChunk::Reasoning(r) => {
+                    let _ = app.emit("chat-reasoning", r.to_string());
+                }
+            }
         })
         .await
         .map_err(|e| e.to_string())
@@ -494,6 +514,139 @@ fn read_workspace_memory(workspace_root: &str) -> Option<String> {
     Some(trimmed.chars().take(16_000).collect())
 }
 
+/// ask_vision 工具（Plan27 C3 #1c）的视觉追问 system 提示词：意图驱动、要点化、只答所问。
+const VISION_FOLLOWUP_SYSTEM: &str = "你是视觉追问助手。请仔细重新观察会话中的图片，针对用户的具体追问给出精确、要点化的中文回答；只回答被问到的内容，不泛泛而谈、不寒暄。看不清或图中没有相关信息时如实说明。";
+
+/// 执行 ask_vision 工具：取本会话历史图片 → 读视觉 provider → 调 analyze_image 精读追问。
+///
+/// 流程（Plan27 C3 #1c）：
+/// 1）get_messages 取本会话历史，解析各消息 parts_json 中 type=="image" 的 part（取 mediaType/base64，
+///    按出现顺序、去重）；无图返回提示「本会话没有图片可追问」。
+/// 2）读 vision provider（role="vision"）；未配置返回提示去「设置 → 模型供应商」配置视觉模型。
+/// 3）用 analyze_image(base_url, key, model, api_format, 视觉追问 system, question, &images) 精读，
+///    返回 { ok:true, answer }；usage 由调用方并入本轮。失败返回 Err 让工具循环回灌错误。
+async fn execute_ask_vision(
+    app: &AppHandle,
+    conversation_id: &str,
+    arguments: &str,
+) -> (Result<serde_json::Value, String>, Option<mdga_shared::RawUsage>) {
+    // 解析 question 参数。
+    let question = match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(v) => v
+            .get("question")
+            .and_then(|q| q.as_str())
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(str::to_string),
+        Err(e) => return (Err(format!("工具参数解析失败: {e}")), None),
+    };
+    let Some(question) = question else {
+        return (Err("ask_vision 缺少 question".to_string()), None);
+    };
+
+    // 从会话历史抽取图片（按出现顺序去重）与视觉 provider 配置，仅在持锁期间访问 DB。
+    let state = app.state::<AppState>();
+    let (images, vision_provider) = {
+        let Ok(db) = state.db.lock() else {
+            return (Err("数据库忙，请稍后重试".to_string()), None);
+        };
+        let messages = match get_messages(&db, conversation_id) {
+            Ok(m) => m,
+            Err(e) => return (Err(e.to_string()), None),
+        };
+        let images = collect_conversation_images(&messages);
+        let vp = get_model_provider(&db, "vision").ok().flatten();
+        (images, vp)
+    };
+
+    if images.is_empty() {
+        // 无图：返回提示而非报错（工具成功，answer 即提示语）。
+        return (
+            Ok(serde_json::json!({
+                "ok": true,
+                "answer": "本会话没有图片可追问。请提示用户先上传图片后再使用 ask_vision。"
+            })),
+            None,
+        );
+    }
+    let Some(vp) = vision_provider else {
+        return (
+            Ok(serde_json::json!({
+                "ok": true,
+                "answer": "当前未配置视觉模型，无法对图片追问。请提示用户在 设置 → 模型供应商 → 扩展 agent 的模态 配置视觉模型。"
+            })),
+            None,
+        );
+    };
+
+    // 视觉 base_url 直接用用户自填值（视觉不强制走 preset 官方端点）。
+    let vbase = vp.base_url.clone().unwrap_or_default();
+    let _ = app.emit("agent-status", serde_json::json!({ "state": "analyzing_image" }));
+    match analyze_image(
+        &vbase,
+        &vp.api_key,
+        &vp.model_id,
+        &vp.api_format,
+        VISION_FOLLOWUP_SYSTEM,
+        &question,
+        &images,
+    )
+    .await
+    {
+        Ok((answer, usage)) => {
+            // 视觉追问 usage 单独记账（与主模型分开），保证 CSV 导出含视觉开销。
+            if let Some(u) = &usage {
+                if let Ok(db) = state.db.lock() {
+                    let _ = save_token_ledger_entry(
+                        &db,
+                        conversation_id,
+                        "vision",
+                        &serde_json::to_string(u).unwrap_or_default(),
+                    );
+                }
+            }
+            (Ok(serde_json::json!({ "ok": true, "answer": answer })), usage)
+        }
+        Err(e) => (Err(format!("视觉追问失败: {e}")), None),
+    }
+}
+
+/// 从会话历史消息中按出现顺序提取图片（mediaType, base64），并对相同 base64 去重。
+///
+/// 解析每条消息的 parts_json（JSON 数组），取 type=="image" 的 part 的 mediaType / base64。
+/// 解析失败或非数组的消息跳过；用于 ask_vision 重新喂图给视觉模型。
+fn collect_conversation_images(
+    messages: &[mdga_storage::StoredMessage],
+) -> Vec<mdga_deepseek_client::VisionImage> {
+    let mut images: Vec<mdga_deepseek_client::VisionImage> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in messages {
+        let Some(parts_json) = msg.parts_json.as_deref() else {
+            continue;
+        };
+        let Ok(parts) = serde_json::from_str::<serde_json::Value>(parts_json) else {
+            continue;
+        };
+        let Some(arr) = parts.as_array() else {
+            continue;
+        };
+        for part in arr {
+            if part.get("type").and_then(|t| t.as_str()) != Some("image") {
+                continue;
+            }
+            let media_type = part.get("mediaType").and_then(|m| m.as_str());
+            let base64 = part.get("base64").and_then(|b| b.as_str());
+            if let (Some(media_type), Some(base64)) = (media_type, base64) {
+                if base64.is_empty() || !seen.insert(base64.to_string()) {
+                    continue; // 空或重复图片跳过
+                }
+                images.push((media_type.to_string(), base64.to_string()));
+            }
+        }
+    }
+    images
+}
+
 /// Agent 工具循环：每轮带工具问模型、执行返回的工具、把结果回灌，直到模型不再调用工具
 /// （自然终止）或用户中断。不设轮数上限——上下文自动压缩兜底体积，取消按钮兜底失控；
 /// 所有工具执行前都经 SessionSecurityContext 裁决。
@@ -513,6 +666,8 @@ async fn chat_with_builtin_tools(
     // Plan21 #4：本轮在进入工具循环前已产生的 usage（如自动初看的视觉开销），作为预算累计起点，
     // 使下方预算判断（:491-503）覆盖视觉/前置开销，而不仅是主循环内的 token。
     initial_usage: Option<mdga_shared::RawUsage>,
+    // Plan27 C2 #2：主供应商上下文窗口（tokens，可空）。有值时软上限按其 × 0.8 推导。
+    context_window: Option<i64>,
 ) -> Result<Option<mdga_shared::RawUsage>, String> {
     let security_context = session_security_context(
         workspace_path.to_string(),
@@ -542,6 +697,10 @@ async fn chat_with_builtin_tools(
     let mut last_failure_signature: Option<String> = None;
     let mut repeated_failure_count: usize = 0;
 
+    // Plan27 C2 #2：本轮压缩软上限——主供应商有 context_window 则用其 × 0.8，否则回退默认（env 仍优先）。
+    // 整轮恒定，故循环外算一次：既用于压缩触发判断，也作为 context-usage 事件的 softLimit。
+    let soft_limit = context_soft_limit_for(context_window);
+
     let mut round: usize = 0;
     loop {
         round += 1;
@@ -568,7 +727,6 @@ async fn chat_with_builtin_tools(
 
         // 两级上下文压缩：超软上限先把较早的大体积工具结果换成短桩（机械、零成本）；
         // 若已无桩可压仍超限，触发摘要压缩（auto-compact），把旧历史压成任务进度摘要。
-        let soft_limit = context_soft_limit_tokens();
         if last_prompt_tokens > soft_limit {
             let compacted = compact_tool_outputs(
                 &mut wire_messages,
@@ -898,6 +1056,13 @@ async fn chat_with_builtin_tools(
                 "load_skill" => execute_load_skill(workspace_path, &arguments),
                 "remember" => execute_remember(workspace_path, &arguments),
                 "add_mcp_server" => execute_add_mcp_server(app, &arguments),
+                "ask_vision" => {
+                    // Plan27 C3（#1c）：对本会话已上传图片做针对性追问/精读。
+                    let (vision_result, vision_usage) =
+                        execute_ask_vision(app, conversation_id, &arguments).await;
+                    usage = merge_usage(usage, vision_usage);
+                    vision_result
+                }
                 "web_fetch" => execute_web_fetch(&arguments).await,
                 "web_search" => execute_web_search(&arguments).await,
                 "list_shells" | "get_shell_output" | "kill_shell" => {
