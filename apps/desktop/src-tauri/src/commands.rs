@@ -20,8 +20,8 @@ use mdga_storage::{
     list_file_checkpoints,
     list_mcp_servers, list_permission_rules, mark_checkpoint_reverted, remove_mcp_server,
     remove_permission_rule, save_active_workspace, save_message, set_conversation_archived,
-    set_conversation_pinned, set_mcp_server_enabled, update_title, ActivityEventRecord,
-    Conversation, FileCheckpoint, StoredMessage, Workspace,
+    set_conversation_pinned, set_mcp_server_enabled, update_conversation_workspace, update_title,
+    ActivityEventRecord, Conversation, FileCheckpoint, StoredMessage, Workspace,
 };
 use mdga_storage::{
     delete_model_provider, get_setting, set_setting, upsert_model_provider, ModelProvider,
@@ -220,6 +220,49 @@ pub(crate) fn new_conversation_with_workspace(
         workspace.as_ref().map(|(_, name)| name.as_str()),
     )
     .map_err(|e| e.to_string())
+}
+
+/// 改绑已有会话的工作区（Plan23 A）：选目录则绑定到该工作区，None/空白则解绑为纯聊天。
+///
+/// 输入会话 ID 与可选路径；path 为 Some 且 trim 非空时校验为已存在目录（与 set_workspace_path
+/// 一致），name 取路径 basename；否则 path/name 均传 None。写库后失效该会话的 repo_map 缓存，
+/// 使换工作区后下一轮重新生成结构摘要。返回更新后的 Conversation。
+#[tauri::command]
+pub(crate) fn set_conversation_workspace(
+    state: State<AppState>,
+    conversation_id: String,
+    path: Option<String>,
+) -> Result<Conversation, String> {
+    let workspace = match path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(path) => {
+            let path_buf = std::path::PathBuf::from(path);
+            if !path_buf.is_dir() {
+                return Err("工作区路径不存在或不是目录".to_string());
+            }
+            let name = workspace_name_from_path(path);
+            Some((path.to_string(), name))
+        }
+        None => None,
+    };
+
+    // 仅在写库时持有 db 锁，避免与 repo_maps 锁同时持有。
+    let conversation = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        update_conversation_workspace(
+            &db,
+            &conversation_id,
+            workspace.as_ref().map(|(path, _)| path.as_str()),
+            workspace.as_ref().map(|(_, name)| name.as_str()),
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    // 失效该会话的 repo_map 缓存：换工作区后下一轮重新生成结构摘要。
+    if let Ok(mut maps) = state.repo_maps.lock() {
+        maps.remove(&conversation_id);
+    }
+
+    Ok(conversation)
 }
 
 /// 返回所有会话列表，按最近更新时间倒序。

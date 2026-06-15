@@ -376,6 +376,52 @@ pub fn update_title(conn: &Connection, conv_id: &str, title: &str) -> SqlResult<
     Ok(())
 }
 
+/// 更新已有会话的工作区绑定（Plan23 A：改已有会话工作区）。
+///
+/// 输入会话 ID、可选工作区路径和名称；更新 workspace_path/workspace_name/mode/updated_at，
+/// mode 规则与 create_conversation_with_workspace 一致（path.is_some() → local_workspace，否则
+/// chat_only）。更新后查回并返回该 Conversation（复用 get_conversation 的 SELECT 列顺序）。
+pub fn update_conversation_workspace(
+    conn: &Connection,
+    conv_id: &str,
+    path: Option<&str>,
+    name: Option<&str>,
+) -> SqlResult<Conversation> {
+    let mode = if path.is_some() {
+        "local_workspace"
+    } else {
+        "chat_only"
+    };
+    conn.execute(
+        "UPDATE conversations
+         SET workspace_path = ?1, workspace_name = ?2, mode = ?3, updated_at = ?4
+         WHERE id = ?5",
+        params![path, name, mode, now_ts(), conv_id],
+    )?;
+    // 查回最新行返回，列顺序与 get_conversation 保持一致。
+    let mut stmt = conn.prepare(
+        "SELECT id, title, workspace_path, workspace_name, mode, pinned, archived, created_at, updated_at
+         FROM conversations
+         WHERE id = ?1
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query([conv_id])?;
+    let row = rows
+        .next()?
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    Ok(Conversation {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        workspace_path: row.get(2)?,
+        workspace_name: row.get(3)?,
+        mode: row.get(4)?,
+        pinned: row.get::<_, i64>(5)? != 0,
+        archived: row.get::<_, i64>(6)? != 0,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
 /// 删除会话及其所有消息（ON DELETE CASCADE）。
 pub fn delete_conversation(conn: &Connection, conv_id: &str) -> SqlResult<()> {
     conn.execute("DELETE FROM conversations WHERE id = ?1", params![conv_id])?;
@@ -1068,6 +1114,44 @@ mod tests {
         assert_eq!(conv.workspace_name.as_deref(), Some("MDGA"));
         assert_eq!(conv.mode, "local_workspace");
         assert_eq!(stored[0].workspace_path.as_deref(), Some("C:\\workspace\\demo"));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn updates_conversation_workspace_binding() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        // 起始为纯聊天会话。
+        let conv = create_conversation(&conn).expect("conv");
+        assert_eq!(conv.mode, "chat_only");
+        assert_eq!(conv.workspace_path, None);
+
+        // 绑定到工作区：mode 切 local_workspace，path/name 写入。
+        let bound = update_conversation_workspace(
+            &conn,
+            &conv.id,
+            Some("C:\\workspace\\demo"),
+            Some("demo"),
+        )
+        .expect("bind workspace");
+        assert_eq!(bound.id, conv.id);
+        assert_eq!(bound.mode, "local_workspace");
+        assert_eq!(bound.workspace_path.as_deref(), Some("C:\\workspace\\demo"));
+        assert_eq!(bound.workspace_name.as_deref(), Some("demo"));
+        assert!(bound.updated_at >= conv.updated_at);
+        // 落库一致。
+        let stored = get_conversation(&conn, &conv.id).expect("query").expect("exists");
+        assert_eq!(stored.workspace_path.as_deref(), Some("C:\\workspace\\demo"));
+        assert_eq!(stored.mode, "local_workspace");
+
+        // 解绑为纯聊天：path/name 清空，mode 回 chat_only。
+        let unbound = update_conversation_workspace(&conn, &conv.id, None, None)
+            .expect("unbind workspace");
+        assert_eq!(unbound.mode, "chat_only");
+        assert_eq!(unbound.workspace_path, None);
+        assert_eq!(unbound.workspace_name, None);
 
         let _ = std::fs::remove_file(db_path);
     }

@@ -8,10 +8,10 @@ import rehypeHighlight from "rehype-highlight";
 import "highlight.js/styles/github.css";
 import {
   SquarePen, Search, Pin, Archive, ArchiveRestore, Trash2, Settings2,
-  Paperclip, ListChecks, Square, ArrowUp, GitCompare, Plug, Sun, Moon,
+  ListChecks, Square, ArrowUp, GitCompare, Plug, Sun, Moon,
   Check, X, Ban, Info, CircleDot, CheckSquare, ChevronRight,
   ChevronDown, FolderOpen, Gauge, AtSign, CornerDownRight, Eye, EyeOff, Lock,
-  Copy, RefreshCw, Pencil,
+  Copy, RefreshCw, Pencil, Plus, MessageCircle,
 } from "lucide-react";
 
 /** MDGA 品牌标识：深海声纳波纹（致敬 DeepSeek 的「deep」，非官方鲸鱼 logo） */
@@ -303,6 +303,8 @@ export function App() {
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("workspace_auto");
   const [draftWorkspace, setDraftWorkspace] = useState<DraftWorkspace | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  // 工作区胶囊小菜单开合（B2）：footer 内胶囊点击弹出「选择/更换」「纯聊天」两项。
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [askUser, setAskUser] = useState<AskUserRequest | null>(null);
   // 侧边栏：搜索过滤、行内重命名、归档区展开
@@ -686,6 +688,7 @@ export function App() {
     setPendingImages([]);
     setPlanMode(false);
     setQueuedSteering([]);
+    setWorkspaceMenuOpen(false);
   }
 
   async function handleDeleteConversation(e: React.MouseEvent, id: string) {
@@ -746,6 +749,59 @@ export function App() {
     } catch (err) {
       setWorkspaceError(String(err));
     }
+  }
+
+  /**
+   * 从 composer 工作区胶囊菜单触发「选择/更换工作区…」（B2）。
+   * - 无 activeConvId（新会话草稿）：选目录后写入 draftWorkspace，首发时随 new_conversation_with_workspace 绑定。
+   * - 有 activeConvId（已存会话）：调后端 set_conversation_workspace 改绑，用返回的 Conversation 刷新该条。
+   */
+  async function handlePickWorkspaceFromComposer() {
+    setWorkspaceMenuOpen(false);
+    if (!activeConvId) {
+      await handleSelectWorkspace();
+      return;
+    }
+    try {
+      const selected = await open({ directory: true, multiple: false });
+      if (!selected || Array.isArray(selected)) return;
+      const updated = await invoke<Conversation>("set_conversation_workspace", {
+        conversationId: activeConvId,
+        path: selected,
+      });
+      setConversations((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+    } catch (err) {
+      pushToast("error", humanizeError(String(err)));
+    }
+  }
+
+  /**
+   * 从 composer 工作区胶囊菜单触发「纯聊天（不绑定）」（B2）。
+   * - 无 activeConvId：清空 draftWorkspace。
+   * - 有 activeConvId：调后端 set_conversation_workspace（path=null）解绑。
+   */
+  async function handleClearWorkspaceFromComposer() {
+    setWorkspaceMenuOpen(false);
+    if (!activeConvId) {
+      setDraftWorkspace(null);
+      setWorkspaceError(null);
+      return;
+    }
+    try {
+      const updated = await invoke<Conversation>("set_conversation_workspace", {
+        conversationId: activeConvId,
+        path: null,
+      });
+      setConversations((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+    } catch (err) {
+      pushToast("error", humanizeError(String(err)));
+    }
+  }
+
+  /** 工作区胶囊当前展示名（B2）：已存会话取 activeConversation，新会话草稿取 draftWorkspace。 */
+  function composerWorkspaceName(): string | null {
+    if (activeConvId) return activeConversation?.workspaceName ?? null;
+    return draftWorkspace?.name ?? null;
   }
 
   // ── 发送消息 ────────────────────────────────────────────────────────────
@@ -1655,21 +1711,13 @@ export function App() {
 
       {/* 工作区 */}
       <section className="workspace" aria-label="MDGA workspace">
-        <header className="topbar">
-          <div>
+        <header className="topbar topbar--slim">
+          <div className="topbar__brand">
             <p className="eyebrow">Make DeepSeek Great Again</p>
             <h1>MDGA</h1>
           </div>
           <div className="status-strip" aria-label="status">
-            {activeConversation?.workspaceName ? (
-              <span className="chip" title={activeConversation.workspacePath ?? undefined}>
-                <FolderOpen size={13} /> {activeConversation.workspaceName}
-              </span>
-            ) : activeConversation ? (
-              <span className="chip" title="本会话未绑定工作区，Agent 无法执行本地操作；新建对话时可选择工作区">
-                纯聊天
-              </span>
-            ) : null}
+            {/* B3：工作区身份已由 composer 底部胶囊承载，顶栏不再重复 chip；仅保留上下文% 与「变更」。 */}
             {ctxUsage && ctxUsage.softLimit > 0 && (
               <span
                 className="chip chip--accent"
@@ -1738,21 +1786,10 @@ export function App() {
           </section>
         ) : (
           <section className="hero-panel" aria-label="New conversation">
+            {/* B4：空态以「提问语 + 输入框」为重心；工作区入口下沉到 composer 胶囊。 */}
             <h2>我们应该在 MDGA 中做些什么？</h2>
-            <section className="workspace-picker" aria-label="New conversation workspace">
-              <button type="button" onClick={handleSelectWorkspace}>
-                选择工作区
-              </button>
-              {draftWorkspace ? (
-                <div className="workspace-picker__selected">
-                  <strong>{draftWorkspace.name}</strong>
-                  <span title={draftWorkspace.path}>{draftWorkspace.path}</span>
-                </div>
-              ) : (
-                <p>未绑定工作区，仅聊天模式</p>
-              )}
-              {workspaceError && <p className="workspace-picker__error">{workspaceError}</p>}
-            </section>
+            <p className="hero-panel__hint">在下方输入框左下角选择工作区，或直接开始纯聊天。</p>
+            {workspaceError && <p className="hero-panel__error">{workspaceError}</p>}
             {/* 未配主模型引导（Plan19 P0a）：显著 CTA，点击直达 设置 → 模型供应商。 */}
             {mainConfigured === false && (
               <div className="onboarding-cta" role="status" aria-label="需要配置模型">
@@ -1769,20 +1806,12 @@ export function App() {
                 </button>
               </div>
             )}
-            <section className="mvp-grid" aria-label="能力概览">
-              <article>
-                <h3>应用内配置供应商</h3>
-                <p>在设置内选预设、填 API Key 与模型 ID，密钥仅存本地、不上传云端；支持 OpenAI 兼容与自托管端点。</p>
-              </article>
-              <article>
-                <h3>成本透明</h3>
-                <p>记录请求级 token usage、缓存命中与估算费用，可导出账本随时核对花销。</p>
-              </article>
-              <article>
-                <h3>权限分级</h3>
-                <p>默认受限，高风险动作进入审批确认与审计，看清动作内容再决定是否放行。</p>
-              </article>
-            </section>
+            {/* B4：能力卡弱化为一行精简提示，不再抢空态视觉焦点。 */}
+            <ul className="hero-tips" aria-label="能力概览">
+              <li>应用内配置供应商，密钥仅存本地</li>
+              <li>请求级成本透明，可导出账本</li>
+              <li>权限分级，高风险动作先审批</li>
+            </ul>
           </section>
         )}
 
@@ -1856,83 +1885,16 @@ export function App() {
             </div>
           )}
 
-          {/* 控制行：权限模式 + 计划（左）/ 模型（右）。可随时切换，改动在当前回复结束后的下一轮生效。 */}
-          <div className="composer-controls">
-            <div className="composer-controls__left">
-              <select
-                className="control-select"
-                value={permissionMode}
-                onChange={(e) => handlePermissionModeChange(e.target.value as PermissionMode)}
-                aria-label="权限模式"
-                title={sending ? "切换将在当前回复结束后的下一轮生效" : "权限模式"}
-              >
-                {PERMISSION_MODES.map((mode) => (
-                  <option key={mode} value={mode}>{getPermissionModeLabel(mode)}</option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className={`control-toggle${planMode ? " control-toggle--on" : ""}`}
-                title="计划模式：让 Agent 先给出分步计划，确认后再执行"
-                onClick={() => setPlanMode((v) => !v)}
-              >
-                <ListChecks size={14} /> 计划
-              </button>
-            </div>
-            {/* 当前模型只读胶囊（Plan20 🔴1）：展示主 provider 的 model_id，点击进 设置 → 模型供应商。
-                模型唯一真相源在那里配；控制行不再是第二真相源。 */}
-            <button
-              type="button"
-              className="model-pill"
-              onClick={() => openSettings("provider")}
-              aria-label="当前模型，点击修改"
-              title={mainModelId ? `当前模型：${mainModelId}（点击进 设置 → 模型供应商 修改）` : "尚未配置主模型，点击去配置"}
-            >
-              <Gauge size={13} className="model-pill__icon" />
-              <span className="model-pill__id">{mainModelId || "未配置模型"}</span>
-            </button>
-          </div>
-
-          {/* 附图预览（Plan18 M18.1）：📎 选中的图片在发送前显示缩略图，可逐个移除 */}
-          {pendingImages.length > 0 && (
-            <div className="image-tray" aria-label="待发送图片">
-              {pendingImages.map((img, i) => (
-                <span key={i} className="image-tray__item" title={img.name}>
-                  <img
-                    className="image-tray__thumb"
-                    src={`data:${img.mediaType};base64,${img.base64}`}
-                    alt={img.name ?? "待发送图片"}
-                  />
-                  <button
-                    type="button"
-                    className="image-tray__remove"
-                    aria-label="移除图片"
-                    onClick={() => setPendingImages((prev) => prev.filter((_, j) => j !== i))}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-
+          {/* B1：composer 统一容器 —— 上为 textarea、中为待发图托盘、下为底部控制行。
+              拖拽高亮/粘贴/拖放等行为绑定在此容器上，保持原逻辑不变。 */}
           <div
-            className={`composer${dragOver ? " composer--dragover" : ""}`}
+            className={`composer composer--unified${dragOver ? " composer--dragover" : ""}`}
             onDrop={handleComposerDrop}
             onDragOver={handleComposerDragOver}
             onDragLeave={() => setDragOver(false)}
           >
-            <button
-              type="button"
-              className="composer__attach"
-              title="导入本地文档（txt/md/csv/pdf/docx）或图片（需配置视觉模型）"
-              aria-label="导入文档或图片"
-              onClick={handleImportFile}
-              disabled={sending}
-            >
-              <Paperclip size={18} />
-            </button>
             <textarea
+              className="composer__input"
               aria-label="Message"
               placeholder={sending ? "Agent 运行中：输入并回车可插话，下一轮生效（不打断当前任务）" : planMode ? "计划模式：先出计划，确认后再执行（Enter 发送）" : "随心输入（Enter 发送，Shift+Enter 换行，/ 命令，@ 引用文件）"}
               value={input}
@@ -1943,15 +1905,120 @@ export function App() {
               onKeyDown={handleKeyDown}
               onPaste={handleComposerPaste}
             />
-            {sending ? (
-              <button type="button" className="composer__send composer__send--stop" onClick={handleStop} aria-label="停止">
-                <Square size={14} fill="currentColor" />
-              </button>
-            ) : (
-              <button type="button" className="composer__send" onClick={handleSend} disabled={!input.trim()} aria-label="发送">
-                <ArrowUp size={18} />
-              </button>
+
+            {/* 附图预览（Plan18 M18.1）：选中的图片在发送前显示缩略图，可逐个移除。位于 textarea 与 footer 之间。 */}
+            {pendingImages.length > 0 && (
+              <div className="image-tray" aria-label="待发送图片">
+                {pendingImages.map((img, i) => (
+                  <span key={i} className="image-tray__item" title={img.name}>
+                    <img
+                      className="image-tray__thumb"
+                      src={`data:${img.mediaType};base64,${img.base64}`}
+                      alt={img.name ?? "待发送图片"}
+                    />
+                    <button
+                      type="button"
+                      className="image-tray__remove"
+                      aria-label="移除图片"
+                      onClick={() => setPendingImages((prev) => prev.filter((_, j) => j !== i))}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
             )}
+
+            {/* 底部控制行：左组 [+ 附件][工作区胶囊][权限][模型]，右组 [计划][发送/停止]。 */}
+            <div className="composer-footer">
+              <div className="composer-footer__left">
+                {/* 附件「+」（B1）：原 handleImportFile，图标由 Paperclip 改为 Plus。 */}
+                <button
+                  type="button"
+                  className="composer__attach"
+                  title="导入本地文档（txt/md/csv/pdf/docx）或图片（需配置视觉模型）"
+                  aria-label="导入文档或图片"
+                  onClick={handleImportFile}
+                  disabled={sending}
+                >
+                  <Plus size={18} />
+                </button>
+
+                {/* 工作区胶囊（B2）：点击弹出小菜单——选择/更换工作区、纯聊天。 */}
+                <div className="workspace-pill-wrap">
+                  <button
+                    type="button"
+                    className={`workspace-pill${composerWorkspaceName() ? " workspace-pill--bound" : ""}`}
+                    onClick={() => setWorkspaceMenuOpen((v) => !v)}
+                    aria-haspopup="menu"
+                    aria-expanded={workspaceMenuOpen}
+                    title={composerWorkspaceName() ? `工作区：${composerWorkspaceName()}` : "未绑定工作区（纯聊天），点击选择"}
+                  >
+                    <FolderOpen size={13} className="workspace-pill__icon" />
+                    <span className="workspace-pill__name">{composerWorkspaceName() ?? "选择工作区"}</span>
+                  </button>
+                  {workspaceMenuOpen && (
+                    <>
+                      {/* 点击遮罩关闭菜单（覆盖全屏，透明） */}
+                      <div className="workspace-menu__backdrop" onClick={() => setWorkspaceMenuOpen(false)} />
+                      <div className="workspace-menu" role="menu">
+                        <button type="button" className="workspace-menu__item" role="menuitem" onClick={handlePickWorkspaceFromComposer}>
+                          <FolderOpen size={14} /> 选择/更换工作区…
+                        </button>
+                        <button type="button" className="workspace-menu__item" role="menuitem" onClick={handleClearWorkspaceFromComposer}>
+                          <MessageCircle size={14} /> 纯聊天（不绑定）
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {/* 权限模式紧凑胶囊（B1）：仍是 select，onChange 行为不变。 */}
+                <select
+                  className="control-select control-select--compact"
+                  value={permissionMode}
+                  onChange={(e) => handlePermissionModeChange(e.target.value as PermissionMode)}
+                  aria-label="权限模式"
+                  title={sending ? "切换将在当前回复结束后的下一轮生效" : "权限模式"}
+                >
+                  {PERMISSION_MODES.map((mode) => (
+                    <option key={mode} value={mode}>{getPermissionModeLabel(mode)}</option>
+                  ))}
+                </select>
+
+                {/* 当前模型只读胶囊（Plan20 🔴1）：点击进 设置 → 模型供应商。 */}
+                <button
+                  type="button"
+                  className="model-pill"
+                  onClick={() => openSettings("provider")}
+                  aria-label="当前模型，点击修改"
+                  title={mainModelId ? `当前模型：${mainModelId}（点击进 设置 → 模型供应商 修改）` : "尚未配置主模型，点击去配置"}
+                >
+                  <Gauge size={13} className="model-pill__icon" />
+                  <span className="model-pill__id">{mainModelId || "未配置模型"}</span>
+                </button>
+              </div>
+
+              <div className="composer-footer__right">
+                <button
+                  type="button"
+                  className={`control-toggle${planMode ? " control-toggle--on" : ""}`}
+                  title="计划模式：让 Agent 先给出分步计划，确认后再执行"
+                  onClick={() => setPlanMode((v) => !v)}
+                >
+                  <ListChecks size={14} /> 计划
+                </button>
+                {sending ? (
+                  <button type="button" className="composer__send composer__send--stop" onClick={handleStop} aria-label="停止">
+                    <Square size={14} fill="currentColor" />
+                  </button>
+                ) : (
+                  <button type="button" className="composer__send" onClick={handleSend} disabled={!input.trim()} aria-label="发送">
+                    <ArrowUp size={18} />
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
         </div>
       </section>

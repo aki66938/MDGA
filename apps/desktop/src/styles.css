@@ -47,6 +47,13 @@ body {
   --radius-btn: 8px;
   --radius-tag: 6px;
 
+  /* 对话栏（栅格第 2 轨）左右内边距。滚动条 = 该列右边界：今天与窗口右缘重合，
+     未来停靠式第三栏在 .app-shell 追加第 3 轨后，对话栏收窄、滚动条自动落到第 2/3 栏分界。 */
+  --col-gutter: 48px;
+  /* 滚动条配色（淡中性，融入主题）。 */
+  --scrollbar-thumb: rgba(26, 29, 36, 0.18);
+  --scrollbar-thumb-hover: rgba(26, 29, 36, 0.32);
+
   color: var(--text);
   background: var(--canvas);
   font-family:
@@ -82,6 +89,8 @@ body {
   --diff-del-fg: #F4989C;
 
   --shadow-pop: 0 10px 32px rgba(0, 0, 0, 0.45);
+  --scrollbar-thumb: rgba(232, 235, 242, 0.16);
+  --scrollbar-thumb-hover: rgba(232, 235, 242, 0.30);
 }
 
 button,
@@ -96,12 +105,36 @@ textarea {
   }
 }
 
+/* ── 滚动条精细化（Plan24）：细、淡、配色融入主题；全局统一（含侧栏 / 设置 / 代码块横向条）。
+   WebView2 = Chromium，用 ::-webkit-scrollbar 精控；transparent border + background-clip 让可见宽≈4px、留呼吸。 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 /* ── 整体布局 ── */
 
 .app-shell {
   display: grid;
   height: 100vh;
   overflow: hidden;
+  /* 第 1 轨=侧栏，第 2 轨=对话栏。未来停靠式第三栏在此追加第 3 轨
+     （如 260px minmax(0,1fr) 360px）；对话栏的滚动条作为第 2 轨右边界会自动归位，无需改动 .message-list。 */
   grid-template-columns: 260px minmax(0, 1fr);
 }
 
@@ -158,7 +191,7 @@ textarea {
   min-width: 0;
   height: 100vh;
   overflow: hidden;
-  padding: 32px 48px 24px;
+  padding: 32px var(--col-gutter) 24px;
   gap: 0;
 }
 
@@ -178,6 +211,21 @@ textarea {
   margin: 0 0 6px;
   color: var(--text-2);
   font-size: 13px;
+}
+
+/* B3 顶栏瘦身：品牌区收窄，eyebrow 缩小、h1 降级为侧栏标识尺寸，顶栏不再放大标题。 */
+.topbar--slim {
+  padding-bottom: 12px;
+}
+.topbar--slim .topbar__brand .eyebrow {
+  margin: 0 0 2px;
+  font-size: 11px;
+  letter-spacing: .2px;
+}
+.topbar--slim .topbar__brand h1 {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: .2px;
 }
 
 h1,
@@ -299,6 +347,48 @@ h1 {
   font-weight: 600;
 }
 
+/* B4 空态聚焦：提问语下方一句小提示，引导到 composer 工作区胶囊 */
+.hero-panel__hint {
+  margin: -16px 0 0;
+  color: var(--text-2);
+  font-size: 13.5px;
+  text-align: center;
+}
+.hero-panel__error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+/* B4 能力卡弱化：从三张大卡改为一行精简的小提示，不抢空态焦点 */
+.hero-tips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px 18px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  width: min(680px, 100%);
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+.hero-tips li {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.hero-tips li::before {
+  content: "";
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--brand);
+  opacity: .7;
+}
+
 /* ── 消息列表：唯一的滚动容器 ── */
 
 .message-list {
@@ -308,15 +398,22 @@ h1 {
   display: flex;
   flex-direction: column;
   gap: 16px;
-  padding: 24px 0;
-  width: min(760px, 100%);
-  align-self: center;
+  /* 滚动容器撑满对话栏：用负外边距抵消 .workspace 自身的 --col-gutter 内边距，
+     撑到该列 border-box 边缘（被 .workspace overflow:hidden 裁切）→ 滚动条落在对话栏右边界。
+     这是「列相对」的（抵消父列内边距），加第三栏后随列收窄自动归位，不含任何窗口宽度硬编码。
+     再用等量 padding 把内容推回、align-items 居中、消息行限宽，保持消息 760 居中。 */
+  align-self: stretch;
+  align-items: center;
+  margin: 0 calc(-1 * var(--col-gutter));
+  padding: 24px var(--col-gutter);
 }
 
-/* 每条消息的行容器，user 右对齐，assistant 左对齐 */
+/* 每条消息的行容器，user 右对齐，assistant 左对齐。
+   限宽 760 + 由 .message-list 的 align-items:center 居中（滚动容器满列、内容居中）。 */
 .message-row {
   display: flex;
   flex-direction: column;
+  width: min(760px, 100%);
 }
 
 .message-row:has(.message--user) {
@@ -574,6 +671,49 @@ h1 {
   line-height: 1.5;
 }
 
+/* ── B1：统一 composer 容器（textarea 在上、footer 控制行在下，竖向布局）── */
+.composer--unified {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 10px 12px 10px;
+}
+.composer--unified .composer__input {
+  flex: none;
+  width: 100%;
+  min-height: 46px;
+  max-height: 220px;
+  resize: none;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  padding: 2px 2px 0;
+  line-height: 1.5;
+}
+/* 统一容器内附图托盘紧贴在 textarea 与 footer 之间 */
+.composer--unified .image-tray {
+  padding: 4px 2px 0;
+}
+
+/* 底部控制行：左组 [+ 附件][工作区][权限][模型]，右组 [计划][发送/停止] */
+.composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.composer-footer__left,
+.composer-footer__right {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.composer-footer__left {
+  flex: 1;
+  overflow: visible;
+}
+
 /* 拖拽图片悬停高亮（Plan19 P0b）：边框与背景提示「松手即可添加」 */
 .composer--dragover {
   border-color: var(--brand);
@@ -602,6 +742,92 @@ h1 {
 }
 
 .composer__attach:disabled { opacity: .4; cursor: not-allowed; }
+
+/* B1：footer 内的「+」附件按钮，与同排胶囊统一为紧凑尺寸 */
+.composer-footer__left .composer__attach {
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.composer-footer__left .composer__attach:hover:not(:disabled) {
+  color: var(--brand);
+  background: var(--brand-tint);
+  border-color: var(--brand-tint-strong);
+}
+
+/* ── B2：工作区胶囊 + 弹出小菜单 ── */
+.workspace-pill-wrap {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+}
+.workspace-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 200px;
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px;
+  padding: 0 11px;
+  cursor: pointer;
+  transition: all .14s;
+}
+.workspace-pill:hover { border-color: var(--border-strong); color: var(--text); }
+.workspace-pill--bound {
+  color: var(--brand);
+  border-color: var(--brand-tint-strong);
+  background: var(--brand-tint);
+}
+.workspace-pill__icon { flex-shrink: 0; }
+.workspace-pill__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 工作区小菜单：弹在胶囊上方，避免被 composer 边缘裁切 */
+.workspace-menu__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+}
+.workspace-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 61;
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-pop);
+}
+.workspace-menu__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: none;
+  background: none;
+  border-radius: 7px;
+  padding: 8px 10px;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background .12s;
+}
+.workspace-menu__item:hover { background: var(--surface-3); }
+.workspace-menu__item svg { flex-shrink: 0; color: var(--text-3); }
 
 /* ── MVP 卡片 ── */
 
@@ -1008,6 +1234,8 @@ h1 {
   padding: 6px 0;
   font-size: 13px;
   color: var(--text-3);
+  /* 与消息同列：760 居中块，内容左对齐（滚动容器已满列居中）。 */
+  width: min(760px, 100%);
 }
 
 
@@ -1347,6 +1575,30 @@ h1 {
   background: var(--brand-tint);
   color: var(--brand);
   border-color: var(--brand-tint-strong);
+}
+
+/* B1：composer footer 控件统一高度与圆角，消除「零件拼接」感。
+   send 圆形按钮稍小、其余胶囊同高 30px。 */
+.composer-footer__left > *,
+.composer-footer__right > .control-toggle {
+  height: 30px;
+}
+.composer-footer .control-select--compact {
+  height: 30px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+.composer-footer .control-toggle {
+  height: 30px;
+}
+.composer-footer .model-pill {
+  height: 30px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+.composer-footer .composer__send {
+  width: 32px;
+  height: 32px;
 }
 
 .slash-menu {

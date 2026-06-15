@@ -33,8 +33,8 @@ use commands::{
     read_image_base64,
     load_messages, new_conversation, new_conversation_with_workspace, persist_message,
     pin_conversation, queue_steering, remove_conversation, rename_conversation, respond_approval,
-    respond_ask_user, revert_to_checkpoint, set_command_sandbox, set_task_budget, set_workspace_path,
-    toggle_mcp_server,
+    respond_ask_user, revert_to_checkpoint, set_command_sandbox, set_conversation_workspace,
+    set_task_budget, set_workspace_path, toggle_mcp_server,
 };
 use commands::{
     get_app_setting, get_model_provider_config, remove_model_provider, save_model_provider,
@@ -167,6 +167,7 @@ fn main() {
             send_message,
             new_conversation,
             new_conversation_with_workspace,
+            set_conversation_workspace,
             get_conversations,
             load_messages,
             persist_message,
