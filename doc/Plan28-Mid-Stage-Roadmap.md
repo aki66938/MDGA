@@ -54,6 +54,16 @@ storage(SQLite `:memory:` 端到端 CRUD)、mcp-client(JSON-RPC 解析)、tools(
 ### 🧭 中长期(单独立项)
 - **P3-9 agent-core 抽取**:先抽象 Tauri IPC / 存储接口,再把工具调度 / 消息构建 / 压缩触发迁入 `agent-core`(现仅 23 行占位),为独立测试 / 将来多端复用。
 - **P3-10 AppContainer 沙箱(M8.2)**:文件路径 + 网络隔离,补齐安全纵深(当前仅降权 + Job Object)。
+  - **进展(0.0.39,基座完成但暂未启用)**:`crates/tool-runtime/src/appcontainer_win.rs` 已实现并真机验证——
+    文件路径隔离(默认拒绝 + 工作区 ACL 授权)、网络默认拒绝 + 能力 SID 放行(放行需宿主防火墙开)、
+    powershell 包装 + 擦密钥 + 容器临时目录;另修复 R3(后台命令绕过沙箱的 fail-open)。
+  - **拦路问题(showstopper)**:容器内 native console 程序(git/npm/node…)的 stdout/stderr **不回传**——
+    根因是 AppContainer 断开「容器进程 → 其子进程」的 I/O 继承(powershell 自身输出回得来,其派生的
+    native 孙进程输出丢失)。**ConPTY 限时 spike 已验证仍无解**(非容器能捕获、容器不能;回归测试
+    `conpty_appcontainer_loses_native_child_output`)。
+  - **决策**:默认仍用受限令牌沙箱;AppContainer 全套实现 + 隔离测试以 `#![allow(dead_code)]` 门控保留。
+    待**换稳定版 Windows**(本机 Canary 28000,疑似构建相关)或**真实无控制台进程(Tauri)环境**复测后再评估启用。
+    详见 memory `appcontainer-console-output-blocker`。
 
 ---
 

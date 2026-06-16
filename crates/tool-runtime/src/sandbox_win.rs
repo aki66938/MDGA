@@ -9,10 +9,11 @@
 //! fail-closed：任一步骤失败即返回 Err，调用方不得降级为无沙箱执行。
 //! 注意：本层不隔离网络与文件系统路径——那由 M8.2 的 AppContainer 提供。
 
-use crate::{CommandLineCallback, RunCommandResult, ToolRuntimeError};
+use crate::{CommandCancel, CommandLineCallback, RunCommandResult, ToolRuntimeError};
 use std::io::Read;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{
@@ -60,7 +61,7 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 /// 把命令编码为 PowerShell -EncodedCommand 参数（UTF-16LE → base64），彻底规避命令行转义问题。
-fn encoded_command_line(command: &str) -> Vec<u16> {
+pub(crate) fn encoded_command_line(command: &str) -> Vec<u16> {
     let utf16le: Vec<u8> = command
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
@@ -71,7 +72,7 @@ fn encoded_command_line(command: &str) -> Vec<u16> {
 }
 
 /// 构建擦除密钥后的 UTF-16 环境块（KEY=VAL\0...\0\0）。
-fn build_scrubbed_env_block() -> Vec<u16> {
+pub(crate) fn build_scrubbed_env_block() -> Vec<u16> {
     let mut block: Vec<u16> = Vec::new();
     for (k, v) in std::env::vars() {
         let upper = k.to_uppercase();
@@ -97,6 +98,7 @@ pub fn run_in_restricted_sandbox(
     command: &str,
     timeout: Duration,
     on_line: Option<CommandLineCallback>,
+    cancel: Option<CommandCancel>,
 ) -> Result<RunCommandResult, ToolRuntimeError> {
     unsafe {
         // 1) 打开当前进程令牌
@@ -240,6 +242,16 @@ pub fn run_in_restricted_sandbox(
         loop {
             let wait = WaitForSingleObject(pi.hProcess, 50);
             if wait == WAIT_OBJECT_0 {
+                break;
+            }
+            // 外部取消（后台 kill_shell 置位）：杀进程收尾。让沙箱路径也支持取消，
+            // 后台命令从此可在沙箱内执行并被 kill（修复 R3：后台命令此前完全绕过沙箱）。
+            if cancel
+                .as_ref()
+                .map(|c| c.load(Ordering::SeqCst))
+                .unwrap_or(false)
+            {
+                let _ = TerminateProcess(pi.hProcess, 1);
                 break;
             }
             if started.elapsed() >= timeout {

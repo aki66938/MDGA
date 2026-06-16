@@ -1,5 +1,7 @@
 #[cfg(windows)]
 mod sandbox_win;
+#[cfg(windows)]
+mod appcontainer_win;
 
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -1401,7 +1403,7 @@ pub fn run_command(
     workspace_root: impl AsRef<Path>,
     request: RunCommandRequest,
 ) -> Result<RunCommandResult, ToolRuntimeError> {
-    run_command_streaming(workspace_root, request, None, None, false)
+    run_command_streaming(workspace_root, request, None, None, false, false)
 }
 
 /// 行级流式输出回调：命令每产生一行 stdout/stderr 调用一次，供 UI 实时展示。
@@ -1418,6 +1420,7 @@ pub fn run_command_streaming(
     on_line: Option<CommandLineCallback>,
     cancel: Option<CommandCancel>,
     sandbox: bool,
+    allow_network: bool,
 ) -> Result<RunCommandResult, ToolRuntimeError> {
     let command = request.command.trim();
     if command.is_empty() {
@@ -1431,15 +1434,23 @@ pub fn run_command_streaming(
             .clamp(1, MAX_COMMAND_TIMEOUT_SECS),
     );
 
-    // 沙箱开启时走受限令牌路径（fail-closed：非 Windows 平台无此能力则报错，不降级裸跑）。
+    // 沙箱开启时走受限令牌沙箱（剥权 + Job Object + 擦密钥）。
+    //
+    // AppContainer（真文件路径 + 网络隔离，见 appcontainer_win）已就绪并通过文件/网络隔离功能测试,
+    // 但存在拦路问题:容器内 **native console 程序的 stdout/stderr 不回传**(只有 PowerShell cmdlet
+    // 输出回得来),真实 agent 命令(git/npm/node)的输出会丢失。故在该问题(待 ConPTY 等方案)解决前,
+    // 默认仍走受限令牌沙箱,不把 AppContainer 设为默认。allow_network 预留给 AppContainer 接通后使用。
     if sandbox {
         #[cfg(windows)]
         {
-            return sandbox_win::run_in_restricted_sandbox(&workspace, command, timeout, on_line);
+            let _ = allow_network;
+            return sandbox_win::run_in_restricted_sandbox(
+                &workspace, command, timeout, on_line, cancel,
+            );
         }
         #[cfg(not(windows))]
         {
-            let _ = (&on_line, &cancel);
+            let _ = (&on_line, &cancel, allow_network);
             return Err(ToolRuntimeError::CommandFailed(
                 "命令沙箱仅在 Windows 上可用；请在设置中关闭沙箱后再执行命令".to_string(),
             ));

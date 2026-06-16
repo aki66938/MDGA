@@ -4,7 +4,7 @@
 //! 从 main.rs 抽出（Plan16 阶段2）：纯函数搬移，无行为变更。
 
 use crate::state::{AppState, BgShell, BG_SHELL_SEQ};
-use mdga_sandbox_runtime::SessionSecurityContext;
+use mdga_sandbox_runtime::{NetworkMode, SessionSecurityContext};
 use mdga_tool_runtime::RunCommandRequest;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,14 @@ pub(crate) fn execute_run_command_tool(
     let request = serde_json::from_str::<RunCommandRequest>(arguments)
         .map_err(|e| format!("工具参数解析失败: {e}"))?;
     let workspace = security_context.workspace_root.clone();
+    // 沙箱设置:前台/后台一致遵循(R3 修复——此前后台硬编码不沙箱化,是 fail-open 漏洞)。
+    let sandbox = app.state::<AppState>().command_sandbox.load(Ordering::SeqCst);
+    // AppContainer 网络门控:务实映射——Disabled 断网;AllowListed/FullAccess 放行裸命令出站
+    // (逐域名 allowlist 在 AppContainer 层无法对裸 socket 强制,仅约束应用内网络工具)。
+    let allow_network = matches!(
+        security_context.network_mode,
+        NetworkMode::AllowListed | NetworkMode::FullAccess
+    );
 
     if request.background {
         let shell_id = format!("sh-{}", BG_SHELL_SEQ.fetch_add(1, Ordering::SeqCst));
@@ -66,13 +74,14 @@ pub(crate) fn execute_run_command_tool(
                 }
                 let _ = app_line.emit("command-output", line);
             });
-            // 后台命令暂不沙箱化（沙箱路径不支持轮询/kill），M8.2 再统一。
+            // R3 修复：后台命令与前台一致受沙箱设置约束（沙箱路径现已支持 cancel，可被 kill_shell 终止）。
             let outcome = mdga_tool_runtime::run_command_streaming(
                 &workspace,
                 RunCommandRequest { background: false, ..request },
                 Some(cb),
                 Some(cancel_thread.clone()),
-                false,
+                sandbox,
+                allow_network,
             );
             let final_status = if cancel_thread.load(Ordering::SeqCst) {
                 "killed"
@@ -96,12 +105,13 @@ pub(crate) fn execute_run_command_tool(
         }));
     }
 
-    // 前台命令：按设置决定是否在受限令牌沙箱中执行。
-    let sandbox = app.state::<AppState>().command_sandbox.load(Ordering::SeqCst);
+    // 前台命令：按设置决定是否在受限令牌沙箱中执行（沙箱设置已在上方读取，前后台一致）。
     let cb = command_line_callback(app);
     serde_json::to_value(
-        mdga_tool_runtime::run_command_streaming(&workspace, request, Some(cb), None, sandbox)
-            .map_err(|e| e.to_string())?,
+        mdga_tool_runtime::run_command_streaming(
+            &workspace, request, Some(cb), None, sandbox, allow_network,
+        )
+        .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
 }
