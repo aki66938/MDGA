@@ -43,10 +43,6 @@ use windows::Win32::Security::{
     FreeSid, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, PSID,
 };
 use windows::Win32::System::Console::{ClosePseudoConsole, CreatePseudoConsole, COORD, HPCON};
-use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
-    REG_DWORD, REG_OPTION_NON_VOLATILE,
-};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
@@ -64,36 +60,6 @@ fn err(msg: impl std::fmt::Display) -> ToolRuntimeError {
 /// 把宽字符串转成以 NUL 结尾的 UTF-16。
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// 幂等设 HKCU\Console\LowBoxConsoleEnabled=1:放行 AppContainer(LowBox)进程的控制台连接,
-/// 是方案 B 让容器内 native console 程序输出能回传的前提(配合 lpacCom 能力 + ConPTY)。
-unsafe fn ensure_lowbox_console_enabled() {
-    let mut hkey = HKEY::default();
-    let subkey = wide("Console");
-    let rc = RegCreateKeyExW(
-        HKEY_CURRENT_USER,
-        PCWSTR(subkey.as_ptr()),
-        0,
-        PCWSTR::null(),
-        REG_OPTION_NON_VOLATILE,
-        KEY_SET_VALUE,
-        None,
-        &mut hkey,
-        None,
-    );
-    if rc.is_ok() {
-        let name = wide("LowBoxConsoleEnabled");
-        let val: u32 = 1;
-        let _ = RegSetValueExW(
-            hkey,
-            PCWSTR(name.as_ptr()),
-            0,
-            REG_DWORD,
-            Some(&val.to_le_bytes()),
-        );
-        let _ = RegCloseKey(hkey);
-    }
 }
 
 /// 构建容器用环境块:擦密钥 + 把 TEMP/TMP 重定向到容器可写的沙箱临时目录。
@@ -349,16 +315,13 @@ pub fn run_in_appcontainer_sandbox(
     allow_network: bool,
 ) -> Result<RunCommandResult, ToolRuntimeError> {
     unsafe {
-        // 放行 LowBox 控制台(方案 B 前提,幂等设 HKCU\Console\LowBoxConsoleEnabled=1)。
-        ensure_lowbox_console_enabled();
-        // 能力:registryRead(读 HKCU\Console\LowBoxConsoleEnabled)+ lpacCom(放行 native 连 conhost)
-        // (+ allow_network 时加 internetClient/Server/privateNetwork)。能力须在 profile 创建期与进程
-        // 启动期都登记,仅启动期传入不会真正落入令牌。
+        // 能力:lpacCom(放行 native console 子进程连 conhost,使其输出经 ConPTY 回传——这是容器内
+        // native 输出能回传的关键,不需改任何系统注册表)(+ allow_network 时加互联网能力)。能力须在
+        // profile 创建期与进程启动期都登记,仅启动期传入不会真正落入令牌。
         let mut cap_sids: Vec<PSID> = Vec::new();
         let mut caps: Vec<SID_AND_ATTRIBUTES> = Vec::new();
         let mut cap_strs: Vec<&str> = vec![
-            "S-1-15-3-1024-1065365936-1281604716-3511738428-1654721687-432734479-3232135806-4053264122-3456934681", // registryRead
-            "S-1-15-3-1024-2405443489-874036122-4286035555-1823921565-1746547431-2453885448-3625952902-991631256",  // lpacCom
+            "S-1-15-3-1024-2405443489-874036122-4286035555-1823921565-1746547431-2453885448-3625952902-991631256", // lpacCom
         ];
         if allow_network {
             cap_strs.extend(["S-1-15-3-1", "S-1-15-3-2", "S-1-15-3-3"]);
@@ -625,7 +588,7 @@ mod tests {
         );
     }
 
-    /// 生产路径端到端:run_in_appcontainer_sandbox(ConPTY + lpacCom + LowBoxConsole + New-PSDrive)
+    /// 生产路径端到端:run_in_appcontainer_sandbox(ConPTY + lpacCom 能力 + New-PSDrive)
     /// 跑 native 命令,验证(1)在工作区 cwd 跑(相对路径读到工作区文件) (2)native 输出经伪控制台回传、
     /// 已 strip_vt 成纯文本。这是方案 B 完整接通的回归测试。
     #[test]
