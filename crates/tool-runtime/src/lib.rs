@@ -1441,21 +1441,33 @@ pub fn run_command_streaming(
     if sandbox {
         #[cfg(windows)]
         {
-            match appcontainer_win::run_in_appcontainer_sandbox(
-                &workspace,
-                command,
-                timeout,
-                on_line.clone(),
-                cancel.clone(),
-                allow_network,
-            ) {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    eprintln!("[sandbox] AppContainer 不可用,降级到受限令牌沙箱: {e}");
-                    return sandbox_win::run_in_restricted_sandbox(
-                        &workspace, command, timeout, on_line, cancel,
-                    );
+            // 运行时能力自检(每进程一次,缓存):实测本机 AppContainer 能否回传 native 输出。各版本
+            // Windows 对 LowBoxConsoleEnabled/ConPTY 支持不一,实测为准而非赌版本号;不通过即降级。
+            static APPCONTAINER_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let use_ac = *APPCONTAINER_OK.get_or_init(appcontainer_win::appcontainer_self_test);
+            if use_ac {
+                match appcontainer_win::run_in_appcontainer_sandbox(
+                    &workspace,
+                    command,
+                    timeout,
+                    on_line.clone(),
+                    cancel.clone(),
+                    allow_network,
+                ) {
+                    Ok(result) => return Ok(result),
+                    Err(e) => {
+                        eprintln!("[sandbox] AppContainer 执行失败,降级到受限令牌沙箱: {e}");
+                        return sandbox_win::run_in_restricted_sandbox(
+                            &workspace, command, timeout, on_line, cancel,
+                        );
+                    }
                 }
+            } else {
+                // 本机 AppContainer 自检未通过(版本不支持 / 能力缺失 / 输出不回传),fail-closed 走受限令牌沙箱。
+                eprintln!("[sandbox] AppContainer 自检未通过,使用受限令牌沙箱");
+                return sandbox_win::run_in_restricted_sandbox(
+                    &workspace, command, timeout, on_line, cancel,
+                );
             }
         }
         #[cfg(not(windows))]

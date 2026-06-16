@@ -562,6 +562,36 @@ pub fn run_in_appcontainer_sandbox(
     }
 }
 
+/// 运行时能力自检:在临时区跑探针,实测**本机** AppContainer 方案能否回传 native console 输出。
+///
+/// 各版本 Windows 对 LowBoxConsoleEnabled / ConPTY / AppContainer / lpacCom 的支持不一(我们只在
+/// 一台 Win11 上验证过),与其按版本号猜,不如实跑一条 `cmd echo <token>` 看输出是否回传——回传则
+/// AppContainer 全功能可用,否则由调用方 fail-closed 降级到受限令牌沙箱。结果应由调用方缓存(每进程
+/// 探一次即可)。探针自带 ensure_lowbox_console_enabled(经 run_in_appcontainer_sandbox),故也顺带
+/// 验证了注册表开关在本机是否真生效。
+pub fn appcontainer_self_test() -> bool {
+    let probe_ws = std::env::temp_dir().join("mdga-ac-selftest");
+    if std::fs::create_dir_all(&probe_ws).is_err() {
+        return false;
+    }
+    // nonce(纳秒时戳)防误判:避免历史/缓存输出里残留的 token 被当成探针成功。
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let token = format!("MDGA_SELFTEST_{nonce:x}");
+    let r = run_in_appcontainer_sandbox(
+        &probe_ws,
+        &format!("cmd /c echo {token}"),
+        Duration::from_secs(15),
+        None,
+        None,
+        false,
+    );
+    let _ = std::fs::remove_dir_all(&probe_ws);
+    matches!(r, Ok(o) if o.stdout.contains(token.as_str()))
+}
+
 /// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 的原始值(windows 0.58 未必导出常量,直接用数值)。
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_VAL: usize = 0x0002_0016;
 
@@ -583,6 +613,16 @@ mod tests {
         assert_eq!(strip_vt("a\r\nb\r\n"), "a\nb\n");
         assert_eq!(strip_vt("plain text 42"), "plain text 42");
         assert_eq!(strip_vt("\u{1b}]0;t\u{1b}\\X"), "X");
+    }
+
+    /// 运行时自检在本机应通过(方案B可用)——这是 dispatch 决定走 AppContainer 还是降级受限令牌的依据。
+    #[test]
+    fn appcontainer_self_test_passes_here() {
+        let _g = test_guard();
+        assert!(
+            appcontainer_self_test(),
+            "本机 AppContainer 自检未通过——dispatch 会降级受限令牌(若预期可用,查 LowBoxConsole/能力/ConPTY)"
+        );
     }
 
     /// 生产路径端到端:run_in_appcontainer_sandbox(ConPTY + lpacCom + LowBoxConsole + New-PSDrive)

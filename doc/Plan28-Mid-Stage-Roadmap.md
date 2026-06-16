@@ -64,8 +64,13 @@ storage(SQLite `:memory:` 端到端 CRUD)、mcp-client(JSON-RPC 解析)、tools(
     `run_command_streaming` 沙箱开启时默认走 AppContainer,老 Windows 不支持时 fail-closed 降级受限令牌。
   - **回归测试**:`appcontainer_sandbox_runs_native_in_workspace`(端到端)、文件隔离内/外、网络默认拒绝、
     `strip_vt`。真机(Win11 Canary 28000)全绿。
-  - **未尽**:网络放行依赖宿主防火墙开;输出实时流式(当前命令结束后才按行回调);跨 Windows 版本稳健性待广验。
-    详见 memory `appcontainer-console-output-blocker`。
+  - **跨版本健壮性(0.0.40)**:`appcontainer_self_test()` 每进程实跑探针(nonce 防误判)验证 native 输出真回传,
+    `run_command_streaming` 据此选 AppContainer 或 fail-closed 降级受限令牌——**不按版本号判定**(LowBoxConsoleEnabled
+    无文档、各版本 console 行为有别,尤其 26100/24H2 重写了 console 分配策略)。注册表在运行时(当前用户 HKCU)设、
+    不进安装器(elevated 会写错 hive)。最低 Win10 1809。
+  - **未尽 / TODO**:网络放行依赖宿主防火墙开;输出非实时(命令结束后按行回调);delay-load/vendor ConPTY
+    (消除系统 ConPTY 版本漂移 + 防 <1809 静态导入启动崩);各 Windows 档(Win10 22H2 / Win11 23H2 / 24H2)
+    分别实测、每次 servicing 后重测。详见 memory `appcontainer-console-output-blocker`。
 
 ---
 
