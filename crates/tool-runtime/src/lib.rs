@@ -1434,19 +1434,29 @@ pub fn run_command_streaming(
             .clamp(1, MAX_COMMAND_TIMEOUT_SECS),
     );
 
-    // 沙箱开启时走受限令牌沙箱（剥权 + Job Object + 擦密钥）。
-    //
-    // AppContainer（真文件路径 + 网络隔离，见 appcontainer_win）已就绪并通过文件/网络隔离功能测试,
-    // 但存在拦路问题:容器内 **native console 程序的 stdout/stderr 不回传**(只有 PowerShell cmdlet
-    // 输出回得来),真实 agent 命令(git/npm/node)的输出会丢失。故在该问题(待 ConPTY 等方案)解决前,
-    // 默认仍走受限令牌沙箱,不把 AppContainer 设为默认。allow_network 预留给 AppContainer 接通后使用。
+    // 沙箱开启时优先走 AppContainer（真文件路径 + 网络隔离 + native 输出经 ConPTY 回传，见 appcontainer_win）：
+    // AppContainer 令牌 Low IL + 默认拒绝文件/网络，仅显式授权工作区可读写；native console 程序输出经
+    // 伪控制台 + lpacCom/LowBoxConsoleEnabled 回传。该 Windows 版本不支持 AppContainer 时 fail-closed
+    // 降级到受限令牌沙箱（剥权 + Job Object + 擦密钥，绝不裸跑）。非 Windows 平台无沙箱能力则报错。
     if sandbox {
         #[cfg(windows)]
         {
-            let _ = allow_network;
-            return sandbox_win::run_in_restricted_sandbox(
-                &workspace, command, timeout, on_line, cancel,
-            );
+            match appcontainer_win::run_in_appcontainer_sandbox(
+                &workspace,
+                command,
+                timeout,
+                on_line.clone(),
+                cancel.clone(),
+                allow_network,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    eprintln!("[sandbox] AppContainer 不可用,降级到受限令牌沙箱: {e}");
+                    return sandbox_win::run_in_restricted_sandbox(
+                        &workspace, command, timeout, on_line, cancel,
+                    );
+                }
+            }
         }
         #[cfg(not(windows))]
         {

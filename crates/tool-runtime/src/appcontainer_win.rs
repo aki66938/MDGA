@@ -12,9 +12,6 @@
 //! 即使 internetClient 能力已落入令牌,容器仍无法出站(默认拒绝侧不受影响,始终生效)。
 
 #![cfg(windows)]
-// 本模块已实现并通过文件/网络隔离功能测试,但因「容器内 native console 程序 stdout 不回传」尚未
-// 接入 run_command_streaming 作默认(见该函数注释)。在接通前,函数仅由测试使用,故允许 dead_code。
-#![allow(dead_code)]
 
 use crate::{CommandCancel, CommandLineCallback, RunCommandResult, ToolRuntimeError};
 use std::ffi::c_void;
@@ -25,7 +22,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HLOCAL, WAIT_OBJECT_0,
+    CloseHandle, LocalFree, HANDLE, HLOCAL, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSidToSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
@@ -40,17 +37,21 @@ use windows::Win32::Security::{
     PSECURITY_DESCRIPTOR,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
 };
 use windows::Win32::Security::{
-    FreeSid, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, PSID,
+    FreeSid, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, PSID,
 };
 use windows::Win32::System::Console::{ClosePseudoConsole, CreatePseudoConsole, COORD, HPCON};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
+    REG_DWORD, REG_OPTION_NON_VOLATILE,
+};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
     STARTUPINFOEXW,
@@ -63,6 +64,36 @@ fn err(msg: impl std::fmt::Display) -> ToolRuntimeError {
 /// 把宽字符串转成以 NUL 结尾的 UTF-16。
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 幂等设 HKCU\Console\LowBoxConsoleEnabled=1:放行 AppContainer(LowBox)进程的控制台连接,
+/// 是方案 B 让容器内 native console 程序输出能回传的前提(配合 lpacCom 能力 + ConPTY)。
+unsafe fn ensure_lowbox_console_enabled() {
+    let mut hkey = HKEY::default();
+    let subkey = wide("Console");
+    let rc = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        PCWSTR(subkey.as_ptr()),
+        0,
+        PCWSTR::null(),
+        REG_OPTION_NON_VOLATILE,
+        KEY_SET_VALUE,
+        None,
+        &mut hkey,
+        None,
+    );
+    if rc.is_ok() {
+        let name = wide("LowBoxConsoleEnabled");
+        let val: u32 = 1;
+        let _ = RegSetValueExW(
+            hkey,
+            PCWSTR(name.as_ptr()),
+            0,
+            REG_DWORD,
+            Some(&val.to_le_bytes()),
+        );
+        let _ = RegCloseKey(hkey);
+    }
 }
 
 /// 构建容器用环境块:擦密钥 + 把 TEMP/TMP 重定向到容器可写的沙箱临时目录。
@@ -193,30 +224,122 @@ unsafe fn grant_dir_access_to_appcontainer(path: &Path, ac_sid: PSID) -> Result<
     Ok(())
 }
 
-/// 读取管道（已包成 File），UTF-8 lossy、按行回调、截断到 64KiB。
-fn drain(mut file: std::fs::File, on_line: Option<CommandLineCallback>) -> (String, bool) {
-    const MAX: usize = 64 * 1024;
-    let mut buf = Vec::new();
-    let _ = file.read_to_end(&mut buf);
-    let truncated = buf.len() > MAX;
-    if truncated {
-        buf.truncate(MAX);
+/// 给目录授「仅遍历(FILE_TRAVERSE)、不继承」的 ACE：让容器能穿过此目录到达更深的已授权目录,
+/// 但不能列此目录内容、也不传播给子项。用于给工作区父链开路——否则 PowerShell `Set-Location`
+/// 到用户 profile 路径下的工作区会「拒绝访问」(AppContainer 默认对用户目录链遍历受限)。
+unsafe fn grant_traverse_to_appcontainer(path: &Path, ac_sid: PSID) -> Result<(), ToolRuntimeError> {
+    let mut wpath = wide(&path.as_os_str().to_string_lossy());
+    let mut old_dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let rc = GetNamedSecurityInfoW(
+        PCWSTR(wpath.as_ptr()),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        Some(&mut old_dacl),
+        None,
+        &mut sd,
+    );
+    if rc.0 != 0 {
+        return Err(err(format!("GetNamedSecurityInfo(traverse) 失败: {}", rc.0)));
     }
-    let text = String::from_utf8_lossy(&buf).to_string();
-    if let Some(cb) = on_line {
-        for line in text.lines() {
-            cb(line.to_string());
-        }
+    let ea = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_TRAVERSE.0,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: windows::Win32::Security::ACE_FLAGS(0), // 不继承
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: PWSTR(ac_sid.0 as *mut u16),
+        },
+    };
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let rc = SetEntriesInAclW(Some(&[ea]), Some(old_dacl as *const ACL), &mut new_dacl);
+    if rc.0 != 0 {
+        return Err(err(format!("SetEntriesInAcl(traverse) 失败: {}", rc.0)));
     }
-    (text, truncated)
+    let rc = SetNamedSecurityInfoW(
+        PWSTR(wpath.as_mut_ptr()),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        PSID::default(),
+        PSID::default(),
+        Some(new_dacl as *const ACL),
+        None,
+    );
+    let _ = LocalFree(HLOCAL(new_dacl as *mut c_void));
+    if !sd.0.is_null() {
+        let _ = LocalFree(HLOCAL(sd.0));
+    }
+    if rc.0 != 0 {
+        return Err(err(format!("SetNamedSecurityInfo(traverse) 失败: {}", rc.0)));
+    }
+    Ok(())
 }
 
-/// 在 AppContainer 中执行一条命令(经 powershell -EncodedCommand 包装、擦密钥环境),通过管道回读
-/// stdout/stderr。隔离层次:真 AppContainer 令牌(Low IL + 默认拒绝文件/网络) + 工作区 ACL 授权
-/// (容器仅能读写工作区) + 能力 SID 网络门控(allow_network 决定能否出站)。
+/// 把 ConPTY 输出的 VT/ANSI 转义流剥离为纯文本:去掉 CSI(ESC[..final)、OSC(ESC]..BEL/ST)、
+/// 其它 ESC 序列;`\r\n` 归一为 `\n`,丢弃裸 `\r`(伪控制台的光标回车)。
+pub(crate) fn strip_vt(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\u{1b}' {
+            match chars.get(i + 1) {
+                Some('[') => {
+                    // CSI: ESC [ ...参数/中间字节... final(0x40..=0x7e)
+                    i += 2;
+                    while i < chars.len() {
+                        let f = chars[i];
+                        i += 1;
+                        if ('\u{40}'..='\u{7e}').contains(&f) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC: ESC ] ... (BEL | ESC \)
+                    i += 2;
+                    while i < chars.len() {
+                        if chars[i] == '\u{07}' {
+                            i += 1;
+                            break;
+                        }
+                        if chars[i] == '\u{1b}' && chars.get(i + 1) == Some(&'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                Some(_) => i += 2, // 其它 ESC x:跳过两字符
+                None => i += 1,
+            }
+            continue;
+        }
+        if c == '\r' {
+            i += 1; // 丢弃裸 \r(\r\n 的 \n 下一轮保留)
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// 在 AppContainer 中执行命令并捕获输出。隔离层次:真 AppContainer 令牌(Low IL + 默认拒绝文件/网络)
+/// + 工作区 ACL 授权(容器仅能读写工作区) + 能力 SID 网络门控(allow_network 决定能否出站)。
 ///
-/// fail-closed:任一步骤失败返回 Err,由 run_command_streaming 决定是否降级到受限令牌沙箱
-/// (仅当 AppContainer 不被该 Windows 版本支持时降级,而非裸跑)。
+/// 输出走 ConPTY 伪控制台:配合 LowBoxConsoleEnabled + lpacCom/registryRead 能力,容器内 native console
+/// 程序(git/npm/cmd 等)的输出才能回传(纯管道在 AppContainer 内对 native 孙进程会丢)。命令前用
+/// New-PSDrive 把工作区挂成 PSDrive 并 Set-Location 进去——规避 AppContainer 下 Set-Location 到用户
+/// profile 路径的「拒绝访问」,使 native cwd 与 cmdlet 相对路径都落在工作区。输出为 VT 流,strip_vt 还原。
+///
+/// fail-closed:任一步骤失败返回 Err,由 run_command_streaming 决定是否降级到受限令牌沙箱。
 pub fn run_in_appcontainer_sandbox(
     workspace: &Path,
     command: &str,
@@ -226,44 +349,48 @@ pub fn run_in_appcontainer_sandbox(
     allow_network: bool,
 ) -> Result<RunCommandResult, ToolRuntimeError> {
     unsafe {
-        // P1 网络隔离：能力 SID 决定容器能否联网。默认无能力 = 完全无网(默认拒绝)。
-        // allow_network=true 时加三个互联网能力 SID(internetClient / internetClientServer /
-        // privateNetworkClientServer),容器方可出站。SID 由字符串转换得来,需 LocalFree 回收。
-        // 关键:能力须在「创建 profile 时」与「启动进程时」都登记(MSDN AppContainer 样例),
-        // 仅在启动时传入不会真正落入令牌的能力数组。故先建能力、再据此建/派生 profile。
+        // 放行 LowBox 控制台(方案 B 前提,幂等设 HKCU\Console\LowBoxConsoleEnabled=1)。
+        ensure_lowbox_console_enabled();
+        // 能力:registryRead(读 HKCU\Console\LowBoxConsoleEnabled)+ lpacCom(放行 native 连 conhost)
+        // (+ allow_network 时加 internetClient/Server/privateNetwork)。能力须在 profile 创建期与进程
+        // 启动期都登记,仅启动期传入不会真正落入令牌。
         let mut cap_sids: Vec<PSID> = Vec::new();
         let mut caps: Vec<SID_AND_ATTRIBUTES> = Vec::new();
+        let mut cap_strs: Vec<&str> = vec![
+            "S-1-15-3-1024-1065365936-1281604716-3511738428-1654721687-432734479-3232135806-4053264122-3456934681", // registryRead
+            "S-1-15-3-1024-2405443489-874036122-4286035555-1823921565-1746547431-2453885448-3625952902-991631256",  // lpacCom
+        ];
         if allow_network {
-            for s in ["S-1-15-3-1", "S-1-15-3-2", "S-1-15-3-3"] {
-                let sw = wide(s);
-                let mut sid = PSID::default();
-                if ConvertStringSidToSidW(PCWSTR(sw.as_ptr()), &mut sid).is_ok() {
-                    cap_sids.push(sid);
-                    caps.push(SID_AND_ATTRIBUTES {
-                        Sid: sid,
-                        Attributes: 0x0000_0004, // SE_GROUP_ENABLED
-                    });
-                }
+            cap_strs.extend(["S-1-15-3-1", "S-1-15-3-2", "S-1-15-3-3"]);
+        }
+        for s in &cap_strs {
+            let sw = wide(s);
+            let mut sid = PSID::default();
+            if ConvertStringSidToSidW(PCWSTR(sw.as_ptr()), &mut sid).is_ok() {
+                cap_sids.push(sid);
+                caps.push(SID_AND_ATTRIBUTES {
+                    Sid: sid,
+                    Attributes: 0x0000_0004, // SE_GROUP_ENABLED
+                });
             }
         }
         let caps_arg: Option<&[SID_AND_ATTRIBUTES]> =
             if caps.is_empty() { None } else { Some(&caps[..]) };
-        // 容器名按能力集区分:无网/有网各一套 profile,避免「已存在但能力集不符」的派生陷阱。
-        // (实测:profile 若以无能力建好,后续仅靠启动期能力数组无法补登记,网络仍被挡。)
+        // 容器名按能力集区分,避免「已存在但能力集不符」的派生陷阱。
         let (name, display) = if allow_network {
-            ("MDGA.Sandbox.Net", "MDGA command sandbox (net)")
+            ("MDGA.Sandbox.Lpac.Net", "MDGA sandbox (lpac, net)")
         } else {
-            ("MDGA.Sandbox", "MDGA command sandbox")
+            ("MDGA.Sandbox.Lpac", "MDGA sandbox (lpac)")
         };
-
-        // AppContainer 标准启动用 CreateProcessW（不传显式令牌,系统从能力派生 AppContainer 令牌）。
-        // 实测:显式受限令牌 + AppContainer 属性(CreateProcessAsUserW)不会产生真正容器(无包 SID)。
         let ac_sid = create_or_derive_appcontainer_sid(name, display, caps_arg)?;
-        // P2：授权工作区目录,使容器命令能读写工作区(否则默认拒绝、连工作区都进不去)。
+        // 授权工作区目录(容器仅能读写工作区)+ 工作区父链 traverse(New-PSDrive 解析工作区路径需要)。
         grant_dir_access_to_appcontainer(workspace, ac_sid)?;
-
-        // 容器专用临时目录:授权给容器并接管 TEMP/TMP。容器读不到用户 %TEMP%,而 PowerShell
-        // 处理外部命令、.NET、众多工具都需可写 TEMP——缺它会导致外部命令静默无输出。
+        let mut anc = workspace.parent();
+        while let Some(dir) = anc {
+            let _ = grant_traverse_to_appcontainer(dir, ac_sid);
+            anc = dir.parent();
+        }
+        // 容器专用临时目录:授权 + 接管 TEMP/TMP(容器读不到用户 %TEMP%,而 PowerShell/.NET/工具需可写 TEMP)。
         let sandbox_temp = std::env::temp_dir().join("mdga-sandbox-temp");
         let _ = std::fs::create_dir_all(&sandbox_temp);
         grant_dir_access_to_appcontainer(&sandbox_temp, ac_sid)?;
@@ -280,17 +407,30 @@ pub fn run_in_appcontainer_sandbox(
             Reserved: 0,
         };
 
-        // proc-thread 属性列表：先取 size,再分配,再写入 SECURITY_CAPABILITIES 属性。
+        // ConPTY 管道:in(我们写→PTY)、out(PTY→我们读)。
+        let (mut in_r, mut in_w) = (HANDLE::default(), HANDLE::default());
+        let (mut out_r, mut out_w) = (HANDLE::default(), HANDLE::default());
+        CreatePipe(&mut in_r, &mut in_w, None, 0)
+            .map_err(|e| err(format!("CreatePipe(in) 失败: {e}")))?;
+        CreatePipe(&mut out_r, &mut out_w, None, 0)
+            .map_err(|e| err(format!("CreatePipe(out) 失败: {e}")))?;
+        let coord = COORD { X: 160, Y: 50 };
+        let hpc: HPCON = CreatePseudoConsole(coord, in_r, out_w, 0)
+            .map_err(|e| err(format!("CreatePseudoConsole 失败: {e}")))?;
+        let _ = CloseHandle(in_r);
+        let _ = CloseHandle(out_w);
+
+        // 属性列表:SECURITY_CAPABILITIES + PSEUDOCONSOLE。
         let mut attr_size: usize = 0;
         let _ = InitializeProcThreadAttributeList(
             LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
-            1,
+            2,
             0,
             &mut attr_size,
         );
         let mut attr_buf = vec![0u8; attr_size];
         let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut c_void);
-        InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size)
+        InitializeProcThreadAttributeList(attr_list, 2, 0, &mut attr_size)
             .map_err(|e| err(format!("InitializeProcThreadAttributeList 失败: {e}")))?;
         UpdateProcThreadAttribute(
             attr_list,
@@ -301,211 +441,7 @@ pub fn run_in_appcontainer_sandbox(
             None,
             None,
         )
-        .map_err(|e| err(format!("UpdateProcThreadAttribute 失败: {e}")))?;
-
-        // 管道（写端可继承,读端不可继承）。
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: std::ptr::null_mut(),
-            bInheritHandle: true.into(),
-        };
-        let (mut out_r, mut out_w) = (HANDLE::default(), HANDLE::default());
-        let (mut err_r, mut err_w) = (HANDLE::default(), HANDLE::default());
-        CreatePipe(&mut out_r, &mut out_w, Some(&sa), 0)
-            .map_err(|e| err(format!("CreatePipe(out) 失败: {e}")))?;
-        CreatePipe(&mut err_r, &mut err_w, Some(&sa), 0)
-            .map_err(|e| err(format!("CreatePipe(err) 失败: {e}")))?;
-        let _ = windows::Win32::Foundation::SetHandleInformation(out_r, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
-        let _ = windows::Win32::Foundation::SetHandleInformation(err_r, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
-
-        // STARTUPINFOEXW：cb=EX 大小,挂上属性列表。
-        let mut si = STARTUPINFOEXW::default();
-        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        si.StartupInfo.hStdOutput = out_w;
-        si.StartupInfo.hStdError = err_w;
-        si.StartupInfo.hStdInput = HANDLE::default();
-        si.lpAttributeList = attr_list;
-
-        // 与受限令牌沙箱一致:powershell -EncodedCommand 包装(规避转义) + 擦密钥环境块;
-        // 额外把 TEMP/TMP 重定向到容器可写的沙箱临时目录(否则外部命令静默无输出)。
-        let mut cmdline = crate::sandbox_win::encoded_command_line(command);
-        let mut env_block = build_sandbox_env_block(&sandbox_temp_str);
-        let cwd = wide(&workspace.as_os_str().to_string_lossy());
-        let mut pi = PROCESS_INFORMATION::default();
-        let create_result = CreateProcessW(
-            PCWSTR::null(),
-            PWSTR(cmdline.as_mut_ptr()),
-            None,
-            None,
-            true,
-            EXTENDED_STARTUPINFO_PRESENT
-                | CREATE_SUSPENDED
-                | CREATE_NO_WINDOW
-                | CREATE_UNICODE_ENVIRONMENT,
-            Some(env_block.as_mut_ptr() as *const c_void), // 擦密钥后的环境块
-            PCWSTR(cwd.as_ptr()),
-            &si.StartupInfo,
-            &mut pi,
-        );
-
-        let _ = CloseHandle(out_w);
-        let _ = CloseHandle(err_w);
-        DeleteProcThreadAttributeList(attr_list);
-        // 能力 SID 已被 CreateProcess 消费,回收(ConvertStringSidToSidW 经 LocalAlloc 分配)。
-        for sid in &cap_sids {
-            let _ = LocalFree(HLOCAL(sid.0));
-        }
-
-        if let Err(e) = create_result {
-            let _ = CloseHandle(out_r);
-            let _ = CloseHandle(err_r);
-            FreeSid(ac_sid);
-            return Err(err(format!("CreateProcess(AppContainer) 失败: {e}")));
-        }
-
-        ResumeThread(pi.hThread);
-
-        let on_line2 = on_line.clone();
-        let out_file = std::fs::File::from_raw_handle(out_r.0 as *mut _);
-        let err_file = std::fs::File::from_raw_handle(err_r.0 as *mut _);
-        let out_handle = std::thread::spawn(move || drain(out_file, on_line2));
-        let err_handle = std::thread::spawn(move || drain(err_file, on_line));
-
-        let started = Instant::now();
-        let mut timed_out = false;
-        loop {
-            let wait = WaitForSingleObject(pi.hProcess, 50);
-            if wait == WAIT_OBJECT_0 {
-                break;
-            }
-            if cancel.as_ref().map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
-                let _ = TerminateProcess(pi.hProcess, 1);
-                break;
-            }
-            if started.elapsed() >= timeout {
-                let _ = TerminateProcess(pi.hProcess, 1);
-                timed_out = true;
-                break;
-            }
-        }
-
-        let mut exit_code: u32 = 0;
-        let _ = GetExitCodeProcess(pi.hProcess, &mut exit_code);
-        let (stdout, out_trunc) = out_handle.join().unwrap_or_default();
-        let (stderr, err_trunc) = err_handle.join().unwrap_or_default();
-        let duration_ms = started.elapsed().as_millis();
-
-        let _ = CloseHandle(pi.hThread);
-        let _ = CloseHandle(pi.hProcess);
-        FreeSid(ac_sid);
-
-        Ok(RunCommandResult {
-            command: command.to_string(),
-            exit_code: if timed_out { None } else { Some(exit_code as i32) },
-            stdout,
-            stderr,
-            truncated: out_trunc || err_trunc,
-            timed_out,
-            duration_ms,
-        })
-    }
-}
-
-/// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 的原始值(windows 0.58 未必导出常量,直接用数值)。
-const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_VAL: usize = 0x0002_0016;
-
-/// ConPTY spike：用伪控制台(CreatePseudoConsole)在 AppContainer 内跑命令并捕获**全部** console 输出
-/// (含 native 孙进程,如 cmd/git)。验证「容器内 native 命令 stdout 不回传」能否被 ConPTY 解决。
-///
-/// 与 run_in_appcontainer_sandbox 共用容器创建+ACL 授权;差别仅在 I/O:不重定向 std 句柄,而是把伪控制台
-/// 同时作为 SECURITY_CAPABILITIES 之外的第二个 proc-thread 属性挂上,从伪控制台输出管道回读(VT 流)。
-pub fn run_in_appcontainer_conpty_spike(
-    workspace: &Path,
-    command: &str,
-    timeout: Duration,
-    allow_network: bool,
-    use_container: bool,
-) -> Result<(Option<i32>, String), ToolRuntimeError> {
-    unsafe {
-        // --- 容器与授权(同 run_in_appcontainer_sandbox)---
-        let mut cap_sids: Vec<PSID> = Vec::new();
-        let mut caps: Vec<SID_AND_ATTRIBUTES> = Vec::new();
-        if allow_network {
-            for s in ["S-1-15-3-1", "S-1-15-3-2", "S-1-15-3-3"] {
-                let sw = wide(s);
-                let mut sid = PSID::default();
-                if ConvertStringSidToSidW(PCWSTR(sw.as_ptr()), &mut sid).is_ok() {
-                    cap_sids.push(sid);
-                    caps.push(SID_AND_ATTRIBUTES { Sid: sid, Attributes: 0x0000_0004 });
-                }
-            }
-        }
-        let caps_arg: Option<&[SID_AND_ATTRIBUTES]> =
-            if caps.is_empty() { None } else { Some(&caps[..]) };
-        let (name, display) = if allow_network {
-            ("MDGA.Sandbox.Net", "MDGA command sandbox (net)")
-        } else {
-            ("MDGA.Sandbox", "MDGA command sandbox")
-        };
-        let ac_sid = create_or_derive_appcontainer_sid(name, display, caps_arg)?;
-        grant_dir_access_to_appcontainer(workspace, ac_sid)?;
-        let sandbox_temp = std::env::temp_dir().join("mdga-sandbox-temp");
-        let _ = std::fs::create_dir_all(&sandbox_temp);
-        grant_dir_access_to_appcontainer(&sandbox_temp, ac_sid)?;
-        let sandbox_temp_str = sandbox_temp.as_os_str().to_string_lossy().to_string();
-
-        let sec_caps = SECURITY_CAPABILITIES {
-            AppContainerSid: ac_sid,
-            Capabilities: if caps.is_empty() {
-                std::ptr::null_mut()
-            } else {
-                caps.as_mut_ptr()
-            },
-            CapabilityCount: caps.len() as u32,
-            Reserved: 0,
-        };
-
-        // --- ConPTY 管道:in(我们写→PTY 读)、out(PTY 写→我们读)---
-        let (mut in_r, mut in_w) = (HANDLE::default(), HANDLE::default());
-        let (mut out_r, mut out_w) = (HANDLE::default(), HANDLE::default());
-        CreatePipe(&mut in_r, &mut in_w, None, 0)
-            .map_err(|e| err(format!("CreatePipe(conpty in) 失败: {e}")))?;
-        CreatePipe(&mut out_r, &mut out_w, None, 0)
-            .map_err(|e| err(format!("CreatePipe(conpty out) 失败: {e}")))?;
-
-        let coord = COORD { X: 120, Y: 40 };
-        let hpc: HPCON = CreatePseudoConsole(coord, in_r, out_w, 0)
-            .map_err(|e| err(format!("CreatePseudoConsole 失败: {e}")))?;
-        // 伪控制台已持有 in_r / out_w 的副本,父进程关掉自己这份。
-        let _ = CloseHandle(in_r);
-        let _ = CloseHandle(out_w);
-
-        // --- proc-thread 属性列表:PSEUDOCONSOLE(+ 容器时叠加 SECURITY_CAPABILITIES)---
-        let attr_count = if use_container { 2 } else { 1 };
-        let mut attr_size: usize = 0;
-        let _ = InitializeProcThreadAttributeList(
-            LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
-            attr_count,
-            0,
-            &mut attr_size,
-        );
-        let mut attr_buf = vec![0u8; attr_size];
-        let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut c_void);
-        InitializeProcThreadAttributeList(attr_list, attr_count, 0, &mut attr_size)
-            .map_err(|e| err(format!("InitializeProcThreadAttributeList 失败: {e}")))?;
-        if use_container {
-            UpdateProcThreadAttribute(
-                attr_list,
-                0,
-                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                Some(&sec_caps as *const _ as *const c_void),
-                std::mem::size_of::<SECURITY_CAPABILITIES>(),
-                None,
-                None,
-            )
-            .map_err(|e| err(format!("UpdateProcThreadAttribute(caps) 失败: {e}")))?;
-        }
+        .map_err(|e| err(format!("UpdateProcThreadAttribute(caps) 失败: {e}")))?;
         UpdateProcThreadAttribute(
             attr_list,
             0,
@@ -517,10 +453,7 @@ pub fn run_in_appcontainer_conpty_spike(
         )
         .map_err(|e| err(format!("UpdateProcThreadAttribute(pty) 失败: {e}")))?;
 
-        // --- STARTUPINFOEXW:伪控制台即子进程控制台。
-        // 关键:显式把 std 句柄设为 NULL(USESTDHANDLES),阻止子进程经 PEB 继承父进程(本测试下是 cargo
-        // 的重定向管道)的 std 句柄——否则子进程 stdout 漏到父管道而非伪控制台。NULL 句柄下控制台程序
-        // 会重开 CONOUT$(即伪控制台)。
+        // STARTUPINFOEXW:NULL std 句柄,强制子进程用伪控制台(不经 PEB 继承父进程的重定向句柄)。
         let mut si = STARTUPINFOEXW::default();
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -529,7 +462,14 @@ pub fn run_in_appcontainer_conpty_spike(
         si.StartupInfo.hStdError = HANDLE::default();
         si.lpAttributeList = attr_list;
 
-        let mut cmdline = crate::sandbox_win::encoded_command_line(command);
+        // 命令包装:New-PSDrive 把工作区挂成 PSDrive 并 Set-Location 进去,再跑用户命令。
+        let ws_root = workspace.as_os_str().to_string_lossy().replace('\'', "''");
+        let wrapped = format!(
+            "New-PSDrive -Name MWS -PSProvider FileSystem -Root '{ws}' -Scope Global -ErrorAction SilentlyContinue | Out-Null; Set-Location MWS: -ErrorAction SilentlyContinue; {cmd}",
+            ws = ws_root,
+            cmd = command
+        );
+        let mut cmdline = crate::sandbox_win::encoded_command_line(&wrapped);
         let mut env_block = build_sandbox_env_block(&sandbox_temp_str);
         let cwd = wide(&workspace.as_os_str().to_string_lossy());
         let mut pi = PROCESS_INFORMATION::default();
@@ -554,10 +494,10 @@ pub fn run_in_appcontainer_conpty_spike(
             let _ = CloseHandle(in_w);
             ClosePseudoConsole(hpc);
             FreeSid(ac_sid);
-            return Err(err(format!("CreateProcess(ConPTY) 失败: {e}")));
+            return Err(err(format!("CreateProcess(AppContainer/ConPTY) 失败: {e}")));
         }
 
-        // 并发读伪控制台输出管道(VT 流);进程退出后关 PTY 触发 EOF,reader 收尾。
+        // 并发读伪控制台输出(VT 流);进程退出后关 PTY 触发 EOF,reader 收尾。
         let out_file = std::fs::File::from_raw_handle(out_r.0 as *mut _);
         let reader = std::thread::spawn(move || {
             let mut f = out_file;
@@ -572,6 +512,10 @@ pub fn run_in_appcontainer_conpty_spike(
             if WaitForSingleObject(pi.hProcess, 50) == WAIT_OBJECT_0 {
                 break;
             }
+            if cancel.as_ref().map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+                let _ = TerminateProcess(pi.hProcess, 1);
+                break;
+            }
             if started.elapsed() >= timeout {
                 let _ = TerminateProcess(pi.hProcess, 1);
                 timed_out = true;
@@ -580,19 +524,46 @@ pub fn run_in_appcontainer_conpty_spike(
         }
         let mut exit_code: u32 = 0;
         let _ = GetExitCodeProcess(pi.hProcess, &mut exit_code);
-
-        // 关伪控制台 → out_w 末引用关闭 → out_r EOF → reader 返回。
         ClosePseudoConsole(hpc);
         let _ = CloseHandle(in_w);
-        let buf = reader.join().unwrap_or_default();
+        let raw = reader.join().unwrap_or_default();
         let _ = CloseHandle(pi.hThread);
         let _ = CloseHandle(pi.hProcess);
         FreeSid(ac_sid);
+        let duration_ms = started.elapsed().as_millis();
 
-        let text = String::from_utf8_lossy(&buf).to_string();
-        Ok((if timed_out { None } else { Some(exit_code as i32) }, text))
+        // VT 流剥离为纯文本,截断到 64KiB(char 边界);按行触发 on_line 回调。
+        let mut text = strip_vt(&String::from_utf8_lossy(&raw));
+        let mut truncated = false;
+        const MAX: usize = 64 * 1024;
+        if text.len() > MAX {
+            let mut end = MAX;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            truncated = true;
+        }
+        if let Some(cb) = on_line.as_ref() {
+            for line in text.lines() {
+                cb(line.to_string());
+            }
+        }
+
+        Ok(RunCommandResult {
+            command: command.to_string(),
+            exit_code: if timed_out { None } else { Some(exit_code as i32) },
+            stdout: text,
+            stderr: String::new(), // ConPTY 合并 stdout/stderr 到单一终端流
+            truncated,
+            timed_out,
+            duration_ms,
+        })
     }
 }
+
+/// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 的原始值(windows 0.58 未必导出常量,直接用数值)。
+const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_VAL: usize = 0x0002_0016;
 
 #[cfg(test)]
 mod tests {
@@ -605,40 +576,39 @@ mod tests {
         SANDBOX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// ConPTY 限时 spike 的结论性记录(真机 Win11 Canary 28000):
-    /// - **非容器** ConPTY:同时捕获 cmdlet(CMDLETOK123)与 native 孙进程(CONPTYOK)——装配正确。
-    /// - **容器** ConPTY:只捕获 powershell 自身输出(CMDLETOK123),native 孙进程输出(CONPTYOK)仍丢失。
-    ///
-    /// 即:AppContainer 破坏「容器进程 → 其子进程」的 I/O 继承(管道与控制台皆然),ConPTY 也救不回来。
-    /// 这是 AppContainer 作命令沙箱的根本拦路问题;暂缓接通(见 [[appcontainer-console-output-blocker]])。
-    /// 关键修复:子进程须以 STARTF_USESTDHANDLES + NULL std 句柄创建,才不继承父进程重定向句柄、改用伪控制台。
     #[test]
-    fn conpty_appcontainer_loses_native_child_output() {
-        let _g = test_guard();
-        let ws = std::env::temp_dir().join(format!("mdga-ac-pty-{}", std::process::id()));
-        std::fs::create_dir_all(&ws).expect("建工作区目录失败");
-        let cmd = "Write-Output CMDLETOK123; cmd /c echo CONPTYOK";
-        let (_e0, t0) =
-            run_in_appcontainer_conpty_spike(&ws, cmd, Duration::from_secs(20), false, false)
-                .expect("ConPTY(非容器) 起进程失败");
-        let (_e1, t1) =
-            run_in_appcontainer_conpty_spike(&ws, cmd, Duration::from_secs(20), false, true)
-                .expect("ConPTY(容器) 起进程失败");
-        let _ = std::fs::remove_dir_all(&ws);
-        eprintln!("--- 非容器 ---\n{}\n--- 容器 ---\n{}", t0.escape_debug(), t1.escape_debug());
+    fn strip_vt_removes_escapes() {
+        assert_eq!(strip_vt("\u{1b}[?25l\u{1b}[2Jhello\u{1b}[m"), "hello");
+        assert_eq!(strip_vt("\u{1b}]0;title\u{07}world"), "world");
+        assert_eq!(strip_vt("a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(strip_vt("plain text 42"), "plain text 42");
+        assert_eq!(strip_vt("\u{1b}]0;t\u{1b}\\X"), "X");
+    }
 
-        // 非容器:装配正确,native 输出能被伪控制台捕获。
-        assert!(t0.contains("CONPTYOK"), "非容器 ConPTY 装配异常:\n{}", t0.escape_debug());
-        // 容器:powershell 自身输出回得来,但 native 孙进程输出丢失——记录这一拦路事实。
-        assert!(
-            t1.contains("CMDLETOK123"),
-            "容器内连 powershell 自身输出都没捕获(与已知现象不符):\n{}",
-            t1.escape_debug()
+    /// 生产路径端到端:run_in_appcontainer_sandbox(ConPTY + lpacCom + LowBoxConsole + New-PSDrive)
+    /// 跑 native 命令,验证(1)在工作区 cwd 跑(相对路径读到工作区文件) (2)native 输出经伪控制台回传、
+    /// 已 strip_vt 成纯文本。这是方案 B 完整接通的回归测试。
+    #[test]
+    fn appcontainer_sandbox_runs_native_in_workspace() {
+        let _g = test_guard();
+        let ws = std::env::temp_dir().join(format!("mdga-ac-prod-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("hello.txt"), "PRODFILE_88").unwrap();
+        let r = run_in_appcontainer_sandbox(
+            &ws,
+            "cmd /c type hello.txt",
+            Duration::from_secs(30),
+            None,
+            None,
+            false,
         );
+        let _ = std::fs::remove_dir_all(&ws);
+        let out = r.expect("起进程失败(环境可能不支持 AppContainer)");
+        eprintln!("[prod] exit={:?} stdout=[{}]", out.exit_code, out.stdout.trim());
         assert!(
-            !t1.contains("CONPTYOK"),
-            "容器内 native 孙进程输出竟回来了——拦路问题已变化,应重评 AppContainer 接通:\n{}",
-            t1.escape_debug()
+            out.stdout.contains("PRODFILE_88"),
+            "生产沙箱:native 命令未在工作区读到文件/输出未回传:\n{}",
+            out.stdout
         );
     }
 
@@ -719,11 +689,8 @@ mod tests {
         );
     }
 
-    /// 记录关键现状:AppContainer 内 native console 程序**能跑、能写文件**(工作区已授权),
-    /// 但其 console stdout/stderr **不会**回传到父进程管道(只有 PowerShell cmdlet 输出回得来)。
-    /// 这是 AppContainer 的 console 隔离特性——真实 agent 命令(git/npm/node)的输出会丢失,
-    /// 是 AppContainer 作为命令沙箱的拦路问题(待 ConPTY 等方案解决前不能作默认)。
-    /// 本测试断言「native 命令能写文件」这一**已成立**的事实(证明命令确实在跑)。
+    /// native 命令能在容器内跑、能写工作区文件(cmd 自身 `>` 重定向)。与 appcontainer_sandbox_runs_
+    /// native_in_workspace(测 stdout 经伪控制台回传)互补:本测试聚焦"命令确实执行并写盘"。
     #[test]
     fn appcontainer_native_command_runs_and_writes_files() {
         let _g = test_guard();
