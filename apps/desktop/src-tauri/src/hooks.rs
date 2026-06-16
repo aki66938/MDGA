@@ -1,5 +1,5 @@
-//! 生命周期钩子与诊断命令：从工作区 .mdga/hooks.json 读取用户定义的 PreToolUse / PostToolUse
-//! 钩子，以及 .mdga/diagnostics 的收尾诊断命令。
+//! 生命周期钩子：从工作区 .mdga/hooks.json 读取用户定义的 PreToolUse / PostToolUse 钩子。
+//!（.mdga/diagnostics 收尾诊断命令的纯读取已于 Plan28 P3-9 迁入 mdga-agent-core。）
 //!
 //! 从 main.rs 抽出（Plan16 阶段2）：纯函数搬移，无行为变更。
 //! PreToolUse 在工具执行前运行，退出码非 0 则阻断该工具（stdout/stderr 作为原因回灌模型）；
@@ -22,17 +22,9 @@ struct HooksConfig {
     post_tool_use: Vec<HookEntry>,
 }
 
-/// 读取工作区 .mdga/diagnostics 的诊断命令（首个非空非注释行）；不存在则 None。
-/// 例：写入 `cargo check` 或 `npm run typecheck`，Agent 改完代码收尾前自动跑、有错则修。
-pub(crate) fn read_diagnostics_command(workspace: &str) -> Option<String> {
-    let path = std::path::Path::new(workspace).join(".mdga").join("diagnostics");
-    let content = std::fs::read_to_string(path).ok()?;
-    content
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_string)
-}
+// 注（Plan28 P3-9）：read_diagnostics_command（读 .mdga/diagnostics 首行命令，纯 std::fs）
+// 已随 detect_verification_command 迁入 mdga-agent-core（verification 子模块）。本文件不再保留，
+// 桌面端如需读取诊断命令请改用 `mdga_agent_core::read_diagnostics_command`。
 
 fn load_hooks(workspace: &str) -> HooksConfig {
     let path = std::path::Path::new(workspace).join(".mdga").join("hooks.json");

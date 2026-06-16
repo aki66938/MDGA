@@ -1,0 +1,4 @@
+# MDGA 自身的「写后验证」命令（Plan28 P1-6 自我示范）。
+# 取首个非空非注释行作为命令：Agent 改完 Rust 代码后会自动跑它确认没引入错误。
+# 前端改动请用 /check（见 .mdga/commands/check.md）补跑 tsc。
+cargo check --workspace

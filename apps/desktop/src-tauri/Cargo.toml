@@ -5,6 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+mdga-agent-core = { path = "../../../crates/agent-core" }
 mdga-deepseek-client = { path = "../../../crates/deepseek-client" }
 mdga-mcp-client = { path = "../../../crates/mcp-client" }
 mdga-sandbox-runtime = { path = "../../../crates/sandbox-runtime" }

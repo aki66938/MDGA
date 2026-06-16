@@ -2394,8 +2394,10 @@ dependencies = [
 name = "mdga-agent-core"
 version = "0.1.0"
 dependencies = [
+ "mdga-deepseek-client",
  "mdga-shared",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -2418,6 +2420,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
+ "mdga-agent-core",
  "mdga-deepseek-client",
  "mdga-mcp-client",
  "mdga-sandbox-runtime",

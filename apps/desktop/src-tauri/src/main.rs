@@ -8,11 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 
-/// 触发上下文压缩的软上限默认值（以上一次响应返回的 prompt_tokens 为准）。
-/// DeepSeek V4 Flash / Pro 官方标称 1M 上下文，故取 800K：在接近上限前压缩，
-/// 留约 200K headroom 给模型输出与当轮工具结果，避免顶满 1M 触发服务端退化。
-/// 可用环境变量 MDGA_CONTEXT_SOFT_LIMIT 覆盖（便于低阈值压测验证压缩机制）。
-pub(crate) const CONTEXT_SOFT_LIMIT_TOKENS: u64 = 800_000;
+// 注（Plan28 P3-9）：CONTEXT_SOFT_LIMIT_TOKENS 与软上限推导 context_soft_limit_for 已迁入
+// mdga-agent-core（compaction 子模块）；本文件不再定义该常量，桌面端改 `mdga_agent_core::...` 引用。
 /// 摘要压缩时保留最近 N 条 wire 消息原文，更早的历史压缩成任务进度摘要。
 pub(crate) const KEEP_RECENT_WIRE_MESSAGES: usize = 8;
 /// 工具结果被压缩后替换成的短桩内容。
@@ -42,7 +39,8 @@ use commands::{
     set_app_setting, smoke_test_tool_call, test_provider_connection,
 };
 
-mod agent_prompt;
+// 注（Plan28 P3-9）：原 agent_prompt 模块（仅持有三个灵魂常量）已不再需要——常量权威定义
+// 迁入 mdga-agent-core，消息构建也已迁过去；桌面端不再有 crate::agent_prompt::* 引用，故移除该模块。
 
 mod agent_loop;
 use agent_loop::send_message;
@@ -104,24 +102,8 @@ mod chat;
 // 已完成模块 compaction.rs 通过 `crate::chat_completion_with_retry` 引用，保留 crate 根再导出。
 pub(crate) use chat::chat_completion_with_retry;
 
-pub(crate) fn merge_usage(
-    first: Option<mdga_shared::RawUsage>,
-    second: Option<mdga_shared::RawUsage>,
-) -> Option<mdga_shared::RawUsage> {
-    match (first, second) {
-        (None, None) => None,
-        (Some(usage), None) | (None, Some(usage)) => Some(usage),
-        (Some(a), Some(b)) => Some(mdga_shared::RawUsage {
-            prompt_tokens: a.prompt_tokens + b.prompt_tokens,
-            completion_tokens: a.completion_tokens + b.completion_tokens,
-            total_tokens: a.total_tokens + b.total_tokens,
-            prompt_cache_hit_tokens: a.prompt_cache_hit_tokens + b.prompt_cache_hit_tokens,
-            prompt_cache_miss_tokens: a.prompt_cache_miss_tokens + b.prompt_cache_miss_tokens,
-            reasoning_tokens: a.reasoning_tokens + b.reasoning_tokens,
-            raw_json: serde_json::json!([a.raw_json, b.raw_json]).to_string(),
-        }),
-    }
-}
+// 注（Plan28 P3-9）：merge_usage（纯 RawUsage 合并）已迁入 mdga-agent-core（usage 子模块）。
+// 桌面端各调用点改为 `use mdga_agent_core::merge_usage;` 直接引用。
 
 // ── 入口 ──────────────────────────────────────────────────────────────────
 

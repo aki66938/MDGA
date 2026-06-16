@@ -736,4 +736,183 @@ mod tests {
         let v = parse_sse_jsonrpc(sse).expect("should parse");
         assert_eq!(v["id"], 1);
     }
+
+    // ── Plan28 P2-7：JSON-RPC 解析/构造端到端补测（成功/错误/通知/边界） ────────
+
+    /// 成功响应：extract_result 取出 result，丢弃外层 jsonrpc/id 信封。
+    #[test]
+    fn extract_result_returns_result_on_success() {
+        let resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": { "tools": [], "ok": true }
+        });
+        let out = extract_result(&resp).expect("成功响应应取出 result");
+        assert_eq!(out["ok"], true);
+        assert!(out["tools"].is_array());
+    }
+
+    /// 错误响应：extract_result 把 error 对象映射为 ServerError，错误文本含原始 error JSON。
+    #[test]
+    fn extract_result_maps_error_to_server_error() {
+        let resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "error": { "code": -32601, "message": "Method not found" }
+        });
+        let err = extract_result(&resp).expect_err("错误响应应映射为 Err");
+        match err {
+            McpError::ServerError(msg) => {
+                // 错误负载（含 code 与 message）应被原样带出，便于排障。
+                assert!(msg.contains("-32601"));
+                assert!(msg.contains("Method not found"));
+            }
+            other => panic!("应为 ServerError，实际 {other:?}"),
+        }
+    }
+
+    /// 边界：既无 result 也无 error（如通知的空回执 / 畸形响应）时，extract_result 回 Null，不 panic。
+    #[test]
+    fn extract_result_missing_result_yields_null() {
+        let resp = serde_json::json!({ "jsonrpc": "2.0", "id": 1 });
+        let out = extract_result(&resp).expect("缺 result 应回 Null 而非 Err");
+        assert!(out.is_null());
+    }
+
+    /// 错误优先：响应同时含 result 与 error 时，按 JSON-RPC 语义以 error 为准。
+    #[test]
+    fn extract_result_prefers_error_over_result() {
+        let resp = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "ok": true },
+            "error": { "code": -1, "message": "boom" }
+        });
+        assert!(matches!(extract_result(&resp), Err(McpError::ServerError(_))));
+    }
+
+    /// 请求信封构造：手动复刻 request() 内的 JSON-RPC 报文形状，断言四要素齐备且 id 为数值。
+    #[test]
+    fn builds_jsonrpc_request_envelope() {
+        let id: u64 = 42;
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": "echo", "arguments": { "text": "hi" } }
+        });
+        assert_eq!(message["jsonrpc"], "2.0");
+        assert_eq!(message["id"], 42);
+        assert_eq!(message["method"], "tools/call");
+        assert_eq!(message["params"]["name"], "echo");
+        assert_eq!(message["params"]["arguments"]["text"], "hi");
+    }
+
+    /// 通知信封构造：通知无 id（fire-and-forget），其余字段齐备。
+    #[test]
+    fn builds_jsonrpc_notification_envelope_without_id() {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        });
+        assert_eq!(message["jsonrpc"], "2.0");
+        assert_eq!(message["method"], "notifications/initialized");
+        // 通知不带 id，是与请求的关键区别。
+        assert!(message.get("id").is_none());
+    }
+
+    /// tools/list 结果反序列化为 Vec<McpToolDef>，缺省 description / inputSchema 用 default 兜底。
+    #[test]
+    fn parses_tools_list_result_with_defaults() {
+        let result = serde_json::json!({
+            "tools": [
+                { "name": "a", "description": "first", "inputSchema": { "type": "object" } },
+                { "name": "b" }
+            ]
+        });
+        let tools: Vec<McpToolDef> = serde_json::from_value(result["tools"].clone())
+            .expect("tools 应解析");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "a");
+        assert_eq!(tools[0].description, "first");
+        // 缺省字段走 #[serde(default)]：description 为空串、inputSchema 为 Null。
+        assert_eq!(tools[1].name, "b");
+        assert_eq!(tools[1].description, "");
+        assert!(tools[1].input_schema.is_null());
+    }
+
+    /// resources/list 项反序列化：camelCase mimeType 正确映射，可空字段缺省为 None。
+    #[test]
+    fn parses_resource_with_camel_case_mime_type() {
+        let raw = serde_json::json!({
+            "uri": "file:///a.txt",
+            "name": "A",
+            "mimeType": "text/plain"
+        });
+        let res: McpResource = serde_json::from_value(raw).expect("resource 应解析");
+        assert_eq!(res.uri, "file:///a.txt");
+        assert_eq!(res.name, "A");
+        assert_eq!(res.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(res.description, None);
+    }
+
+    /// SSE 边界：多条 data 帧时取最后一条携带 id/result/error 的 JSON-RPC 对象。
+    #[test]
+    fn sse_takes_last_jsonrpc_frame() {
+        let sse = "\
+event: message\n\
+data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\
+\n\
+event: message\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"final\":true}}\n\
+\n";
+        let v = parse_sse_jsonrpc(sse).expect("应取出最后的响应帧");
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["result"]["final"], true);
+    }
+
+    /// SSE 边界：错误响应帧（含 error）也应被识别并取出。
+    #[test]
+    fn sse_extracts_error_frame() {
+        let sse = "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32000,\"message\":\"x\"}}\n\n";
+        let v = parse_sse_jsonrpc(sse).expect("应取出错误帧");
+        assert_eq!(v["error"]["code"], -32000);
+        // 经 extract_result 后应转为 ServerError。
+        assert!(matches!(extract_result(&v), Err(McpError::ServerError(_))));
+    }
+
+    /// SSE 边界：无任何 data 行（仅注释/事件名）时返回 None，不 panic。
+    #[test]
+    fn sse_returns_none_without_data_lines() {
+        assert!(parse_sse_jsonrpc(": keep-alive\nevent: ping\n\n").is_none());
+        assert!(parse_sse_jsonrpc("").is_none());
+    }
+
+    /// call_tool 的内容拼接语义（在此直接验证其解析逻辑形状）：
+    /// content 数组中多个 text 片段以换行拼接，isError=true 应被识别为错误。
+    #[test]
+    fn tool_call_result_text_and_error_flag() {
+        // 成功：多段 text 以 \n 拼接。
+        let ok = serde_json::json!({
+            "content": [ { "type": "text", "text": "line1" }, { "type": "text", "text": "line2" } ],
+            "isError": false
+        });
+        let text = ok
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        assert_eq!(text, "line1\nline2");
+        assert!(!ok.get("isError").and_then(|v| v.as_bool()).unwrap_or(false));
+
+        // 失败：isError=true。
+        let bad = serde_json::json!({ "content": [ { "text": "boom" } ], "isError": true });
+        assert!(bad.get("isError").and_then(|v| v.as_bool()).unwrap_or(false));
+    }
 }

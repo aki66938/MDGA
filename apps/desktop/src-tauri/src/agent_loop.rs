@@ -1,8 +1,10 @@
-//! Agent 主流程：send_message 命令、内置工具循环 chat_with_builtin_tools、
-//! 工作区上下文注入 messages_with_workspace_context 与项目长期记忆读取。
+//! Agent 主流程：send_message 命令、内置工具循环 chat_with_builtin_tools 与工具分发编排。
 //! 依赖 chat / tools / subagent / permissions / checkpoint / compaction / mcp 等全部下游模块。
 //!
 //! 从 main.rs 抽出（Plan16，最后一步）：纯代码搬移与可见性调整，无行为变更。
+//! Plan28 P3-9：工作区上下文注入 messages_with_workspace_context / 项目长期记忆读取
+//! read_workspace_memory / 验证命令探测 detect_verification_command 等纯逻辑已迁入
+//! mdga-agent-core，本文件改为 `use mdga_agent_core::...` 调用，仅保留耦合 Tauri 的编排链路。
 
 use crate::chat::{
     assistant_message_for_tool_calls, chat_messages_to_wire, recover_tool_calls_from_content,
@@ -11,10 +13,9 @@ use crate::chat::{
 use crate::checkpoint::{capture_checkpoint_before, persist_checkpoint, post_execution_diff};
 use crate::command_run::{execute_bg_shell_tool, execute_run_command_tool};
 use crate::compaction::{
-    compact_tool_outputs, context_soft_limit_for, maybe_persist_large_output,
-    summarize_wire_history,
+    compact_tool_outputs, maybe_persist_large_output, summarize_wire_history,
 };
-use crate::hooks::{read_diagnostics_command, run_post_tool_hooks, run_pre_tool_hooks};
+use crate::hooks::{run_post_tool_hooks, run_pre_tool_hooks};
 use crate::mcp::{
     collect_mcp_bindings, execute_add_mcp_server, execute_mcp_resource_tool, execute_mcp_tool,
     McpBinding,
@@ -29,7 +30,12 @@ use crate::tools::{
     execute_remember, execute_todo_write, load_workspace_skills, PARALLEL_READONLY_TOOLS,
 };
 use crate::web::{execute_web_fetch, execute_web_search};
-use crate::{commands::permission_mode_from_str, merge_usage, record_tool_event};
+use crate::{commands::permission_mode_from_str, record_tool_event};
+// Plan28 P3-9：内核纯逻辑（消息构建 / 记忆读取 / 压缩软上限 / 验证探测 / usage 合并）已迁入 agent-core。
+use mdga_agent_core::{
+    context_soft_limit_for, detect_verification_command, merge_usage,
+    messages_with_workspace_context, read_workspace_memory,
+};
 use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMessage, StreamChunk};
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
 use mdga_shared::PermissionMode;
@@ -332,99 +338,6 @@ pub(crate) async fn send_message(
     Ok(())
 }
 
-fn messages_with_workspace_context(
-    messages: Vec<ChatMessage>,
-    workspace_path: Option<&str>,
-    workspace_name: Option<&str>,
-    repo_map: Option<&str>,
-    workspace_memory: Option<&str>,
-    skills: &[(String, String)],
-) -> Vec<ChatMessage> {
-    // 把后端可信的 session 工作区快照注入模型上下文，使 DeepSeek 能回答当前工作区问题。
-    let Some(path) = workspace_path.filter(|path| !path.trim().is_empty()) else {
-        // 纯聊天会话（未绑定工作区）：明确告知模型没有任何工具，防止它凭训练记忆
-        // 幻觉输出 <ToolCall>/DSML 等工具调用标记（0.0.17 dev 实测出现过）。
-        let mut injected = Vec::with_capacity(messages.len() + 1);
-        injected.push(ChatMessage {
-            role: "system".to_string(),
-            content: "当前会话未绑定工作区，你没有任何本地文件、目录或命令工具可用。\
-如果用户要求读写文件、列目录、修改代码或执行命令，请直接告知：需要点击「+ 新对话」并选择工作区后才能执行本地操作。\
-绝对不要输出任何工具调用标记（如 <ToolCall>、DSML 标记等），也不要假装已经执行了本地操作。"
-                .to_string(),
-        });
-        injected.extend(messages);
-        return injected;
-    };
-    let name = workspace_name
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("未命名工作区");
-    let mut injected = Vec::with_capacity(messages.len() + 4);
-    // 不可变核心原则（Plan25 #1，动静分离）：身份锚定 / 工具纪律 / 行为准则全部引用 agent_prompt 常量，
-    // 单点维护、字节稳定以提升 prompt 缓存命中。动态的工作区路径 / 记忆 / 技能仍在下方内联拼接。
-    // 身份锚定：明确 MDGA 不是 Claude Code，配置在 .mdga/，防止模型沿用 .claude 等训练记忆里的约定。
-    injected.push(ChatMessage {
-        role: "system".to_string(),
-        content: crate::agent_prompt::IDENTITY_ANCHOR.to_string(),
-    });
-    injected.push(ChatMessage {
-        role: "system".to_string(),
-        content: format!(
-            "你正在 MDGA 桌面端中运行。本轮会话绑定的工作区名称是 {name}，工作区路径是 {path}。\
-除非用户明确授权越界，否则你应假定所有本地文件任务都发生在该工作区内。\
-当用户询问你当前所在的工作区或工作目录时，应直接回答这个路径；不要声称自己没有工作区。\
-当用户要求列目录、读取文件、创建文件、修改文件或删除文件时，必须分别调用 list_dir、read_file、\
-create_file、write_file 或 delete_file 工具完成真实本地操作；不要只给出代码示例，\
-不要建议用户手动操作，也不要在没有工具结果时声称文件已处理。"
-        ),
-    });
-    injected.push(ChatMessage {
-        role: "system".to_string(),
-        content: crate::agent_prompt::TOOL_DISCIPLINE.to_string(),
-    });
-    // 行为准则（Plan25 #1 新增）：不可变工作风格——简洁、改前先读、优先 edit/apply_patch、
-    // 能查清不提问、写完必验证、不可逆操作谨慎、达成即停。
-    injected.push(ChatMessage {
-        role: "system".to_string(),
-        content: crate::agent_prompt::CODE_OF_CONDUCT.to_string(),
-    });
-    // repo map：开局注入工作区结构摘要，让模型无需逐层 list_dir 就了解项目骨架。
-    if let Some(map) = repo_map.filter(|map| !map.trim().is_empty()) {
-        injected.push(ChatMessage {
-            role: "system".to_string(),
-            content: format!(
-                "当前工作区结构摘要（已忽略 .git/node_modules/target 等噪声目录，可能有省略）：\n{map}\n\
-需要查看更深层目录或文件内容时，再调用 list_dir / read_file。"
-            ),
-        });
-    }
-    // 项目长期记忆：工作区根目录 MDGA.md（对标 CLAUDE.md / AGENTS.md），每次请求注入，
-    // 永不被上下文压缩冲掉，承载项目目标、规范与架构约定。
-    if let Some(memory) = workspace_memory.filter(|m| !m.trim().is_empty()) {
-        injected.push(ChatMessage {
-            role: "system".to_string(),
-            content: format!(
-                "项目长期记忆（来自工作区根目录的 MDGA.md，跨会话持久有效，优先遵循其中的目标与约定）：\n{memory}"
-            ),
-        });
-    }
-    // 技能列表（渐进披露）：只注入名称与描述，完整说明由模型按需调用 load_skill 加载。
-    if !skills.is_empty() {
-        let list = skills
-            .iter()
-            .map(|(name, desc)| format!("- {name}：{desc}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        injected.push(ChatMessage {
-            role: "system".to_string(),
-            content: format!(
-                "当前工作区可用技能（来自 .mdga/skills/）。当任务与某项技能匹配时，先调用 load_skill 加载其完整说明再执行：\n{list}"
-            ),
-        });
-    }
-    injected.extend(messages);
-    injected
-}
-
 /// 把 todo 清单（todo_write 的 items 数组）压成轻量文本，供每轮回灌提醒（Plan25 #5①）。
 /// 每项取 status 与 content/title，未完成项优先呈现；整体截断防膨胀。
 fn summarize_todos(items: &[serde_json::Value]) -> String {
@@ -449,41 +362,6 @@ fn summarize_todos(items: &[serde_json::Value]) -> String {
     joined.chars().take(2_000).collect()
 }
 
-/// 探测本工作区可用的「写后验证」命令（Plan25 #7）：优先用户显式配置的 .mdga/diagnostics，
-/// 否则按工作区可识别的构建/测试约定推断。探测不到则返回 None（跳过验证回路）。
-///
-/// 推断优先级：Cargo.toml → `cargo check`；package.json 含 scripts.test → `npm test`，
-/// 否则含 scripts.build → `npm run build`。其它生态暂不推断（避免误跑昂贵/有副作用命令）。
-fn detect_verification_command(workspace: &str) -> Option<String> {
-    // 显式诊断命令最高优先：用户已声明权威验证手段。
-    if let Some(cmd) = read_diagnostics_command(workspace) {
-        return Some(cmd);
-    }
-    let root = std::path::Path::new(workspace);
-    if root.join("Cargo.toml").is_file() {
-        return Some("cargo check".to_string());
-    }
-    if let Ok(text) = std::fs::read_to_string(root.join("package.json")) {
-        if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&text) {
-            let scripts = pkg.get("scripts");
-            let has = |name: &str| {
-                scripts
-                    .and_then(|s| s.get(name))
-                    .and_then(|v| v.as_str())
-                    .map(|s| !s.trim().is_empty())
-                    .unwrap_or(false)
-            };
-            if has("test") {
-                return Some("npm test".to_string());
-            }
-            if has("build") {
-                return Some("npm run build".to_string());
-            }
-        }
-    }
-    None
-}
-
 /// 把 todo 清单落盘到 <workspace>/.mdga/tasks/current.json（Plan25 #5②）。失败忽略，不阻塞主链路。
 fn persist_current_todos(workspace: &str, items: &[serde_json::Value]) {
     let dir = std::path::Path::new(workspace).join(".mdga").join("tasks");
@@ -500,18 +378,6 @@ fn persist_current_todos(workspace: &str, items: &[serde_json::Value]) {
     if let Ok(text) = serde_json::to_string_pretty(&payload) {
         let _ = std::fs::write(dir.join("current.json"), text);
     }
-}
-
-/// 读取工作区根目录的 MDGA.md 作为项目长期记忆；不存在或为空时返回 None。
-/// 上限 16K 字符，防止超大记忆文件挤占上下文。
-fn read_workspace_memory(workspace_root: &str) -> Option<String> {
-    let path = std::path::Path::new(workspace_root).join("MDGA.md");
-    let content = std::fs::read_to_string(path).ok()?;
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.chars().take(16_000).collect())
 }
 
 /// ask_vision 工具（Plan27 C3 #1c）的视觉追问 system 提示词：意图驱动、要点化、只答所问。
@@ -1258,92 +1124,8 @@ fn detect_and_emit_stuck(
 mod tests {
     use super::*;
 
-    #[test]
-    fn prepends_workspace_context_to_deepseek_messages() {
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "你是否清楚现在所在的工作区路径是什么".to_string(),
-        }];
-
-        let injected = messages_with_workspace_context(
-            messages,
-            Some("C:\\workspace\\demo"),
-            Some("MDGA"),
-            None,
-            None,
-            &[],
-        );
-
-        // injected[0] 是 MDGA 身份锚定消息。
-        assert_eq!(injected[0].role, "system");
-        assert!(injected[0].content.contains("MDGA"));
-        assert!(injected[0].content.contains(".mdga"));
-        assert_eq!(injected[1].role, "system");
-        assert!(injected[1].content.contains("C:\\workspace\\demo"));
-        assert!(injected[1].content.contains("MDGA"));
-        assert!(injected[1].content.contains("除非用户明确授权越界"));
-        assert!(injected[1].content.contains("必须分别调用"));
-        assert!(injected[1].content.contains("read_file"));
-        assert!(injected[1].content.contains("write_file"));
-        assert!(injected[1].content.contains("delete_file"));
-        assert!(injected[1].content.contains("list_dir"));
-        assert_eq!(injected[2].role, "system");
-        assert!(injected[2].content.contains("edit_file"));
-        assert!(injected[2].content.contains("search_text"));
-        // injected[3] 是行为准则（Plan25 #1 新增）。
-        assert_eq!(injected[3].role, "system");
-        assert!(injected[3].content.contains("行为准则"));
-        assert!(injected[3].content.contains("改动前先读"));
-        assert_eq!(injected[4].role, "user");
-    }
-
-
-    #[test]
-    fn injects_repo_map_when_provided() {
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "项目结构是什么".to_string(),
-        }];
-
-        let injected = messages_with_workspace_context(
-            messages,
-            Some("C:\\workspace\\demo"),
-            Some("MDGA"),
-            Some("src/\n  main.rs\nCargo.toml"),
-            None,
-            &[],
-        );
-
-        // sys(身份) + sys(workspace) + sys(tools) + sys(行为准则) + sys(repo map) + user
-        assert_eq!(injected.len(), 6);
-        assert_eq!(injected[4].role, "system");
-        assert!(injected[4].content.contains("工作区结构摘要"));
-        assert!(injected[4].content.contains("main.rs"));
-        assert_eq!(injected[5].role, "user");
-    }
-
-    #[test]
-    fn injects_workspace_memory_when_provided() {
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "继续开发".to_string(),
-        }];
-
-        let injected = messages_with_workspace_context(
-            messages,
-            Some("C:\\workspace\\demo"),
-            Some("MDGA"),
-            None,
-            Some("项目目标：做一个计算器。代码规范：KISS。"),
-            &[],
-        );
-
-        // sys(身份) + sys(workspace) + sys(tools) + sys(行为准则) + sys(memory) + user
-        assert_eq!(injected.len(), 6);
-        assert_eq!(injected[4].role, "system");
-        assert!(injected[4].content.contains("项目长期记忆"));
-        assert!(injected[4].content.contains("做一个计算器"));
-    }
+    // 注（Plan28 P3-9）：messages_with_workspace_context 的 3 个单测已随该函数迁入
+    // mdga-agent-core（crates/agent-core/src/messages.rs），此处不再保留。
 
     #[test]
     fn executes_create_file_tool_call_inside_workspace() {

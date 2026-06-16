@@ -12,7 +12,9 @@ use crate::permissions::{
 };
 use crate::state::{AppState, BgTask, BG_TASK_SEQ};
 use crate::tools::{all_builtin_tool_schemas, execute_builtin_tool_call};
-use crate::{merge_usage, record_tool_event};
+use crate::record_tool_event;
+// Plan28 P3-9：merge_usage 已迁入 agent-core。
+use mdga_agent_core::merge_usage;
 use mdga_deepseek_client::strip_dsml_markup;
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
 use mdga_shared::PermissionMode;

@@ -1,3 +1,10 @@
+//! Token 计价与成本汇总。
+//!
+//! ⚠️ 价格说明（Plan28 P2-8）：下方价格为**手工维护的快照**（当前 2026-06 版，来源见各函数注释），
+//! **无自动更新机制**——DeepSeek 官方调价后需在此**新增一个版本**（不覆盖历史，version 字段已写入每条
+//! token 记录以便账单回放）。多供应商场景：本表仅覆盖 DeepSeek;非 DeepSeek 主供应商的成本前端按
+//! 「—」展示（不按 DeepSeek 价误导,见 Plan21 #5），如需精确计费需后续引入 per-provider 价表。
+
 use mdga_shared::RawUsage;
 use serde::{Deserialize, Serialize};
 
