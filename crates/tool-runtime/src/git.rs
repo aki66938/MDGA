@@ -13,12 +13,110 @@
 
 use crate::ToolRuntimeError;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// git 命令超时（本地操作，给大仓库留足余量；网络操作不在 v1）。
 const GIT_TIMEOUT_SECS: u64 = 60;
+
+/// 在 PATH 里按 which 风格解析出 `git` 的绝对路径。
+///
+/// 安全要点：`run_git` 以 `current_dir(workspace)` 派生子进程；Windows 的 `CreateProcess`
+/// 在按裸名（"git"）查找可执行文件时会先搜当前目录、再搜 PATH，于是工作区里若放了一枚
+/// 同名 `git.exe`（攻击者可控）就会抢在真 git 前被执行。这里显式在 PATH 各目录里查找，
+/// 拿到绝对路径后再派生，彻底绕开「cwd 优先」语义；工作区目录本身永不参与查找。
+///
+/// 解析顺序：逐个 PATH 目录，Windows 上对每个目录依次尝试无扩展名与
+/// `.exe`/`.cmd`/`.bat`（外加 PATHEXT 里列出的其余扩展名）；非 Windows 仅取无扩展名且
+/// 校验可执行位。返回首个命中的绝对路径；都没命中返回 None（调用方据此回传清晰错误）。
+fn resolve_git_path() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        // 空分量在 Windows 上历史语义等同当前目录——这正是我们要规避的攻击面，跳过。
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if let Some(hit) = find_git_in_dir(&dir) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// 在单个目录里寻找名为 `git` 的可执行文件，命中返回其绝对路径。
+fn find_git_in_dir(dir: &Path) -> Option<PathBuf> {
+    for candidate in git_candidate_names() {
+        let full = dir.join(&candidate);
+        if is_executable_file(&full) {
+            return Some(full);
+        }
+    }
+    None
+}
+
+/// 待尝试的文件名列表（含平台相关的可执行扩展名）。
+fn git_candidate_names() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        // 默认四件套：无扩展名 + 常见可执行扩展；再并入 PATHEXT 里声明的其余扩展名，
+        // 不区分大小写去重。无扩展名放最前以兼容罕见的无后缀分发。
+        let mut names: Vec<String> = vec![
+            "git".to_string(),
+            "git.exe".to_string(),
+            "git.cmd".to_string(),
+            "git.bat".to_string(),
+        ];
+        if let Some(pathext) = std::env::var_os("PATHEXT") {
+            if let Some(s) = pathext.to_str() {
+                for ext in s.split(';') {
+                    let ext = ext.trim();
+                    if ext.is_empty() {
+                        continue;
+                    }
+                    // PATHEXT 形如 ".COM;.EXE;.BAT;.CMD"，统一成小写带点。
+                    let ext = ext.to_ascii_lowercase();
+                    let ext = if let Some(stripped) = ext.strip_prefix('.') {
+                        stripped.to_string()
+                    } else {
+                        ext
+                    };
+                    let cand = format!("git.{ext}");
+                    if !names.iter().any(|n| n.eq_ignore_ascii_case(&cand)) {
+                        names.push(cand);
+                    }
+                }
+            }
+        }
+        names
+    }
+    #[cfg(not(windows))]
+    {
+        vec!["git".to_string()]
+    }
+}
+
+/// 判断路径是否为一个可执行的常规文件。
+fn is_executable_file(path: &Path) -> bool {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 任一可执行位置位即视为可执行。
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows 上「可执行」由扩展名表达，能 stat 到常规文件即可。
+        true
+    }
+}
 
 // ── 请求类型 ────────────────────────────────────────────────────────────────
 
@@ -220,7 +318,14 @@ struct GitOutput {
 
 /// 在工作区目录下以参数向量调用 `git`（不经 shell），抽干管道、带超时。
 fn run_git(workspace: &Path, args: &[&str]) -> Result<GitOutput, ToolRuntimeError> {
-    let mut builder = Command::new("git");
+    // 安全：先把 `git` 解析成 PATH 中的绝对路径再派生。否则 `current_dir(workspace)` +
+    // 裸名 "git" 会让 Windows CreateProcess 先搜 cwd，工作区里同名 git.exe 即可抢占执行。
+    let git_path = resolve_git_path().ok_or_else(|| {
+        ToolRuntimeError::CommandFailed(
+            "git 未安装或不在 PATH 中（请确认已安装 git 且在 PATH 中）".to_string(),
+        )
+    })?;
+    let mut builder = Command::new(&git_path);
     builder
         .args(args)
         .current_dir(workspace)
@@ -767,6 +872,102 @@ mod tests {
         assert_eq!(res.staged[0].status, "R");
         assert_eq!(res.staged[0].path, "new_name.rs");
         assert_eq!(res.staged[0].orig_path.as_deref(), Some("old_name.rs"));
+    }
+
+    /// 造一个唯一临时目录，避免并行测试互踩。
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time available")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mdga-git-resolve-{tag}-{nonce}"));
+        std::fs::create_dir_all(&dir).expect("temp dir created");
+        dir
+    }
+
+    /// 在目录里放一枚「可执行的」假 git，跨平台命名 + 加可执行位。
+    fn write_fake_git(dir: &Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let name = "git.exe";
+        #[cfg(not(windows))]
+        let name = "git";
+        let p = dir.join(name);
+        std::fs::write(&p, b"#!/bin/sh\nexit 0\n").expect("write fake git");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&p, perms).unwrap();
+        }
+        p
+    }
+
+    #[test]
+    fn resolve_git_finds_executable_in_dir() {
+        let dir = unique_temp_dir("found");
+        let fake = write_fake_git(&dir);
+
+        // find_git_in_dir 应在该目录里解析出绝对路径，且指向我们刚写的文件。
+        let hit = find_git_in_dir(&dir).expect("fake git should be found");
+        assert!(hit.is_absolute(), "解析结果应为绝对路径: {hit:?}");
+        assert_eq!(hit, fake);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_git_misses_empty_dir() {
+        // 空目录里没有任何 git 候选，应解析失败（调用方据此回传清晰错误）。
+        let dir = unique_temp_dir("empty");
+        assert!(
+            find_git_in_dir(&dir).is_none(),
+            "空目录不应解析出 git"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_git_ignores_directory_named_git() {
+        // 一个名为 git/git.exe 的【目录】不应被当成可执行命中（防 is_file 误判）。
+        let dir = unique_temp_dir("dirname");
+        #[cfg(windows)]
+        let decoy = dir.join("git.exe");
+        #[cfg(not(windows))]
+        let decoy = dir.join("git");
+        std::fs::create_dir_all(&decoy).expect("create decoy dir");
+        assert!(
+            find_git_in_dir(&dir).is_none(),
+            "同名目录不应被当作可执行命中"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_candidate_names_cover_expected_exts() {
+        let names = git_candidate_names();
+        // 无扩展名总在候选里，且放在最前以兼容罕见无后缀分发。
+        assert_eq!(names.first().map(String::as_str), Some("git"));
+        #[cfg(windows)]
+        {
+            for want in ["git.exe", "git.cmd", "git.bat"] {
+                assert!(
+                    names.iter().any(|n| n == want),
+                    "Windows 候选应含 {want}，实际: {names:?}"
+                );
+            }
+            // 不应有重复（含与 PATHEXT 合并后的大小写去重）。
+            let mut lower: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+            lower.sort();
+            let before = lower.len();
+            lower.dedup();
+            assert_eq!(before, lower.len(), "候选名不应重复: {names:?}");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(names, vec!["git".to_string()]);
+        }
     }
 
     #[test]
