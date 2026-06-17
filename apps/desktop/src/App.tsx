@@ -1070,13 +1070,34 @@ export function App() {
       .trim();
   }
 
-  /** 编辑重试（Plan19 P1a）：把该用户消息文字回填到输入框，供修改后再次发送。 */
-  function editRetryMessage(msg: Message) {
-    if (sending) return;
+  /** 编辑重试 = rewind to here（0.0.49，CC「rewind in here」）：把被编辑的这条用户消息及其后的
+   *  全部问答截断（DB + UI），并回退这些轮次期间产生的文件变更，文本回填输入框供修改后重发。
+   *  先调后端成功再截断 UI，失败则不动、提示重试，避免 UI 与 DB 不一致。 */
+  async function editRetryMessage(msg: Message, index: number) {
+    if (sending || !activeConvId) return;
     const text = messageText(msg);
     if (!text) return;
+    const n = messages.length - index; // 被编辑那条 + 其后全部
+    if (n <= 0) return;
+    let result: { deleted: number; filesReverted: number };
+    try {
+      result = await invoke<{ deleted: number; filesReverted: number }>("rewind_to_message", {
+        conversationId: activeConvId,
+        n,
+      });
+    } catch (err) {
+      pushToast("error", humanizeError(String(err)));
+      return;
+    }
+    setMessages(messages.slice(0, index));
     setInput(text);
     updateFileMention(text);
+    if (result.filesReverted > 0) {
+      pushToast(
+        "info",
+        `已回退到此处：撤销 ${result.deleted} 条消息、${result.filesReverted} 处文件改动。`
+      );
+    }
   }
 
   /** 重发（Plan19 P1a）：直接以该用户消息的文字再发一次（复用 sendText / handleSend 路径）。 */
@@ -1643,7 +1664,7 @@ export function App() {
                     isLastAssistant={msg.role === "assistant" && i === lastAssistantIdx}
                     onCopy={() => messageText(msg)}
                     onResend={() => resendMessage(msg)}
-                    onEditRetry={() => editRetryMessage(msg)}
+                    onEditRetry={() => editRetryMessage(msg, i)}
                     onRegenerate={handleRegenerate}
                     usage={msg.usage}
                     showCost={isDeepseekMain}

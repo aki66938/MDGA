@@ -428,6 +428,66 @@ pub(crate) fn delete_last_assistant_message(
     mdga_storage::delete_last_assistant_message(&db, &conversation_id).map_err(|e| e.to_string())
 }
 
+/// 编辑已发消息 = 回退到此处（0.0.49，CC「rewind in here」+ 连文件回退）：删该会话「末尾 n 条」
+/// 消息；并把这些被删轮次期间产生的文件变更一并回退（按 cut_ts 时戳关联 file_checkpoints、seq 倒序
+/// 撤销）；最后清 wire 快照，防断额/崩溃续接重放被删历史。返回 { deleted, filesReverted }。
+#[tauri::command]
+pub(crate) fn rewind_to_message(
+    state: State<AppState>,
+    conversation_id: String,
+    n: usize,
+) -> Result<serde_json::Value, String> {
+    // 1) 截断锚点 cut_ts：末尾 n 条里最早一条的 created_at。早于它的文件变更属保留轮次，不回退。
+    let cut_ts = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        mdga_storage::cut_timestamp_for_last_n(&db, &conversation_id, n).map_err(|e| e.to_string())?
+    };
+    let Some(cut_ts) = cut_ts else {
+        return Ok(serde_json::json!({ "deleted": 0, "filesReverted": 0 }));
+    };
+
+    // 2) 文件回退：created_at >= cut_ts 且未回退、可回退的检查点，按 seq 倒序撤销（后发生的先回退）。
+    //    无绑定工作区则跳过文件回退、只截断对话。
+    let (workspace, targets) = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let workspace = get_conversation(&db, &conversation_id)
+            .map_err(|e| e.to_string())?
+            .and_then(|c| c.workspace_path);
+        let mut targets: Vec<FileCheckpoint> = if workspace.is_some() {
+            list_file_checkpoints(&db, &conversation_id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|c| c.created_at >= cut_ts && !c.reverted && c.revertible)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        targets.sort_by(|a, b| b.seq.cmp(&a.seq));
+        (workspace, targets)
+    };
+    let mut files_reverted = 0usize;
+    if let Some(workspace) = workspace {
+        for checkpoint in &targets {
+            if apply_checkpoint_revert(&workspace, checkpoint).is_ok() {
+                let db = state.db.lock().map_err(|e| e.to_string())?;
+                let _ = mark_checkpoint_reverted(&db, &checkpoint.id);
+                files_reverted += 1;
+            }
+        }
+    }
+
+    // 3) 删末尾 n 条消息 + 清 wire 快照。
+    let deleted = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let deleted = mdga_storage::delete_last_n_messages(&db, &conversation_id, n)
+            .map_err(|e| e.to_string())?;
+        mdga_storage::delete_wire_snapshot(&db, &conversation_id).map_err(|e| e.to_string())?;
+        deleted
+    };
+
+    Ok(serde_json::json!({ "deleted": deleted, "filesReverted": files_reverted }))
+}
+
 /// 按关键词搜索会话（Plan27 C5 #6 正文搜索）：标题或消息正文 LIKE 命中，按 updated_at 倒序。
 ///
 /// query 经 trim 后为空则直接返回空列表（前端空查询应回退本地列表，不应走此命令）。
@@ -606,6 +666,8 @@ pub(crate) async fn compact_history(
 
     let db = state.db.lock().map_err(|e| e.to_string())?;
     delete_messages(&db, &conversation_id).map_err(|e| e.to_string())?;
+    // 0.0.49：压缩同样截断了历史，清 wire 快照防断额/崩溃续接重放被删原文。
+    mdga_storage::delete_wire_snapshot(&db, &conversation_id).map_err(|e| e.to_string())?;
     save_message(
         &db,
         &conversation_id,

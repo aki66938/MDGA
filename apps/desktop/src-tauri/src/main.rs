@@ -31,8 +31,8 @@ use commands::{
     read_image_base64, recent_denied_actions, search_conversations,
     load_messages, load_wire, new_conversation, new_conversation_with_workspace, persist_message,
     pin_conversation, queue_steering, remove_conversation, rename_conversation, respond_approval,
-    respond_ask_user, revert_to_checkpoint, set_command_sandbox, set_conversation_workspace,
-    set_task_budget, set_workspace_path, toggle_mcp_server,
+    respond_ask_user, revert_to_checkpoint, rewind_to_message, set_command_sandbox,
+    set_conversation_workspace, set_task_budget, set_workspace_path, toggle_mcp_server,
 };
 use commands::{
     get_app_setting, get_model_provider_config, remove_model_provider, save_model_provider,
@@ -186,6 +186,7 @@ fn main() {
             read_image_base64,
             get_conversation_events,
             delete_last_assistant_message,
+            rewind_to_message,
             search_conversations,
             recent_denied_actions,
             cancel_agent,

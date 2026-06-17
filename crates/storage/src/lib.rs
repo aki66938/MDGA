@@ -532,6 +532,16 @@ pub fn get_wire_snapshot(conn: &Connection, conv_id: &str) -> SqlResult<Option<S
     }
 }
 
+/// 删除会话的 wire 快照(0.0.49)。截断历史(rewind / compact)后必须清,否则断额/崩溃续接会
+/// 从这份旧快照重放被删掉的历史。无则无操作。
+pub fn delete_wire_snapshot(conn: &Connection, conv_id: &str) -> SqlResult<()> {
+    conn.execute(
+        "DELETE FROM wire_snapshots WHERE conversation_id = ?1",
+        params![conv_id],
+    )?;
+    Ok(())
+}
+
 /// 查询会话的所有消息，按时间正序排列。
 pub fn get_messages(conn: &Connection, conv_id: &str) -> SqlResult<Vec<StoredMessage>> {
     let mut stmt = conn.prepare(
@@ -586,6 +596,45 @@ pub fn delete_last_assistant_message(conn: &Connection, conv_id: &str) -> SqlRes
     }
     let affected = conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
     Ok(affected > 0)
+}
+
+/// rewind 截断锚点(0.0.49):取「末尾 n 条」里最早一条的 created_at —— 早于它的消息保留、
+/// 同它或晚于它的被删。供按时戳关联回退这些被删轮次产生的文件变更。
+/// 排序与删除一致用 (created_at DESC, rowid DESC),取第 n 条(OFFSET n-1)即最早被删条。
+/// n=0 或会话消息不足 n 条返回 None。
+pub fn cut_timestamp_for_last_n(conn: &Connection, conv_id: &str, n: usize) -> SqlResult<Option<i64>> {
+    if n == 0 {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT created_at FROM messages
+         WHERE conversation_id = ?1
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1 OFFSET ?2",
+    )?;
+    let mut rows = stmt.query(params![conv_id, (n - 1) as i64])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+/// 删除会话「末尾 n 条」消息(0.0.49 rewind「回退到此处」截断)。返回实删条数。
+/// 用子查询按 (created_at DESC, rowid DESC) 选末尾 n 条 id 再删,防同秒并列误删邻近轮次。
+pub fn delete_last_n_messages(conn: &Connection, conv_id: &str, n: usize) -> SqlResult<usize> {
+    if n == 0 {
+        return Ok(0);
+    }
+    let affected = conn.execute(
+        "DELETE FROM messages WHERE id IN (
+             SELECT id FROM messages
+             WHERE conversation_id = ?1
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT ?2
+         )",
+        params![conv_id, n as i64],
+    )?;
+    Ok(affected)
 }
 
 // ── Token 账本（独立条目）─────────────────────────────────────────────────
@@ -1157,6 +1206,40 @@ mod tests {
         assert!(list[1].reverted);
         assert_eq!(list[0].prev_content.as_deref(), Some("old"));
         assert_eq!(list[1].prev_content, None);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn rewind_truncates_last_n_messages_and_clears_wire() {
+        // 0.0.49 edit=rewind 的存储原语:删末尾 n 条 + cut_ts 锚点 + 清 wire 快照。
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db");
+        let conv = create_conversation(&conn).expect("conv");
+        for i in 0..5 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            save_message(&conn, &conv.id, role, &format!("m{i}"), None, None).expect("save");
+        }
+        save_wire_snapshot(&conn, &conv.id, "[stale]").expect("wire");
+
+        // cut_ts:末尾 2 条里最早一条的 created_at,应存在。
+        assert!(cut_timestamp_for_last_n(&conn, &conv.id, 2).expect("cut").is_some());
+        assert!(cut_timestamp_for_last_n(&conn, &conv.id, 0).expect("cut0").is_none());
+
+        // 删末尾 2 条 → 剩 3 条,末条为 m2(同秒插入靠 rowid 定序)。
+        assert_eq!(delete_last_n_messages(&conn, &conv.id, 2).expect("del"), 2);
+        let remaining = get_messages(&conn, &conv.id).expect("get");
+        assert_eq!(remaining.len(), 3);
+        assert_eq!(remaining.last().unwrap().content, "m2");
+
+        // n=0 无操作;n 超总数删全部。
+        assert_eq!(delete_last_n_messages(&conn, &conv.id, 0).expect("del0"), 0);
+        assert_eq!(delete_last_n_messages(&conn, &conv.id, 99).expect("delall"), 3);
+        assert!(get_messages(&conn, &conv.id).expect("get").is_empty());
+
+        // 清 wire 快照。
+        delete_wire_snapshot(&conn, &conv.id).expect("delwire");
+        assert!(get_wire_snapshot(&conn, &conv.id).expect("getwire").is_none());
 
         let _ = std::fs::remove_file(db_path);
     }
