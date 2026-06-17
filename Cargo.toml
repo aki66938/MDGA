@@ -2,6 +2,7 @@
 members = [
   "apps/desktop/src-tauri",
   "crates/agent-core",
+  "crates/codemap",
   "crates/deepseek-client",
   "crates/mcp-client",
   "crates/sandbox-runtime",

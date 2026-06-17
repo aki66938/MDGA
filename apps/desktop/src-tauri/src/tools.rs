@@ -7,9 +7,11 @@ use crate::permissions::tool_capability_for_name;
 use crate::web::{execute_web_fetch, execute_web_search};
 use mdga_sandbox_runtime::SessionSecurityContext;
 use mdga_tool_runtime::{
-    code_overview, create_file, delete_dir, delete_file, edit_file, glob_files, list_dir, make_dir,
-    move_path, read_file, run_command, search_text, stat_path, write_file, CodeOverviewRequest,
-    CreateFileRequest, DeleteDirRequest, DeleteFileRequest, EditFileRequest, GlobFilesRequest,
+    code_overview, create_file, delete_dir, delete_file, edit_file, git_add, git_branch,
+    git_commit, git_diff, git_log, git_status, glob_files, list_dir, make_dir, move_path, read_file,
+    run_command, search_text, stat_path, write_file, CodeOverviewRequest, CreateFileRequest,
+    DeleteDirRequest, DeleteFileRequest, EditFileRequest, GitAddRequest, GitBranchRequest,
+    GitCommitRequest, GitDiffRequest, GitLogRequest, GitStatusRequest, GlobFilesRequest,
     ListDirRequest, MakeDirRequest, MovePathRequest, ReadFileRequest, RunCommandRequest,
     SearchTextRequest, StatPathRequest, WriteFileRequest,
 };
@@ -133,8 +135,13 @@ pub(crate) const PARALLEL_READONLY_TOOLS: &[&str] = &[
     "glob_files",
     "stat_path",
     "code_overview",
+    "repo_map",
     "web_fetch",
     "web_search",
+    // R4：git 只读工具，无副作用、可并行。
+    "git_status",
+    "git_diff",
+    "git_log",
 ];
 
 /// 执行一个只读工具调用（同步文件工具或异步 web 工具），供并行批量执行。
@@ -288,6 +295,24 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                         "path": { "type": "string", "description": "Relative path inside the workspace. Use \".\" for the workspace root; may be a file or a directory." }
                     },
                     "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        // repo_map（R2）：tree-sitter 抽取定义 + PageRank 引用排名的全仓符号地图。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "repo_map",
+                "description": "Get a RANKED repository map of the most important code definitions across the whole workspace, WITHOUT reading files one by one. Parses sources with tree-sitter (Rust, Python, JS, TS/TSX, Go) to extract definitions (functions, methods, types, classes, traits, etc.) and references, then ranks them with a personalized PageRank over the reference graph (the more a symbol is referenced by important files, the higher it ranks). Output lists files in importance order, each with its top definition signature lines and line numbers. Use this EARLY to orient in an unfamiliar or large codebase, to find where the core/most-referenced code lives, and to see who-depends-on-what — it complements glob_files/search_text (which find by name/text) and code_overview (which counts structure in one path). Pass focus_files and/or query to bias the map toward a specific area. Read-only; lightweight; large repos are capped and the result says so.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "focusFiles": { "type": "array", "items": { "type": "string" }, "description": "Optional workspace-relative file paths to focus the map around (PageRank is personalized toward these and their collaborators)." },
+                        "query": { "type": "string", "description": "Optional free-text keywords; symbols whose names match are boosted and their defining files surfaced first." },
+                        "maxTokens": { "type": "integer", "description": "Optional token budget for the rendered map (default 1500, clamped to 200–20000)." }
+                    },
+                    "required": [],
                     "additionalProperties": false
                 }
             }
@@ -604,6 +629,92 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        // R4：git 原生工具——结构化 commit/diff/branch/status，取代 run_command 裸跑 git 字符串。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_status",
+                "description": "Get the STRUCTURED git status of the workspace: current branch, upstream, ahead/behind counts, and lists of staged / unstaged / untracked / conflicted files (each with a porcelain status code). Prefer this over running `git status` via run_command — it returns parsed fields, not text to scrape.",
+                "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_diff",
+                "description": "Show changes as a structured diff: per-file additions/deletions plus the unified patch text. Use mode to choose what is compared. Prefer this over `git diff` via run_command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "type": "string", "enum": ["unstaged", "staged", "all"], "description": "unstaged (default) = working tree vs index; staged = index vs HEAD; all = working tree vs HEAD." },
+                        "path": { "type": "string", "description": "Optional workspace-relative file or directory to limit the diff to." }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_log",
+                "description": "Return recent commits as structured records (hash, short hash, author, email, ISO date, subject). Prefer this over `git log` via run_command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "maxCount": { "type": "integer", "description": "Number of commits to return (default 20, max 200)." },
+                        "path": { "type": "string", "description": "Optional workspace-relative path: only commits touching it." }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_branch",
+                "description": "List branches, or create/switch branches. action='list' (default) returns local branches (set includeRemote=true to include remote-tracking) with the current one flagged. action='create' creates AND switches to a new branch (name required). action='switch' switches to an existing branch (name required).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "create", "switch"], "description": "Defaults to list." },
+                        "name": { "type": "string", "description": "Branch name (required for create/switch)." },
+                        "includeRemote": { "type": "boolean", "description": "list only: include remote-tracking branches. Default false." }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_add",
+                "description": "Stage changes for commit. Provide paths (workspace-relative) to stage specific files, or set all=true to stage everything (`git add -A`). Returns the full set of currently staged files afterwards.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paths": { "type": "array", "items": { "type": "string" }, "description": "Workspace-relative paths to stage." },
+                        "all": { "type": "boolean", "description": "Stage all changes (overrides paths). Default false." }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_commit",
+                "description": "Create a commit from the staged changes with the given message. Set all=true to also stage modified/deleted TRACKED files first (`git commit -a`); untracked files are never included by all. Returns the new commit hash and summary. Stage new files with git_add first.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": { "type": "string", "description": "Commit message." },
+                        "all": { "type": "boolean", "description": "Stage tracked modifications before committing (-a). Default false." }
+                    },
+                    "required": ["message"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     ]
 }
 
@@ -740,6 +851,7 @@ pub(crate) fn execute_builtin_tool_call(
             )
             .map_err(|err| err.to_string())
         }
+        "repo_map" => execute_repo_map(workspace_path, arguments),
         "move_path" => {
             let request = serde_json::from_str::<MovePathRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
@@ -758,8 +870,74 @@ pub(crate) fn execute_builtin_tool_call(
             serde_json::to_value(run_command(workspace_path, request).map_err(|err| err.to_string())?)
                 .map_err(|err| err.to_string())
         }
+        // R4：git 原生工具（结构化）。
+        "git_status" => {
+            let request = serde_json::from_str::<GitStatusRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_status(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "git_diff" => {
+            let request = serde_json::from_str::<GitDiffRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_diff(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "git_log" => {
+            let request = serde_json::from_str::<GitLogRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_log(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "git_branch" => {
+            let request = serde_json::from_str::<GitBranchRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_branch(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "git_add" => {
+            let request = serde_json::from_str::<GitAddRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_add(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "git_commit" => {
+            let request = serde_json::from_str::<GitCommitRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_commit(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
         other => Err(format!("未知工具: {other}")),
     }
+}
+
+/// repo_map 工具（R2）：解析工作区源码，构建 tree-sitter + PageRank 的全仓符号地图。
+/// 参数全可选；空参数即「默认预算的全仓概览」。只读、无副作用。
+fn execute_repo_map(workspace_path: &str, arguments: &str) -> Result<serde_json::Value, String> {
+    #[derive(serde::Deserialize, Default)]
+    struct RepoMapArgs {
+        #[serde(rename = "focusFiles", default)]
+        focus_files: Vec<String>,
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(rename = "maxTokens", default)]
+        max_tokens: usize,
+    }
+    // 空字符串 / "{}" / 缺省都按默认请求处理。
+    let trimmed = arguments.trim();
+    let args = if trimmed.is_empty() {
+        RepoMapArgs::default()
+    } else {
+        serde_json::from_str::<RepoMapArgs>(trimmed)
+            .map_err(|err| format!("工具参数解析失败: {err}"))?
+    };
+    let request = mdga_codemap::CodemapRequest {
+        focus_files: args.focus_files,
+        query: args.query,
+        max_tokens: args.max_tokens,
+    };
+    serde_json::to_value(mdga_codemap::build_repo_map(workspace_path, &request))
+        .map_err(|err| err.to_string())
 }
 
 pub(crate) fn execute_create_file_tool_call(

@@ -212,7 +212,20 @@ pub(crate) async fn send_message(
         .map(|path| {
             let mut maps = state.repo_maps.lock().expect("repo_maps mutex poisoned");
             maps.entry(conversation_id.clone())
-                .or_insert_with(|| mdga_tool_runtime::workspace_map(path))
+                .or_insert_with(|| {
+                    // 文件树摘要（结构）+ tree-sitter/PageRank 关键符号地图（语义骨架），二者
+                    // 拼成一份会话级缓存：让模型开局既知目录结构，也知核心代码在哪、谁调用谁。
+                    let tree = mdga_tool_runtime::workspace_map(path);
+                    let codemap = mdga_codemap::repo_map_for_context(path, 1200);
+                    if codemap.trim().is_empty() {
+                        tree
+                    } else {
+                        format!(
+                            "{tree}\n\n关键符号地图（tree-sitter 抽取定义 + PageRank 引用排名，\
+                             文件按重要度降序、附定义行号；非语义向量）：\n{codemap}"
+                        )
+                    }
+                })
                 .clone()
         });
     let workspace_memory = conversation

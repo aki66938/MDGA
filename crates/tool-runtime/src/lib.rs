@@ -3,6 +3,10 @@ mod sandbox_win;
 #[cfg(windows)]
 mod appcontainer_win;
 
+// R4：git 原生工具（壳调 git CLI + 结构化解析）。types/fns 全部从此再导出。
+mod git;
+pub use git::*;
+
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
