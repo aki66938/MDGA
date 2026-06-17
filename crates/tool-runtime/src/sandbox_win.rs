@@ -61,7 +61,10 @@ fn base64_encode(input: &[u8]) -> String {
 
 /// 把命令编码为 PowerShell -EncodedCommand 参数（UTF-16LE → base64），彻底规避命令行转义问题。
 pub(crate) fn encoded_command_line(command: &str) -> Vec<u16> {
-    let utf16le: Vec<u8> = command
+    // 前置 $ProgressPreference='SilentlyContinue':PowerShell 首次用模块会画进度条,stderr 被重定向到
+    // 管道时这些进度记录被序列化成 `#< CLIXML` 噪音混进命令 stderr,易让 agent 误判命令报错。静默掉进度流。
+    let wrapped = format!("$ProgressPreference='SilentlyContinue';{command}");
+    let utf16le: Vec<u8> = wrapped
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
