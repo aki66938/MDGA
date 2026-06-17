@@ -773,39 +773,42 @@ pub fn focused_command(step: &VerifyStep, failing: &[String]) -> Option<String> 
     if failing.is_empty() || step.kind == VerifyKind::Build {
         return None;
     }
-    let names: Vec<&String> = failing.iter().take(MAX_FOCUSED).collect();
+    // 安全(R3 命令注入修复):失败用例名来自被测程序 stdout(不可信),下面会被拼进经 powershell
+    // 执行的命令字符串。只放行安全字符集的名字,含 shell 元字符($()/反引号/; | & 等)的一律丢弃,
+    // 防注入;过滤后无可用名(例如全是被构造的恶意名)则回退全量验证(返回 None)。
+    let names: Vec<&str> = failing
+        .iter()
+        .map(String::as_str)
+        .filter(|n| is_safe_test_name(n))
+        .take(MAX_FOCUSED)
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
     match step.framework {
-        Framework::CargoTest => {
-            // `cargo test -- <filter1> <filter2> ...`:`--` 后的多个过滤词被 libtest 取 OR。
-            let filters = names
-                .iter()
-                .map(|n| n.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            Some(format!("cargo test -- {filters}"))
-        }
-        Framework::Pytest => {
-            // pytest 接受多个 node id 直接定位。
-            let ids = names
-                .iter()
-                .map(|n| n.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            Some(format!("pytest {ids}"))
-        }
-        Framework::GoTest => {
-            let pattern = names
-                .iter()
-                .map(|n| n.as_str())
-                .collect::<Vec<_>>()
-                .join("|");
-            Some(format!("go test -run '^({pattern})$' ./..."))
-        }
+        // `cargo test -- <filter1> <filter2> ...`:`--` 后的多个过滤词被 libtest 取 OR。
+        Framework::CargoTest => Some(format!("cargo test -- {}", names.join(" "))),
+        // pytest 接受多个 node id 直接定位。
+        Framework::Pytest => Some(format!("pytest {}", names.join(" "))),
+        Framework::GoTest => Some(format!("go test -run '^({})$' ./...", names.join("|"))),
         // Node 的 -t 是正则,失败名含特殊字符易误伤,保守走全量。
         Framework::NodeTest | Framework::NodeBuild | Framework::CargoCheck | Framework::Generic => {
             None
         }
     }
+}
+
+/// 测试用例名是否只含安全字符——失败名源自不可信的测试输出,拼进 shell 命令前必须过滤以防注入。
+/// 放行:字母数字 + 测试标识常见的 `_ : . / - [ ] # =`(覆盖 rust `mod::test`、pytest node id
+/// `file.py::Test::case[param]`、go `TestName`);拒绝空白、引号、`$` 反引号、`; | & ( ) < > * ? { } !`
+/// 等所有 shell 元字符。
+fn is_safe_test_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 200
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '_' | ':' | '.' | '/' | '-' | '[' | ']' | '#' | '=')
+        })
 }
 
 #[cfg(test)]
@@ -1018,6 +1021,32 @@ FAIL
             framework: Framework::CargoCheck,
         };
         assert_eq!(focused_command(&build, &["x".into()]), None);
+    }
+
+    #[test]
+    fn focused_command_rejects_injection() {
+        // 安全名放行,shell 元字符名拒绝(失败名来自不可信测试 stdout)。
+        assert!(is_safe_test_name("tests::ok_name"));
+        assert!(is_safe_test_name("t/x.py::Test::case[p-1]"));
+        assert!(!is_safe_test_name("a; rm -rf /"));
+        assert!(!is_safe_test_name("$(touch pwned)"));
+        assert!(!is_safe_test_name("a`whoami`"));
+        assert!(!is_safe_test_name("a b"));
+        let cargo = VerifyStep {
+            command: "cargo test".into(),
+            kind: VerifyKind::Test,
+            framework: Framework::CargoTest,
+        };
+        // 全是恶意名 → 回退全量(None),绝不把元字符拼进命令。
+        assert_eq!(
+            focused_command(&cargo, &["$(rm -rf /)".into(), "a; evil".into()]),
+            None
+        );
+        // 混合:安全名照常窄跑,恶意名被过滤。
+        assert_eq!(
+            focused_command(&cargo, &["tests::good".into(), "x`evil`".into()]),
+            Some("cargo test -- tests::good".into())
+        );
     }
 
     #[test]

@@ -210,23 +210,30 @@ pub(crate) async fn send_message(
         .as_deref()
         .filter(|path| !path.trim().is_empty())
         .map(|path| {
+            // R2 性能修复:命中会话缓存只短暂持锁(显式作用域释放守卫)即返回;未命中时把全仓
+            // walk + tree-sitter 解析(耗时)放到锁外做,最后再短暂持锁回写——避免持锁跑重活、
+            // 把所有会话串行阻塞在这一把 state.repo_maps 锁上(首图生成期尤甚)。
+            {
+                let maps = state.repo_maps.lock().expect("repo_maps mutex poisoned");
+                if let Some(cached) = maps.get(conversation_id.as_str()) {
+                    return cached.clone();
+                }
+            }
+            // 文件树摘要（结构）+ tree-sitter/PageRank 关键符号地图（语义骨架）：锁外构建,
+            // 让模型开局既知目录结构,也知核心代码在哪、谁调用谁。
+            let tree = mdga_tool_runtime::workspace_map(path);
+            let codemap = mdga_codemap::repo_map_for_context(path, 1200);
+            let built = if codemap.trim().is_empty() {
+                tree
+            } else {
+                format!(
+                    "{tree}\n\n关键符号地图（tree-sitter 抽取定义 + PageRank 引用排名，\
+                     文件按重要度降序、附定义行号；非语义向量）：\n{codemap}"
+                )
+            };
+            // 回写缓存(短暂持锁);并发下若他人已抢先写入,以已有的为准。
             let mut maps = state.repo_maps.lock().expect("repo_maps mutex poisoned");
-            maps.entry(conversation_id.clone())
-                .or_insert_with(|| {
-                    // 文件树摘要（结构）+ tree-sitter/PageRank 关键符号地图（语义骨架），二者
-                    // 拼成一份会话级缓存：让模型开局既知目录结构，也知核心代码在哪、谁调用谁。
-                    let tree = mdga_tool_runtime::workspace_map(path);
-                    let codemap = mdga_codemap::repo_map_for_context(path, 1200);
-                    if codemap.trim().is_empty() {
-                        tree
-                    } else {
-                        format!(
-                            "{tree}\n\n关键符号地图（tree-sitter 抽取定义 + PageRank 引用排名，\
-                             文件按重要度降序、附定义行号；非语义向量）：\n{codemap}"
-                        )
-                    }
-                })
-                .clone()
+            maps.entry(conversation_id.clone()).or_insert(built).clone()
         });
     let workspace_memory = conversation
         .workspace_path
@@ -801,6 +808,15 @@ async fn chat_with_builtin_tools(
                     verify_rounds += 1;
                     // 重置写改标记：下一轮只有再次发生写改才会再次触发验证，避免空转。
                     edits_made = false;
+                    // R3 安全修复:自动验证命令必须遵循用户的「命令沙箱」开关 + 会话网络模式。
+                    // 此前硬编码 run_command(sandbox=false) 裸跑——等于用户开了沙箱却仍把 cargo test /
+                    // pytest / build(会执行 build.rs / 测试体 / conftest 等任意项目代码)放沙箱外自动跑。
+                    let verify_sandbox =
+                        app.state::<AppState>().command_sandbox.load(Ordering::SeqCst);
+                    let verify_net = matches!(
+                        security_context.network_mode,
+                        NetworkMode::AllowListed | NetworkMode::FullAccess
+                    );
                     let mut fed_back = false;
                     let _ = app.emit("agent-status", serde_json::json!({ "state": "thinking", "round": round }));
                     'steps: for step in &plan.steps {
@@ -809,9 +825,13 @@ async fn chat_with_builtin_tools(
                         let is_focused = focused.is_some();
                         let cmd = focused.unwrap_or_else(|| step.command.clone());
                         let _ = app.emit("chat-chunk", format!("\n\n（正在运行验证：`{cmd}`…）\n\n"));
-                        let result = match mdga_tool_runtime::run_command(
+                        let result = match mdga_tool_runtime::run_command_streaming(
                             workspace_path,
                             RunCommandRequest { command: cmd.clone(), timeout_secs: Some(300), background: false },
+                            None,
+                            None,
+                            verify_sandbox,
+                            verify_net,
                         ) {
                             Ok(r) => r,
                             Err(_) => continue, // 命令起不来：跳过该门，不阻断收尾
@@ -821,9 +841,13 @@ async fn chat_with_builtin_tools(
                             // 窄跑的测试门通过：复跑整套确认整体绿（防修复碰坏别的用例）。
                             if is_focused && step.kind == VerifyKind::Test {
                                 let _ = app.emit("chat-chunk", format!("\n\n（失败用例已绿，复跑整套确认：`{}`…）\n\n", step.command));
-                                if let Ok(full) = mdga_tool_runtime::run_command(
+                                if let Ok(full) = mdga_tool_runtime::run_command_streaming(
                                     workspace_path,
                                     RunCommandRequest { command: step.command.clone(), timeout_secs: Some(300), background: false },
+                                    None,
+                                    None,
+                                    verify_sandbox,
+                                    verify_net,
                                 ) {
                                     let full_failed = full.exit_code.unwrap_or(0) != 0 || full.timed_out;
                                     if full_failed {
