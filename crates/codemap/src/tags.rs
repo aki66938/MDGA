@@ -35,6 +35,10 @@ pub struct FileTags {
 const MAX_SIG_LEN: usize = 160;
 /// 解析的单文件字节上限（超过视为非源码/生成物，跳过）。
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// 进程内文件标签缓存的条目上限。超过即整表清空（粗粒度淘汰），
+/// 避免长驻进程在反复扫不同仓库 / 大量文件后无界膨胀。
+/// 条目均经 mtime+len 校验，清空仅丢失复用、不影响正确性。
+const MAX_CACHE_ENTRIES: usize = 4000;
 
 /// 读取并解析文件，返回其标签（命中 mtime 缓存则直接复用）。
 /// 任何失败都返回空标签（Arc 复用，避免重复分配）。
@@ -57,14 +61,22 @@ pub fn tags_for_file(abs_path: &Path) -> Arc<FileTags> {
     }
 
     let tags = Arc::new(parse_file(abs_path));
-    cache.lock().unwrap().insert(
-        abs_path.to_path_buf(),
-        CacheEntry {
-            mtime,
-            len,
-            tags: Arc::clone(&tags),
-        },
-    );
+    {
+        let mut guard = cache.lock().unwrap();
+        // 插入前若已达上限，整表清空再插入新条目（粗粒度但 O(1) 摊销、实现简单）。
+        // 缓存仅作复用加速，丢弃后下次会按 mtime+len 重新解析，语义不变。
+        if guard.len() >= MAX_CACHE_ENTRIES {
+            guard.clear();
+        }
+        guard.insert(
+            abs_path.to_path_buf(),
+            CacheEntry {
+                mtime,
+                len,
+                tags: Arc::clone(&tags),
+            },
+        );
+    }
     tags
 }
 
@@ -188,4 +200,50 @@ fn tags_cache() -> &'static Mutex<HashMap<PathBuf, CacheEntry>> {
 fn empty_tags() -> Arc<FileTags> {
     static EMPTY: OnceLock<Arc<FileTags>> = OnceLock::new();
     Arc::clone(EMPTY.get_or_init(|| Arc::new(FileTags::default())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 缓存达上限后再插入会整表清空,验证其不会无界膨胀:
+    /// 写 MAX_CACHE_ENTRIES+2 个真实小文件并依次解析,缓存条目数应始终 ≤ 上限。
+    /// 注意 tags_cache 是进程全局的——本测试单独控制条目数,故先快照、用专属临时目录,
+    /// 并在断言后清理,避免与其他测试相互污染。
+    #[test]
+    fn tags_cache_is_bounded() {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let id = N.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "mdga-codemap-cache-test-{}-{}",
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 先清空缓存,确保从已知状态出发(其他测试可能已往全局缓存塞过条目)。
+        tags_cache().lock().unwrap().clear();
+
+        let n = MAX_CACHE_ENTRIES + 2;
+        for i in 0..n {
+            let p = dir.join(format!("f{i}.rs"));
+            std::fs::write(&p, format!("pub fn f{i}() {{}}\n")).unwrap();
+            let _ = tags_for_file(&p);
+            let size = tags_cache().lock().unwrap().len();
+            assert!(
+                size <= MAX_CACHE_ENTRIES,
+                "缓存条目数应始终 ≤ {MAX_CACHE_ENTRIES},第 {i} 次插入后实得 {size}"
+            );
+        }
+        // 越过上限后必然发生过至少一次清空,最终条目数应远小于已解析的文件总数。
+        let final_size = tags_cache().lock().unwrap().len();
+        assert!(
+            final_size < n,
+            "越过上限后应已淘汰过条目,实得 {final_size} 不应等于全部 {n} 个文件"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

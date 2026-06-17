@@ -19,6 +19,18 @@ use std::path::PathBuf;
 
 /// 发现阶段扫描的文件数上限(超过即截断并标记)。
 const MAX_FILES: usize = 8000;
+
+/// 无论是否被 gitignore,都硬排除的重目录(依赖/构建产物/VCS 元数据)。
+/// 这些目录里没有项目源码价值,却动辄上万文件,放进遍历会拖垮发现阶段。
+const HARD_EXCLUDED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    ".git",
+    "dist",
+    "build",
+    ".next",
+    ".svelte-kit",
+];
 const DEFAULT_MAX_TOKENS: usize = 1500;
 const MIN_MAX_TOKENS: usize = 200;
 const MAX_MAX_TOKENS: usize = 20000;
@@ -62,7 +74,21 @@ pub fn build_repo_map(workspace_root: &str, request: &CodemapRequest) -> Codemap
     let mut rel_paths: Vec<String> = Vec::new();
     let mut abs_paths: Vec<PathBuf> = Vec::new();
     let mut discover_truncated = false;
-    for result in WalkBuilder::new(&root).hidden(true).parents(true).build() {
+    let walker = WalkBuilder::new(&root)
+        .hidden(true)
+        .parents(true)
+        // 硬排除重目录:对目录项按名字过滤,filter_entry 会连同其整棵子树一起剪掉,
+        // 与 gitignore 无关——即便仓库未忽略 node_modules/target 也照样跳过。
+        .filter_entry(|entry| {
+            if entry.file_type().is_some_and(|t| t.is_dir()) {
+                if let Some(name) = entry.file_name().to_str() {
+                    return !HARD_EXCLUDED_DIRS.contains(&name);
+                }
+            }
+            true
+        })
+        .build();
+    for result in walker {
         let Ok(entry) = result else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -86,7 +112,10 @@ pub fn build_repo_map(workspace_root: &str, request: &CodemapRequest) -> Codemap
     }
 
     if rel_paths.is_empty() {
-        return empty_result("工作区内未发现受支持语言的源文件(rs/py/js/ts/tsx/go)");
+        return empty_result(
+            "工作区内未发现受支持语言的源文件\
+             (rust:rs、python:py/pyi、javascript:js/jsx/mjs/cjs、typescript:ts/mts/cts/tsx、go:go)",
+        );
     }
 
     // 2) 抽取标签(按 mtime 缓存)。
@@ -352,5 +381,43 @@ mod tests {
         let result = build_repo_map("C:/definitely/not/here/mdga-x", &default_req());
         assert!(result.map.is_empty());
         assert_eq!(result.total_files, 0);
+    }
+
+    /// 重目录(node_modules / target)即便未被 gitignore 也应被硬排除:
+    /// 其内源文件不计入 total_files、不出现在地图里;同级真实源码照常收录。
+    #[test]
+    fn hard_excludes_heavy_dirs_regardless_of_gitignore() {
+        let dir = temp_workspace();
+        // 真实源码:应被收录。
+        write(&dir, "app.rs", "pub fn real_app() {}\n");
+
+        // node_modules 下的源文件:应被排除(注意:此处无 .gitignore,验证与 gitignore 无关)。
+        let nm = dir.join("node_modules").join("pkg");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(nm.join("dep.js"), "export function dep() {}\n").unwrap();
+        std::fs::write(nm.join("dep.ts"), "export function depTs() {}\n").unwrap();
+
+        // target 下的生成产物源文件:应被排除。
+        let tgt = dir.join("target").join("debug");
+        std::fs::create_dir_all(&tgt).unwrap();
+        std::fs::write(tgt.join("build.rs"), "pub fn generated() {}\n").unwrap();
+
+        let result = build_repo_map(dir.to_str().unwrap(), &default_req());
+        assert_eq!(
+            result.total_files, 1,
+            "只应扫到 app.rs;node_modules/target 须被硬排除,实得 {} 个文件、地图:\n{}",
+            result.total_files, result.map
+        );
+        assert!(
+            !result.map.contains("dep") && !result.map.contains("generated"),
+            "地图不应包含被排除目录里的符号,实得:\n{}",
+            result.map
+        );
+        assert!(
+            result.map.contains("real_app"),
+            "地图应包含真实源码 app.rs 的符号,实得:\n{}",
+            result.map
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
