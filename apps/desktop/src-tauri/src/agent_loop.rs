@@ -33,8 +33,9 @@ use crate::web::{execute_web_fetch, execute_web_search};
 use crate::{commands::permission_mode_from_str, record_tool_event};
 // Plan28 P3-9：内核纯逻辑（消息构建 / 记忆读取 / 压缩软上限 / 验证探测 / usage 合并）已迁入 agent-core。
 use mdga_agent_core::{
-    context_soft_limit_for, detect_verification_command, merge_usage,
-    messages_with_workspace_context, read_workspace_memory,
+    context_soft_limit_for, detect_verification_plan, focused_command, format_verify_feedback,
+    merge_usage, messages_with_workspace_context, parse_report, read_workspace_memory,
+    report_signature, VerifyKind,
 };
 use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMessage, StreamChunk};
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
@@ -68,8 +69,11 @@ const TOOL_RESULT_STUB_THRESHOLD: usize = 1_500;
 /// 卡死检测阈值（Plan25 #5③）：连续「无成功工具且无新叙述」轮数，或「同一工具+同参连续失败」
 /// 次数达到该值，判定为卡死/打转，emit 通知并暂停，提示用户介入。
 const STUCK_THRESHOLD: usize = 3;
-/// 验证回路最多自纠轮数（Plan25 #7）：写类操作后自动跑构建/测试，失败回灌让模型修复，超此轮数放弃。
-const VERIFY_MAX_ROUNDS: usize = 2;
+/// 验证回路最多自纠轮数（Plan25 #7 → R3 升级）：写类操作后自动跑「编译门→测试门」，失败结构化回灌让
+/// 模型修复到绿，超此轮数放弃。R3 起从 2 上调到 5（有 doom-loop 停滞护栏兜底，不会空转烧轮）。
+const VERIFY_MAX_ROUNDS: usize = 5;
+/// 验证 doom-loop 护栏阈值（R3）：连续相同「失败签名」轮数达到此值即判定停滞，升级用户而非继续空转。
+const VERIFY_STALL_THRESHOLD: usize = 2;
 
 // ── DeepSeek ──────────────────────────────────────────────────────────────
 
@@ -610,6 +614,10 @@ async fn chat_with_builtin_tools(
     // 验证回路（Plan25 #7）：记录是否发生过写类工具改动 + 已进行的验证自纠轮数（上限 VERIFY_MAX_ROUNDS）。
     let mut edits_made = false;
     let mut verify_rounds: usize = 0;
+    // R3 doom-loop 护栏 + 按影响选测的跨轮状态：上轮失败签名 / 连续停滞计数 / 上轮失败用例名。
+    let mut verify_prev_sig: Option<String> = None;
+    let mut verify_stall: usize = 0;
+    let mut verify_failing: Vec<String> = Vec::new();
     // 长任务跟踪（Plan25 #5①②）：维护最近一次 todo_write 的清单，每轮在 wire 末尾 user 之前注入轻量提醒，
     // 并在每次 todo_write 成功后落盘 <workspace>/.mdga/tasks/current.json。
     let mut current_todos: Option<Vec<serde_json::Value>> = None;
@@ -773,28 +781,84 @@ async fn chat_with_builtin_tools(
         // 自动跑一次；失败则把输出作为新一轮 user 回灌让模型自纠（最多 VERIFY_MAX_ROUNDS 轮），
         // 通过 / 放弃后结束。验证回路用独立计数 verify_rounds，不与卡死检测（#5③）共用打转判断。
         if tool_calls.is_empty() {
+            // R3 真 TDD 自修复回路：本轮发生过写改且未超轮数，按探测到的验证计划跑「编译门→测试门」，
+            // 首个失败的门即结构化解析 + 回灌让模型修复到绿；doom-loop 护栏在失败集合长期不变时升级用户。
             if edits_made && verify_rounds < VERIFY_MAX_ROUNDS {
-                if let Some(cmd) = detect_verification_command(workspace_path) {
+                if let Some(plan) = detect_verification_plan(workspace_path) {
                     verify_rounds += 1;
+                    // 重置写改标记：下一轮只有再次发生写改才会再次触发验证，避免空转。
+                    edits_made = false;
+                    let mut fed_back = false;
                     let _ = app.emit("agent-status", serde_json::json!({ "state": "thinking", "round": round }));
-                    let _ = app.emit("chat-chunk", format!("\n\n（正在运行验证：`{cmd}`…）\n\n"));
-                    if let Ok(result) = mdga_tool_runtime::run_command(
-                        workspace_path,
-                        RunCommandRequest { command: cmd.clone(), timeout_secs: Some(180), background: false },
-                    ) {
+                    'steps: for step in &plan.steps {
+                        // 按影响选测：测试门且上轮已有失败用例名 → 先只重跑这些失败（快）；否则全量。
+                        let focused = focused_command(step, &verify_failing);
+                        let is_focused = focused.is_some();
+                        let cmd = focused.unwrap_or_else(|| step.command.clone());
+                        let _ = app.emit("chat-chunk", format!("\n\n（正在运行验证：`{cmd}`…）\n\n"));
+                        let result = match mdga_tool_runtime::run_command(
+                            workspace_path,
+                            RunCommandRequest { command: cmd.clone(), timeout_secs: Some(300), background: false },
+                        ) {
+                            Ok(r) => r,
+                            Err(_) => continue, // 命令起不来：跳过该门，不阻断收尾
+                        };
                         let failed = result.exit_code.unwrap_or(0) != 0 || result.timed_out;
-                        if failed {
-                            let out: String = format!("{}\n{}", result.stdout, result.stderr)
-                                .chars().take(6000).collect();
-                            // 重置写改标记：下一轮只有再次发生写改才会再次触发验证，避免空转。
-                            edits_made = false;
-                            wire_messages.push(serde_json::json!({
-                                "role": "user",
-                                "content": format!("验证命令 `{cmd}` 报告了问题，请定位并修复后再结束：\n{out}")
-                            }));
-                            continue; // 回到循环让 agent 修
+                        if !failed {
+                            // 窄跑的测试门通过：复跑整套确认整体绿（防修复碰坏别的用例）。
+                            if is_focused && step.kind == VerifyKind::Test {
+                                let _ = app.emit("chat-chunk", format!("\n\n（失败用例已绿，复跑整套确认：`{}`…）\n\n", step.command));
+                                if let Ok(full) = mdga_tool_runtime::run_command(
+                                    workspace_path,
+                                    RunCommandRequest { command: step.command.clone(), timeout_secs: Some(300), background: false },
+                                ) {
+                                    let full_failed = full.exit_code.unwrap_or(0) != 0 || full.timed_out;
+                                    if full_failed {
+                                        let report = parse_report(step.framework, step.kind, &full.stdout, &full.stderr);
+                                        verify_failing = report.failures.iter().map(|f| f.name.clone()).collect();
+                                        let sig = report_signature(&report, full.exit_code, full.timed_out);
+                                        if verify_stall_hit(&sig, &mut verify_prev_sig, &mut verify_stall) {
+                                            emit_verify_stall(app, conversation_id, &step.command);
+                                            return Ok(usage);
+                                        }
+                                        wire_messages.push(serde_json::json!({
+                                            "role": "user",
+                                            "content": format_verify_feedback(&step.command, &report),
+                                        }));
+                                        fed_back = true;
+                                        break 'steps;
+                                    }
+                                }
+                            }
+                            if step.kind == VerifyKind::Test {
+                                verify_failing.clear(); // 整套绿：清掉失败名
+                            }
+                            continue; // 该门通过，进入下一门
                         }
+                        // 该门失败：结构化解析 + doom-loop 护栏 + 回灌，首个失败门即停（不跑后续门）。
+                        let report = parse_report(step.framework, step.kind, &result.stdout, &result.stderr);
+                        // 仅测试门的失败用例可供下轮窄跑；编译门失败清空（修好编译后应整套重跑）。
+                        verify_failing = if step.kind == VerifyKind::Test {
+                            report.failures.iter().map(|f| f.name.clone()).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let sig = report_signature(&report, result.exit_code, result.timed_out);
+                        if verify_stall_hit(&sig, &mut verify_prev_sig, &mut verify_stall) {
+                            emit_verify_stall(app, conversation_id, &cmd);
+                            return Ok(usage);
+                        }
+                        wire_messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": format_verify_feedback(&cmd, &report),
+                        }));
+                        fed_back = true;
+                        break 'steps;
                     }
+                    if fed_back {
+                        continue; // 回到循环让 agent 修
+                    }
+                    // 所有门通过：验证绿，正常收尾。
                 }
             }
             return Ok(usage);
@@ -1200,12 +1264,66 @@ fn detect_and_emit_stuck(
     false
 }
 
+/// R3 验证 doom-loop 护栏：比较本轮失败签名与上轮。签名不变累加停滞计数、达到
+/// [`VERIFY_STALL_THRESHOLD`] 返回 true（应停止自纠并升级用户）；签名变化则视为有进展，
+/// 以本轮签名重置停滞计数。
+fn verify_stall_hit(sig: &str, prev: &mut Option<String>, stall: &mut usize) -> bool {
+    match prev.as_deref() {
+        Some(p) if p == sig => *stall += 1,
+        _ => {
+            *prev = Some(sig.to_string());
+            *stall = 0;
+        }
+    }
+    *stall >= VERIFY_STALL_THRESHOLD
+}
+
+/// R3 验证停滞升级：复用卡死的 `agent-stuck` 事件通道，emit 通知并向前端发提示，等待用户介入。
+fn emit_verify_stall(app: &AppHandle, conversation_id: &str, command: &str) {
+    let _ = app.emit(
+        "agent-stuck",
+        serde_json::json!({
+            "conversationId": conversation_id,
+            "reason": format!("验证停滞：`{command}` 连续多轮失败集合无变化"),
+        }),
+    );
+    let _ = app.emit(
+        "chat-chunk",
+        format!("\n\n（检测到验证停滞：`{command}` 连续多轮报告同一组失败、未见收敛，已暂停以等待你介入。可调整需求或提供更多信息后让我继续。）"),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // 注（Plan28 P3-9）：messages_with_workspace_context 的 3 个单测已随该函数迁入
     // mdga-agent-core（crates/agent-core/src/messages.rs），此处不再保留。
+
+    #[test]
+    fn verify_stall_guard_trips_on_repeated_signature() {
+        // R3 doom-loop 护栏：同一失败签名连续累计达到 VERIFY_STALL_THRESHOLD 才判停滞。
+        let mut prev = None;
+        let mut stall = 0usize;
+        // 第 1 轮：签名 A，记录、计数清零，不触发。
+        assert!(!verify_stall_hit("F:a|b", &mut prev, &mut stall));
+        // 第 2 轮：仍 A，stall=1，未达阈值（2）。
+        assert!(!verify_stall_hit("F:a|b", &mut prev, &mut stall));
+        // 第 3 轮：仍 A，stall=2，触发停滞。
+        assert!(verify_stall_hit("F:a|b", &mut prev, &mut stall));
+    }
+
+    #[test]
+    fn verify_stall_guard_resets_on_progress() {
+        // 失败签名变化（有进展）应重置停滞计数，不会误判停滞。
+        let mut prev = None;
+        let mut stall = 0usize;
+        assert!(!verify_stall_hit("F:a", &mut prev, &mut stall));
+        assert!(!verify_stall_hit("F:a", &mut prev, &mut stall)); // stall=1
+        assert!(!verify_stall_hit("F:b", &mut prev, &mut stall)); // 变化 → 重置为 0
+        assert!(!verify_stall_hit("F:b", &mut prev, &mut stall)); // stall=1，仍未达阈值
+        assert_eq!(stall, 1);
+    }
 
     #[test]
     fn finalize_wire_pads_orphan_tool_call() {

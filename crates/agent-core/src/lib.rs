@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 mod compaction;
 mod messages;
 mod prompt;
+mod test_report;
 mod usage;
 mod verification;
 
@@ -21,6 +22,10 @@ mod verification;
 pub use compaction::{context_soft_limit_for, CONTEXT_SOFT_LIMIT_TOKENS};
 pub use messages::{messages_with_workspace_context, read_workspace_memory};
 pub use prompt::{CODE_OF_CONDUCT, IDENTITY_ANCHOR, TOOL_DISCIPLINE};
+pub use test_report::{
+    detect_verification_plan, focused_command, format_verify_feedback, parse_report,
+    report_signature, Failure, Framework, TestReport, VerifyKind, VerifyPlan, VerifyStep,
+};
 pub use usage::merge_usage;
 pub use verification::{detect_verification_command, read_diagnostics_command};
 
