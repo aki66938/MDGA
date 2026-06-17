@@ -6,21 +6,25 @@
 //! - `lsp_hover`：某位置的类型/签名/文档
 //! - `lsp_diagnostics`：某文件的错误/警告
 //!
-//! 实现：按文件扩展名从**硬编码白名单**解析语言服务器（.rs→rust-analyzer；
-//! .ts/.tsx/.js/.jsx/.mjs/.cjs→typescript-language-server --stdio；.py/.pyi→pyright-langserver --stdio），
-//! 在工作区目录下拉起子进程，走 stdio 上 Content-Length 帧化的 JSON-RPC，做
-//! initialize→initialized→didOpen→请求→shutdown，做完即关、Drop 强杀子进程。
+//! 实现：按文件扩展名从**硬编码精选注册表**解析语言服务器（见 `server.rs`，含 Rust/TS-JS/
+//! Python/Go/C-C++/Ruby/PHP/Lua），把服务器**程序名**经 `which` 解析为 PATH 中的**绝对路径**
+//! 再在工作区目录下拉起子进程，走 stdio 上 Content-Length 帧化的 JSON-RPC，做
+//! initialize→initialized→didOpen→请求。会话由**进程级池子**（`pool.rs`）跨多次调用复用，
+//! 省掉冷启动索引；空闲超时被 reaper 回收，Drop / 超时 / 回收都强杀子进程。
 //!
 //! 安全（强约束，对齐 tool-runtime 的 git/run_command）：
 //! - 路径用 `validate_relative_path`/`canonical_workspace` 同款逻辑做工作区内校验（拒绝 `..` 与绝对路径）；
 //! - 服务器子进程 cwd=工作区、擦除密钥环境变量（API Key 等）；
-//! - 服务器程序与参数**全部硬编码**，绝不接受 config/模型输入的任意命令；
-//! - 整条操作有硬超时，超时/Drop 都强杀子进程（无泄漏、无挂死）；
+//! - 服务器程序与参数**全部硬编码**（精选注册表），绝不接受 config/模型/工作区输入的任意命令；
+//! - 服务器二进制只在 **PATH 目录**里 which 式解析为绝对路径（不含 cwd），防工作区同名劫持；
+//! - 每次操作有硬超时，超时/Drop/池回收都强杀子进程（无泄漏、无挂死）；
 //! - 缺少服务器二进制 → 清晰的 `ServerUnavailable` 错误，绝不挂起。
 
 mod client;
 mod framing;
+mod pool;
 mod server;
+mod which;
 
 use client::{file_uri_for, LspSession};
 use serde::{Deserialize, Serialize};
@@ -243,19 +247,56 @@ fn normalize_relative(path: &Path) -> String {
 
 // ── 公共工具入口 ──────────────────────────────────────────────────────────────
 
-/// 共用准备：校验路径 → 解析服务器 → 启动会话 → didOpen 目标文件。
-/// 返回 (会话, 目标文件 uri, 工作区根, 安全相对路径)。
-fn open_session(
-    workspace_root: impl AsRef<Path>,
-    path: &str,
-) -> Result<(LspSession, String, PathBuf, PathBuf), LspError> {
+/// 一次工具调用的「已就绪上下文」：会话（来自池复用或新建）+ 归还所需的 key + 目标文件信息。
+struct Prepared {
+    session: LspSession,
+    /// 用于用完归还到池子的键（规范化工作区 + 命令 + 参数）。
+    key: pool::PoolKey,
+    /// 目标文件 file:// URI。
+    uri: String,
+    /// 规范化工作区根（绝对路径）。
+    workspace: PathBuf,
+    /// 安全的工作区相对路径。
+    relative: PathBuf,
+}
+
+/// 共用准备：校验路径 → 解析服务器 → **从池借出或新建**会话 → 重置超时 → 同步目标文件全文。
+///
+/// 池化要点：同 (工作区, 服务器命令+参数) 的会话被复用，省掉冷启动索引。复用时通过
+/// `sync_document`（首次 didOpen、之后 didChange 全量替换）把**磁盘最新内容**喂给服务器，
+/// 保证文件在外部被改写后结果依然正确（不基于陈旧快照）。
+fn open_session(workspace_root: impl AsRef<Path>, path: &str) -> Result<Prepared, LspError> {
     let (workspace, relative, target) = resolve_existing_file(workspace_root, path)?;
     let spec = resolve_server(&normalize_relative(&relative))?;
     let text = read_doc_text(&target)?;
     let uri = file_uri_for(&workspace, &relative);
-    let mut session = LspSession::start(&spec, &workspace)?;
-    session.did_open(&uri, spec.language_id, &text)?;
-    Ok((session, uri, workspace, relative))
+
+    let key = pool::PoolKey::new(&workspace.to_string_lossy(), spec.command, spec.args);
+
+    // 先尝试从池借出长寿命会话；借不到（未命中/已死）再新建。
+    let mut session = match pool::checkout(&key) {
+        Some(s) => s,
+        None => LspSession::start(&spec, &workspace)?,
+    };
+    // 复用会话的 deadline 早已过期，必须重置；新建会话重置也无害。
+    session.begin_op();
+    // 首次 didOpen / 复用则 didChange（喂磁盘最新全文）。
+    session.sync_document(&uri, spec.language_id, &text)?;
+
+    Ok(Prepared {
+        session,
+        key,
+        uri,
+        workspace,
+        relative,
+    })
+}
+
+/// 一次操作成功收尾：把会话归还到池子以便后续复用（取代旧的 `shutdown()`）。
+///
+/// 仅在操作**成功**路径调用；出错时直接 Drop 会话（强杀子进程），不归还可能已损坏的会话。
+fn finish(session: LspSession, key: pool::PoolKey) {
+    pool::checkin(key, session);
 }
 
 /// lsp_definition：某位置符号的定义跳转。
@@ -263,14 +304,19 @@ pub fn lsp_definition(
     workspace_root: impl AsRef<Path>,
     request: LspPositionRequest,
 ) -> Result<LspLocationsResult, LspError> {
-    let (mut session, uri, workspace, _rel) = open_session(&workspace_root, &request.path)?;
+    let Prepared {
+        mut session,
+        key,
+        uri,
+        workspace,
+        ..
+    } = open_session(&workspace_root, &request.path)?;
     let result = session.request_until_ready(
         "textDocument/definition",
         position_params(&uri, request.line, request.character),
         is_empty_locations,
-    );
-    session.shutdown();
-    let result = result?;
+    )?;
+    finish(session, key);
     let locations = parse_locations(&result, &workspace);
     Ok(LspLocationsResult {
         count: locations.len(),
@@ -292,13 +338,18 @@ pub fn lsp_references(
     workspace_root: impl AsRef<Path>,
     request: LspPositionRequest,
 ) -> Result<LspLocationsResult, LspError> {
-    let (mut session, uri, workspace, _rel) = open_session(&workspace_root, &request.path)?;
+    let Prepared {
+        mut session,
+        key,
+        uri,
+        workspace,
+        ..
+    } = open_session(&workspace_root, &request.path)?;
     let mut params = position_params(&uri, request.line, request.character);
     params["context"] = serde_json::json!({ "includeDeclaration": true });
     let result =
-        session.request_until_ready("textDocument/references", params, is_empty_locations);
-    session.shutdown();
-    let result = result?;
+        session.request_until_ready("textDocument/references", params, is_empty_locations)?;
+    finish(session, key);
     let locations = parse_locations(&result, &workspace);
     Ok(LspLocationsResult {
         count: locations.len(),
@@ -311,14 +362,18 @@ pub fn lsp_hover(
     workspace_root: impl AsRef<Path>,
     request: LspPositionRequest,
 ) -> Result<LspHoverResult, LspError> {
-    let (mut session, uri, _ws, _rel) = open_session(&workspace_root, &request.path)?;
+    let Prepared {
+        mut session,
+        key,
+        uri,
+        ..
+    } = open_session(&workspace_root, &request.path)?;
     let result = session.request_until_ready(
         "textDocument/hover",
         position_params(&uri, request.line, request.character),
         |v| v.is_null() || parse_hover(v).is_empty(),
-    );
-    session.shutdown();
-    let result = result?;
+    )?;
+    finish(session, key);
     let contents = parse_hover(&result);
     Ok(LspHoverResult {
         found: !contents.is_empty(),
@@ -331,16 +386,34 @@ pub fn lsp_diagnostics(
     workspace_root: impl AsRef<Path>,
     request: LspDiagnosticsRequest,
 ) -> Result<LspDiagnosticsResult, LspError> {
-    let (mut session, uri, _ws, relative) = open_session(&workspace_root, &request.path)?;
-    let raw = session.collect_diagnostics(&uri);
-    session.shutdown();
-    let raw = raw?;
+    let Prepared {
+        mut session,
+        key,
+        uri,
+        relative,
+        ..
+    } = open_session(&workspace_root, &request.path)?;
+    let raw = session.collect_diagnostics(&uri)?;
+    finish(session, key);
     let diagnostics = parse_diagnostics(&raw);
     Ok(LspDiagnosticsResult {
         path: normalize_relative(&relative),
         count: diagnostics.len(),
         diagnostics,
     })
+}
+
+// ── 池子诊断/可观测入口（供 e2e 测试验证复用，与运行时无副作用） ───────────────
+
+/// 当前进程级 LSP 会话池中常驻（空闲）会话数。测试/诊断用。
+pub fn pool_pooled_count() -> usize {
+    pool::pooled_count()
+}
+
+/// 立即回收所有空闲超过给定秒数的会话，返回被回收数。`0` 表示回收全部空闲会话。
+/// 暴露给测试以验证空闲会话**可被回收**（不必真等 5 分钟 TTL）；reaper 平时按 5min 自动跑。
+pub fn pool_reap_idle_secs(secs: u64) -> usize {
+    pool::reap_idle_with_ttl(std::time::Duration::from_secs(secs))
 }
 
 // ── 响应解析（把裸 LSP JSON 转成结构化结果） ─────────────────────────────────
@@ -353,19 +426,25 @@ fn position_params(uri: &str, line: u32, character: u32) -> serde_json::Value {
 }
 
 /// 把 file:// URI 转回工作区相对路径；落在工作区外则回退为去掉 scheme 的路径。
+///
+/// 注意：不同服务器对 Windows 盘符的编码不一：有的发 `file:///C:/x`（裸冒号、大写盘符），
+/// 有的发 `file:///c%3A/x`（**百分号编码的冒号** + 小写盘符，pyright 即如此）。因此必须
+/// **先 percent-decode 再做盘符前导斜杠处理**，否则 `%3A` 不等于 `:`，会漏掉去前导斜杠那步，
+/// 导致相对化失败（path 残留 `/c:/...`）。
 fn uri_to_relative(uri: &str, workspace: &Path) -> String {
     let raw = uri.strip_prefix("file://").unwrap_or(uri);
-    // Windows: file:///C:/x → /C:/x，去掉前导斜杠。
-    let raw = if raw.starts_with('/')
-        && raw.len() > 2
-        && raw.as_bytes()[2] == b':'
-        && raw[1..2].chars().all(|c| c.is_ascii_alphabetic())
-    {
-        &raw[1..]
-    } else {
-        raw
-    };
+    // 先解码（还原 %3A→: / %20→空格 等）并正斜杠化；盘符判定要在解码后做。
     let decoded = percent_decode(raw).replace('\\', "/");
+    // Windows: /C:/x → C:/x，去掉盘符前的前导斜杠（兼容大小写盘符与已解码的冒号）。
+    let decoded = if decoded.starts_with('/')
+        && decoded.len() > 2
+        && decoded.as_bytes()[2] == b':'
+        && decoded[1..2].chars().all(|c| c.is_ascii_alphabetic())
+    {
+        decoded[1..].to_string()
+    } else {
+        decoded
+    };
     // 工作区根做同样的正斜杠化 + 剥离 Windows verbatim 前缀，才能与 URI 路径前缀比对。
     let ws = strip_verbatim(&workspace.to_string_lossy().replace('\\', "/"));
     // 大小写不敏感地比对前缀（Windows 盘符大小写不固定）。
@@ -641,6 +720,17 @@ mod tests {
         // 同盘下应转相对（注意：strip_prefix 比对需路径分隔一致，这里仅验证不 panic 且产出合理）。
         let rel = uri_to_relative("file:///C:/ws/src/a.rs", ws);
         assert!(rel.ends_with("src/a.rs"), "got {rel}");
+    }
+
+    #[test]
+    fn uri_relative_handles_percent_encoded_lowercase_drive() {
+        // pyright 风格：百分号编码冒号 + 小写盘符。必须先解码再去盘符前导斜杠，才能相对化。
+        let ws = Path::new("C:\\ws\\proj");
+        let rel = uri_to_relative("file:///c%3A/ws/proj/app.py", ws);
+        assert_eq!(rel, "app.py", "应相对化（解码 %3A 后去前导斜杠），实际 {rel}");
+        // 大小写盘符混用也应相对化。
+        let rel2 = uri_to_relative("file:///C%3A/ws/proj/sub/mod.py", ws);
+        assert_eq!(rel2, "sub/mod.py", "got {rel2}");
     }
 
     #[test]
