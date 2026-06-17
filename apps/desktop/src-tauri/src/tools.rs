@@ -142,6 +142,11 @@ pub(crate) const PARALLEL_READONLY_TOOLS: &[&str] = &[
     "git_status",
     "git_diff",
     "git_log",
+    // R1：LSP 只读工具，无副作用、可并行（各自拉起一次性服务器进程）。
+    "lsp_definition",
+    "lsp_references",
+    "lsp_hover",
+    "lsp_diagnostics",
 ];
 
 /// 执行一个只读工具调用（同步文件工具或异步 web 工具），供并行批量执行。
@@ -715,6 +720,73 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        // R1：LSP 编译器级代码智能——4 个只读工具（go-to-def / references / hover / diagnostics）。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_definition",
+                "description": "Go to the DEFINITION of the symbol at a position, using a real language server (compiler-grade, not text search). Returns the definition location(s) as structured path/line/character. Use this to find where a function/type/variable is actually defined — more accurate than search_text. Positions are 0-based; path is workspace-relative. Supported: .rs (rust-analyzer), .ts/.tsx/.js/.jsx/.mjs/.cjs (typescript-language-server), .py/.pyi (pyright). Requires the matching language server installed; otherwise returns a clear error.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Workspace-relative source file path." },
+                        "line": { "type": "integer", "description": "0-based line number of the symbol." },
+                        "character": { "type": "integer", "description": "0-based character/column on that line." }
+                    },
+                    "required": ["path", "line", "character"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_references",
+                "description": "Find ALL REFERENCES to the symbol at a position (including its declaration), using a real language server. Returns reference locations as structured path/line/character. Use this to see everywhere a symbol is used before refactoring — compiler-grade, more accurate than search_text. Positions are 0-based; path is workspace-relative. Same language support and server requirement as lsp_definition.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Workspace-relative source file path." },
+                        "line": { "type": "integer", "description": "0-based line number of the symbol." },
+                        "character": { "type": "integer", "description": "0-based character/column on that line." }
+                    },
+                    "required": ["path", "line", "character"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_hover",
+                "description": "Get the TYPE / SIGNATURE / documentation at a position, using a real language server (the same info an IDE shows on hover). Returns rendered text. Use this to learn a symbol's resolved type or a function's signature without reading its whole definition. Positions are 0-based; path is workspace-relative. Same language support and server requirement as lsp_definition.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Workspace-relative source file path." },
+                        "line": { "type": "integer", "description": "0-based line number of the symbol." },
+                        "character": { "type": "integer", "description": "0-based character/column on that line." }
+                    },
+                    "required": ["path", "line", "character"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_diagnostics",
+                "description": "Get compiler/linter DIAGNOSTICS (errors and warnings) for a file from a real language server, as structured items (line, character, severity, message, source). Use this to check whether a file has type errors or warnings BEFORE concluding it compiles. path is workspace-relative; positions are 0-based. Same language support and server requirement as lsp_definition.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Workspace-relative source file path." }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     ]
 }
 
@@ -906,6 +978,39 @@ pub(crate) fn execute_builtin_tool_call(
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
             serde_json::to_value(git_commit(workspace_path, request).map_err(|err| err.to_string())?)
                 .map_err(|err| err.to_string())
+        }
+        // R1：LSP 只读工具（编译器级代码智能）。
+        "lsp_definition" => {
+            let request = serde_json::from_str::<mdga_lsp::LspPositionRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(
+                mdga_lsp::lsp_definition(workspace_path, request).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())
+        }
+        "lsp_references" => {
+            let request = serde_json::from_str::<mdga_lsp::LspPositionRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(
+                mdga_lsp::lsp_references(workspace_path, request).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())
+        }
+        "lsp_hover" => {
+            let request = serde_json::from_str::<mdga_lsp::LspPositionRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(
+                mdga_lsp::lsp_hover(workspace_path, request).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())
+        }
+        "lsp_diagnostics" => {
+            let request = serde_json::from_str::<mdga_lsp::LspDiagnosticsRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(
+                mdga_lsp::lsp_diagnostics(workspace_path, request).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())
         }
         other => Err(format!("未知工具: {other}")),
     }

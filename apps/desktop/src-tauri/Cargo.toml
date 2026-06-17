@@ -8,6 +8,7 @@ version.workspace = true
 mdga-agent-core = { path = "../../../crates/agent-core" }
 mdga-codemap = { path = "../../../crates/codemap" }
 mdga-deepseek-client = { path = "../../../crates/deepseek-client" }
+mdga-lsp = { path = "../../../crates/lsp" }
 mdga-mcp-client = { path = "../../../crates/mcp-client" }
 mdga-sandbox-runtime = { path = "../../../crates/sandbox-runtime" }
 mdga-shared = { path = "../../../crates/shared" }

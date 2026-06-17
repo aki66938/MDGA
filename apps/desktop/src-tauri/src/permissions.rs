@@ -35,10 +35,12 @@ pub(crate) fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability
         // code_overview（Plan28 P0-2，Lane B 新增）只读取并统计代码结构，与 read_file / search_text 同列。
         // repo_map（R2）只解析源码构建符号地图，同属只读。
         // git_status/git_diff/git_log 为只读 git 工具，与 read_file/search_text 同列自动放行（R4）。
+        // lsp_* 为只读 LSP 工具（仅查询语言服务器、不改文件），同列自动放行（R1）。
         "list_dir" | "read_file" | "stat_path" | "search_text" | "glob_files" | "code_overview"
         | "repo_map" | "todo_write" | "ask_user" | "run_subtask" | "load_skill" | "remember"
         | "list_shells" | "get_shell_output" | "kill_shell" | "get_task_output" | "kill_task"
-        | "list_tasks" | "git_status" | "git_diff" | "git_log" => Ok(ToolCapability::FileRead),
+        | "list_tasks" | "git_status" | "git_diff" | "git_log" | "lsp_definition"
+        | "lsp_references" | "lsp_hover" | "lsp_diagnostics" => Ok(ToolCapability::FileRead),
         // git_add/git_commit/git_branch 改动暂存区/引用，与文件写同档（R4）：默认模式自动放行、
         // AskEveryTime 逐次审批、Restricted 拒绝；都在工作区内、可审计、可回滚。
         "create_file" | "write_file" | "edit_file" | "apply_patch" | "make_dir" | "move_path"

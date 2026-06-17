@@ -4,6 +4,7 @@ members = [
   "crates/agent-core",
   "crates/codemap",
   "crates/deepseek-client",
+  "crates/lsp",
   "crates/mcp-client",
   "crates/sandbox-runtime",
   "crates/shared",

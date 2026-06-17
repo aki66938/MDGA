@@ -2439,6 +2439,7 @@ dependencies = [
  "mdga-agent-core",
  "mdga-codemap",
  "mdga-deepseek-client",
+ "mdga-lsp",
  "mdga-mcp-client",
  "mdga-sandbox-runtime",
  "mdga-shared",
@@ -2458,6 +2459,15 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "mdga-lsp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
