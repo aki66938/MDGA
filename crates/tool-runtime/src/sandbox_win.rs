@@ -280,6 +280,8 @@ pub fn run_in_restricted_sandbox(
             truncated: out_trunc || err_trunc,
             timed_out,
             duration_ms,
+            sandbox_layer: Some("restricted".to_string()),
+            sandbox_degraded: false,
         })
     }
 }

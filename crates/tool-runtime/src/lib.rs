@@ -382,6 +382,12 @@ pub struct RunCommandResult {
     pub truncated: bool,
     pub timed_out: bool,
     pub duration_ms: u128,
+    /// 实际生效的沙箱层:"appcontainer"(首选) / "restricted"(受限令牌) / None(未沙箱)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_layer: Option<String>,
+    /// true 表示本应走 AppContainer,因自检未过或执行失败降级到了受限令牌沙箱。
+    #[serde(default)]
+    pub sandbox_degraded: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1459,7 +1465,11 @@ pub fn run_command_streaming(
                         eprintln!("[sandbox] AppContainer 执行失败,降级到受限令牌沙箱: {e}");
                         return sandbox_win::run_in_restricted_sandbox(
                             &workspace, command, timeout, on_line, cancel,
-                        );
+                        )
+                        .map(|mut r| {
+                            r.sandbox_degraded = true;
+                            r
+                        });
                     }
                 }
             } else {
@@ -1467,7 +1477,11 @@ pub fn run_command_streaming(
                 eprintln!("[sandbox] AppContainer 自检未通过,使用受限令牌沙箱");
                 return sandbox_win::run_in_restricted_sandbox(
                     &workspace, command, timeout, on_line, cancel,
-                );
+                )
+                .map(|mut r| {
+                    r.sandbox_degraded = true;
+                    r
+                });
             }
         }
         #[cfg(not(windows))]
@@ -1542,6 +1556,8 @@ pub fn run_command_streaming(
         truncated: out_trunc || err_trunc,
         timed_out,
         duration_ms,
+        sandbox_layer: None,
+        sandbox_degraded: false,
     })
 }
 

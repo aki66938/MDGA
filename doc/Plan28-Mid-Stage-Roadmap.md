@@ -68,6 +68,17 @@ storage(SQLite `:memory:` 端到端 CRUD)、mcp-client(JSON-RPC 解析)、tools(
     native 输出真回传,`run_command_streaming` 据此选 AppContainer 或 fail-closed 降级受限令牌——**不按版本号判定**
     (各版本 console 行为有别,尤其 26100/24H2 重写了 console 分配策略)。**0.0.41 实测 lpacCom 单独够,移除了对
     `LowBoxConsoleEnabled` 注册表 + `registryRead` 能力的全部依赖——app 不碰任何系统注册表键、隔离更严**。最低 Win10 1809。
+  - **健壮性 / 隔离强化(0.0.41)**:① 攻克命令收尾偶发卡死——根因是父链授遍历权时对 `%TEMP%` 海量子项用
+    `SetNamedSecurityInfoW` 触发继承传播卡 ~54s,改 `SetKernelObjectSecurity`(只设对象自身 DACL 不递归)降到 ~1ms
+    (Job Object/reader/WaitForSingleObject「挂死」均为误诊,详见 memory `appcontainer-acl-grant-propagation`);
+    ② Job Object(KILL_ON_JOB_CLOSE + 进程数/内存配额)治理进程树、杜绝孤儿/fork 炸弹;③ 容器名按 workspace+网络模式
+    唯一(`MDGA.Sbx.{hash}.{n|d}`,每工作区独立 SID/profile/ACL),grant 改 `SET_ACCESS` 幂等、profile/ACL 进程级
+    串行锁、temp 按命令唯一并收尾删除;④ `SidGuard`/`LocalSidsGuard` RAII 防早返回泄漏;⑤ 拒绝向 junction/symlink
+    授读写(防 reparse 逃逸);⑥ `RunCommandResult` 暴露 `sandboxLayer`/`sandboxDegraded`。回归 +reparse 拒绝/同工作区
+    幂等/超时不挂,真机 34 项全绿。
+  - **网络逐域名 spike(0.0.41)**:4 路研究证实三约束(不改系统/不需管理员/不写驱动)下逐域名「真边界」做不到
+    (能看域名的代理可绕过、能强制的 WFP 看不到域名),保持网络全开/全关二选一(WFP 强制的真边界);逐域名列未来项
+    (WFP 按 package SID 逐 IP + 自建 DNS 监听,首次需管理员,MVP 2-4 周)。详见 memory `appcontainer-network-perdomain-spike`。
   - **未尽 / TODO**:网络放行依赖宿主防火墙开;输出非实时(命令结束后按行回调);delay-load/vendor ConPTY
     (消除系统 ConPTY 版本漂移 + 防 <1809 静态导入启动崩);各 Windows 档(Win10 22H2 / Win11 23H2 / 24H2)
     分别实测、每次 servicing 后重测。详见 memory `appcontainer-console-output-blocker`。

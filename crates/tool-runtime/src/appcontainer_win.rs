@@ -15,39 +15,47 @@
 
 use crate::{CommandCancel, CommandLineCallback, RunCommandResult, ToolRuntimeError};
 use std::ffi::c_void;
-use std::io::Read;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, HANDLE, HLOCAL, WAIT_OBJECT_0,
+    CloseHandle, LocalFree, BOOL, HANDLE, HLOCAL, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertStringSidToSidW, GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW,
+    SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT,
+    SE_KERNEL_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-    PSECURITY_DESCRIPTOR,
+    EqualSid, GetAce, InitializeSecurityDescriptor, SetKernelObjectSecurity,
+    SetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE,
+    DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+    OPEN_EXISTING,
 };
 use windows::Win32::Security::{
     FreeSid, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, PSID,
 };
 use windows::Win32::System::Console::{ClosePseudoConsole, CreatePseudoConsole, COORD, HPCON};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
+    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
+    InitializeProcThreadAttributeList, ResumeThread, UpdateProcThreadAttribute,
+    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
     STARTUPINFOEXW,
@@ -124,12 +132,93 @@ unsafe fn create_or_derive_appcontainer_sid(
     }
 }
 
+/// SID 的 RAII 守卫:Drop 时 FreeSid,确保任一早返回路径(grant/ConPTY/CreateProcess 失败)都不泄漏容器 SID。
+struct SidGuard(PSID);
+impl Drop for SidGuard {
+    fn drop(&mut self) {
+        if !self.0 .0.is_null() {
+            unsafe { FreeSid(self.0) };
+        }
+    }
+}
+
+/// 能力 SID(ConvertStringSidToSidW 经 LocalAlloc 分配)的 RAII 守卫:Drop 时逐个 LocalFree,
+/// 确保 grant/ConPTY 等早返回路径不泄漏。
+struct LocalSidsGuard(Vec<PSID>);
+impl Drop for LocalSidsGuard {
+    fn drop(&mut self) {
+        for sid in &self.0 {
+            if !sid.0.is_null() {
+                unsafe {
+                    let _ = LocalFree(HLOCAL(sid.0));
+                }
+            }
+        }
+    }
+}
+
+/// 目录是否为重解析点(junction/symlink)。向 reparse 点授「读写」会经其 target 逃逸出工作区,故拒绝。
+fn is_reparse_point(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_attributes() & 0x0000_0400 != 0) // FILE_ATTRIBUTE_REPARSE_POINT
+        .unwrap_or(false)
+}
+
+/// grant_dir_access_to_appcontainer 实际写回 DACL(SetNamedSecurityInfoW)的累计次数——幂等跳过命中时
+/// 不增。供测试验证「第二次起跳过重写」,也是写放大的可观测指标。
+pub(crate) static GRANT_WRITE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 检查 DACL 是否已含「指向 ac_sid、非继承、可继承(OI|CI)、含读写执行」的 allow ACE。命中说明工作区
+/// 先前已授权过本容器(容器 SID 跨进程稳定),可跳过重写——避免每命令重写整棵子树 SD(改子文件 ChangeTime
+/// 会误触发 tauri dev / vite 等文件监视器 rebuild,对大 repo 还每命令卡顿)。
+unsafe fn dacl_has_inheritable_grant(dacl: *mut ACL, ac_sid: PSID) -> bool {
+    if dacl.is_null() {
+        return false;
+    }
+    let want_mask = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0;
+    let want_inherit = OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0;
+    let count = (*dacl).AceCount;
+    for i in 0..count {
+        let mut ace_ptr: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl, i as u32, &mut ace_ptr).is_err() {
+            continue;
+        }
+        let header = ace_ptr as *const ACE_HEADER;
+        if (*header).AceType != 0 {
+            continue; // 非 ACCESS_ALLOWED_ACE_TYPE(=0)
+        }
+        if (*header).AceFlags & 0x10 != 0 {
+            continue; // INHERITED_ACE:继承来的不算根上显式授权
+        }
+        if (*header).AceFlags as u32 & want_inherit != want_inherit {
+            continue; // 须同时含 OBJECT_INHERIT|CONTAINER_INHERIT
+        }
+        let aaa = ace_ptr as *const ACCESS_ALLOWED_ACE;
+        if (*aaa).Mask & want_mask != want_mask {
+            continue;
+        }
+        let sid_in_ace = PSID(&(*aaa).SidStart as *const u32 as *mut c_void);
+        if EqualSid(sid_in_ace, ac_sid).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 /// 给目录的 DACL 追加一条「允许容器 SID 读/写/执行(遍历)」的 ACE,使 AppContainer 命令能访问工作区。
 ///
 /// 机制:AppContainer 默认拒绝;授权 = GetNamedSecurityInfoW 取现有 DACL → SetEntriesInAclW 合并新 ACE
 /// (GRANT_ACCESS 追加,不替换) → SetNamedSecurityInfoW 写回。继承标志使子目录/文件一并可访问。
 /// 注:spike 阶段暂未释放安全描述符/新 DACL(每命令小泄漏),集成时补 LocalFree。
 unsafe fn grant_dir_access_to_appcontainer(path: &Path, ac_sid: PSID) -> Result<(), ToolRuntimeError> {
+    // junction/symlink 逃逸防护:授读写给重解析点会经 target 逃出工作区。fail-closed 拒绝。
+    if is_reparse_point(path) {
+        return Err(err(format!(
+            "拒绝向重解析点(junction/symlink)授读写权,防逃逸出工作区: {}",
+            path.display()
+        )));
+    }
     let mut wpath = wide(&path.as_os_str().to_string_lossy());
 
     let mut old_dacl: *mut ACL = std::ptr::null_mut();
@@ -148,9 +237,19 @@ unsafe fn grant_dir_access_to_appcontainer(path: &Path, ac_sid: PSID) -> Result<
         return Err(err(format!("GetNamedSecurityInfo 失败: {}", rc.0)));
     }
 
+    // 幂等跳过:工作区根已含本容器 SID 的可继承读写执行 ACE(先前命令已授权)→ 直接返回,不重写子树。
+    // 关键修复:否则每命令都 SetNamedSecurityInfoW 重写整棵子树 SD,改子文件 ChangeTime 误触发
+    // tauri dev/vite 等监视器 rebuild(dev 下应用反复重启),对大 repo 还每命令卡几十秒。
+    if dacl_has_inheritable_grant(old_dacl, ac_sid) {
+        if !sd.0.is_null() {
+            let _ = LocalFree(HLOCAL(sd.0));
+        }
+        return Ok(());
+    }
+
     let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0,
-        grfAccessMode: GRANT_ACCESS,
+        grfAccessMode: SET_ACCESS, // 幂等:替换该容器 SID 现有 ACE,多命令不累积
         grfInheritance: windows::Win32::Security::ACE_FLAGS(
             OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0,
         ),
@@ -187,6 +286,7 @@ unsafe fn grant_dir_access_to_appcontainer(path: &Path, ac_sid: PSID) -> Result<
     if rc.0 != 0 {
         return Err(err(format!("SetNamedSecurityInfo 失败: {}", rc.0)));
     }
+    GRANT_WRITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -194,25 +294,41 @@ unsafe fn grant_dir_access_to_appcontainer(path: &Path, ac_sid: PSID) -> Result<
 /// 但不能列此目录内容、也不传播给子项。用于给工作区父链开路——否则 PowerShell `Set-Location`
 /// 到用户 profile 路径下的工作区会「拒绝访问」(AppContainer 默认对用户目录链遍历受限)。
 unsafe fn grant_traverse_to_appcontainer(path: &Path, ac_sid: PSID) -> Result<(), ToolRuntimeError> {
-    let mut wpath = wide(&path.as_os_str().to_string_lossy());
+    let wpath = wide(&path.as_os_str().to_string_lossy());
+    // 打开目录句柄(READ_CONTROL|WRITE_DAC 才能读/改 DACL;BACKUP_SEMANTICS 才能以句柄打开目录对象)。
+    let h = CreateFileW(
+        PCWSTR(wpath.as_ptr()),
+        0x0002_0000u32 | 0x0004_0000u32, // READ_CONTROL | WRITE_DAC
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+    )
+    .map_err(|e| err(format!("打开目录句柄(traverse) 失败: {e}")))?;
+
+    // 读原 DACL(GetSecurityInfo 是读操作,不传播)。
     let mut old_dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = PSECURITY_DESCRIPTOR::default();
-    let rc = GetNamedSecurityInfoW(
-        PCWSTR(wpath.as_ptr()),
-        SE_FILE_OBJECT,
+    let rc = GetSecurityInfo(
+        h,
+        SE_KERNEL_OBJECT,
         DACL_SECURITY_INFORMATION,
         None,
         None,
         Some(&mut old_dacl),
         None,
-        &mut sd,
+        Some(&mut sd),
     );
     if rc.0 != 0 {
-        return Err(err(format!("GetNamedSecurityInfo(traverse) 失败: {}", rc.0)));
+        let _ = CloseHandle(h);
+        return Err(err(format!("GetSecurityInfo(traverse) 失败: {}", rc.0)));
     }
+
+    // 追加「仅遍历(FILE_TRAVERSE)、不继承」的 ACE。
     let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: FILE_TRAVERSE.0,
-        grfAccessMode: GRANT_ACCESS,
+        grfAccessMode: SET_ACCESS, // 幂等:替换该容器 SID 现有 ACE
         grfInheritance: windows::Win32::Security::ACE_FLAGS(0), // 不继承
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
@@ -225,24 +341,31 @@ unsafe fn grant_traverse_to_appcontainer(path: &Path, ac_sid: PSID) -> Result<()
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
     let rc = SetEntriesInAclW(Some(&[ea]), Some(old_dacl as *const ACL), &mut new_dacl);
     if rc.0 != 0 {
+        if !sd.0.is_null() {
+            let _ = LocalFree(HLOCAL(sd.0));
+        }
+        let _ = CloseHandle(h);
         return Err(err(format!("SetEntriesInAcl(traverse) 失败: {}", rc.0)));
     }
-    let rc = SetNamedSecurityInfoW(
-        PWSTR(wpath.as_mut_ptr()),
-        SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        PSID::default(),
-        PSID::default(),
-        Some(new_dacl as *const ACL),
-        None,
-    );
+
+    // 关键:用 SetKernelObjectSecurity(走 NtSetSecurityObject)写回——它只设该目录对象「自身」的 DACL,
+    // 绝不向子树传播继承。而 SetNamedSecurityInfo(advapi32)写带可继承 ACE 的 DACL 时会枚举并重写
+    // 全部子项,对 %TEMP% 这种海量子项目录会卡数十秒(实测父链此处 54s)。父链只需目录自身可遍历,无需
+    // 传播给子项,故底层 API 既正确又快。
+    let mut new_sd = SECURITY_DESCRIPTOR::default();
+    let psd = PSECURITY_DESCRIPTOR(&mut new_sd as *mut _ as *mut c_void);
+    let set_res = InitializeSecurityDescriptor(psd, 1) // SECURITY_DESCRIPTOR_REVISION
+        .and_then(|_| {
+            SetSecurityDescriptorDacl(psd, BOOL(1), Some(new_dacl as *const ACL), BOOL(0))
+        })
+        .and_then(|_| SetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, psd));
+
     let _ = LocalFree(HLOCAL(new_dacl as *mut c_void));
     if !sd.0.is_null() {
         let _ = LocalFree(HLOCAL(sd.0));
     }
-    if rc.0 != 0 {
-        return Err(err(format!("SetNamedSecurityInfo(traverse) 失败: {}", rc.0)));
-    }
+    let _ = CloseHandle(h);
+    set_res.map_err(|e| err(format!("SetKernelObjectSecurity(traverse) 失败: {e}")))?;
     Ok(())
 }
 
@@ -339,13 +462,29 @@ pub fn run_in_appcontainer_sandbox(
         }
         let caps_arg: Option<&[SID_AND_ATTRIBUTES]> =
             if caps.is_empty() { None } else { Some(&caps[..]) };
-        // 容器名按能力集区分,避免「已存在但能力集不符」的派生陷阱。
-        let (name, display) = if allow_network {
-            ("MDGA.Sandbox.Lpac.Net", "MDGA sandbox (lpac, net)")
-        } else {
-            ("MDGA.Sandbox.Lpac", "MDGA sandbox (lpac)")
+        // 能力 SID(LocalAlloc)用 RAII 守卫:任一早返回也释放(caps 已存 PSID 副本,不受影响)。
+        let _cap_guard = LocalSidsGuard(std::mem::take(&mut cap_sids));
+        // 容器名按 workspace + 网络模式唯一:每工作区独立 SID/profile/ACL,不跨工作区累积权限。
+        // 网络模式入名避免「已存在但能力集不符」的派生陷阱。DefaultHasher::new() 确定性(固定 key),
+        // 同工作区跨进程稳定 → profile 可复用。
+        let ws_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            workspace.as_os_str().hash(&mut h);
+            h.finish()
         };
-        let ac_sid = create_or_derive_appcontainer_sid(name, display, caps_arg)?;
+        let net_tag = if allow_network { "n" } else { "d" };
+        let name = format!("MDGA.Sbx.{ws_hash:016x}.{net_tag}");
+        let display = format!("MDGA sandbox {ws_hash:08x} ({net_tag})");
+
+        // profile 创建 + ACL 授权用进程级锁串行化:避免并发命令对同目录 SetSecurityInfo / 同名 profile
+        // 创建竞争(命令「执行」阶段不持锁,仍并行)。
+        static SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let setup_guard = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // SID 用 RAII 守卫:任一早返回(grant/ConPTY/CreateProcess 失败)都不泄漏。
+        let _ac_guard = SidGuard(create_or_derive_appcontainer_sid(&name, &display, caps_arg)?);
+        let ac_sid = _ac_guard.0;
         // 授权工作区目录(容器仅能读写工作区)+ 工作区父链 traverse(New-PSDrive 解析工作区路径需要)。
         grant_dir_access_to_appcontainer(workspace, ac_sid)?;
         let mut anc = workspace.parent();
@@ -353,11 +492,18 @@ pub fn run_in_appcontainer_sandbox(
             let _ = grant_traverse_to_appcontainer(dir, ac_sid);
             anc = dir.parent();
         }
-        // 容器专用临时目录:授权 + 接管 TEMP/TMP(容器读不到用户 %TEMP%,而 PowerShell/.NET/工具需可写 TEMP)。
-        let sandbox_temp = std::env::temp_dir().join("mdga-sandbox-temp");
+        // 容器专用临时目录:按命令唯一(避免共享累积 + 并发冲突),收尾删除。接管 TEMP/TMP(容器读不到
+        // 用户 %TEMP%,而 PowerShell/.NET/工具需可写 TEMP)。
+        static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temp_seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sandbox_temp =
+            std::env::temp_dir().join(format!("mdga-sbx-{}-{}", std::process::id(), temp_seq));
         let _ = std::fs::create_dir_all(&sandbox_temp);
         grant_dir_access_to_appcontainer(&sandbox_temp, ac_sid)?;
         let sandbox_temp_str = sandbox_temp.as_os_str().to_string_lossy().to_string();
+
+        // profile + ACL 已完成,释放 setup 锁;后续 ConPTY/CreateProcess/命令执行并行进行。
+        drop(setup_guard);
 
         let sec_caps = SECURITY_CAPABILITIES {
             AppContainerSid: ac_sid,
@@ -435,6 +581,24 @@ pub fn run_in_appcontainer_sandbox(
         let mut cmdline = crate::sandbox_win::encoded_command_line(&wrapped);
         let mut env_block = build_sandbox_env_block(&sandbox_temp_str);
         let cwd = wide(&workspace.as_os_str().to_string_lossy());
+
+        // Job Object:KILL_ON_JOB_CLOSE 保证进程树(含 native 孙进程)随 job 关闭干净销毁——既杜绝孤儿,
+        // 又让超时/cancel 后 PTY 写端随之全关、reader 不再永久阻塞;加进程数/内存配额防 fork-bomb / 内存炸。
+        let job = CreateJobObjectW(None, PCWSTR::null())
+            .map_err(|e| err(format!("CreateJobObject 失败: {e}")))?;
+        let mut jinfo = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        jinfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            | JOB_OBJECT_LIMIT_JOB_MEMORY;
+        jinfo.BasicLimitInformation.ActiveProcessLimit = 256; // 进程数上限
+        jinfo.JobMemoryLimit = 4 * 1024 * 1024 * 1024; // 4GiB 进程树总内存上限
+        let _ = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &jinfo as *const _ as *const c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+
         let mut pi = PROCESS_INFORMATION::default();
         let create_result = CreateProcessW(
             PCWSTR::null(),
@@ -442,33 +606,44 @@ pub fn run_in_appcontainer_sandbox(
             None,
             None,
             false, // ConPTY:句柄经伪控制台传入,不靠继承
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             Some(env_block.as_mut_ptr() as *const c_void),
             PCWSTR(cwd.as_ptr()),
             &si.StartupInfo,
             &mut pi,
         );
         DeleteProcThreadAttributeList(attr_list);
-        for sid in &cap_sids {
-            let _ = LocalFree(HLOCAL(sid.0));
-        }
         if let Err(e) = create_result {
             let _ = CloseHandle(out_r);
             let _ = CloseHandle(in_w);
+            let _ = CloseHandle(job);
             ClosePseudoConsole(hpc);
-            FreeSid(ac_sid);
             return Err(err(format!("CreateProcess(AppContainer/ConPTY) 失败: {e}")));
         }
+        // 挂进 job 后再 resume:子进程一启动就在 job 内,它 fork 的孙进程也自动归 job。
+        let _ = AssignProcessToJobObject(job, pi.hProcess);
+        ResumeThread(pi.hThread);
 
-        // 并发读伪控制台输出(VT 流);进程退出后关 PTY 触发 EOF,reader 收尾。
-        let out_file = std::fs::File::from_raw_handle(out_r.0 as *mut _);
-        let reader = std::thread::spawn(move || {
-            let mut f = out_file;
-            let mut buf = Vec::new();
-            let _ = f.read_to_end(&mut buf);
-            buf
+        // 读伪控制台输出(VT 流)的线程:增量把 chunk 发回主线程(不 join,避免永久阻塞在 read)。
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let out_raw = out_r.0 as isize;
+        std::thread::spawn(move || {
+            let mut f = std::fs::File::from_raw_handle(out_raw as *mut c_void);
+            let mut chunk = [0u8; 8192];
+            loop {
+                match std::io::Read::read(&mut f, &mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(chunk[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
         });
 
+        // 等子进程退出 / cancel / 超时(WaitForSingleObject 50ms 粒度)。超时后由下方 TerminateJobObject
+        // 杀整个进程树兜底。
         let started = Instant::now();
         let mut timed_out = false;
         loop {
@@ -476,23 +651,41 @@ pub fn run_in_appcontainer_sandbox(
                 break;
             }
             if cancel.as_ref().map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
-                let _ = TerminateProcess(pi.hProcess, 1);
                 break;
             }
             if started.elapsed() >= timeout {
-                let _ = TerminateProcess(pi.hProcess, 1);
                 timed_out = true;
                 break;
             }
         }
         let mut exit_code: u32 = 0;
         let _ = GetExitCodeProcess(pi.hProcess, &mut exit_code);
-        ClosePseudoConsole(hpc);
+        // 杀整个进程树(含 native 孙进程)。
+        let _ = TerminateJobObject(job, 1);
         let _ = CloseHandle(in_w);
-        let raw = reader.join().unwrap_or_default();
+        // ClosePseudoConsole 会阻塞到所有客户端(含 ConPTY 自己的 conhost,不在 job 内)退出;放 detached
+        // 线程,避免某进程不退时卡死主线程。它生效后会关掉 out_w → reader 读到 EOF。
+        let hpc_raw = hpc.0 as isize;
+        std::thread::spawn(move || {
+            ClosePseudoConsole(HPCON(hpc_raw));
+        });
+        // 收集 PTY 输出:reader 因 out_r EOF 正常结束(发送端 drop→Disconnected),或 3s 无新数据兜底(绝不永久挂)。
+        let mut raw = Vec::new();
+        let read_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if Instant::now() >= read_deadline {
+                break; // 收尾总体兜底:进程已结束,最多再等 3s 排空 PTY,绝不永久挂(含持续输出场景)
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(c) => raw.extend_from_slice(&c),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
         let _ = CloseHandle(pi.hThread);
         let _ = CloseHandle(pi.hProcess);
-        FreeSid(ac_sid);
+        let _ = CloseHandle(job);
+        let _ = std::fs::remove_dir_all(&sandbox_temp); // 删本命令专属临时目录
         let duration_ms = started.elapsed().as_millis();
 
         // VT 流剥离为纯文本,截断到 64KiB(char 边界);按行触发 on_line 回调。
@@ -521,6 +714,8 @@ pub fn run_in_appcontainer_sandbox(
             truncated,
             timed_out,
             duration_ms,
+            sandbox_layer: Some("appcontainer".to_string()),
+            sandbox_degraded: false,
         })
     }
 }
@@ -588,6 +783,34 @@ mod tests {
         );
     }
 
+    /// Job Object 应让超时/cancel 后及时返回(不挂死):跑一个持续运行的 native 命令(waitfor 等永不到来的
+    /// 信号),设短 timeout;验证 Job 杀进程树后 PTY 写端全关、reader 立即 EOF、调用及时返回(不卡在 join)。
+    #[test]
+    fn appcontainer_timeout_does_not_hang() {
+        let _g = test_guard();
+        let ws = std::env::temp_dir().join(format!("mdga-ac-to-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let start = Instant::now();
+        let r = run_in_appcontainer_sandbox(
+            &ws,
+            "Start-Sleep -Seconds 8",
+            Duration::from_secs(3),
+            None,
+            None,
+            false,
+        );
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_dir_all(&ws);
+        let out = r.expect("起进程失败");
+        eprintln!("[timeout] timed_out={} elapsed={:?}", out.timed_out, elapsed);
+        assert!(out.timed_out, "应判超时");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "超时后应及时返回(Job 杀进程树→ PTY EOF),实际 {:?} 说明 reader 挂死",
+            elapsed
+        );
+    }
+
     /// 生产路径端到端:run_in_appcontainer_sandbox(ConPTY + lpacCom 能力 + New-PSDrive)
     /// 跑 native 命令,验证(1)在工作区 cwd 跑(相对路径读到工作区文件) (2)native 输出经伪控制台回传、
     /// 已 strip_vt 成纯文本。这是方案 B 完整接通的回归测试。
@@ -613,6 +836,115 @@ mod tests {
             "生产沙箱:native 命令未在工作区读到文件/输出未回传:\n{}",
             out.stdout
         );
+        assert_eq!(
+            out.sandbox_layer.as_deref(),
+            Some("appcontainer"),
+            "可观测:AppContainer 路径应标记 sandbox_layer=appcontainer"
+        );
+        assert!(!out.sandbox_degraded, "AppContainer 成功不应标记降级");
+    }
+
+    /// junction/symlink 逃逸防护:工作区是重解析点时,grant 阶段 fail-closed 拒绝(防经 target 逃出工作区)。
+    #[test]
+    fn appcontainer_rejects_reparse_point_workspace() {
+        let _g = test_guard();
+        let pid = std::process::id();
+        let real = std::env::temp_dir().join(format!("mdga-real-{pid}"));
+        let link = std::env::temp_dir().join(format!("mdga-junc-{pid}"));
+        std::fs::create_dir_all(&real).unwrap();
+        let _ = std::fs::remove_dir_all(&link);
+        // mklink /J 建 junction(普通用户即可,无需管理员)。
+        let made = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &real.to_string_lossy(),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            let _ = std::fs::remove_dir_all(&real);
+            eprintln!("[reparse] 无法建 junction,跳过");
+            return;
+        }
+        assert!(is_reparse_point(&link), "junction 应被识别为 reparse point");
+        let r = run_in_appcontainer_sandbox(
+            &link,
+            "cmd /c echo x",
+            Duration::from_secs(20),
+            None,
+            None,
+            false,
+        );
+        let _ = std::fs::remove_dir_all(&link);
+        let _ = std::fs::remove_dir_all(&real);
+        let e = r.expect_err("对 reparse 工作区应 fail-closed 拒绝");
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("重解析点"),
+            "错误应说明拒绝 reparse 授权,实际: {msg}"
+        );
+    }
+
+    /// 同工作区重复跑:验证容器名复用 + SET_ACCESS 幂等(ACE 不累积)+ SidGuard 不泄漏 + temp 收尾删除。
+    /// 多次跑都应稳定成功、读到工作区文件,且本进程的 mdga-sbx-* 临时目录不残留累积。
+    #[test]
+    fn appcontainer_repeat_same_workspace_idempotent() {
+        let _g = test_guard();
+        let ws = std::env::temp_dir().join(format!("mdga-ac-rep-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("rep.txt"), "REP_77").unwrap();
+        for i in 0..3 {
+            let out = run_in_appcontainer_sandbox(
+                &ws,
+                "cmd /c type rep.txt",
+                Duration::from_secs(30),
+                None,
+                None,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("第 {i} 次起进程失败: {e}"));
+            assert!(
+                out.stdout.contains("REP_77"),
+                "第 {i} 次未读到工作区文件:\n{}",
+                out.stdout
+            );
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+        // 各命令专属临时目录应已在各自收尾删除,不累积残留。
+        let prefix = format!("mdga-sbx-{}-", std::process::id());
+        let leaked = std::fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .count();
+        assert_eq!(leaked, 0, "命令专属临时目录未清理,残留 {leaked} 个");
+    }
+
+    /// 幂等跳过(闪退修复):同工作区第二条命令应跳过 workspace 的 ACL 重写,只剩每命令新建的 temp 写回。
+    /// 这是"每命令重写工作区子树 SD → 误触发 dev 文件监视器 rebuild"的直接验证。
+    #[test]
+    fn grant_dir_access_skips_rewrite_when_already_granted() {
+        let _g = test_guard();
+        let ws = std::env::temp_dir().join(format!("mdga-grant-skip-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("f.txt"), "x").unwrap();
+        use std::sync::atomic::Ordering;
+        let c0 = GRANT_WRITE_COUNT.load(Ordering::Relaxed);
+        run_in_appcontainer_sandbox(&ws, "cmd /c echo a", Duration::from_secs(30), None, None, false)
+            .expect("第 1 次起进程失败");
+        let c1 = GRANT_WRITE_COUNT.load(Ordering::Relaxed);
+        run_in_appcontainer_sandbox(&ws, "cmd /c echo b", Duration::from_secs(30), None, None, false)
+            .expect("第 2 次起进程失败");
+        let c2 = GRANT_WRITE_COUNT.load(Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&ws);
+        // 第 1 次:workspace + sandbox_temp 各写回一次 = +2;第 2 次:workspace 命中跳过、仅 temp 写回 = +1。
+        assert_eq!(c1 - c0, 2, "首次应写回 workspace + temp 两处 ACL");
+        assert_eq!(c2 - c1, 1, "第二次 workspace 应跳过(幂等),只剩 temp 写回");
     }
 
     /// P0 spike：在 token+AppContainer 内跑 `whoami /groups`,断言进程能起、且完整性级别=Low、
