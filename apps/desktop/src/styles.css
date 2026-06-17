@@ -852,9 +852,9 @@ h1 {
 }
 
 .conv-item {
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 4px;
   border-radius: 8px;
   padding: 8px 10px;
@@ -863,6 +863,7 @@ h1 {
   font-size: 13px;
   line-height: 1.4;
   user-select: none;
+  overflow: hidden;
   transition: background 0.1s;
 }
 
@@ -877,37 +878,35 @@ h1 {
 
 .conv-item__title {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+  /* 稿 A:标题溢出时右缘渐隐(替代省略号 …),与 hover 时动作区渐变无缝衔接(CC desktop 风)。 */
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent);
 }
 
+/* 删除按钮:与其他动作图标统一尺寸;整组淡入由父级 .conv-item__actions 统一控制,hover 染危险色。 */
 .conv-item__delete {
   flex-shrink: 0;
-  width: 18px;
-  height: 18px;
+  width: 22px;
+  height: 22px;
   display: flex;
   align-items: center;
   justify-content: center;
   border: none;
   background: none;
   color: var(--text-3);
-  font-size: 14px;
   cursor: pointer;
-  border-radius: 4px;
-  opacity: 0;
-  transition: opacity 0.1s;
+  border-radius: 5px;
   padding: 0;
   line-height: 1;
-}
-
-.conv-item:hover .conv-item__delete {
-  opacity: 1;
+  transition: background 0.1s, color 0.1s;
 }
 
 .conv-item__delete:hover {
   background: var(--border);
-  color: var(--text-2);
+  color: var(--danger);
 }
 
 /* ── 内联工具执行行（在对话流中与叙述文字交错渲染） ── */
@@ -1006,38 +1005,50 @@ h1 {
   border-color: var(--text-3);
 }
 
+/* 动作区(稿 A · 无界渐隐):绝对覆盖在标题右侧,默认隐藏且穿透点击;hover 整行时连同
+   「透明 → 侧栏 hover 底色」的渐变一起淡入,渐变把图标左侧的标题文字羽化虚化,贴 CC desktop。
+   渐变终点用 --surface-3(动作区仅 hover 出现,而 hover 行底色恒为 --surface-3,二者一致)。 */
 .conv-item__actions {
+  position: absolute;
+  top: 0;
+  right: 0;
+  height: 100%;
   display: flex;
   align-items: center;
-  gap: 2px;
-  flex-shrink: 0;
+  gap: 1px;
+  padding: 0 8px 0 42px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s;
+  background: linear-gradient(to right, transparent, var(--surface-3) 46%);
+  border-radius: 0 8px 8px 0;
+}
+
+.conv-item:hover .conv-item__actions {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .conv-item__action {
-  width: 20px;
-  height: 20px;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
   display: flex;
   align-items: center;
   justify-content: center;
   border: none;
   background: none;
-  font-size: 11px;
+  color: var(--text-3);
   cursor: pointer;
-  border-radius: 4px;
-  opacity: 0;
-  transition: opacity 0.1s;
+  border-radius: 5px;
   padding: 0;
   line-height: 1;
-  filter: grayscale(1) opacity(0.7);
-}
-
-.conv-item:hover .conv-item__action {
-  opacity: 1;
+  transition: background 0.1s, color 0.1s;
 }
 
 .conv-item__action:hover {
   background: var(--border);
-  filter: none;
+  color: var(--text);
 }
 
 .conv-item__pin-mark {

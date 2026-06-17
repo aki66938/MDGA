@@ -1,7 +1,7 @@
 // 侧边栏视图组件（行为敏感解耦增量 1，Task B）：从 App() 纯搬移侧栏 JSX。
 // 铁律：无业务逻辑，仅渲染 + 调 props；JSX/className/文案/结构与原 App 内完全一致。
 import {
-  SquarePen, Search, Pin, Archive, ArchiveRestore, Trash2, Settings2,
+  SquarePen, Search, Pin, Pencil, Archive, ArchiveRestore, Trash2, Settings2,
   Sun, Moon, ChevronDown, ChevronRight,
 } from "lucide-react";
 import { BrandMark } from "./dialogs";
@@ -85,35 +85,46 @@ export function Sidebar(props: SidebarProps) {
             {conv.title}
           </span>
         )}
-        <span className="conv-item__actions">
-          <button
-            className="conv-item__action"
-            type="button"
-            aria-label={conv.pinned ? "取消置顶" : "置顶"}
-            title={conv.pinned ? "取消置顶" : "置顶"}
-            onClick={(e) => onTogglePin(e, conv)}
-          >
-            <Pin size={14} />
-          </button>
-          <button
-            className="conv-item__action"
-            type="button"
-            aria-label={conv.archived ? "取消归档" : "归档"}
-            title={conv.archived ? "取消归档" : "归档"}
-            onClick={(e) => onToggleArchive(e, conv)}
-          >
-            {conv.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
-          </button>
-          <button
-            className="conv-item__delete"
-            type="button"
-            aria-label="删除会话"
-            title="删除"
-            onClick={(e) => onDeleteConversation(e, conv.id)}
-          >
-            <Trash2 size={14} />
-          </button>
-        </span>
+        {editingConvId !== conv.id && (
+          <span className="conv-item__actions">
+            <button
+              className="conv-item__action"
+              type="button"
+              aria-label="重命名"
+              title="重命名"
+              onClick={(e) => onStartRename(e, conv)}
+            >
+              <Pencil size={14} />
+            </button>
+            <button
+              className="conv-item__action"
+              type="button"
+              aria-label={conv.pinned ? "取消置顶" : "置顶"}
+              title={conv.pinned ? "取消置顶" : "置顶"}
+              onClick={(e) => onTogglePin(e, conv)}
+            >
+              <Pin size={14} />
+            </button>
+            <button
+              className="conv-item__action"
+              type="button"
+              aria-label={conv.archived ? "取消归档" : "归档"}
+              title={conv.archived ? "取消归档" : "归档"}
+              onClick={(e) => onToggleArchive(e, conv)}
+            >
+              {conv.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
+            </button>
+            <button
+              className="conv-item__delete"
+              type="button"
+              aria-label="删除会话"
+              title="删除"
+              onClick={(e) => onDeleteConversation(e, conv.id)}
+            >
+              <Trash2 size={14} />
+            </button>
+          </span>
+        )}
       </div>
     );
   }
