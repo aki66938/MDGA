@@ -62,35 +62,38 @@ body {
 }
 
 :root[data-theme="dark"] {
+  /* 暗色对齐 GitHub 新版 dark(0.0.50,按用户实测取色):主背景 #212830、hover #262C36、
+     核心文字 #D1D7E0、描述文字 #9198A1;强调色保留 DeepSeek 品牌蓝(产品身份),品牌选中底
+     取在该中性底上不突兀的低饱和蓝。其余(页底 / 侧栏 / 边框 / 弱字)按这套往下推一档。 */
   --brand: #6B83FF;
   --brand-hover: #8497FF;
   --brand-active: #5870F0;
-  --brand-tint: #1E2747;
-  --brand-tint-strong: #26315A;
+  --brand-tint: #2B354D;
+  --brand-tint-strong: #303A59;
   --on-brand: #FFFFFF;
 
-  --canvas: #0E1422;
-  --surface: #161D2E;
-  --surface-2: #121829;
-  --surface-3: #1C2436;
-  --border: #232C40;
-  --border-strong: #303A52;
+  --canvas: #181D24;       /* 页底:比主背景再深一档 */
+  --surface: #212830;      /* GitHub 主背景(实测) */
+  --surface-2: #1C222B;    /* 侧栏:比主背景略深,层级分明 */
+  --surface-3: #262C36;    /* GitHub hover / 抬升面(实测) */
+  --border: #3D444D;       /* GitHub border.default(新版) */
+  --border-strong: #4A535D;
 
-  --text: #E8EBF2;
-  --text-2: #9AA3B8;
-  --text-3: #6B7488;
+  --text: #D1D7E0;         /* GitHub fg.default(实测,核心文字) */
+  --text-2: #9198A1;       /* GitHub fg.muted(实测,描述性文字) */
+  --text-3: #656C76;       /* GitHub fg.subtle(弱化:时间戳 / 占位等) */
 
-  --success: #3DBA88;
-  --danger: #F0666B;
-  --warning: #E0A53A;
-  --diff-add-bg: rgba(61, 186, 136, 0.16);
-  --diff-add-fg: #6FD3AB;
-  --diff-del-bg: rgba(240, 102, 107, 0.16);
-  --diff-del-fg: #F4989C;
+  --success: #3FB950;      /* GitHub success.fg */
+  --danger: #F85149;       /* GitHub danger.fg */
+  --warning: #D29922;      /* GitHub attention.fg */
+  --diff-add-bg: rgba(63, 185, 80, 0.15);
+  --diff-add-fg: #56D364;
+  --diff-del-bg: rgba(248, 81, 73, 0.15);
+  --diff-del-fg: #FF7B72;
 
-  --shadow-pop: 0 10px 32px rgba(0, 0, 0, 0.45);
-  --scrollbar-thumb: rgba(232, 235, 242, 0.16);
-  --scrollbar-thumb-hover: rgba(232, 235, 242, 0.30);
+  --shadow-pop: 0 10px 32px rgba(1, 4, 9, 0.5);
+  --scrollbar-thumb: rgba(209, 215, 224, 0.14);
+  --scrollbar-thumb-hover: rgba(209, 215, 224, 0.28);
 }
 
 button,
@@ -630,6 +633,9 @@ h1 {
   background: transparent;
   padding: 9px 2px;
   line-height: 1.5;
+  /* 必须显式设 color:textarea 不设时回退系统默认黑,暗底上又黑又难认。跟随主题 --text
+     (暗色为 GitHub 新版核心文字 #D1D7E0,亮色为近黑 #1A1D24)。 */
+  color: var(--text);
 }
 
 /* ── B1：统一 composer 容器（textarea 在上、footer 控制行在下，竖向布局）── */
@@ -1065,6 +1071,9 @@ h1 {
   padding: 4px 6px;
   font-size: 13px;
   outline: none;
+  /* 显式设前景/背景:否则暗色下回退系统默认(白底黑字),既突兀又难认。 */
+  background: var(--surface);
+  color: var(--text);
 }
 
 .archived-toggle {
