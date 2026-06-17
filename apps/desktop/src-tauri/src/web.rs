@@ -101,13 +101,15 @@ pub(crate) async fn execute_web_search(arguments: &str) -> Result<serde_json::Va
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .build()
         .map_err(|e| e.to_string())?;
-    // DDG HTML 端点连发会触发反爬:返回 202/403 + 含 anomaly.js 的挑战页(需 JS),解析必空。
-    // 看 HTTP 状态码 + 探测挑战页,命中则退避后重试(最多 3 次),区分「被限流」与「真无结果」。
+    // DDG HTML 端点:用 GET(?q=)而非 POST——实测同一真实 UA 下,POST 到 html.duckduckgo.com 会被
+    // 反爬判定、直接返回 202 + 含 anomaly.js 的挑战页(需 JS)解析必空;GET 同参数则 200 正常返回结果。
+    // (0.0.45 的 C 修复只换了真实 UA、仍用 POST,所以依旧空;本版改 GET 才真正修好。)
+    // 仍保留状态码 + 挑战页探测 + 退避重试(最多 3 次),区分「被限流」与「真无结果」。
     let mut note = String::from("未获取到搜索结果");
     for attempt in 0..3u32 {
         let resp = match client
-            .post("https://html.duckduckgo.com/html/")
-            .form(&[("q", query)])
+            .get("https://html.duckduckgo.com/html/")
+            .query(&[("q", query)])
             .send()
             .await
         {

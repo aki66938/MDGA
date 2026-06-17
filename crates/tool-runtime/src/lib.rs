@@ -1487,19 +1487,38 @@ fn dev_watch_marker(workspace: &Path) -> Option<String> {
             .find(|(rel, _)| dir.join(rel).exists())
             .map(|(_, name)| name.to_string())
     }
-    if let Some(m) = markers_in(workspace) {
-        return Some(m);
-    }
-    if let Ok(entries) = std::fs::read_dir(workspace) {
+    // 有界递归(深度 ≤3,0.0.47):catch 嵌套在 monorepo 子目录里的工程(如 apps/desktop/src-tauri,根下第 2 层)。
+    // 只看「根 + 1 层」会漏掉深层嵌套工程、误判为可隔离 → 跑 AppContainer 改源码 ACL 触发 watcher rebuild。
+    // 跳过 node_modules/target/.git 等海量目录,保证探测自身快(几十毫秒级)。
+    fn search(dir: &Path, depth: u32) -> Option<String> {
+        if let Some(m) = markers_in(dir) {
+            return Some(m);
+        }
+        if depth == 0 {
+            return None;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return None;
+        };
         for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                if let Some(m) = markers_in(&entry.path()) {
-                    return Some(m);
-                }
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                name.as_ref(),
+                "node_modules" | "target" | ".git" | "dist" | "build" | ".next" | ".svelte-kit"
+            ) {
+                continue;
+            }
+            if let Some(m) = search(&entry.path(), depth - 1) {
+                return Some(m);
             }
         }
+        None
     }
-    None
+    search(workspace, 3)
 }
 
 /// 与 run_command 相同，但可选地把命令输出逐行回调给调用方，并可选地接受取消标志。
@@ -1532,23 +1551,25 @@ pub fn run_command_streaming(
     if sandbox {
         #[cfg(windows)]
         {
-            // 运行时能力自检(每进程一次,缓存):实测本机 AppContainer 能否回传 native 输出。各版本
-            // Windows 对 LowBoxConsoleEnabled/ConPTY 支持不一,实测为准而非赌版本号;不通过即降级。
+            // 文件隔离-A 先判:工作区被 dev-watch 或过大时,AppContainer 首次授权会改工作区每个文件 SD
+            // (触发 tauri/vite watcher rebuild + 大 repo 卡顿)。fail-soft 降级受限令牌沙箱(不碰用户 ACL)。
+            // 放在自检之前(0.0.47):注定降级的工作区直接走受限沙箱,跳过 AppContainer 自检(建容器 profile +
+            // ConPTY 探针,有固定开销)——省掉这类工作区首条命令的等待;自检改为仅在真要上 AppContainer 时才惰性跑。
+            if let Some(reason) = workspace_grant_would_disrupt(&workspace) {
+                eprintln!("[sandbox] {reason}");
+                return sandbox_win::run_in_restricted_sandbox(
+                    &workspace, command, timeout, on_line, cancel,
+                )
+                .map(|mut r| {
+                    r.sandbox_degraded = true;
+                    r
+                });
+            }
+            // 运行时能力自检(每进程一次,缓存):实测本机 AppContainer 能否回传 native 输出。各版本 Windows 对
+            // LowBoxConsoleEnabled/ConPTY 支持不一,实测为准而非赌版本号;不通过即降级。仅非降级工作区才需要。
             static APPCONTAINER_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let use_ac = *APPCONTAINER_OK.get_or_init(appcontainer_win::appcontainer_self_test);
             if use_ac {
-                // 文件隔离-A:工作区被 dev-watch 或过大时,AppContainer 首次授权会改工作区每个文件 SD
-                // (触发 tauri/vite watcher rebuild + 大 repo 卡顿)。fail-soft 降级受限令牌沙箱(不碰用户 ACL)。
-                if let Some(reason) = workspace_grant_would_disrupt(&workspace) {
-                    eprintln!("[sandbox] {reason}");
-                    return sandbox_win::run_in_restricted_sandbox(
-                        &workspace, command, timeout, on_line, cancel,
-                    )
-                    .map(|mut r| {
-                        r.sandbox_degraded = true;
-                        r
-                    });
-                }
                 match appcontainer_win::run_in_appcontainer_sandbox(
                     &workspace,
                     command,
@@ -2001,6 +2022,22 @@ mod tests {
         assert!(
             dev_watch_marker(&mono).is_some(),
             "子目录 Tauri 项目应被检测到"
+        );
+        // 0.0.47:更深的嵌套(apps/desktop/src-tauri,根下第 2 层)也要被有界递归检测到。
+        let deep = base.join("deep");
+        std::fs::create_dir_all(deep.join("apps/desktop/src-tauri")).unwrap();
+        std::fs::write(deep.join("apps/desktop/src-tauri/tauri.conf.json"), "{}").unwrap();
+        assert!(
+            dev_watch_marker(&deep).is_some(),
+            "深层嵌套(apps/desktop)的 Tauri 项目应被有界递归检测到"
+        );
+        // node_modules 等海量目录内的配置文件不应被当作 dev-watch(探测应跳过这些目录)。
+        let skip = base.join("skipdir");
+        std::fs::create_dir_all(skip.join("node_modules/pkg")).unwrap();
+        std::fs::write(skip.join("node_modules/pkg/vite.config.ts"), "export default {}").unwrap();
+        assert!(
+            dev_watch_marker(&skip).is_none(),
+            "node_modules 内的配置不应被当作 dev-watch"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
