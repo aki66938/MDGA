@@ -841,7 +841,7 @@ async fn chat_with_builtin_tools(
                             // 窄跑的测试门通过：复跑整套确认整体绿（防修复碰坏别的用例）。
                             if is_focused && step.kind == VerifyKind::Test {
                                 let _ = app.emit("chat-chunk", format!("\n\n（失败用例已绿，复跑整套确认：`{}`…）\n\n", step.command));
-                                if let Ok(full) = mdga_tool_runtime::run_command_streaming(
+                                match mdga_tool_runtime::run_command_streaming(
                                     workspace_path,
                                     RunCommandRequest { command: step.command.clone(), timeout_secs: Some(300), background: false },
                                     None,
@@ -849,18 +849,36 @@ async fn chat_with_builtin_tools(
                                     verify_sandbox,
                                     verify_net,
                                 ) {
-                                    let full_failed = full.exit_code.unwrap_or(0) != 0 || full.timed_out;
-                                    if full_failed {
-                                        let report = parse_report(step.framework, step.kind, &full.stdout, &full.stderr);
-                                        verify_failing = report.failures.iter().map(|f| f.name.clone()).collect();
-                                        let sig = report_signature(&report, full.exit_code, full.timed_out);
-                                        if verify_stall_hit(&sig, &mut verify_prev_sig, &mut verify_stall) {
-                                            emit_verify_stall(app, conversation_id, &step.command);
-                                            return Ok(usage);
+                                    Ok(full) => {
+                                        let full_failed = full.exit_code.unwrap_or(0) != 0 || full.timed_out;
+                                        if full_failed {
+                                            let report = parse_report(step.framework, step.kind, &full.stdout, &full.stderr);
+                                            verify_failing = report.failures.iter().map(|f| f.name.clone()).collect();
+                                            let sig = report_signature(&report, full.exit_code, full.timed_out);
+                                            if verify_stall_hit(&sig, &mut verify_prev_sig, &mut verify_stall) {
+                                                emit_verify_stall(app, conversation_id, &step.command);
+                                                return Ok(usage);
+                                            }
+                                            wire_messages.push(serde_json::json!({
+                                                "role": "user",
+                                                "content": format_verify_feedback(&step.command, &report),
+                                            }));
+                                            fed_back = true;
+                                            break 'steps;
                                         }
+                                    }
+                                    // 确认用的整套复跑「起不来」(命令未能启动)：这**不是**绿。
+                                    // 窄跑只证明了之前失败的那几个用例已过,但整体回归未被确认。
+                                    // 绝不能 fail-open 当通过收尾——保留上轮失败名(verify_failing 不清),
+                                    // 回灌让模型自查并重跑整套,把本门当作「不确定」继续争取下一轮。
+                                    Err(e) => {
+                                        let _ = app.emit("chat-chunk", format!("\n\n（复跑整套未能启动：{e}；视为未确认，继续验证。）\n\n"));
                                         wire_messages.push(serde_json::json!({
                                             "role": "user",
-                                            "content": format_verify_feedback(&step.command, &report),
+                                            "content": format!(
+                                                "验证命令 `{}`（测试门）未能启动以确认整套通过：{}。\n仅窄跑过之前失败的用例，整体回归未确认。请检查测试命令/环境后重新运行整套测试，确认全绿再结束。",
+                                                step.command, e
+                                            ),
                                         }));
                                         fed_back = true;
                                         break 'steps;

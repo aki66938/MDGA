@@ -315,7 +315,8 @@ fn scan_location(line: &str) -> Option<(String, Option<u32>)> {
                 .map(|i| i + 1)
                 .unwrap_or(0);
             let path = line[path_start..ext_end].to_string();
-            let after = if next == Some(':') { &rest[1..] } else { &rest[1..] };
+            // 位置分隔符 ':'(rust/js)或 '('(tsc)后即行号数字,统一跳过该单字符分隔符。
+            let after = &rest[1..];
             let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
             let line_no = digits.parse::<u32>().ok();
             if !path.is_empty() && best.as_ref().map(|b| path_start < b.0).unwrap_or(true) {
@@ -327,22 +328,31 @@ fn scan_location(line: &str) -> Option<(String, Option<u32>)> {
     best.map(|(_, p, l)| (p, l))
 }
 
-/// 抽取 text 中紧挨在某个词(如 "passed"/"failed"/"ignored")之前的数字。
+/// 抽取 text 中紧挨在某个词(如 "passed"/"failed"/"ignored")之前的数字,**累加所有出现**。
 /// 词比较**大小写敏感**:摘要计数恒为小写(`2 failed`/`7 passed`),而逐条标记是大写
 /// (`FAILED tests/..` / cargo `... FAILED`)——大小写区分才能避免把标记行误当计数。
-/// 去除词的尾随标点(逗号/分号),用于 cargo/jest/pytest/vitest 摘要计数。
+/// 累加而非只取首个:cargo 一次跑会输出**多条** `test result:`(单元测试 + 各 doctest 等),
+/// 只取首条会把后续二进制/文档测试的计数漏掉而严重低估。pytest/jest 摘要恒为单行,累加无副作用。
+/// 去除词的尾随标点(逗号/分号),用于 cargo/jest/pytest/vitest 摘要计数。返回 None 表示一次都没匹配到。
 fn num_before_word(text: &str, word: &str) -> Option<usize> {
     let tokens: Vec<&str> = text.split_whitespace().collect();
+    let mut total: usize = 0;
+    let mut hit = false;
     for i in 1..tokens.len() {
         let tok = tokens[i].trim_matches(|c: char| !c.is_ascii_alphabetic());
         if tok == word {
             if let Ok(n) = tokens[i - 1].trim_matches(|c: char| !c.is_ascii_digit()).parse::<usize>()
             {
-                return Some(n);
+                total = total.saturating_add(n);
+                hit = true;
             }
         }
     }
-    None
+    if hit {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 // ── 解析分发 ──────────────────────────────────────────────────────────────────
@@ -870,6 +880,46 @@ test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; 
         assert_eq!(adds.file.as_deref(), Some("src/math.rs"));
         assert_eq!(adds.line, Some(42));
         assert_eq!(adds.message, "assertion `left == right` failed");
+    }
+
+    #[test]
+    fn parse_cargo_test_sums_multiple_result_lines() {
+        // 一次 cargo test 通常输出多条 `test result:`(单元测试 + doctest 等),
+        // 计数必须累加,只取首条会严重低估(回归测试:num_before_word 累加而非取首个)。
+        let out = "\
+running 2 tests
+test tests::a ... ok
+test tests::b ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests mycrate
+
+running 3 tests
+test src/lib.rs - foo (line 5) ... ok
+test src/lib.rs - bar (line 9) ... ok
+test src/lib.rs - baz (line 12) ... FAILED
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+";
+        let r = parse_report(Framework::CargoTest, VerifyKind::Test, out, "");
+        // 2(单元) + 2(doctest) 通过,1 doctest 失败 —— 跨两条 result 行累加。
+        assert_eq!(r.passed, 4);
+        assert_eq!(r.failed, 1);
+    }
+
+    #[test]
+    fn scan_location_tsc_paren_form_skips_separator() {
+        // 回归测试(defect 2):tsc 的 `path.ext(line,col)` 与 rust 的 `path.ext:line`
+        // 都应跳过单字符分隔符后取到正确行号(此前是恒等的死分支)。
+        assert_eq!(
+            scan_location("foo.ts(123,5): error TS2322"),
+            Some(("foo.ts".to_string(), Some(123)))
+        );
+        assert_eq!(
+            scan_location("  --> src/x.rs:77:3"),
+            Some(("src/x.rs".to_string(), Some(77)))
+        );
     }
 
     #[test]
