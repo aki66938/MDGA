@@ -33,14 +33,15 @@ pub(crate) fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability
     match tool_name {
         // 只读或纯 UI / 后台控制类工具：自动放行，不打断用户。remember 仅追加项目记忆文件，低风险。
         // code_overview（Plan28 P0-2，Lane B 新增）只读取并统计代码结构，与 read_file / search_text 同列。
+        // git_status/git_diff/git_log 为只读 git 工具，与 read_file/search_text 同列自动放行（R4）。
         "list_dir" | "read_file" | "stat_path" | "search_text" | "glob_files" | "code_overview"
         | "todo_write" | "ask_user" | "run_subtask" | "load_skill" | "remember" | "list_shells"
-        | "get_shell_output" | "kill_shell" | "get_task_output" | "kill_task" | "list_tasks" => {
-            Ok(ToolCapability::FileRead)
-        }
-        "create_file" | "write_file" | "edit_file" | "apply_patch" | "make_dir" | "move_path" => {
-            Ok(ToolCapability::FileWrite)
-        }
+        | "get_shell_output" | "kill_shell" | "get_task_output" | "kill_task" | "list_tasks"
+        | "git_status" | "git_diff" | "git_log" => Ok(ToolCapability::FileRead),
+        // git_add/git_commit/git_branch 改动暂存区/引用，与文件写同档（R4）：默认模式自动放行、
+        // AskEveryTime 逐次审批、Restricted 拒绝；都在工作区内、可审计、可回滚。
+        "create_file" | "write_file" | "edit_file" | "apply_patch" | "make_dir" | "move_path"
+        | "git_add" | "git_commit" | "git_branch" => Ok(ToolCapability::FileWrite),
         "delete_file" | "delete_dir" => Ok(ToolCapability::FileDelete),
         // 注册 MCP 会拉起外部进程/网络服务，按命令执行级别裁决（FullAccess 或审批）。
         "run_command" | "add_mcp_server" => Ok(ToolCapability::CommandRun),
@@ -325,6 +326,7 @@ fn approval_preview(tool_name: &str, arguments: &str) -> String {
     let get = |key: &str| value.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let raw = match tool_name {
         "run_command" => get("command"),
+        "git_commit" => get("message"),
         "write_file" | "create_file" => get("content"),
         "apply_patch" | "edit_file" => {
             let diff = get("diff");

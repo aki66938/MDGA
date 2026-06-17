@@ -7,9 +7,11 @@ use crate::permissions::tool_capability_for_name;
 use crate::web::{execute_web_fetch, execute_web_search};
 use mdga_sandbox_runtime::SessionSecurityContext;
 use mdga_tool_runtime::{
-    code_overview, create_file, delete_dir, delete_file, edit_file, glob_files, list_dir, make_dir,
-    move_path, read_file, run_command, search_text, stat_path, write_file, CodeOverviewRequest,
-    CreateFileRequest, DeleteDirRequest, DeleteFileRequest, EditFileRequest, GlobFilesRequest,
+    code_overview, create_file, delete_dir, delete_file, edit_file, git_add, git_branch,
+    git_commit, git_diff, git_log, git_status, glob_files, list_dir, make_dir, move_path, read_file,
+    run_command, search_text, stat_path, write_file, CodeOverviewRequest, CreateFileRequest,
+    DeleteDirRequest, DeleteFileRequest, EditFileRequest, GitAddRequest, GitBranchRequest,
+    GitCommitRequest, GitDiffRequest, GitLogRequest, GitStatusRequest, GlobFilesRequest,
     ListDirRequest, MakeDirRequest, MovePathRequest, ReadFileRequest, RunCommandRequest,
     SearchTextRequest, StatPathRequest, WriteFileRequest,
 };
@@ -135,6 +137,10 @@ pub(crate) const PARALLEL_READONLY_TOOLS: &[&str] = &[
     "code_overview",
     "web_fetch",
     "web_search",
+    // R4：git 只读工具，无副作用、可并行。
+    "git_status",
+    "git_diff",
+    "git_log",
 ];
 
 /// 执行一个只读工具调用（同步文件工具或异步 web 工具），供并行批量执行。
@@ -604,6 +610,92 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        // R4：git 原生工具——结构化 commit/diff/branch/status，取代 run_command 裸跑 git 字符串。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_status",
+                "description": "Get the STRUCTURED git status of the workspace: current branch, upstream, ahead/behind counts, and lists of staged / unstaged / untracked / conflicted files (each with a porcelain status code). Prefer this over running `git status` via run_command — it returns parsed fields, not text to scrape.",
+                "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_diff",
+                "description": "Show changes as a structured diff: per-file additions/deletions plus the unified patch text. Use mode to choose what is compared. Prefer this over `git diff` via run_command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "type": "string", "enum": ["unstaged", "staged", "all"], "description": "unstaged (default) = working tree vs index; staged = index vs HEAD; all = working tree vs HEAD." },
+                        "path": { "type": "string", "description": "Optional workspace-relative file or directory to limit the diff to." }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_log",
+                "description": "Return recent commits as structured records (hash, short hash, author, email, ISO date, subject). Prefer this over `git log` via run_command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "maxCount": { "type": "integer", "description": "Number of commits to return (default 20, max 200)." },
+                        "path": { "type": "string", "description": "Optional workspace-relative path: only commits touching it." }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_branch",
+                "description": "List branches, or create/switch branches. action='list' (default) returns local branches (set includeRemote=true to include remote-tracking) with the current one flagged. action='create' creates AND switches to a new branch (name required). action='switch' switches to an existing branch (name required).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "create", "switch"], "description": "Defaults to list." },
+                        "name": { "type": "string", "description": "Branch name (required for create/switch)." },
+                        "includeRemote": { "type": "boolean", "description": "list only: include remote-tracking branches. Default false." }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_add",
+                "description": "Stage changes for commit. Provide paths (workspace-relative) to stage specific files, or set all=true to stage everything (`git add -A`). Returns the full set of currently staged files afterwards.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paths": { "type": "array", "items": { "type": "string" }, "description": "Workspace-relative paths to stage." },
+                        "all": { "type": "boolean", "description": "Stage all changes (overrides paths). Default false." }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_commit",
+                "description": "Create a commit from the staged changes with the given message. Set all=true to also stage modified/deleted TRACKED files first (`git commit -a`); untracked files are never included by all. Returns the new commit hash and summary. Stage new files with git_add first.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": { "type": "string", "description": "Commit message." },
+                        "all": { "type": "boolean", "description": "Stage tracked modifications before committing (-a). Default false." }
+                    },
+                    "required": ["message"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     ]
 }
 
@@ -756,6 +848,43 @@ pub(crate) fn execute_builtin_tool_call(
             let request = serde_json::from_str::<RunCommandRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
             serde_json::to_value(run_command(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        // R4：git 原生工具（结构化）。
+        "git_status" => {
+            let request = serde_json::from_str::<GitStatusRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_status(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "git_diff" => {
+            let request = serde_json::from_str::<GitDiffRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_diff(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "git_log" => {
+            let request = serde_json::from_str::<GitLogRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_log(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "git_branch" => {
+            let request = serde_json::from_str::<GitBranchRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_branch(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "git_add" => {
+            let request = serde_json::from_str::<GitAddRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_add(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "git_commit" => {
+            let request = serde_json::from_str::<GitCommitRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_commit(workspace_path, request).map_err(|err| err.to_string())?)
                 .map_err(|err| err.to_string())
         }
         other => Err(format!("未知工具: {other}")),
