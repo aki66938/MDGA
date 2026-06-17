@@ -2005,6 +2005,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// B 修复回归(0.0.45):受限令牌沙箱(文件隔离-A 降级目标)应能跑 native 命令并回传输出,
+    /// 而非进程启动即失败——此前 lpDesktop=NULL + deny-only Admin 致 echo/dir/whoami 全 exit -1073741502。
+    #[cfg(windows)]
+    #[test]
+    fn restricted_sandbox_runs_native_command() {
+        let ws = std::env::temp_dir().join(format!("mdga-restricted-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let r = sandbox_win::run_in_restricted_sandbox(
+            &ws,
+            "cmd /c echo RESTRICTED_OK",
+            std::time::Duration::from_secs(20),
+            None,
+            None,
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+        let out = r.expect("受限令牌沙箱起进程失败");
+        eprintln!("[restricted] exit={:?} stdout=[{}]", out.exit_code, out.stdout.trim());
+        assert!(
+            out.stdout.contains("RESTRICTED_OK"),
+            "受限令牌沙箱应能跑 native 命令并回传输出(此前 exit -1073741502 启动失败):\n{}",
+            out.stdout
+        );
+        assert_eq!(out.sandbox_layer.as_deref(), Some("restricted"));
+    }
+
     fn temp_workspace() -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

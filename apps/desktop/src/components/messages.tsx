@@ -7,7 +7,7 @@ import rehypeHighlight from "rehype-highlight";
 import "highlight.js/styles/github.css";
 import {
   CheckSquare, CircleDot, Square, Info, Check, Copy, RefreshCw, Pencil,
-  ChevronDown, ChevronRight, Brain, Ban, X,
+  ChevronDown, ChevronRight, Ban, X,
 } from "lucide-react";
 import type {
   TodoItem, Message, ToolPart, VisionPart, ReasoningPart, RenderBlock, UsageSummary,
@@ -130,6 +130,8 @@ export function MessageActions({
   onResend,
   onEditRetry,
   onRegenerate,
+  usage,
+  showCost,
 }: {
   msg: Message;
   disabled: boolean;
@@ -139,11 +141,17 @@ export function MessageActions({
   onResend: () => void;
   onEditRetry: () => void;
   onRegenerate: () => void;
+  /** 该轮 token 用量（0.0.45）：随操作条同行展示，仅 assistant 消息有。 */
+  usage?: UsageSummary;
+  /** 是否显示成本金额（非 DeepSeek 主供应商时以「—」占位）。 */
+  showCost: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const hasText = msg.parts.some((p) => p.type === "text" && p.content.trim().length > 0);
-  // 有文字才显示复制/重发/编辑；但最后一条助手消息即使无文字（纯工具）也要能「重新生成」。
-  if (!hasText && !isLastAssistant) return null;
+  const showUsage = msg.role === "assistant" && !!usage;
+  // 有文字才显示复制/重发/编辑；但最后一条助手消息即使无文字（纯工具）也要能「重新生成」；
+  // 另:assistant 带 token 用量时也要出条(把每轮 token 行并入本操作条,0.0.45)。
+  if (!hasText && !isLastAssistant && !showUsage) return null;
 
   async function handleCopy() {
     try {
@@ -157,6 +165,7 @@ export function MessageActions({
 
   return (
     <div className={`message-actions message-actions--${msg.role}`} aria-label="消息操作">
+      {showUsage && usage && <UsageBadge usage={usage} showCost={showCost} />}
       {hasText && (
         <button
           type="button"
@@ -300,7 +309,18 @@ export function ReasoningCard({ part }: { part: ReasoningPart }) {
         aria-expanded={expanded}
       >
         <span className="reasoning-card__caret"><ChevronRight size={13} /></span>
-        <Brain size={13} className="reasoning-card__brain" />
+        <span className="reasoning-card__bulb" aria-hidden="true">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+            <line x1="12" y1="1.6" x2="12" y2="3" />
+            <line x1="5.6" y1="3.6" x2="6.6" y2="4.7" />
+            <line x1="18.4" y1="3.6" x2="17.4" y2="4.7" />
+            <line x1="2.6" y1="11" x2="4.1" y2="11" />
+            <line x1="19.9" y1="11" x2="21.4" y2="11" />
+            <path d="M12 4.4a5.4 5.4 0 0 0-3.4 9.6c0.6 0.5 0.9 1.2 0.9 2v0.3h5v-0.3c0-0.8 0.3-1.5 0.9-2A5.4 5.4 0 0 0 12 4.4z" />
+            <line x1="9.9" y1="18.6" x2="14.1" y2="18.6" />
+            <line x1="10.5" y1="20.6" x2="13.5" y2="20.6" />
+          </svg>
+        </span>
         <span className="reasoning-card__title">思考过程</span>
       </button>
       {expanded && (

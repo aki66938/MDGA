@@ -20,8 +20,7 @@ use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::{
-    CreateRestrictedToken, CreateWellKnownSid, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
-    WinBuiltinAdministratorsSid, DISABLE_MAX_PRIVILEGE, PSID, TOKEN_ADJUST_DEFAULT,
+    CreateRestrictedToken, SECURITY_ATTRIBUTES, DISABLE_MAX_PRIVILEGE, TOKEN_ADJUST_DEFAULT,
     TOKEN_ADJUST_GROUPS, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
     TOKEN_QUERY,
 };
@@ -115,27 +114,15 @@ pub fn run_in_restricted_sandbox(
         )
         .map_err(|e| err(format!("OpenProcessToken 失败: {e}")))?;
 
-        // 2) 构造 Administrators SID（用于禁用）
-        let mut admin_sid = [0u8; 68];
-        let mut sid_len = admin_sid.len() as u32;
-        CreateWellKnownSid(
-            WinBuiltinAdministratorsSid,
-            None,
-            PSID(admin_sid.as_mut_ptr() as *mut _),
-            &mut sid_len,
-        )
-        .map_err(|e| err(format!("CreateWellKnownSid 失败: {e}")))?;
-        let sids_to_disable = [SID_AND_ATTRIBUTES {
-            Sid: PSID(admin_sid.as_mut_ptr() as *mut _),
-            Attributes: 0,
-        }];
-
-        // 3) 派生受限令牌：剥离所有特权 + 禁用 Administrators 组
+        // 2) 派生受限令牌：仅 DISABLE_MAX_PRIVILEGE 剥离所有特权(已足以挡住管理员能力)。
+        //    不再 deny-only 禁用 Administrators 组——deny-only Admin 会改变有效组集合,使降权令牌在
+        //    交互窗口站 / 桌面的 DACL 命中失败,致命令进程在 DLL 初始化期打开 winsta0\default 被拒
+        //    (0xC0000142 STATUS_DLL_INIT_FAILED,echo/dir/whoami 全部 exit -1073741502)。
         let mut restricted = HANDLE::default();
         CreateRestrictedToken(
             process_token,
             DISABLE_MAX_PRIVILEGE,
-            Some(&sids_to_disable),
+            None,
             None,
             None,
             &mut restricted,
@@ -180,9 +167,15 @@ pub fn run_in_restricted_sandbox(
             HANDLE_FLAGS(0),
         );
 
-        // 6) STARTUPINFO（重定向 std 句柄）
+        // 6) STARTUPINFO（重定向 std 句柄）。必须显式指定交互桌面 winsta0\default,否则降权进程在
+        //    DLL 初始化期连 CSRSS / 打开桌面失败(0xC0000142)。desktop 缓冲须活到 CreateProcessAsUserW 返回。
+        let mut desktop: Vec<u16> = "winsta0\\default"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let mut si = STARTUPINFOW::default();
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        si.lpDesktop = PWSTR(desktop.as_mut_ptr());
         si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdOutput = out_w;
         si.hStdError = err_w;
@@ -271,6 +264,19 @@ pub fn run_in_restricted_sandbox(
         let _ = CloseHandle(pi.hProcess);
         let _ = CloseHandle(job); // 关闭 job → KILL_ON_JOB_CLOSE 收尾残留子进程
         let _ = CloseHandle(restricted);
+
+        // 加固:exit_code 落在 NTSTATUS 错误段(0xC000_0000+)且无任何输出 → 不是命令的正常退出码,
+        // 而是进程启动即失败(如 0xC0000142 DLL init)。当沙箱启动失败返回 Err 触发 fail-closed,
+        // 避免把「沙箱跑不起来」静默上报成「命令退出码 -1073741502」误导诊断。
+        if !timed_out
+            && (exit_code & 0xF000_0000) == 0xC000_0000
+            && stdout.is_empty()
+            && stderr.is_empty()
+        {
+            return Err(err(format!(
+                "受限令牌沙箱进程启动失败(NTSTATUS 0x{exit_code:08X},命令未执行)"
+            )));
+        }
 
         Ok(RunCommandResult {
             command: command.to_string(),

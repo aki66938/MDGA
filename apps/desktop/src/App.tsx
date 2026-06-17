@@ -56,7 +56,6 @@ import {
   TodoPanel,
   MessageContent,
   MessageActions,
-  UsageBadge,
   ConversationUsageSummary,
 } from "./components/messages";
 import {
@@ -1646,29 +1645,15 @@ export function App() {
                     onResend={() => resendMessage(msg)}
                     onEditRetry={() => editRetryMessage(msg)}
                     onRegenerate={handleRegenerate}
+                    usage={msg.usage}
+                    showCost={isDeepseekMain}
                   />
-                  {msg.role === "assistant" && msg.usage && (
-                    <UsageBadge usage={msg.usage} showCost={isDeepseekMain} />
-                  )}
                 </div>
               );
             })}
             {sending && (
               <div className="agent-working" aria-label="Agent 工作状态">
-                <span className="idea-bulb" aria-hidden="true">
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-                    <g className="idea-bulb__rays">
-                      <line x1="12" y1="1.6" x2="12" y2="3" />
-                      <line x1="5.6" y1="3.6" x2="6.6" y2="4.7" />
-                      <line x1="18.4" y1="3.6" x2="17.4" y2="4.7" />
-                      <line x1="2.6" y1="11" x2="4.1" y2="11" />
-                      <line x1="19.9" y1="11" x2="21.4" y2="11" />
-                    </g>
-                    <path d="M12 4.4a5.4 5.4 0 0 0-3.4 9.6c0.6 0.5 0.9 1.2 0.9 2v0.3h5v-0.3c0-0.8 0.3-1.5 0.9-2A5.4 5.4 0 0 0 12 4.4z" />
-                    <line x1="9.9" y1="18.6" x2="14.1" y2="18.6" />
-                    <line x1="10.5" y1="20.6" x2="13.5" y2="20.6" />
-                  </svg>
-                </span>
+                <span className="star-spin" aria-hidden="true">✦</span>
                 <span>{agentStatus ?? "正在思考…"}</span>
                 <span className="agent-working__elapsed">{elapsedSec}s</span>
               </div>

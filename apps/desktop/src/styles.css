@@ -379,18 +379,20 @@ h1 {
   line-height: 1.6;
 }
 
-/* ── 消息级操作条（Plan19 P1a）：默认隐藏，hover 整行时淡入 ── */
+/* ── 消息级操作条（Plan19 P1a；0.0.45 改）：每轮 token 行并入本行常驻可见,
+   复制/重发/重生成图标按钮仍默认隐藏、hover 整行(或聚焦)才淡入。 ── */
 
 .message-actions {
   display: flex;
-  gap: 4px;
+  align-items: center;
+  gap: 6px;
   margin-top: 4px;
-  opacity: 0;
-  transition: opacity .12s;
+  min-height: 26px;
 }
 
-.message-row:hover .message-actions {
-  opacity: 1;
+/* token 行落到操作条同行:清掉它独立成行时的上边距,避免被推下半行。字号/弱色沿用 .usage-badge。 */
+.message-actions .usage-badge {
+  margin-top: 0;
 }
 
 .message-actions--user {
@@ -410,7 +412,14 @@ h1 {
   border-radius: 7px;
   padding: 0;
   cursor: pointer;
-  transition: color .12s, background .12s;
+  opacity: 0;
+  transition: color .12s, background .12s, opacity .12s;
+}
+
+/* 仅图标按钮 hover 整行(或键盘聚焦)才淡入;token 行不参与淡入、始终可见。 */
+.message-row:hover .message-actions__btn,
+.message-actions__btn:focus-visible {
+  opacity: 1;
 }
 
 .message-actions__btn:hover:not(:disabled) {
@@ -2671,26 +2680,43 @@ h1 {
 
 .slash-menu__icon { color: var(--text-3); flex-shrink: 0; }
 
-/* 思考图标「金点子」灯泡：线性灯泡 + 环绕放射线,暖灯泡色(深色更亮),亮起=暖光晕呼吸 + 放射线微张。
-   呼应动漫/游戏里「想到好点子」的灯泡,替代早期四角星。 */
-.idea-bulb {
-  display: inline-flex;
-  color: #F5A623;
+/* agent 实时工作状态四角星：DeepSeek 蓝 ✦ 柔和「呼吸」(缩放 + 透明度脉冲)。
+   用于「正在思考 / 执行工具…」状态行(实时状态指示)。 */
+.star-spin {
+  display: inline-block;
+  color: var(--brand);
+  animation: star-pulse 1.4s ease-in-out infinite;
 }
-:root[data-theme="dark"] .idea-bulb { color: #FBBF24; }
 .tool-inline__star { font-size: 13px; line-height: 1; }
-.idea-bulb svg { animation: bulb-glow 1.8s ease-in-out infinite; }
-.idea-bulb__rays { transform-origin: 12px 12px; animation: ray-flare 1.8s ease-in-out infinite; }
-@keyframes bulb-glow {
-  0%, 100% { opacity: 0.65; filter: drop-shadow(0 0 0 rgba(245, 166, 35, 0)); }
-  50%      { opacity: 1;    filter: drop-shadow(0 0 3px rgba(245, 166, 35, 0.7)); }
-}
-@keyframes ray-flare {
+@keyframes star-pulse {
   0%, 100% { transform: scale(0.82); opacity: 0.5; }
-  50%      { transform: scale(1.08); opacity: 1; }
+  50%      { transform: scale(1.16); opacity: 1; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .idea-bulb svg, .idea-bulb__rays { animation: none; }
+  .star-spin { animation: none; opacity: 0.85; }
+}
+
+/* 思考过程框「金点子」灯泡标识：线性灯泡 + 环绕放射线,暖灯泡色(深色更亮)。
+   「亮起」动画(亮点子!):暖光晕呼吸(drop-shadow 0→4px)+ 整体微缩放使放射线随之微张,
+   2.6s 缓动循环、轻量不喧宾夺主,呼应动漫/游戏里「想到好点子」的灯泡。光晕色用变量随主题切换。 */
+.reasoning-card__bulb {
+  display: inline-flex;
+  color: #F5A623;
+  flex-shrink: 0;
+  --bulb-glow: rgba(245, 166, 35, 0.55);
+  transform-origin: center;
+  animation: bulb-glow 2.6s ease-in-out infinite;
+}
+:root[data-theme="dark"] .reasoning-card__bulb {
+  color: #FBBF24;
+  --bulb-glow: rgba(251, 191, 36, 0.6);
+}
+@keyframes bulb-glow {
+  0%, 100% { transform: scale(0.96); filter: drop-shadow(0 0 0 transparent); opacity: 0.82; }
+  50%      { transform: scale(1.06); filter: drop-shadow(0 0 4px var(--bulb-glow)); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .reasoning-card__bulb { animation: none; opacity: 1; }
 }
 
 /* tool-inline 图标颜色随状态（Lucide 继承 currentColor） */

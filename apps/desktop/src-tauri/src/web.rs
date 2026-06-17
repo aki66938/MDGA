@@ -95,27 +95,47 @@ pub(crate) async fn execute_web_search(arguments: &str) -> Result<serde_json::Va
     let parsed: serde_json::Value =
         serde_json::from_str(arguments).map_err(|e| format!("工具参数解析失败: {e}"))?;
     let query = parsed.get("query").and_then(|v| v.as_str()).ok_or("web_search 缺少 query")?;
+    // 真实浏览器 UA(原 "MDGA/1.0" 自报名易被判爬虫、触发反爬限流)。
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent("Mozilla/5.0 (compatible; MDGA/1.0)")
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
-        .post("https://html.duckduckgo.com/html/")
-        .form(&[("q", query)])
-        .send()
-        .await
-        .map_err(|e| format!("搜索失败: {e}"))?;
-    let html = resp.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
-    let results = parse_ddg_results(&html, 8);
-    if results.is_empty() {
-        return Ok(serde_json::json!({
-            "query": query,
-            "results": [],
-            "note": "未解析到结果（搜索页结构可能变化），可改用 web_fetch 直接抓取已知 URL。"
-        }));
+    // DDG HTML 端点连发会触发反爬:返回 202/403 + 含 anomaly.js 的挑战页(需 JS),解析必空。
+    // 看 HTTP 状态码 + 探测挑战页,命中则退避后重试(最多 3 次),区分「被限流」与「真无结果」。
+    let mut note = String::from("未获取到搜索结果");
+    for attempt in 0..3u32 {
+        let resp = match client
+            .post("https://html.duckduckgo.com/html/")
+            .form(&[("q", query)])
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                note = format!("搜索请求失败: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(400 * (attempt as u64 + 1))).await;
+                continue;
+            }
+        };
+        let status = resp.status();
+        let html = resp.text().await.unwrap_or_default();
+        if !status.is_success() || html.contains("anomaly.js") {
+            note = format!("搜索引擎反爬限流(HTTP {})", status.as_u16());
+            tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1))).await;
+            continue;
+        }
+        let results = parse_ddg_results(&html, 8);
+        if !results.is_empty() {
+            return Ok(serde_json::json!({ "query": query, "results": results }));
+        }
+        note = String::from("未解析到结果(搜索页可能无匹配或结构变化)");
     }
-    Ok(serde_json::json!({ "query": query, "results": results }))
+    Ok(serde_json::json!({
+        "query": query,
+        "results": [],
+        "note": format!("{note}——可能被搜索引擎临时反爬限流,请稍后重试,或改用 web_fetch 直接抓取已知 URL。")
+    }))
 }
 
 /// 从 DuckDuckGo HTML 结果页解析前 limit 条 { title, url, snippet }。
