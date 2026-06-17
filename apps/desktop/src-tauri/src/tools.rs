@@ -133,6 +133,7 @@ pub(crate) const PARALLEL_READONLY_TOOLS: &[&str] = &[
     "glob_files",
     "stat_path",
     "code_overview",
+    "repo_map",
     "web_fetch",
     "web_search",
 ];
@@ -288,6 +289,24 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                         "path": { "type": "string", "description": "Relative path inside the workspace. Use \".\" for the workspace root; may be a file or a directory." }
                     },
                     "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        // repo_map（R2）：tree-sitter 抽取定义 + PageRank 引用排名的全仓符号地图。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "repo_map",
+                "description": "Get a RANKED repository map of the most important code definitions across the whole workspace, WITHOUT reading files one by one. Parses sources with tree-sitter (Rust, Python, JS, TS/TSX, Go) to extract definitions (functions, methods, types, classes, traits, etc.) and references, then ranks them with a personalized PageRank over the reference graph (the more a symbol is referenced by important files, the higher it ranks). Output lists files in importance order, each with its top definition signature lines and line numbers. Use this EARLY to orient in an unfamiliar or large codebase, to find where the core/most-referenced code lives, and to see who-depends-on-what — it complements glob_files/search_text (which find by name/text) and code_overview (which counts structure in one path). Pass focus_files and/or query to bias the map toward a specific area. Read-only; lightweight; large repos are capped and the result says so.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "focusFiles": { "type": "array", "items": { "type": "string" }, "description": "Optional workspace-relative file paths to focus the map around (PageRank is personalized toward these and their collaborators)." },
+                        "query": { "type": "string", "description": "Optional free-text keywords; symbols whose names match are boosted and their defining files surfaced first." },
+                        "maxTokens": { "type": "integer", "description": "Optional token budget for the rendered map (default 1500, clamped to 200–20000)." }
+                    },
+                    "required": [],
                     "additionalProperties": false
                 }
             }
@@ -740,6 +759,7 @@ pub(crate) fn execute_builtin_tool_call(
             )
             .map_err(|err| err.to_string())
         }
+        "repo_map" => execute_repo_map(workspace_path, arguments),
         "move_path" => {
             let request = serde_json::from_str::<MovePathRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
@@ -760,6 +780,35 @@ pub(crate) fn execute_builtin_tool_call(
         }
         other => Err(format!("未知工具: {other}")),
     }
+}
+
+/// repo_map 工具（R2）：解析工作区源码，构建 tree-sitter + PageRank 的全仓符号地图。
+/// 参数全可选；空参数即「默认预算的全仓概览」。只读、无副作用。
+fn execute_repo_map(workspace_path: &str, arguments: &str) -> Result<serde_json::Value, String> {
+    #[derive(serde::Deserialize, Default)]
+    struct RepoMapArgs {
+        #[serde(rename = "focusFiles", default)]
+        focus_files: Vec<String>,
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(rename = "maxTokens", default)]
+        max_tokens: usize,
+    }
+    // 空字符串 / "{}" / 缺省都按默认请求处理。
+    let trimmed = arguments.trim();
+    let args = if trimmed.is_empty() {
+        RepoMapArgs::default()
+    } else {
+        serde_json::from_str::<RepoMapArgs>(trimmed)
+            .map_err(|err| format!("工具参数解析失败: {err}"))?
+    };
+    let request = mdga_codemap::CodemapRequest {
+        focus_files: args.focus_files,
+        query: args.query,
+        max_tokens: args.max_tokens,
+    };
+    serde_json::to_value(mdga_codemap::build_repo_map(workspace_path, &request))
+        .map_err(|err| err.to_string())
 }
 
 pub(crate) fn execute_create_file_tool_call(
