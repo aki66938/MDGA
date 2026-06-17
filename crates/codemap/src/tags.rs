@@ -31,8 +31,8 @@ pub struct FileTags {
     pub refs: Vec<String>,
 }
 
-/// 单个源行渲染上限（避免超长行撑爆地图）。
-const MAX_SIG_LEN: usize = 160;
+/// 单个源行渲染上限（避免超长行撑爆地图）。供启发式回退共用同一口径。
+pub(crate) const MAX_SIG_LEN: usize = 160;
 /// 解析的单文件字节上限（超过视为非源码/生成物，跳过）。
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 /// 进程内文件标签缓存的条目上限。超过即整表清空（粗粒度淘汰），
@@ -87,7 +87,12 @@ fn parse_file(abs_path: &Path) -> FileTags {
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
     let Some(def) = lang::lang_for_extension(&ext) else {
-        return FileTags::default();
+        // 无 tree-sitter grammar 的扩展名：走通用启发式回退，让每个文本文件都贡献粗粒度符号。
+        // 非 UTF-8 / 二进制由 heuristic::extract 内部判空，读取失败则返回空标签。
+        return match std::fs::read_to_string(abs_path) {
+            Ok(source) => crate::heuristic::extract(&source),
+            Err(_) => FileTags::default(),
+        };
     };
     let Some(compiled) = compiled_query(def) else {
         return FileTags::default();

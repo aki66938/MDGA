@@ -8,6 +8,7 @@
 //! 构引用图跑 PageRank → token 预算内渲染。任一文件/语言失败都降级跳过,不影响整体。
 
 mod graph;
+mod heuristic;
 mod lang;
 mod render;
 mod tags;
@@ -99,7 +100,7 @@ pub fn build_repo_map(workspace_root: &str, request: &CodemapRequest) -> Codemap
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
-        if !lang::is_supported_extension(&ext) {
+        if !lang::should_scan_extension(&ext) {
             continue;
         }
         if rel_paths.len() >= MAX_FILES {
@@ -113,8 +114,9 @@ pub fn build_repo_map(workspace_root: &str, request: &CodemapRequest) -> Codemap
 
     if rel_paths.is_empty() {
         return empty_result(
-            "工作区内未发现受支持语言的源文件\
-             (rust:rs、python:py/pyi、javascript:js/jsx/mjs/cjs、typescript:ts/mts/cts/tsx、go:go)",
+            "工作区内未发现可扫描的文本源文件\
+             (含 tree-sitter 精确解析的 rust/python/js/ts/go/java/c/c++/c#/ruby/php/bash/lua/scala,\
+             及其它文本文件的启发式回退;仅二进制/媒体/锁文件等被排除)",
         );
     }
 
@@ -416,6 +418,77 @@ mod tests {
         assert!(
             result.map.contains("real_app"),
             "地图应包含真实源码 app.rs 的符号,实得:\n{}",
+            result.map
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新增 grammar 端到端：一个 .java 文件经完整流水线应抽出其 class 与 method 定义。
+    #[test]
+    fn java_grammar_extracts_class_and_method() {
+        let dir = temp_workspace();
+        write(
+            &dir,
+            "Greeter.java",
+            "public class Greeter {\n    public String greet(String who) {\n        return \"hi \" + who;\n    }\n}\n",
+        );
+        let result = build_repo_map(dir.to_str().unwrap(), &default_req());
+        assert_eq!(result.total_files, 1, "应扫到 1 个 .java 文件");
+        assert!(
+            result.map.contains("Greeter"),
+            "地图应含 Java 类名 Greeter,实得:\n{}",
+            result.map
+        );
+        assert!(
+            result.map.contains("greet"),
+            "地图应含 Java 方法名 greet,实得:\n{}",
+            result.map
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启发式回退端到端：无 grammar 的扩展名(.kt)文件也应贡献粗粒度符号,
+    /// 证明「每个文本文件都进地图」的兜底确实接到了主流水线上。
+    #[test]
+    fn heuristic_fallback_extracts_symbol_from_unsupported_ext() {
+        let dir = temp_workspace();
+        // Kotlin 暂无专属 grammar → 走启发式;fun/class 关键字应被识别。
+        write(
+            &dir,
+            "Sample.kt",
+            "// a kotlin file with no tree-sitter grammar\nclass Sample {\n    fun doThing() {}\n}\n",
+        );
+        let result = build_repo_map(dir.to_str().unwrap(), &default_req());
+        assert_eq!(result.total_files, 1, "无 grammar 的文本文件也应被发现并计数");
+        assert!(
+            result.total_definitions >= 1,
+            "启发式应至少抽到 1 个定义,实得 {}",
+            result.total_definitions
+        );
+        assert!(
+            result.map.contains("Sample") || result.map.contains("doThing"),
+            "地图应含启发式抽到的符号(Sample 或 doThing),实得:\n{}",
+            result.map
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 二进制/资源类扩展名不应被发现阶段收录(避免把 .png 等当文本送启发式)。
+    #[test]
+    fn binary_extensions_are_not_scanned() {
+        let dir = temp_workspace();
+        write(&dir, "real.rs", "pub fn keep_me() {}\n");
+        // 一个伪 png:扩展名在排除名单里,即便内容是文本也不该进地图。
+        write(&dir, "asset.png", "function shouldNotAppear() {}\n");
+        let result = build_repo_map(dir.to_str().unwrap(), &default_req());
+        assert_eq!(
+            result.total_files, 1,
+            ".png 应被发现阶段排除,只剩 real.rs,实得 {} 个文件",
+            result.total_files
+        );
+        assert!(
+            !result.map.contains("shouldNotAppear"),
+            "排除扩展名的内容不应出现在地图,实得:\n{}",
             result.map
         );
         let _ = std::fs::remove_dir_all(&dir);
