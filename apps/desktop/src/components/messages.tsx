@@ -299,7 +299,7 @@ export function ReasoningCard({ part }: { part: ReasoningPart }) {
         onClick={() => setExpanded((v) => !v)}
         aria-expanded={expanded}
       >
-        <span className="reasoning-card__caret">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
+        <span className="reasoning-card__caret"><ChevronRight size={13} /></span>
         <Brain size={13} className="reasoning-card__brain" />
         <span className="reasoning-card__title">思考过程</span>
       </button>

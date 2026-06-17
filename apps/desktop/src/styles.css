@@ -2671,20 +2671,26 @@ h1 {
 
 .slash-menu__icon { color: var(--text-3); flex-shrink: 0; }
 
-/* 思考 / 工具运行四角星：早期版本的 ✦ 缓慢整圈旋转 + 透明度脉冲，配色用 DeepSeek 蓝 */
-.star-spin {
-  display: inline-block;
-  color: var(--brand);
-  animation: agent-spin 1.6s linear infinite;
+/* 思考图标「金点子」灯泡：线性灯泡 + 环绕放射线,暖灯泡色(深色更亮),亮起=暖光晕呼吸 + 放射线微张。
+   呼应动漫/游戏里「想到好点子」的灯泡,替代早期四角星。 */
+.idea-bulb {
+  display: inline-flex;
+  color: #F5A623;
 }
+:root[data-theme="dark"] .idea-bulb { color: #FBBF24; }
 .tool-inline__star { font-size: 13px; line-height: 1; }
-@keyframes agent-spin {
-  0%   { transform: rotate(0deg);   opacity: 1; }
-  50%  { transform: rotate(180deg); opacity: 0.5; }
-  100% { transform: rotate(360deg); opacity: 1; }
+.idea-bulb svg { animation: bulb-glow 1.8s ease-in-out infinite; }
+.idea-bulb__rays { transform-origin: 12px 12px; animation: ray-flare 1.8s ease-in-out infinite; }
+@keyframes bulb-glow {
+  0%, 100% { opacity: 0.65; filter: drop-shadow(0 0 0 rgba(245, 166, 35, 0)); }
+  50%      { opacity: 1;    filter: drop-shadow(0 0 3px rgba(245, 166, 35, 0.7)); }
+}
+@keyframes ray-flare {
+  0%, 100% { transform: scale(0.82); opacity: 0.5; }
+  50%      { transform: scale(1.08); opacity: 1; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .star-spin { animation: none; opacity: 0.85; }
+  .idea-bulb svg, .idea-bulb__rays { animation: none; }
 }
 
 /* tool-inline 图标颜色随状态（Lucide 继承 currentColor） */
@@ -2842,9 +2848,9 @@ h1 {
 
 .reasoning-card {
   margin: 6px 0;
-  border: 1px solid var(--border);
+  border: 1px dashed var(--border);
   border-radius: 8px;
-  background: var(--surface-2);
+  background: transparent;
   overflow: hidden;
 }
 
@@ -2862,12 +2868,21 @@ h1 {
   text-align: left;
 }
 
-.reasoning-card__summary:hover { color: var(--text); }
+.reasoning-card__summary:hover { color: var(--text); background: var(--brand-tint); }
 
 .reasoning-card__caret {
   display: inline-flex;
   width: 14px;
   color: var(--text-3);
+  transition: transform .18s ease, color .14s ease;
+}
+.reasoning-card__summary[aria-expanded="true"] .reasoning-card__caret {
+  transform: rotate(90deg);
+  color: var(--brand);
+}
+@keyframes reasoning-expand {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 .reasoning-card__brain { color: var(--text-3); flex-shrink: 0; }
@@ -2877,7 +2892,9 @@ h1 {
 .reasoning-card__body {
   margin: 0;
   padding: 10px 12px;
-  border-top: 1px solid var(--border);
+  border-top: 1px dashed var(--border);
+  background: var(--brand-tint);
+  animation: reasoning-expand .2s ease;
   font-size: 12.5px;
   line-height: 1.6;
   color: var(--text-2);
