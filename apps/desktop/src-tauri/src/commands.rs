@@ -368,6 +368,30 @@ pub(crate) fn persist_message(
     .map_err(|e| e.to_string())
 }
 
+/// 续接(P2 入口):读回某会话落库的 wire 快照,补孤儿 tool_result 后返回合法 wire JSON;无则 None。
+/// 供前端在断额/崩溃后用完整 wire(含 tool 角色)重建上下文续接,而非只回喂纯文本。
+#[tauri::command]
+pub(crate) fn load_wire(
+    state: State<AppState>,
+    conversation_id: String,
+) -> Result<Option<String>, String> {
+    let raw = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        mdga_storage::get_wire_snapshot(&db, &conversation_id).map_err(|e| e.to_string())?
+    };
+    match raw {
+        None => Ok(None),
+        Some(json) => {
+            let mut wire: Vec<serde_json::Value> =
+                serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            crate::agent_loop::finalize_wire(&mut wire);
+            serde_json::to_string(&wire)
+                .map(Some)
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
 /// 更新会话标题。
 ///
 /// 输入会话 ID 和新标题；用于首条消息发送后自动设置有意义的标题。

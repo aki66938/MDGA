@@ -209,6 +209,12 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_token_ledger_conv
             ON token_ledger (conversation_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS wire_snapshots (
+            conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+            wire_json       TEXT NOT NULL,
+            updated_at      INTEGER NOT NULL
+        );
         ",
     )?;
     add_column_if_missing(&conn, "conversations", "workspace_path", "TEXT")?;
@@ -496,6 +502,34 @@ pub fn save_message(
         params![now, conv_id],
     )?;
     Ok(())
+}
+
+// ── Wire snapshot (任务续接 P0) ────────────────────────────────────────────
+
+/// 落库某会话当前完整 wire 历史(OpenAI 格式消息数组的 JSON)。每会话一行,UPSERT 覆盖。
+/// 供断额/崩溃后从 DB 重建完整 wire(含 tool 角色)续接,不再依赖前端 chat-done 整轮才落库。
+pub fn save_wire_snapshot(conn: &Connection, conv_id: &str, wire_json: &str) -> SqlResult<()> {
+    let now = now_ts();
+    conn.execute(
+        "INSERT INTO wire_snapshots (conversation_id, wire_json, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(conversation_id) DO UPDATE SET
+             wire_json = excluded.wire_json,
+             updated_at = excluded.updated_at",
+        params![conv_id, wire_json, now],
+    )?;
+    Ok(())
+}
+
+/// 读回某会话的 wire 快照 JSON(无则 None)。供续接重建上下文(P2 消费)。
+pub fn get_wire_snapshot(conn: &Connection, conv_id: &str) -> SqlResult<Option<String>> {
+    let mut stmt =
+        conn.prepare("SELECT wire_json FROM wire_snapshots WHERE conversation_id = ?1")?;
+    let mut rows = stmt.query(params![conv_id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
 }
 
 /// 查询会话的所有消息，按时间正序排列。

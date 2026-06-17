@@ -79,9 +79,15 @@ storage(SQLite `:memory:` 端到端 CRUD)、mcp-client(JSON-RPC 解析)、tools(
   - **网络逐域名 spike(0.0.41)**:4 路研究证实三约束(不改系统/不需管理员/不写驱动)下逐域名「真边界」做不到
     (能看域名的代理可绕过、能强制的 WFP 看不到域名),保持网络全开/全关二选一(WFP 强制的真边界);逐域名列未来项
     (WFP 按 package SID 逐 IP + 自建 DNS 监听,首次需管理员,MVP 2-4 周)。详见 memory `appcontainer-network-perdomain-spike`。
-  - **未尽 / TODO**:网络放行依赖宿主防火墙开;输出非实时(命令结束后按行回调);delay-load/vendor ConPTY
-    (消除系统 ConPTY 版本漂移 + 防 <1809 静态导入启动崩);各 Windows 档(Win10 22H2 / Win11 23H2 / 24H2)
-    分别实测、每次 servicing 后重测。详见 memory `appcontainer-console-output-blocker`。
+  - **沙箱体验/隔离健壮(0.0.42)**:① 文件隔离-A——走 AppContainer 前检测工作区(dev-watch 启发式 + 文件数预探,
+    按 workspace 缓存),被 watch/过大则降级受限令牌沙箱(不碰用户文件 ACL),修掉"在自己 Tauri 项目里开沙箱=首条
+    命令卡死/dev 反复重启"(见 lib.rs `workspace_grant_would_disrupt`);② 输出实时化——reader 按 \n 切行 + 逐行
+    strip_vt 边读边 on_line 回调;③ 文件隔离-B 结论:不动用户文件 ACL 无现成轻量路径隔离机制(memory
+    `appcontainer-file-isolation-tradeoff`)。另:**任务续接**(独立功能)后端 wire 边执行边落库 + 占位补桩,堵
+    "崩溃/断额全丢",真 resume 留 0.0.43(memory `mdga-task-resume-gap`)。
+  - **未尽 / TODO**:网络放行依赖宿主防火墙开;ConPTY 静态导入 <1809 是否启动崩待 Win10 1607 VM 验真(真崩才上
+    delay-load/vendor;否则永久关闭);各 Windows 档(Win10 22H2 / Win11 23H2 / 24H2)分别实测、每次 servicing 后重测。
+    详见 memory `appcontainer-console-output-blocker`、`appcontainer-file-isolation-tradeoff`。
 
 ---
 

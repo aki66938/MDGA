@@ -513,6 +513,53 @@ fn collect_conversation_images(
     images
 }
 
+/// 把当前 wire 历史落库(每会话一行 UPSERT),供断额/崩溃后重建续接。best-effort,失败不影响主流程。
+fn persist_wire(app: &AppHandle, conversation_id: &str, wire: &[serde_json::Value]) {
+    let Ok(json) = serde_json::to_string(wire) else {
+        return;
+    };
+    let state = app.state::<AppState>();
+    let Ok(db) = state.db.lock() else {
+        return;
+    };
+    let _ = mdga_storage::save_wire_snapshot(&db, conversation_id, &json);
+}
+
+/// P1.5:给已声明 tool_calls 却无对应 tool 结果的孤儿(中断在工具执行中途)补占位 tool 消息,
+/// 使落库 wire 满足「每个 tool_use 必跟 tool_result」不变式(否则续接重放撞 Anthropic 400)。
+/// 在 load_wire 读回时调用——崩溃不经 return,孤儿在读回侧补最稳。
+pub(crate) fn finalize_wire(wire: &mut Vec<serde_json::Value>) {
+    let mut answered = std::collections::HashSet::new();
+    for m in wire.iter() {
+        if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            if let Some(id) = m.get("tool_call_id").and_then(|i| i.as_str()) {
+                answered.insert(id.to_string());
+            }
+        }
+    }
+    let mut orphans = Vec::new();
+    for m in wire.iter() {
+        if m.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(calls) = m.get("tool_calls").and_then(|c| c.as_array()) {
+                for call in calls {
+                    if let Some(id) = call.get("id").and_then(|i| i.as_str()) {
+                        if !answered.contains(id) {
+                            orphans.push(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for id in orphans {
+        wire.push(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "content": "(已中断,工具未完成)"
+        }));
+    }
+}
+
 /// Agent 工具循环：每轮带工具问模型、执行返回的工具、把结果回灌，直到模型不再调用工具
 /// （自然终止）或用户中断。不设轮数上限——上下文自动压缩兜底体积，取消按钮兜底失控；
 /// 所有工具执行前都经 SessionSecurityContext 裁决。
@@ -643,6 +690,8 @@ async fn chat_with_builtin_tools(
             wire_messages.clone()
         };
 
+        // 边执行边落库:每轮发起请求前先落本轮起始 wire(含 steering/压缩),断额(下方 .await?)或崩溃后可重建。
+        persist_wire(app, conversation_id, &wire_messages);
         // 流式获取本轮结果：叙述 token 边流边显（内置标记防泄漏守卫），同时累积 tool_calls。
         let completion =
             stream_round_with_retry(base_url, api_key, request_messages, model, tool_schemas.clone(), app)
@@ -731,6 +780,8 @@ async fn chat_with_builtin_tools(
             completion.assistant_message,
             &tool_calls,
         ));
+        // 边执行边落库:assistant 已声明 tool_calls,工具执行前先落——崩溃在工具执行中也能从 DB 重建到此。
+        persist_wire(app, conversation_id, &wire_messages);
 
         // 卡死检测（Plan25 #5③）本轮状态：是否有任意工具成功执行 + 本轮最后一次失败的「工具+参数」签名。
         let mut round_had_success = false;
@@ -795,6 +846,8 @@ async fn chat_with_builtin_tools(
                     "role": "tool", "tool_call_id": call.id, "content": maybe_persist_large_output(workspace_path, &output_str)
                 }));
             }
+            // 并行批次全部完成,落库(本轮 tool 结果已就绪,断额/崩溃可重建)。
+            persist_wire(app, conversation_id, &wire_messages);
             // 卡死检测（Plan25 #5③）：并行只读批次同样纳入「打转」判断，命中即暂停。
             if detect_and_emit_stuck(
                 app,
@@ -1039,6 +1092,8 @@ async fn chat_with_builtin_tools(
             if status == "succeeded" {
                 run_post_tool_hooks(app, workspace_path, &tool_name, &arguments);
             }
+            // 边执行边落库:每个串行工具处理完即落,崩溃在下一个工具时 DB 已有此结果。
+            persist_wire(app, conversation_id, &wire_messages);
         }
 
         // 卡死检测（Plan25 #5③）：本轮全部工具处理完后评估「打转」，命中即 emit 通知并暂停。
@@ -1126,6 +1181,43 @@ mod tests {
 
     // 注（Plan28 P3-9）：messages_with_workspace_context 的 3 个单测已随该函数迁入
     // mdga-agent-core（crates/agent-core/src/messages.rs），此处不再保留。
+
+    #[test]
+    fn finalize_wire_pads_orphan_tool_call() {
+        // assistant 声明 2 个 tool_call,只有 1 个有 tool 结果 → 另一个孤儿,应补占位 tool 消息。
+        let mut wire = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "call_a", "function": {"name": "read_file", "arguments": "{}"}},
+                    {"id": "call_b", "function": {"name": "run_command", "arguments": "{}"}}
+                ]
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_a", "content": "ok"}),
+        ];
+        finalize_wire(&mut wire);
+        assert_eq!(wire.len(), 4, "应为孤儿 call_b 补一条占位 tool 消息");
+        let last = wire.last().unwrap();
+        assert_eq!(last["role"], "tool");
+        assert_eq!(last["tool_call_id"], "call_b");
+        assert!(last["content"].as_str().unwrap().contains("已中断"));
+    }
+
+    #[test]
+    fn finalize_wire_noop_when_all_answered() {
+        // 所有 tool_call 都有对应结果 → finalize 不应添加任何东西。
+        let mut wire = vec![
+            serde_json::json!({
+                "role": "assistant", "content": null,
+                "tool_calls": [{"id": "call_x", "function": {"name": "read_file", "arguments": "{}"}}]
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_x", "content": "done"}),
+        ];
+        finalize_wire(&mut wire);
+        assert_eq!(wire.len(), 2, "无孤儿时 finalize 不应改动");
+    }
 
     #[test]
     fn executes_create_file_tool_call_inside_workspace() {

@@ -1417,6 +1417,91 @@ pub type CommandLineCallback = std::sync::Arc<dyn Fn(String) + Send + Sync>;
 /// 外部取消标志：置 true 时杀掉命令进程（供后台 shell 的 kill 操作）。
 pub type CommandCancel = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
+/// 文件隔离-A:对工作区做 AppContainer ACL 授权是否会扰动?——被 dev-watch(改文件触发 rebuild/HMR)或
+/// 过大(首次把 ACE 传播到每个文件会卡几十秒)。命中返回降级原因。结果按 workspace 进程级缓存,避免每命令
+/// 重复预探。grant 传播不管 .gitignore,故预探数全部文件(含 target/node_modules),反映真实传播成本。
+#[cfg(windows)]
+fn workspace_grant_would_disrupt(workspace: &Path) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<std::path::PathBuf, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = workspace.to_path_buf();
+    if let Ok(map) = cache.lock() {
+        if let Some(cached) = map.get(&key) {
+            return cached.clone();
+        }
+    }
+    let decision = compute_workspace_disruption(workspace);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, decision.clone());
+    }
+    decision
+}
+
+#[cfg(windows)]
+fn compute_workspace_disruption(workspace: &Path) -> Option<String> {
+    // 1. dev-watch 启发式:工作区根或其直接子目录是会被文件监视器盯着的项目(Tauri/Vite/Next dev)。
+    if let Some(marker) = dev_watch_marker(workspace) {
+        return Some(format!(
+            "工作区疑似在 dev 文件监视下({marker});AppContainer 授权会改文件触发 rebuild/HMR,已降级受限令牌沙箱"
+        ));
+    }
+    // 2. 过大:首次授权要把 ACE 传播到每个文件。数全部文件(不跳 .gitignore,因 grant 也不跳),超预算早停。
+    const GRANT_FILE_BUDGET: usize = 50_000;
+    let mut count = 0usize;
+    for entry in ignore::WalkBuilder::new(workspace)
+        .git_ignore(false)
+        .hidden(false)
+        .build()
+        .flatten()
+    {
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            count += 1;
+            if count > GRANT_FILE_BUDGET {
+                return Some(format!(
+                    "工作区文件数超 {GRANT_FILE_BUDGET};AppContainer 首次授权传播 ACL 会卡顿,已降级受限令牌沙箱(无路径隔离)"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// dev-watch 启发式:工作区根或其直接子目录含 Tauri/Vite/Next 等会被 dev server 监视的项目特征文件。
+/// 命中返回标志名(供日志)。纯路径检测,不保证项目"正在跑 dev";误报顶多损失路径隔离(安全侧)。
+#[cfg(windows)]
+fn dev_watch_marker(workspace: &Path) -> Option<String> {
+    fn markers_in(dir: &Path) -> Option<String> {
+        let probes: &[(&str, &str)] = &[
+            ("src-tauri/tauri.conf.json", "Tauri"),
+            ("vite.config.js", "Vite"),
+            ("vite.config.ts", "Vite"),
+            ("vite.config.mjs", "Vite"),
+            ("next.config.js", "Next.js"),
+            ("next.config.ts", "Next.js"),
+            ("next.config.mjs", "Next.js"),
+        ];
+        probes
+            .iter()
+            .find(|(rel, _)| dir.join(rel).exists())
+            .map(|(_, name)| name.to_string())
+    }
+    if let Some(m) = markers_in(workspace) {
+        return Some(m);
+    }
+    if let Ok(entries) = std::fs::read_dir(workspace) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Some(m) = markers_in(&entry.path()) {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 与 run_command 相同，但可选地把命令输出逐行回调给调用方，并可选地接受取消标志。
 ///
 /// 回调在读取线程中触发，调用方需保证回调自身线程安全且不阻塞过久。
@@ -1452,6 +1537,18 @@ pub fn run_command_streaming(
             static APPCONTAINER_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let use_ac = *APPCONTAINER_OK.get_or_init(appcontainer_win::appcontainer_self_test);
             if use_ac {
+                // 文件隔离-A:工作区被 dev-watch 或过大时,AppContainer 首次授权会改工作区每个文件 SD
+                // (触发 tauri/vite watcher rebuild + 大 repo 卡顿)。fail-soft 降级受限令牌沙箱(不碰用户 ACL)。
+                if let Some(reason) = workspace_grant_would_disrupt(&workspace) {
+                    eprintln!("[sandbox] {reason}");
+                    return sandbox_win::run_in_restricted_sandbox(
+                        &workspace, command, timeout, on_line, cancel,
+                    )
+                    .map(|mut r| {
+                        r.sandbox_degraded = true;
+                        r
+                    });
+                }
                 match appcontainer_win::run_in_appcontainer_sandbox(
                     &workspace,
                     command,
@@ -1879,6 +1976,34 @@ fn collect_files_flat(root: &Path, dir: &Path, files: &mut Vec<String>, cap: usi
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_disrupt_detects_dev_watch() {
+        let base = std::env::temp_dir().join(format!("mdga-disrupt-{}", std::process::id()));
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("a.txt"), "x").unwrap();
+        assert!(
+            compute_workspace_disruption(&plain).is_none(),
+            "普通小目录不应降级"
+        );
+        let vite = base.join("vite_proj");
+        std::fs::create_dir_all(&vite).unwrap();
+        std::fs::write(vite.join("vite.config.ts"), "export default {}").unwrap();
+        assert!(
+            compute_workspace_disruption(&vite).is_some(),
+            "Vite 项目应降级"
+        );
+        let mono = base.join("mono");
+        std::fs::create_dir_all(mono.join("app/src-tauri")).unwrap();
+        std::fs::write(mono.join("app/src-tauri/tauri.conf.json"), "{}").unwrap();
+        assert!(
+            dev_watch_marker(&mono).is_some(),
+            "子目录 Tauri 项目应被检测到"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn temp_workspace() -> std::path::PathBuf {
         let nonce = SystemTime::now()

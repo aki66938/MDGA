@@ -627,16 +627,40 @@ pub fn run_in_appcontainer_sandbox(
         // 读伪控制台输出(VT 流)的线程:增量把 chunk 发回主线程(不 join,避免永久阻塞在 read)。
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let out_raw = out_r.0 as isize;
+        let on_line_reader = on_line.clone();
         std::thread::spawn(move || {
             let mut f = std::fs::File::from_raw_handle(out_raw as *mut c_void);
             let mut chunk = [0u8; 8192];
+            // 流式:按 \n 切行缓冲(跨 chunk),每整行经 strip_vt 后实时 on_line 回调。行内 VT 转义完整、
+            // \n 不会切断多字节 UTF-8,故逐行用纯函数 strip_vt 即可,无需流式状态机。
+            let mut line_buf: Vec<u8> = Vec::new();
             loop {
                 match std::io::Read::read(&mut f, &mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // 仍把原始 chunk 发回主线程收集 raw(供最终 result.stdout)。
                         if tx.send(chunk[..n].to_vec()).is_err() {
                             break;
                         }
+                        if let Some(cb) = on_line_reader.as_ref() {
+                            for &b in &chunk[..n] {
+                                if b == b'\n' {
+                                    cb(strip_vt(&String::from_utf8_lossy(&line_buf)));
+                                    line_buf.clear();
+                                } else {
+                                    line_buf.push(b);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // 收尾:emit 无 \n 结尾的最后一行尾巴。
+            if let Some(cb) = on_line_reader.as_ref() {
+                if !line_buf.is_empty() {
+                    let line = strip_vt(&String::from_utf8_lossy(&line_buf));
+                    if !line.is_empty() {
+                        cb(line);
                     }
                 }
             }
@@ -700,11 +724,7 @@ pub fn run_in_appcontainer_sandbox(
             text.truncate(end);
             truncated = true;
         }
-        if let Some(cb) = on_line.as_ref() {
-            for line in text.lines() {
-                cb(line.to_string());
-            }
-        }
+        // on_line 已由 reader 线程在命令运行期间实时逐行回调(流式),此处不再重复;text 仅填 result.stdout。
 
         Ok(RunCommandResult {
             command: command.to_string(),
@@ -842,6 +862,34 @@ mod tests {
             "可观测:AppContainer 路径应标记 sandbox_layer=appcontainer"
         );
         assert!(!out.sandbox_degraded, "AppContainer 成功不应标记降级");
+    }
+
+    /// 输出实时化(0.0.42):on_line 在命令运行期间逐行回调(reader 流式),验证多行命令每行都收到。
+    #[test]
+    fn appcontainer_streams_lines_via_on_line() {
+        let _g = test_guard();
+        let ws = std::env::temp_dir().join(format!("mdga-ac-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("multi.txt"), "AAA\r\nBBB\r\nCCC\r\n").unwrap();
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = lines.clone();
+        let cb: CommandLineCallback = std::sync::Arc::new(move |line: String| {
+            sink.lock().unwrap().push(line);
+        });
+        let r = run_in_appcontainer_sandbox(
+            &ws,
+            "cmd /c type multi.txt",
+            Duration::from_secs(30),
+            Some(cb),
+            None,
+            false,
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+        let _out = r.expect("起进程失败");
+        let collected = lines.lock().unwrap().join("\n");
+        assert!(collected.contains("AAA"), "on_line 应逐行收到 AAA:\n{collected}");
+        assert!(collected.contains("BBB"), "on_line 应逐行收到 BBB:\n{collected}");
+        assert!(collected.contains("CCC"), "on_line 应逐行收到 CCC:\n{collected}");
     }
 
     /// junction/symlink 逃逸防护:工作区是重解析点时,grant 阶段 fail-closed 拒绝(防经 target 逃出工作区)。
