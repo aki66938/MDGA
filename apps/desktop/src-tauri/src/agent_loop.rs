@@ -268,19 +268,23 @@ pub(crate) async fn send_message(
 
     let result = if plan_mode {
         // 计划模式走纯流式（无工具），让模型把计划直接流给用户审阅。
-        chat_stream(&base_url, &api_key, messages, &model_id, |chunk| {
-            // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
-            match chunk {
-                StreamChunk::Content(c) => {
-                    let _ = app.emit("chat-chunk", c.to_string());
+        tokio::select! {
+            r = chat_stream(&base_url, &api_key, messages, &model_id, |chunk| {
+                // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
+                match chunk {
+                    StreamChunk::Content(c) => {
+                        let _ = app.emit("chat-chunk", c.to_string());
+                    }
+                    StreamChunk::Reasoning(r) => {
+                        let _ = app.emit("chat-reasoning", r.to_string());
+                    }
                 }
-                StreamChunk::Reasoning(r) => {
-                    let _ = app.emit("chat-reasoning", r.to_string());
-                }
+            }) => r.map_err(|e| e.to_string()),
+            _ = crate::chat::wait_for_cancel(&cancel_token) => {
+                let _ = app.emit("chat-chunk", "\n\n（已中断）".to_string());
+                Ok(None)
             }
-        })
-        .await
-        .map_err(|e| e.to_string())
+        }
     } else if let Some(workspace_path) = conversation.workspace_path.as_deref() {
         let mcp_bindings = collect_mcp_bindings(&app);
         chat_with_builtin_tools(
@@ -302,19 +306,23 @@ pub(crate) async fn send_message(
         )
         .await
     } else {
-        chat_stream(&base_url, &api_key, messages, &model_id, |chunk| {
-            // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
-            match chunk {
-                StreamChunk::Content(c) => {
-                    let _ = app.emit("chat-chunk", c.to_string());
+        tokio::select! {
+            r = chat_stream(&base_url, &api_key, messages, &model_id, |chunk| {
+                // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
+                match chunk {
+                    StreamChunk::Content(c) => {
+                        let _ = app.emit("chat-chunk", c.to_string());
+                    }
+                    StreamChunk::Reasoning(r) => {
+                        let _ = app.emit("chat-reasoning", r.to_string());
+                    }
                 }
-                StreamChunk::Reasoning(r) => {
-                    let _ = app.emit("chat-reasoning", r.to_string());
-                }
+            }) => r.map_err(|e| e.to_string()),
+            _ = crate::chat::wait_for_cancel(&cancel_token) => {
+                let _ = app.emit("chat-chunk", "\n\n（已中断）".to_string());
+                Ok(None)
             }
-        })
-        .await
-        .map_err(|e| e.to_string())
+        }
     };
 
     // 无论成功或失败都要清理取消令牌与残留的 steering 队列，避免影响下一轮。
@@ -692,10 +700,26 @@ async fn chat_with_builtin_tools(
 
         // 边执行边落库:每轮发起请求前先落本轮起始 wire(含 steering/压缩),断额(下方 .await?)或崩溃后可重建。
         persist_wire(app, conversation_id, &wire_messages);
-        // 流式获取本轮结果：叙述 token 边流边显（内置标记防泄漏守卫），同时累积 tool_calls。
-        let completion =
-            stream_round_with_retry(base_url, api_key, request_messages, model, tool_schemas.clone(), app)
-                .await?;
+        // 流式获取本轮结果：叙述 token 边流边显，同时累积 tool_calls。传 cancel 使流式可被「停止」立即中断
+        // (此前 cancel 只在轮间/工具前检查,卡在流式 await 时看不到,导致点停止要等响应收完才生效)。
+        let completion = match stream_round_with_retry(
+            base_url,
+            api_key,
+            request_messages,
+            model,
+            tool_schemas.clone(),
+            app,
+            &cancel,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) if e == crate::chat::STREAM_CANCELLED => {
+                let _ = app.emit("chat-chunk", "\n\n（已中断）".to_string());
+                return Ok(usage); // 保留已流式显示 + 已落库 wire,前端 chat-done 会持久化
+            }
+            Err(e) => return Err(e),
+        };
         usage = merge_usage(usage, completion.usage.clone());
         // 成本预算：累计 total_tokens 超过预算则暂停（防失控烧 token）。
         let budget = app.state::<AppState>().task_token_budget.load(Ordering::SeqCst);
@@ -1004,6 +1028,7 @@ async fn chat_with_builtin_tools(
                         conversation_id,
                         permission_mode.clone(),
                         permission_rules.clone(),
+                        &cancel,
                     )
                     .await;
                     usage = merge_usage(usage, sub_usage);

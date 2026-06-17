@@ -55,6 +55,20 @@ pub(crate) fn fallback_model_for(model: &str) -> Option<&'static str> {
     }
 }
 
+/// 用户点停止时,stream_round_with_retry 返回此标记串;调用方据此 return Ok(已完成 usage),
+/// 而非当作错误走 ?(那会丢已流式显示的内容、走前端 catch 不落库)。
+pub(crate) const STREAM_CANCELLED: &str = "__MDGA_STREAM_CANCELLED__";
+
+/// 轮询等待 cancel 置位,供 tokio::select! 与流式请求赛跑。
+pub(crate) async fn wait_for_cancel(cancel: &Arc<AtomicBool>) {
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    }
+}
+
 pub(crate) async fn stream_round_with_retry(
     base_url: &str,
     api_key: &str,
@@ -62,6 +76,7 @@ pub(crate) async fn stream_round_with_retry(
     model: &str,
     tools: Vec<serde_json::Value>,
     app: &AppHandle,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<mdga_deepseek_client::ChatCompletionResult, String> {
     const MAX_ATTEMPTS: u32 = 4;
     let mut model = model.to_string();
@@ -69,29 +84,39 @@ pub(crate) async fn stream_round_with_retry(
     let mut attempt = 0;
     loop {
         attempt += 1;
+        // 流式开始前先看一眼:已取消则直接停,不再发起本轮请求。
+        if cancel.load(Ordering::SeqCst) {
+            return Err(STREAM_CANCELLED.to_string());
+        }
         let emitted = Arc::new(AtomicBool::new(false));
         let emitted_cb = emitted.clone();
         let app_cb = app.clone();
-        let result = chat_stream_with_tools(
-            base_url,
-            api_key,
-            messages.clone(),
-            &model,
-            tools.clone(),
-            move |chunk| {
-                // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
-                emitted_cb.store(true, Ordering::SeqCst);
-                match chunk {
-                    StreamChunk::Content(c) => {
-                        let _ = app_cb.emit("chat-chunk", c.to_string());
+        // 让流式请求与 cancel 轮询赛跑:用户点停止 → wait_for_cancel 先完成 → select! drop 掉流式
+        // future(HTTP 连接随之中断),当轮立即停下,返回取消标记(已 emit 的增量不丢)。
+        let result = tokio::select! {
+            r = chat_stream_with_tools(
+                base_url,
+                api_key,
+                messages.clone(),
+                &model,
+                tools.clone(),
+                move |chunk| {
+                    // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
+                    emitted_cb.store(true, Ordering::SeqCst);
+                    match chunk {
+                        StreamChunk::Content(c) => {
+                            let _ = app_cb.emit("chat-chunk", c.to_string());
+                        }
+                        StreamChunk::Reasoning(r) => {
+                            let _ = app_cb.emit("chat-reasoning", r.to_string());
+                        }
                     }
-                    StreamChunk::Reasoning(r) => {
-                        let _ = app_cb.emit("chat-reasoning", r.to_string());
-                    }
-                }
-            },
-        )
-        .await;
+                },
+            ) => r,
+            _ = wait_for_cancel(cancel) => {
+                return Err(STREAM_CANCELLED.to_string());
+            }
+        };
         match result {
             Ok(value) => return Ok(value),
             Err(err) if err.is_retryable() && !emitted.load(Ordering::SeqCst) => {

@@ -2652,8 +2652,22 @@ h1 {
   color: var(--text-3);
   cursor: not-allowed;
 }
-.composer__send--stop { background: var(--danger); color: #fff; }
-.composer__send--stop:hover:not(:disabled) { background: var(--danger); filter: brightness(0.92); }
+/* 停止按钮：与发送同款品牌蓝圆 + 内部停止方块 + 柔和脉冲光晕——呼应思考/工具四角星的动感,
+   提示 agent 正在运行、可随时点停;不再用突兀的告警红。hover 时停脉冲、聚焦点击。 */
+.composer__send--stop {
+  background: var(--brand);
+  color: var(--on-brand);
+  animation: composer-stop-pulse 1.6s ease-in-out infinite;
+}
+.composer__send--stop:hover:not(:disabled) {
+  background: var(--brand-hover);
+  animation: none;
+}
+@keyframes composer-stop-pulse {
+  0%   { box-shadow: 0 0 0 0 var(--brand-tint-strong); }
+  70%  { box-shadow: 0 0 0 6px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
 
 .slash-menu__icon { color: var(--text-3); flex-shrink: 0; }
 

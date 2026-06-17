@@ -1972,7 +1972,7 @@ export function App() {
                 </button>
                 {sending ? (
                   <button type="button" className="composer__send composer__send--stop" onClick={handleStop} aria-label="停止">
-                    <Square size={14} fill="currentColor" />
+                    <Square size={12} fill="currentColor" />
                   </button>
                 ) : (
                   <button type="button" className="composer__send" onClick={handleSend} disabled={!input.trim()} aria-label="发送">

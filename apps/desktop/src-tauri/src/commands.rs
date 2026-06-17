@@ -1104,9 +1104,20 @@ pub(crate) fn queue_steering(
 /// 若该会话当前没有运行中的 Agent，则为无操作。
 #[tauri::command]
 pub(crate) fn cancel_agent(state: State<AppState>, conversation_id: String) -> Result<(), String> {
-    let cancels = state.cancels.lock().map_err(|e| e.to_string())?;
-    if let Some(token) = cancels.get(&conversation_id) {
-        token.store(true, Ordering::SeqCst);
+    // 对话总开关:① 置主任务取消 flag(同步子任务共享主 cancel,随之自动停;流式请求经 select! 立即中断)。
+    {
+        let cancels = state.cancels.lock().map_err(|e| e.to_string())?;
+        if let Some(token) = cancels.get(&conversation_id) {
+            token.store(true, Ordering::SeqCst);
+        }
+    }
+    // ② 级联停掉该会话所有后台子任务(run_subtask background=true,独立 cancel,每轮检查后停)。
+    if let Ok(tasks) = state.bg_tasks.lock() {
+        for task in tasks.values() {
+            if task.conversation_id == conversation_id {
+                task.cancel.store(true, Ordering::SeqCst);
+            }
+        }
     }
     Ok(())
 }

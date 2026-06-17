@@ -62,6 +62,8 @@ pub(crate) struct BgShell {
 #[derive(Clone)]
 pub(crate) struct BgTask {
     pub(crate) description: String,
+    /// 所属会话 id：cancel_agent（对话总开关）据此级联停掉该会话的所有后台子任务。
+    pub(crate) conversation_id: String,
     pub(crate) report: Arc<Mutex<String>>,
     pub(crate) status: Arc<Mutex<String>>, // running | done | killed | error
     pub(crate) usage: Arc<Mutex<Option<mdga_shared::RawUsage>>>,

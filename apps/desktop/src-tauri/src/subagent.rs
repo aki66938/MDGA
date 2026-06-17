@@ -93,6 +93,7 @@ pub(crate) async fn execute_run_subtask(
     conversation_id: &str,
     permission: mdga_shared::PermissionMode,
     permission_rules: Vec<String>,
+    cancel: &Arc<AtomicBool>,
 ) -> (Result<serde_json::Value, String>, Option<mdga_shared::RawUsage>) {
     let parsed: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(value) => value,
@@ -151,6 +152,7 @@ pub(crate) async fn execute_run_subtask(
                 task_id.clone(),
                 BgTask {
                     description: description.to_string(),
+                    conversation_id: conversation_id.to_string(),
                     report: report.clone(),
                     status: status.clone(),
                     usage: usage_slot.clone(),
@@ -220,7 +222,7 @@ pub(crate) async fn execute_run_subtask(
         description,
         app,
         conversation_id,
-        None,
+        Some(cancel.clone()),
         write_mode,
         permission,
         &permission_rules,
