@@ -42,7 +42,8 @@ import {
   type StoredMessage,
   type ToolEvent,
   type DraftWorkspace,
-  type ProviderConfig,
+  type ConnectionView,
+  type RoleAssignmentView,
   type SettingsSection,
 } from "./types";
 import {
@@ -82,12 +83,12 @@ export function App() {
   const [sending, setSending] = useState(false);
   // 主模型 id（Plan20 🔴1）：单一真相源 = 主 provider 的 model_id（设置→模型供应商配）。
   // 类型放宽为 string 以容纳任意供应商模型名；初始化为默认 DeepSeek 值仅作兜底占位，
-  // 挂载/配置后用 get_model_provider_config('main').modelId 覆盖。后端忽略此入参选模型。
+  // 挂载/配置后用 main 角色分配生效的 modelId 覆盖（get_role_assignments）。后端忽略此入参选模型。
   const [model, setModel] = useState<string>(DEFAULT_DEEPSEEK_MODEL_ID);
   // 控制行只读「当前模型」胶囊展示用：主 provider 的 model_id（未配时为空）。
   const [mainModelId, setMainModelId] = useState<string>("");
   // 主 provider 预设（Plan21 #5）：决定余额查询门禁与成本金额展示。
-  // 取自 get_model_provider_config('main').preset；未配或缺省视为 deepseek（与后端 preset 默认一致），不误伤默认 DeepSeek 用户。
+  // 取自 main 角色生效连接的 preset；未配或缺省视为 deepseek（与后端 preset 默认一致），不误伤默认 DeepSeek 用户。
   const [mainPreset, setMainPreset] = useState<string>("deepseek");
   // 主 provider 是否 DeepSeek：成本金额位与余额查询的统一门禁（Plan21 #5）。
   const isDeepseekMain = mainPreset === "deepseek";
@@ -184,22 +185,34 @@ export function App() {
       .catch(() => setApiKeyStatus({ state: "missing" }));
   }, []);
 
-  // 挂载时查主模型是否已配（Plan19 P0a）：未配则首屏给「去 设置 → 模型供应商」CTA。
+  // 挂载时查主模型是否已配（Plan19 P0a / 0.0.59）：未配则首屏给「去 设置 → 模型连接/分配」CTA。
   // 同时取主 provider 的 model_id（Plan20 🔴1）作控制行只读胶囊展示与透传 send_message 的值。
   useEffect(() => {
     void refreshMainModel();
   }, []);
 
-  /** 拉取主 provider 配置（Plan20 🔴1）：刷新 mainConfigured 与 mainModelId，并把 model 透传值同步为 model_id。 */
+  /** 拉取主模型配置（Plan20 🔴1 / 0.0.59 连接库改造）：刷新 mainConfigured 与 mainModelId，
+   *  并把 model 透传值同步为 main 角色实际生效的 model_id。预设经交叉 list_connections 推导。 */
   async function refreshMainModel() {
-    const cfg = await invoke<ProviderConfig | null>("get_model_provider_config", { role: "main" })
-      .catch(() => null);
-    setMainConfigured(!!cfg);
-    const id = cfg?.modelId?.trim() ?? "";
+    const [assigns, conns] = await Promise.all([
+      invoke<RoleAssignmentView[]>("get_role_assignments").catch(() => [] as RoleAssignmentView[]),
+      invoke<ConnectionView[]>("list_connections").catch(() => [] as ConnectionView[]),
+    ]);
+    const main = assigns.find((a) => a.role === "main");
+    const id = (main?.effective.modelId ?? "").trim();
+    setMainConfigured(!!id);
     setMainModelId(id);
     if (id) setModel(id);
-    // 缓存主 provider 预设（Plan21 #5）：未配/缺省回落 deepseek，供余额门禁与成本金额位判断。
-    setMainPreset((cfg?.preset ?? "deepseek") || "deepseek");
+    // 缓存主模型预设（Plan21 #5）：取 main 引用连接的 preset；未配/缺省回落 deepseek，供余额门禁与成本金额位判断。
+    const conn = main?.connectionId ? conns.find((c) => c.id === main.connectionId) : undefined;
+    setMainPreset((conn?.preset ?? "deepseek") || "deepseek");
+  }
+
+  /** 视觉模型是否已配（0.0.59）：vision 角色有**自身**分配（source==="self"）才算——vision 不回退主模型，
+   *  未分配＝拒绝图像，与旧 get_model_provider_config('vision') 非回退语义一致。 */
+  async function isVisionConfigured(): Promise<boolean> {
+    const assigns = await invoke<RoleAssignmentView[]>("get_role_assignments").catch(() => [] as RoleAssignmentView[]);
+    return assigns.find((a) => a.role === "vision")?.effective.source === "self";
   }
 
   useEffect(() => {
@@ -626,10 +639,10 @@ export function App() {
         setShowHelp(true);
         return true;
       case "/model": {
-        // Plan20 🔴1：模型唯一真相源 = 主 provider 的 model_id。/model 不再切 DeepSeek 清单，
-        // 直接打开 设置 → 模型供应商，由用户在那里改 model_id。
+        // Plan20 🔴1 / 0.0.59：模型唯一真相源 = 主模型分配的 model_id。/model 直接打开
+        // 设置 → 模型分配，由用户在那里改主模型的连接/模型。
         setInput("");
-        await openSettings("provider");
+        await openSettings("assignments");
         return true;
       }
       case "/compact": {
@@ -1307,9 +1320,8 @@ export function App() {
   async function handleImportFile() {
     if (sending) return;
     try {
-      // 模态门禁（Plan17 §7）：有 vision provider 才放开图像入口（本阶段仅放开选择，不做识图推理）。
-      const visionCfg = await invoke<ProviderConfig | null>("get_model_provider_config", { role: "vision" }).catch(() => null);
-      const hasVision = !!visionCfg;
+      // 模态门禁（Plan17 §7 / 0.0.59）：vision 角色有**自身**分配（非回退主模型）才放开图像入口。
+      const hasVision = await isVisionConfigured();
       const textExtensions = ["txt", "md", "csv", "json", "log", "pdf", "docx", "xml", "html", "toml", "yaml", "yml"];
       const filters = hasVision
         ? [{ name: "文档与图像", extensions: [...textExtensions, ...IMAGE_EXTENSIONS] }]
@@ -1320,7 +1332,7 @@ export function App() {
       const ext = selected.split(".").pop()?.toLowerCase() ?? "";
       if (IMAGE_EXTENSIONS.includes(ext)) {
         if (!hasVision) {
-          pushToast("error", "当前未配置视觉模型，无法导入图片。需在 设置 → 模型供应商 → 扩展 agent 的模态 里配置视觉模型。");
+          pushToast("error", "当前未配置视觉模型，无法导入图片。需在 设置 → 模型分配 里为「视觉」角色分配识图模型。");
           return;
         }
         // 有 vision provider（Plan18 M18.1）：读图为 base64 + media_type，暂存到输入框上方缩略图预览，
@@ -1355,10 +1367,9 @@ export function App() {
   async function ingestImageBlobs(files: File[]) {
     const images = files.filter((f) => f.type.startsWith("image/"));
     if (images.length === 0) return;
-    // 模态门禁：无视觉 provider 时拒绝，提示与 📎 入口一致。
-    const visionCfg = await invoke<ProviderConfig | null>("get_model_provider_config", { role: "vision" }).catch(() => null);
-    if (!visionCfg) {
-      pushToast("error", "当前未配置视觉模型，无法导入图片。需在 设置 → 模型供应商 → 扩展 agent 的模态 里配置视觉模型。");
+    // 模态门禁：vision 角色无自身分配时拒绝，提示与 📎 入口一致。
+    if (!(await isVisionConfigured())) {
+      pushToast("error", "当前未配置视觉模型，无法导入图片。需在 设置 → 模型分配 里为「视觉」角色分配识图模型。");
       return;
     }
     const MAX_BYTES = 10 * 1024 * 1024; // 10MB 上限
@@ -1699,17 +1710,17 @@ export function App() {
             <h2>我们应该在 MDGA 中做些什么？</h2>
             <p className="hero-panel__hint">在下方输入框左下角选择工作区，或直接开始纯聊天。</p>
             {workspaceError && <p className="hero-panel__error">{workspaceError}</p>}
-            {/* 未配主模型引导（Plan19 P0a）：显著 CTA，点击直达 设置 → 模型供应商。 */}
+            {/* 未配主模型引导（Plan19 P0a / 0.0.59）：显著 CTA，点击直达 设置 → 模型连接（先建连接填 Key）。 */}
             {mainConfigured === false && (
               <div className="onboarding-cta" role="status" aria-label="需要配置模型">
                 <div className="onboarding-cta__text">
                   <strong>还没配置模型</strong>
-                  <span>先去「设置 → 模型供应商」配置主模型（填 API Key 与模型 ID），即可开始对话。</span>
+                  <span>先到「设置 → 模型连接」新建连接（填 API Key），再到「模型分配」把主模型指过去，即可开始对话。</span>
                 </div>
                 <button
                   type="button"
                   className="onboarding-cta__btn"
-                  onClick={() => openSettings("provider")}
+                  onClick={() => openSettings("connections")}
                 >
                   <Settings2 size={15} /> 去配置模型
                 </button>
@@ -1978,13 +1989,13 @@ export function App() {
               </div>
 
               <div className="composer-footer__right">
-                {/* 当前模型只读胶囊（Plan26：移入右组、贴近发送；图标 Gauge→Cpu）。点击进 设置 → 模型供应商。 */}
+                {/* 当前模型只读胶囊（Plan26：移入右组、贴近发送；图标 Gauge→Cpu）。点击进 设置 → 模型分配。 */}
                 <button
                   type="button"
                   className="model-pill"
-                  onClick={() => openSettings("provider")}
+                  onClick={() => openSettings("assignments")}
                   aria-label="当前模型，点击修改"
-                  title={mainModelId ? `当前模型：${mainModelId}（点击进 设置 → 模型供应商 修改）` : "尚未配置主模型，点击去配置"}
+                  title={mainModelId ? `当前模型：${mainModelId}（点击进 设置 → 模型分配 修改）` : "尚未配置主模型，点击去配置"}
                 >
                   <Cpu size={13} className="model-pill__icon" />
                   <span className="model-pill__id">{mainModelId || "未配置模型"}</span>

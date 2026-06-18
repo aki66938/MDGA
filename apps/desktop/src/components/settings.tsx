@@ -1,16 +1,15 @@
-// 设置弹窗与模型供应商卡片（0.0.37 从 App.tsx 抽出，纯搬移，无逻辑改动）。
+// 设置弹窗：模型连接库（Connections）+ 角色分配（Assignments）+ 其它分类（0.0.59）。
 
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock, Trash2, Pencil } from "lucide-react";
 import { getPermissionModeLabel, type PermissionMode } from "@mdga/ui";
 import {
   PERMISSION_MODES,
   PROVIDER_PRESETS,
-  VISION_PRESET_MODEL,
-  PRESET_CONTEXT_WINDOW,
-  ROUTING_ROLES,
-  type ProviderConfig,
+  ASSIGNABLE_ROLES,
+  type ConnectionView,
+  type RoleAssignmentView,
   type AppInfo,
   type BalanceState,
   type McpServer,
@@ -19,102 +18,216 @@ import {
   type LspKnownServer,
   type LspServerConfig,
   type LspServerSetting,
-  type RoleRouting,
 } from "../types";
 import { humanizeError } from "../utils";
 import { useFocusTrap } from "./dialogs";
 
-// ── ProviderCard（Plan17 §6.2）───────────────────────────────────────────────
+// ── 模型连接库（Connections，0.0.59）─────────────────────────────────────────
+
+/** preset → API 格式默认值：内置预设均 OpenAI 兼容；custom 由用户选。 */
+const PRESET_API_FORMAT: Record<string, "openai" | "anthropic"> = {
+  deepseek: "openai",
+  zhipu: "openai",
+  moonshot: "openai",
+  qwen: "openai",
+};
+
+/** 取连接的展示名：label 优先，其次 preset 名，再次「未命名连接」。 */
+function connectionDisplayName(c: ConnectionView): string {
+  if (c.label && c.label.trim()) return c.label.trim();
+  const presetLabel = PROVIDER_PRESETS.find((p) => p.id === c.preset)?.label;
+  return presetLabel ?? "未命名连接";
+}
 
 /**
- * 可复用的模型供应商卡片：主模型 role="main"、视觉 role="vision" 各用一次。
- * 两栏网格表单（供应商|模型 一行，API Key 整行，高级折叠行整行），右上角状态徽标，底部保存按钮右对齐。
- * 挂载时回填 get_model_provider_config；保存调 save_model_provider；不回显明文 key。
+ * 模型连接库设置（Connections）：一个连接 = 名称 + 预设 + Base URL + API Key + API 格式。
+ * 这是**唯一**录入 API Key 的地方。列表展示每个连接，可新增 / 编辑 / 删除 / 测试连接。
+ *
+ * 挂载拉 list_connections；新增/编辑经 ConnectionEditor（save_connection）；删除经 delete_connection
+ * （若仍被某角色引用，后端拒绝并返回错误，此处原样提示）。绝不回显 apiKey 明文（仅以 hasKey 表态）。
  */
-export function ProviderCard({
-  role,
-  title,
+function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
+  const [connections, setConnections] = useState<ConnectionView[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  // 编辑器状态：null=未打开；{ conn: undefined }=新增；{ conn }=编辑既有连接。
+  const [editing, setEditing] = useState<{ conn?: ConnectionView } | null>(null);
+  // 测试连接：针对某连接就地展示结果。key=连接 id。
+  const [testState, setTestState] = useState<Record<string, { testing?: boolean; ok?: boolean; message?: string }>>({});
+
+  const refresh = () => {
+    setLoading(true);
+    invoke<ConnectionView[]>("list_connections")
+      .then((list) => setConnections(Array.isArray(list) ? list : []))
+      .catch((e) => setError(humanizeError(String(e))))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { refresh(); }, []);
+
+  async function handleDelete(c: ConnectionView) {
+    setError(null);
+    if (!window.confirm(`删除连接「${connectionDisplayName(c)}」？此操作不可撤销。`)) return;
+    try {
+      await invoke("delete_connection", { id: c.id });
+      refresh();
+      onChanged?.();
+    } catch (e) {
+      // 后端「仍被某角色引用」拒绝在此原样提示（含建议先去「模型分配」改引用）。
+      setError(humanizeError(String(e)));
+    }
+  }
+
+  /** 测试某连接：弹一个模型 ID（已知模型作提示）后调 test_connection。 */
+  async function handleTest(c: ConnectionView) {
+    setError(null);
+    let known: string[] = [];
+    try {
+      known = await invoke<string[]>("list_models_for_connection", { connectionId: c.id });
+    } catch {
+      known = [];
+    }
+    const fallback = PROVIDER_PRESETS.find((p) => p.id === c.preset)?.defaultModelId ?? "";
+    const suggested = known[0] ?? fallback;
+    const model = window.prompt(
+      `测试连接「${connectionDisplayName(c)}」，请输入一个用于测试的模型 ID：` +
+        (known.length ? `\n（已知：${known.join("、")}）` : ""),
+      suggested,
+    );
+    if (model == null) return; // 取消
+    const trimmed = model.trim();
+    if (!trimmed) {
+      setTestState((s) => ({ ...s, [c.id]: { ok: false, message: "请提供一个待测模型 ID" } }));
+      return;
+    }
+    setTestState((s) => ({ ...s, [c.id]: { testing: true } }));
+    try {
+      const message = await invoke<string>("test_connection", { connectionId: c.id, model: trimmed });
+      setTestState((s) => ({ ...s, [c.id]: { ok: true, message: message || "连接成功" } }));
+    } catch (e) {
+      setTestState((s) => ({ ...s, [c.id]: { ok: false, message: humanizeError(String(e)) } }));
+    }
+  }
+
+  if (editing) {
+    return (
+      <ConnectionEditor
+        connection={editing.conn}
+        onCancel={() => setEditing(null)}
+        onSaved={() => {
+          setEditing(null);
+          refresh();
+          onChanged?.();
+        }}
+      />
+    );
+  }
+
+  return (
+    <>
+      <h3 className="settings-content__h">模型连接</h3>
+      <p className="settings-desc" style={{ marginTop: 0, marginBottom: 8 }}>
+        在这里集中配置可复用的<b>模型连接</b>（端点 + 密钥，配一次即可）。每个连接 = 名称 + 供应商预设 +
+        Base URL + API Key + API 格式。这是<b>唯一</b>录入 API Key 的地方；配好后到「模型分配」把各角色指到某个连接 + 模型。
+      </p>
+
+      {loading ? (
+        <p className="settings-row__value">加载中…</p>
+      ) : connections.length === 0 ? (
+        <p className="settings-row__value">暂无连接。点击下方「新增连接」配置你的第一个模型供应商。</p>
+      ) : (
+        connections.map((c) => {
+          const t = testState[c.id];
+          const presetLabel = PROVIDER_PRESETS.find((p) => p.id === c.preset)?.label ?? c.preset ?? "自定义";
+          return (
+            <div key={c.id} className="provider-card" style={{ marginBottom: 10 }}>
+              <div className="provider-card__head">
+                <span className="provider-card__title">{connectionDisplayName(c)}</span>
+                <span className={`provider-badge${c.hasKey ? " provider-badge--on" : ""}`}>
+                  {c.hasKey ? "● 已配密钥" : "○ 无密钥"}
+                </span>
+              </div>
+              <p className="settings-desc" style={{ marginTop: 2, marginBottom: 8 }}>
+                预设 <b>{presetLabel}</b>
+                ｜格式 {c.apiFormat === "anthropic" ? "Anthropic" : "OpenAI"}
+                ｜端点 <code>{c.baseUrl?.trim() || "（预设官方端点）"}</code>
+              </p>
+              {t && (t.message || t.testing) && (
+                <p
+                  className="settings-row__value"
+                  style={{ color: t.testing ? "var(--text-2)" : t.ok ? "var(--success)" : "var(--danger)" }}
+                >
+                  {t.testing ? "测试中…" : (t.ok ? "✓ " : "✗ ") + (t.message ?? "")}
+                </p>
+              )}
+              <div className="provider-card__actions">
+                <button type="button" className="approval-card__btn" onClick={() => handleTest(c)} disabled={!!t?.testing}>
+                  <Plug size={14} /> 测试连接
+                </button>
+                <button type="button" className="approval-card__btn" onClick={() => setEditing({ conn: c })}>
+                  <Pencil size={14} /> 编辑
+                </button>
+                <button type="button" className="approval-card__btn" style={{ color: "var(--danger)" }} onClick={() => handleDelete(c)}>
+                  <Trash2 size={14} /> 删除
+                </button>
+              </div>
+            </div>
+          );
+        })
+      )}
+
+      {error && <p className="settings-row__value" style={{ color: "var(--danger)" }}>{error}</p>}
+
+      <div className="provider-card__actions" style={{ justifyContent: "flex-start" }}>
+        <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={() => setEditing({ conn: undefined })}>
+          新增连接
+        </button>
+      </div>
+    </>
+  );
+}
+
+/**
+ * 连接编辑器（新增 / 编辑）：名称 + 预设下拉 + Base URL（可选）+ API Key + API 格式。
+ *
+ * 编辑既有连接（hasKey）时，Key 框占位「已配置 ••••（如需更换请重新输入）」，留空＝保留已存 key；
+ * 新建连接必须填 key（客户端拦截空 key）。保存经 save_connection（id 空＝创建）。绝不回显 key 明文。
+ */
+function ConnectionEditor({
+  connection,
+  onCancel,
   onSaved,
 }: {
-  role: "main" | "vision";
-  title: string;
-  onSaved?: () => void;
+  connection?: ConnectionView;
+  onCancel: () => void;
+  onSaved: () => void;
 }) {
-  const presetModel = role === "vision" ? VISION_PRESET_MODEL : null;
-  const [preset, setPreset] = useState<string>("deepseek");
+  const isNew = !connection;
+  const hasKey = connection?.hasKey ?? false;
+  const [label, setLabel] = useState(connection?.label ?? "");
+  const [preset, setPreset] = useState(connection?.preset ?? "deepseek");
+  const [baseUrl, setBaseUrl] = useState(connection?.baseUrl ?? "");
   const [apiKey, setApiKey] = useState("");
-  const [modelId, setModelId] = useState(
-    role === "vision" ? VISION_PRESET_MODEL.deepseek : "deepseek-v4-pro",
-  );
-  const [baseUrl, setBaseUrl] = useState("");
-  // 上下文窗口（tokens，Plan27 #2）：可选数字输入。空串=不传（后端回退默认）。预设可预填。
-  const [contextWindow, setContextWindow] = useState<string>(
-    role === "main" ? String(PRESET_CONTEXT_WINDOW.deepseek ?? "") : "",
-  );
-  // API 格式（Plan18 §4）：仅视觉 provider 暴露选择（openai|anthropic）；主模型恒 openai。
-  const [apiFormat, setApiFormat] = useState<"openai" | "anthropic">("openai");
-  const [showKey, setShowKey] = useState(false);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  // 已配置：挂载回填到 true，或保存成功后置 true。controls 状态徽标 + key 占位文案。
-  const [configured, setConfigured] = useState(false);
-  // 已配置但用户尚未在本次会话改动 key 时，占位显示「已配置 ••••」而非空密码框。
   const [keyTouched, setKeyTouched] = useState(false);
+  const [apiFormat, setApiFormat] = useState<"openai" | "anthropic">(
+    connection?.apiFormat === "anthropic" ? "anthropic" : "openai",
+  );
+  const [showKey, setShowKey] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(!!(connection?.baseUrl) || (connection?.preset === "custom"));
   const [saving, setSaving] = useState(false);
-  // F2 保存成功反馈：置 true 后数秒自动复位，按钮区显示「已保存 ✓」。
-  const [saved, setSaved] = useState(false);
-  // 保存成功提示的自动复位定时器；再次保存或组件卸载时清理，避免闭包泄漏。
-  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => { if (savedTimer.current) clearTimeout(savedTimer.current); }, []);
   const [error, setError] = useState<string | null>(null);
-  // 测试连接（Plan19 P2a）：就地显示结果，不跳主界面。null=未测、ok=成功（绿）、err=失败（红）。
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
-  // C-1 工具调用冒烟（Plan25 #3）：就地显示该供应商工具调用兼容性。
-  // null=未测；kind="ok" 绿（可用）、"weak" 橙（模型未返回工具调用，可能不支持/较弱）、"error" 红（报错）。
-  const [smokeTesting, setSmokeTesting] = useState(false);
-  const [smokeResult, setSmokeResult] = useState<{ kind: "ok" | "weak" | "error"; message: string } | null>(null);
 
   const presetMeta = PROVIDER_PRESETS.find((p) => p.id === preset) ?? PROVIDER_PRESETS[0];
   const isCustom = preset === "custom";
 
-  // 挂载时回填已存配置（apiKey 脱敏为空：configured=true 但不回显明文）。
-  useEffect(() => {
-    let alive = true;
-    invoke<ProviderConfig | null>("get_model_provider_config", { role })
-      .then((cfg) => {
-        if (!alive || !cfg) return;
-        const p = cfg.preset ?? "deepseek";
-        setPreset(p);
-        setModelId(cfg.modelId || (presetModel ? presetModel[p] ?? "" : PROVIDER_PRESETS.find((x) => x.id === p)?.defaultModelId ?? ""));
-        setBaseUrl(cfg.baseUrl ?? "");
-        setApiFormat(cfg.apiFormat === "anthropic" ? "anthropic" : "openai");
-        // 上下文窗口回填（Plan27 #2）：有值显示，无值留空（不预填，尊重用户「未设」语义）。
-        setContextWindow(cfg.contextWindow != null ? String(cfg.contextWindow) : "");
-        setConfigured(true);
-        if (cfg.baseUrl || p === "custom") setAdvancedOpen(true);
-      })
-      .catch(() => {});
-    return () => { alive = false; };
-  }, [role]);
-
   function handlePresetChange(next: string) {
-    setTestResult(null); // F4：改配置后清旧测试结果，避免误导
-    setSmokeResult(null); // C-1：同步清工具调用冒烟结果
     setPreset(next);
-    const meta = PROVIDER_PRESETS.find((p) => p.id === next);
-    // 切换预设给出合理默认 modelId 占位（视觉块用识图模型表）。
-    setModelId(presetModel ? presetModel[next] ?? "" : meta?.defaultModelId ?? "");
-    // 上下文窗口预填（Plan27 #2）：仅主模型块按预设常见值预填，custom/无值留空。
-    if (role === "main") {
-      const cw = PRESET_CONTEXT_WINDOW[next];
-      setContextWindow(cw != null ? String(cw) : "");
-    }
-    // custom 自动展开高级行（base_url 必填）；非 custom 收起并清空自定义端点回到官方。
-    if (next === "custom") {
-      setAdvancedOpen(true);
-    } else {
+    // 内置预设默认 OpenAI 格式；custom 保持当前选择。custom 须填 Base URL，自动展开高级行。
+    if (next !== "custom") {
+      setApiFormat(PRESET_API_FORMAT[next] ?? "openai");
       setAdvancedOpen(false);
       setBaseUrl("");
+    } else {
+      setAdvancedOpen(true);
     }
   }
 
@@ -125,287 +238,137 @@ export function ProviderCard({
       setAdvancedOpen(true);
       return;
     }
-    if (!modelId.trim()) {
-      setError("请填写模型 ID");
-      return;
-    }
-    // 已配置且用户未改动 key 时不允许提交空 key（避免清掉已存 key）。首次配置必须填 key。
-    if (!keyTouched && !configured && !apiKey.trim()) {
+    // 首次创建（或既有连接尚无密钥）必须填 key；编辑已配密钥连接时留空＝保留。
+    if ((isNew || !hasKey) && !apiKey.trim()) {
       setError("请填写 API Key");
       return;
     }
-    if (keyTouched && !apiKey.trim()) {
-      setError("请填写 API Key");
-      return;
-    }
-    if (!configured && !apiKey.trim()) {
+    if (keyTouched && !apiKey.trim() && (isNew || !hasKey)) {
       setError("请填写 API Key");
       return;
     }
     setSaving(true);
     try {
-      // 上下文窗口（Plan27 #2）：空串/非正数 → 传 null（后端回退默认）；否则传整数 tokens。
-      const cwTrim = contextWindow.trim();
-      const cwNum = cwTrim ? Math.floor(Number(cwTrim)) : NaN;
-      const contextWindowOut = cwTrim && Number.isFinite(cwNum) && cwNum > 0 ? cwNum : null;
-      await invoke("save_model_provider", {
-        role,
+      await invoke("save_connection", {
+        id: connection?.id, // 空/缺＝创建
+        label: label.trim() || null,
         preset,
-        label: presetMeta.label,
         baseUrl: baseUrl.trim() || null,
+        // 留空＝保留已存 key（仅编辑既有连接时有效；新建空 key 已被上面拦截）。
         apiKey: apiKey.trim(),
-        modelId: modelId.trim(),
-        apiFormat: role === "vision" ? apiFormat : "openai",
-        contextWindow: contextWindowOut,
+        apiFormat: isCustom ? apiFormat : (PRESET_API_FORMAT[preset] ?? "openai"),
       });
-      setConfigured(true);
-      setKeyTouched(false);
-      setApiKey("");
-      // F2：保存成功显示「已保存 ✓」，数秒后自动复位（重存时先清旧定时器）。
-      if (savedTimer.current) clearTimeout(savedTimer.current);
-      setSaved(true);
-      savedTimer.current = setTimeout(() => setSaved(false), 2600);
-      onSaved?.();
-    } catch (err) {
-      setError(humanizeError(String(err)));
+      onSaved();
+    } catch (e) {
+      setError(humanizeError(String(e)));
     } finally {
       setSaving(false);
     }
   }
 
-  /**
-   * 测试连接（Plan19 P2a / C-A）：用当前表单做一次最小请求。用户输入了新 key 就传新 key，
-   * 否则传空串（命令内 key 空时从 DB 读该 role 既有 key）。结果就地显示，不跳主界面。
-   */
-  async function handleTest() {
-    setTestResult(null);
-    if (isCustom && !baseUrl.trim()) {
-      setTestResult({ ok: false, message: "自定义供应商必须填写 Base URL" });
-      setAdvancedOpen(true);
-      return;
-    }
-    if (!modelId.trim()) {
-      setTestResult({ ok: false, message: "请填写模型 ID" });
-      return;
-    }
-    // 未配置且未输入 key：前端先拦截不调用。
-    if (!configured && !apiKey.trim()) {
-      setTestResult({ ok: false, message: "请先填写 API Key" });
-      return;
-    }
-    setTesting(true);
-    try {
-      const message = await invoke<string>("test_provider_connection", {
-        role,
-        baseUrl: baseUrl.trim(),
-        apiKey: keyTouched ? apiKey.trim() : "",
-        model: modelId.trim(),
-        apiFormat: role === "vision" ? apiFormat : "openai",
-      });
-      setTestResult({ ok: true, message: message || "连接成功" });
-    } catch (err) {
-      setTestResult({ ok: false, message: humanizeError(String(err)) });
-    } finally {
-      setTesting(false);
-    }
-  }
-
-  /**
-   * 测试工具调用（C-1 / Plan25 #3）：用当前表单做一次最小工具调用冒烟探测。
-   * key 透传规则与 handleTest 一致——改过才传新 key，否则传空串（命令内回退 DB 既有 key）。
-   * 返回 true=该供应商工具调用可用（原生或兜底恢复均算）；false=模型未返回工具调用（可能不支持/较弱）。
-   */
-  async function handleSmokeTest() {
-    setSmokeResult(null);
-    if (isCustom && !baseUrl.trim()) {
-      setSmokeResult({ kind: "error", message: "自定义供应商必须填写 Base URL" });
-      setAdvancedOpen(true);
-      return;
-    }
-    if (!modelId.trim()) {
-      setSmokeResult({ kind: "error", message: "请填写模型 ID" });
-      return;
-    }
-    // 未配置且未输入 key：前端先拦截不调用。
-    if (!configured && !apiKey.trim()) {
-      setSmokeResult({ kind: "error", message: "请先填写 API Key" });
-      return;
-    }
-    setSmokeTesting(true);
-    try {
-      const ok = await invoke<boolean>("smoke_test_tool_call", {
-        role,
-        baseUrl: baseUrl.trim(),
-        apiKey: keyTouched ? apiKey.trim() : "",
-        model: modelId.trim(),
-        apiFormat: role === "vision" ? apiFormat : "openai",
-      });
-      setSmokeResult(
-        ok
-          ? { kind: "ok", message: "工具调用可用" }
-          : { kind: "weak", message: "该模型未返回工具调用（可能不支持/较弱）" },
-      );
-    } catch (err) {
-      setSmokeResult({ kind: "error", message: humanizeError(String(err)) });
-    } finally {
-      setSmokeTesting(false);
-    }
-  }
-
-  // 密码框：已配置且本次未改动 → 占位「已配置 ••••」（只读感）；用户聚焦输入即视为改动。
-  const keyPlaceholder = configured && !keyTouched ? "已配置 ••••（如需更换请重新输入）" : "sk-...";
+  const keyPlaceholder = hasKey && !keyTouched ? "已配置 ••••（如需更换请重新输入）" : "sk-...";
 
   return (
-    <div className="provider-card">
-      <div className="provider-card__head">
-        <span className="provider-card__title">{title}</span>
-        <span className={`provider-badge${configured ? " provider-badge--on" : ""}`}>
-          {configured ? "● 已配置" : "○ 未配置"}
-        </span>
-      </div>
-
-      <div className="provider-grid">
-        <label className="provider-field">
-          <span className="provider-field__label">供应商</span>
-          <select className="model-select" value={preset} onChange={(e) => handlePresetChange(e.target.value)}>
-            {PROVIDER_PRESETS.map((p) => (
-              <option key={p.id} value={p.id}>{p.label}</option>
-            ))}
-          </select>
-        </label>
-        <label className="provider-field">
-          <span className="provider-field__label">模型</span>
-          <input
-            className="conv-search provider-input"
-            type="text"
-            value={modelId}
-            placeholder={presetMeta.defaultModelId || "model-id"}
-            onChange={(e) => { setModelId(e.target.value); setTestResult(null); setSmokeResult(null); }}
-          />
-        </label>
-
-        <label className="provider-field provider-field--full">
-          <span className="provider-field__label">API Key</span>
-          <span className="provider-key">
+    <>
+      <h3 className="settings-content__h">{isNew ? "新增连接" : "编辑连接"}</h3>
+      <div className="provider-card">
+        <div className="provider-grid">
+          <label className="provider-field">
+            <span className="provider-field__label">名称</span>
             <input
               className="conv-search provider-input"
-              type={showKey ? "text" : "password"}
-              value={apiKey}
-              placeholder={keyPlaceholder}
-              onChange={(e) => { setApiKey(e.target.value); setKeyTouched(true); setTestResult(null); setSmokeResult(null); }}
+              type="text"
+              value={label}
+              placeholder={presetMeta.label}
+              onChange={(e) => setLabel(e.target.value)}
             />
-            <button
-              type="button"
-              className="provider-key__eye"
-              title={showKey ? "隐藏" : "显示"}
-              onClick={() => setShowKey((v) => !v)}
-            >
-              {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
-            </button>
-          </span>
-        </label>
-
-        {role === "vision" && (
-          <label className="provider-field provider-field--full">
-            <span className="provider-field__label">API 格式</span>
-            <select
-              className="model-select"
-              value={apiFormat}
-              onChange={(e) => { setApiFormat(e.target.value === "anthropic" ? "anthropic" : "openai"); setTestResult(null); setSmokeResult(null); }}
-            >
-              <option value="openai">OpenAI 格式（/chat/completions）</option>
-              <option value="anthropic">Anthropic 格式（/v1/messages）</option>
+          </label>
+          <label className="provider-field">
+            <span className="provider-field__label">供应商预设</span>
+            <select className="model-select" value={preset} onChange={(e) => handlePresetChange(e.target.value)}>
+              {PROVIDER_PRESETS.map((p) => (
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
             </select>
           </label>
-        )}
 
-        {/* 上下文窗口（Plan27 #2）：可选数字输入，回填 cfg.contextWindow，保存透传（空则传 null）。
-            后端据其推导压缩软上限；非 DeepSeek 小窗口模型可在此据实填写以更早压缩。 */}
-        <label className="provider-field provider-field--full">
-          <span className="provider-field__label">上下文窗口（tokens，可选）</span>
-          <input
-            className="conv-search provider-input"
-            type="number"
-            min={0}
-            value={contextWindow}
-            placeholder={PRESET_CONTEXT_WINDOW[preset] != null ? String(PRESET_CONTEXT_WINDOW[preset]) : "如 128000，留空用默认"}
-            onChange={(e) => { setContextWindow(e.target.value); setTestResult(null); setSmokeResult(null); }}
-          />
-          <span className="provider-field__hint">填写该模型的真实上下文窗口，接近上限时自动压缩。留空则用内置默认。</span>
-        </label>
-
-        <div className="provider-field--full">
-          <button
-            type="button"
-            className="provider-advanced-toggle"
-            onClick={() => !isCustom && setAdvancedOpen((v) => !v)}
-            disabled={isCustom}
-            title={isCustom ? "自定义供应商必须填写 Base URL" : undefined}
-          >
-            {advancedOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-            高级设置（自定义 Base URL）
-          </button>
-          <div className={`provider-advanced${advancedOpen ? " provider-advanced--open" : ""}`}>
-            <div className="provider-advanced__inner">
+          <label className="provider-field provider-field--full">
+            <span className="provider-field__label">API Key</span>
+            <span className="provider-key">
               <input
                 className="conv-search provider-input"
-                type="text"
-                value={baseUrl}
-                placeholder={presetMeta.baseUrl ?? "https://your-endpoint/v1"}
-                onChange={(e) => { setBaseUrl(e.target.value); setTestResult(null); setSmokeResult(null); }}
+                type={showKey ? "text" : "password"}
+                value={apiKey}
+                placeholder={keyPlaceholder}
+                onChange={(e) => { setApiKey(e.target.value); setKeyTouched(true); }}
               />
-              <p className="settings-desc" style={{ marginTop: 4 }}>
-                {isCustom
-                  ? "自定义供应商必须填写 Base URL（自托管/代理）。基址或完整端点均可，照 API 文档粘贴即可，不会重复拼接路径。"
-                  : `留空即使用 ${presetMeta.label} 官方端点；自托管/代理可填。`}
-              </p>
+              <button
+                type="button"
+                className="provider-key__eye"
+                title={showKey ? "隐藏" : "显示"}
+                onClick={() => setShowKey((v) => !v)}
+              >
+                {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
+              </button>
+            </span>
+          </label>
+
+          {isCustom && (
+            <label className="provider-field provider-field--full">
+              <span className="provider-field__label">API 格式</span>
+              <select
+                className="model-select"
+                value={apiFormat}
+                onChange={(e) => setApiFormat(e.target.value === "anthropic" ? "anthropic" : "openai")}
+              >
+                <option value="openai">OpenAI 格式（/chat/completions）</option>
+                <option value="anthropic">Anthropic 格式（/v1/messages）</option>
+              </select>
+            </label>
+          )}
+
+          <div className="provider-field--full">
+            <button
+              type="button"
+              className="provider-advanced-toggle"
+              onClick={() => !isCustom && setAdvancedOpen((v) => !v)}
+              disabled={isCustom}
+              title={isCustom ? "自定义供应商必须填写 Base URL" : undefined}
+            >
+              {advancedOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+              高级设置（自定义 Base URL）
+            </button>
+            <div className={`provider-advanced${advancedOpen ? " provider-advanced--open" : ""}`}>
+              <div className="provider-advanced__inner">
+                <input
+                  className="conv-search provider-input"
+                  type="text"
+                  value={baseUrl}
+                  placeholder={presetMeta.baseUrl ?? "https://your-endpoint/v1"}
+                  onChange={(e) => setBaseUrl(e.target.value)}
+                />
+                <p className="settings-desc" style={{ marginTop: 4 }}>
+                  {isCustom
+                    ? "自定义供应商必须填写 Base URL（自托管/代理）。基址或完整端点均可，照 API 文档粘贴即可，不会重复拼接路径。"
+                    : `留空即使用 ${presetMeta.label} 官方端点；自托管/代理可填。`}
+                </p>
+              </div>
             </div>
           </div>
         </div>
-      </div>
 
-      {error && <p className="settings-row__value" style={{ color: "var(--danger)" }}>{error}</p>}
-      {testResult && (
-        <p className="settings-row__value" style={{ color: testResult.ok ? "var(--success)" : "var(--danger)" }}>
-          {testResult.ok ? "✓ " : "✗ "}{testResult.message}
-        </p>
-      )}
-      {/* C-1 工具调用冒烟结果（Plan25 #3）：与测试连接同区展示——可用绿、未返回工具调用橙、报错红。 */}
-      {smokeResult && (
-        <p
-          className="settings-row__value"
-          style={{
-            color:
-              smokeResult.kind === "ok"
-                ? "var(--success)"
-                : smokeResult.kind === "weak"
-                ? "var(--warning)"
-                : "var(--danger)",
-          }}
-        >
-          {smokeResult.kind === "ok" ? "✓ " : smokeResult.kind === "weak" ? "⚠ " : "✗ "}
-          {smokeResult.message}
-        </p>
-      )}
+        {error && <p className="settings-row__value" style={{ color: "var(--danger)" }}>{error}</p>}
 
-      <div className="provider-card__actions">
-        {saved && (
-          <span className="provider-saved" role="status" style={{ color: "var(--success)" }}>
-            已保存 ✓
-          </span>
-        )}
-        <button type="button" className="approval-card__btn" onClick={handleTest} disabled={testing || smokeTesting || saving}>
-          {testing ? "测试中…" : "测试连接"}
-        </button>
-        {/* C-1：测试工具调用（Plan25 #3），结果就地显示在上方测试区。 */}
-        <button type="button" className="approval-card__btn" onClick={handleSmokeTest} disabled={testing || smokeTesting || saving}>
-          <Plug size={14} /> {smokeTesting ? "探测中…" : "测试工具调用"}
-        </button>
-        <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={handleSave} disabled={saving}>
-          {saving ? "保存中…" : "保存"}
-        </button>
+        <div className="provider-card__actions">
+          <button type="button" className="approval-card__btn" onClick={onCancel} disabled={saving}>
+            取消
+          </button>
+          <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={handleSave} disabled={saving}>
+            {saving ? "保存中…" : "保存"}
+          </button>
+        </div>
       </div>
-    </div>
+    </>
   );
 }
 
@@ -544,257 +507,244 @@ function LspServerSettings() {
   );
 }
 
-// ── RoleRoutingSettings（R8 角色→模型路由，R-uicfg / 0.0.57）──────────────────
+// ── 角色分配（Assignments，0.0.59）───────────────────────────────────────────
 
 /**
- * 角色→模型路由设置：为 action / plan / critique 三个功能角色各绑定一个模型+供应商；不设＝回退主模型。
- * 概览经 get_role_routing；每个角色的表单回填 get_role_provider_config，保存经 save_role_provider，
- * 清除（回退主模型）经 clear_role_provider。api_key 不回显明文（留空＝保留已存 key）。
+ * 角色 → 连接/模型 分配矩阵：每个角色一行 [连接 ▾][模型 ▾]，非主角色可选「跟随主模型」。
+ * **本页绝无 API Key 输入**——密钥只在「模型连接」配。挂载拉 get_role_assignments + list_connections；
+ * 设置经 set_role_assignment、「跟随主模型」经 clear_role_assignment（main 不可清，故主行不提供）。
  */
-function RoleRoutingSettings() {
-  const [routing, setRouting] = useState<RoleRouting[]>([]);
+function AssignmentsSettings() {
+  const [assignments, setAssignments] = useState<RoleAssignmentView[]>([]);
+  const [connections, setConnections] = useState<ConnectionView[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const refresh = () => {
-    invoke<RoleRouting[]>("get_role_routing")
-      .then((r) => setRouting(Array.isArray(r) ? r : []))
-      .catch(() => setRouting([]));
+    Promise.all([
+      invoke<RoleAssignmentView[]>("get_role_assignments"),
+      invoke<ConnectionView[]>("list_connections"),
+    ])
+      .then(([a, c]) => {
+        setAssignments(Array.isArray(a) ? a : []);
+        setConnections(Array.isArray(c) ? c : []);
+      })
+      .catch((e) => setError(humanizeError(String(e))))
+      .finally(() => setLoading(false));
   };
   useEffect(() => { refresh(); }, []);
 
-  function routingOf(role: string): RoleRouting | undefined {
-    return routing.find((r) => r.role === role);
+  function metaOf(role: string): { label: string; desc: string } {
+    const m = ASSIGNABLE_ROLES.find((r) => r.id === role);
+    return m ? { label: m.label, desc: m.desc } : { label: role, desc: "" };
   }
 
   return (
     <>
-      <h3 className="settings-content__h">角色 → 模型路由</h3>
-      <p className="settings-desc" style={{ marginTop: 0 }}>
-        为不同<b>功能角色</b>绑定各自的模型与供应商：未设置的角色自动回退到「主模型」（与从前行为一致）。
-        例如可让「规划」用更强的推理模型、「行动」用更快更省的模型。
+      <h3 className="settings-content__h">模型分配</h3>
+      <p className="settings-desc" style={{ marginTop: 0, marginBottom: 8 }}>
+        把每个<b>角色</b>指到一个已配置的<b>连接</b> + <b>模型</b>。未单独分配的角色自动<b>跟随主模型</b>。
+        此处只选连接与模型，<b>不输入任何 API Key</b>（密钥在「模型连接」配）。
       </p>
-      {ROUTING_ROLES.map((r) => {
-        const cur = routingOf(r.id);
-        return (
-          <RoleRoutingCard
-            key={r.id}
-            role={r.id}
-            title={r.label}
-            desc={r.desc}
-            routing={cur}
-            onChanged={refresh}
-          />
-        );
-      })}
+
+      {connections.length === 0 && !loading && (
+        <p className="settings-row__value" style={{ color: "var(--warning)" }}>
+          还没有任何连接。请先到「模型连接」新增一个连接（填 API Key），再回来分配角色。
+        </p>
+      )}
+
+      {loading ? (
+        <p className="settings-row__value">加载中…</p>
+      ) : (
+        // 按 ASSIGNABLE_ROLES 顺序渲染（缺失的角色用空占位行，理论上后端会全量返回）。
+        ASSIGNABLE_ROLES.map((meta) => {
+          const a =
+            assignments.find((x) => x.role === meta.id) ??
+            ({ role: meta.id, enabled: false, effective: { source: "none" as const } } as RoleAssignmentView);
+          return (
+            <AssignmentRow
+              key={meta.id}
+              assignment={a}
+              title={metaOf(meta.id).label}
+              desc={metaOf(meta.id).desc}
+              connections={connections}
+              onChanged={refresh}
+              onError={setError}
+            />
+          );
+        })
+      )}
+
+      {error && <p className="settings-row__value" style={{ color: "var(--danger)" }}>{error}</p>}
     </>
   );
 }
 
-/** 单个角色的路由卡片：状态徽标（自身/回退主模型）+ 供应商/模型/Key 表单 + 保存/回退主模型。 */
-function RoleRoutingCard({
-  role,
+/**
+ * 单角色分配行：[连接 ▾][模型 ▾]（+ 非主角色的「跟随主模型」选项）。
+ * 连接下拉来自 list_connections（按展示名）；选中后用 list_models_for_connection 拉已知模型；
+ * 列表为空（custom / 未知预设）则模型框降级为自由文本输入。
+ * main 行：无「跟随主模型」选项（它就是默认；后端也拒绝清 main）。
+ */
+function AssignmentRow({
+  assignment,
   title,
   desc,
-  routing,
+  connections,
   onChanged,
+  onError,
 }: {
-  role: "action" | "plan" | "critique";
+  assignment: RoleAssignmentView;
   title: string;
   desc: string;
-  routing?: RoleRouting;
+  connections: ConnectionView[];
   onChanged: () => void;
+  onError: (msg: string | null) => void;
 }) {
-  const [preset, setPreset] = useState<string>("deepseek");
-  const [modelId, setModelId] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [baseUrl, setBaseUrl] = useState("");
-  const [showKey, setShowKey] = useState(false);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [configured, setConfigured] = useState(false);
-  const [keyTouched, setKeyTouched] = useState(false);
+  const role = assignment.role;
+  const isMain = role === "main";
+  // 本行选择态。"" = 跟随主模型（仅非主角色）。回填自身引用（若有）。
+  const [connectionId, setConnectionId] = useState<string>(assignment.connectionId ?? "");
+  const [modelId, setModelId] = useState<string>(assignment.modelId ?? "");
+  // 当前所选连接的已知模型清单（空＝自由文本输入）。
+  const [knownModels, setKnownModels] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => { if (savedTimer.current) clearTimeout(savedTimer.current); }, []);
 
-  const presetMeta = PROVIDER_PRESETS.find((p) => p.id === preset) ?? PROVIDER_PRESETS[0];
-  const isCustom = preset === "custom";
-
-  // 挂载回填该角色自身配置（不回退 main；apiKey 脱敏为空）。
+  // 选连接后拉该连接预设的已知模型（空数组＝自由文本兜底）。
   useEffect(() => {
     let alive = true;
-    invoke<ProviderConfig | null>("get_role_provider_config", { role })
-      .then((cfg) => {
-        if (!alive || !cfg) return;
-        const p = cfg.preset ?? "deepseek";
-        setPreset(p);
-        setModelId(cfg.modelId || (PROVIDER_PRESETS.find((x) => x.id === p)?.defaultModelId ?? ""));
-        setBaseUrl(cfg.baseUrl ?? "");
-        setConfigured(true);
-        if (cfg.baseUrl || p === "custom") setAdvancedOpen(true);
-      })
-      .catch(() => {});
+    if (!connectionId) { setKnownModels([]); return; }
+    invoke<string[]>("list_models_for_connection", { connectionId })
+      .then((list) => { if (alive) setKnownModels(Array.isArray(list) ? list : []); })
+      .catch(() => { if (alive) setKnownModels([]); });
     return () => { alive = false; };
-  }, [role]);
+  }, [connectionId]);
 
-  function handlePresetChange(next: string) {
-    setPreset(next);
-    const meta = PROVIDER_PRESETS.find((p) => p.id === next);
-    setModelId(meta?.defaultModelId ?? "");
-    if (next === "custom") setAdvancedOpen(true);
-    else { setAdvancedOpen(false); setBaseUrl(""); }
+  const eff = assignment.effective;
+  // 「跟随主模型」生效时，把实际生效连接/模型展示出来（source==="main"）。
+  const followingMain = !isMain && eff.source === "main";
+  const badgeText = isMain
+    ? eff.modelId
+      ? "● 已配置"
+      : "⚠ 未配置"
+    : eff.source === "self"
+    ? "● 专属模型"
+    : eff.source === "main"
+    ? "○ 跟随主模型"
+    : "⚠ 主模型未配置";
+
+  function handleConnectionChange(next: string) {
+    onError(null);
+    setConnectionId(next);
+    setModelId(""); // 换连接后清模型，避免跨预设残留无效模型。
   }
 
   async function handleSave() {
-    setError(null);
-    if (isCustom && !baseUrl.trim()) {
-      setError("自定义供应商必须填写 Base URL");
-      setAdvancedOpen(true);
-      return;
-    }
-    if (!modelId.trim()) { setError("请填写模型 ID"); return; }
-    // 首配必须填 key；已配且未改动 key 时留空＝保留已存。
-    if (!configured && !apiKey.trim()) { setError("请填写 API Key"); return; }
-    if (keyTouched && !apiKey.trim()) { setError("请填写 API Key"); return; }
+    onError(null);
+    if (!connectionId) { onError("请选择一个连接"); return; }
+    if (!modelId.trim()) { onError("请选择或填写模型 ID"); return; }
     setSaving(true);
     try {
-      await invoke("save_role_provider", {
+      await invoke("set_role_assignment", {
         role,
-        preset,
-        label: presetMeta.label,
-        baseUrl: baseUrl.trim() || null,
-        apiKey: keyTouched ? apiKey.trim() : "",
+        connectionId,
         modelId: modelId.trim(),
-        contextWindow: null,
+        // contextWindow 作为可选高级项，本行保持简单不暴露（留给连接/默认）。
+        contextWindow: assignment.contextWindow ?? null,
+        enabled: true,
       });
-      setConfigured(true);
-      setKeyTouched(false);
-      setApiKey("");
-      if (savedTimer.current) clearTimeout(savedTimer.current);
-      setSaved(true);
-      savedTimer.current = setTimeout(() => setSaved(false), 2600);
       onChanged();
     } catch (e) {
-      setError(humanizeError(String(e)));
+      onError(humanizeError(String(e)));
     } finally {
       setSaving(false);
     }
   }
 
-  async function handleClear() {
-    setError(null);
+  // 「跟随主模型」：清除该角色自身引用（main 不可清，故主行无此按钮）。
+  async function handleFollowMain() {
+    onError(null);
     setSaving(true);
     try {
-      await invoke("clear_role_provider", { role });
-      setConfigured(false);
-      setApiKey("");
-      setKeyTouched(false);
+      await invoke("clear_role_assignment", { role });
+      setConnectionId("");
+      setModelId("");
       onChanged();
     } catch (e) {
-      setError(humanizeError(String(e)));
+      onError(humanizeError(String(e)));
     } finally {
       setSaving(false);
     }
   }
-
-  // 状态文案：自身配置 / 回退主模型 / 主模型未配。
-  const source = routing?.source ?? "main";
-  const effective = routing?.effectiveModel;
-  const badgeText =
-    source === "self" ? "● 使用专属模型" : source === "main" ? "○ 回退主模型" : "⚠ 主模型未配置";
-  const keyPlaceholder = configured && !keyTouched ? "已配置 ••••（如需更换请重新输入）" : "sk-...";
 
   return (
     <div className="provider-card" style={{ marginBottom: 10 }}>
       <div className="provider-card__head">
         <span className="provider-card__title">{title}</span>
-        <span className={`provider-badge${source === "self" ? " provider-badge--on" : ""}`}>{badgeText}</span>
+        <span className={`provider-badge${eff.source === "self" || (isMain && eff.modelId) ? " provider-badge--on" : ""}`}>
+          {badgeText}
+        </span>
       </div>
-      <p className="settings-desc" style={{ marginTop: 2, marginBottom: 6 }}>
+      <p className="settings-desc" style={{ marginTop: 2, marginBottom: 8 }}>
         {desc}
-        {source !== "self" && effective ? `　当前实际：${effective}` : ""}
+        {followingMain && (eff.connectionLabel || eff.modelId)
+          ? `　跟随主模型 → ${eff.connectionLabel ?? "?"} / ${eff.modelId ?? "?"}`
+          : ""}
       </p>
 
       <div className="provider-grid">
         <label className="provider-field">
-          <span className="provider-field__label">供应商</span>
-          <select className="model-select" value={preset} onChange={(e) => handlePresetChange(e.target.value)}>
-            {PROVIDER_PRESETS.map((p) => (
-              <option key={p.id} value={p.id}>{p.label}</option>
+          <span className="provider-field__label">连接</span>
+          <select
+            className="model-select"
+            value={connectionId}
+            onChange={(e) => handleConnectionChange(e.target.value)}
+          >
+            {!isMain && <option value="">跟随主模型</option>}
+            {isMain && connectionId === "" && <option value="">（请选择连接）</option>}
+            {connections.map((c) => (
+              <option key={c.id} value={c.id}>{connectionDisplayName(c)}</option>
             ))}
           </select>
         </label>
+
         <label className="provider-field">
           <span className="provider-field__label">模型</span>
-          <input
-            className="conv-search provider-input"
-            type="text"
-            value={modelId}
-            placeholder={presetMeta.defaultModelId || "model-id"}
-            onChange={(e) => setModelId(e.target.value)}
-          />
-        </label>
-
-        <label className="provider-field provider-field--full">
-          <span className="provider-field__label">API Key</span>
-          <span className="provider-key">
+          {connectionId && knownModels.length > 0 ? (
+            <select className="model-select" value={modelId} onChange={(e) => { onError(null); setModelId(e.target.value); }}>
+              <option value="">（选择模型）</option>
+              {knownModels.map((m) => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+              {/* 自由补充：已回填一个不在已知清单里的模型时，仍可显示并保留它。 */}
+              {modelId && !knownModels.includes(modelId) && <option value={modelId}>{modelId}（自定义）</option>}
+            </select>
+          ) : (
+            // 已知清单为空（custom / 未知预设）或尚未选连接：自由文本输入模型 ID。
             <input
               className="conv-search provider-input"
-              type={showKey ? "text" : "password"}
-              value={apiKey}
-              placeholder={keyPlaceholder}
-              onChange={(e) => { setApiKey(e.target.value); setKeyTouched(true); }}
+              type="text"
+              value={modelId}
+              placeholder={connectionId ? "输入模型 ID，如 deepseek-chat" : "请先选择连接"}
+              disabled={!connectionId}
+              onChange={(e) => { onError(null); setModelId(e.target.value); }}
             />
-            <button type="button" className="provider-key__eye" title={showKey ? "隐藏" : "显示"} onClick={() => setShowKey((v) => !v)}>
-              {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
-            </button>
-          </span>
+          )}
         </label>
-
-        <div className="provider-field--full">
-          <button
-            type="button"
-            className="provider-advanced-toggle"
-            onClick={() => !isCustom && setAdvancedOpen((v) => !v)}
-            disabled={isCustom}
-            title={isCustom ? "自定义供应商必须填写 Base URL" : undefined}
-          >
-            {advancedOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-            高级设置（自定义 Base URL）
-          </button>
-          <div className={`provider-advanced${advancedOpen ? " provider-advanced--open" : ""}`}>
-            <div className="provider-advanced__inner">
-              <input
-                className="conv-search provider-input"
-                type="text"
-                value={baseUrl}
-                placeholder={presetMeta.baseUrl ?? "https://your-endpoint/v1"}
-                onChange={(e) => setBaseUrl(e.target.value)}
-              />
-              <p className="settings-desc" style={{ marginTop: 4 }}>
-                {isCustom
-                  ? "自定义供应商必须填写 Base URL（自托管/代理）。"
-                  : `留空即使用 ${presetMeta.label} 官方端点；自托管/代理可填。`}
-              </p>
-            </div>
-          </div>
-        </div>
       </div>
 
-      {error && <p className="settings-row__value" style={{ color: "var(--danger)" }}>{error}</p>}
-
       <div className="provider-card__actions">
-        {saved && (
-          <span className="provider-saved" role="status" style={{ color: "var(--success)" }}>
-            已保存 ✓
-          </span>
-        )}
-        {configured && (
-          <button type="button" className="approval-card__btn" onClick={handleClear} disabled={saving}>
-            回退主模型
+        {!isMain && assignment.connectionId && (
+          <button type="button" className="approval-card__btn" onClick={handleFollowMain} disabled={saving}>
+            跟随主模型
           </button>
         )}
-        <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={handleSave} disabled={saving}>
+        <button
+          type="button"
+          className="approval-card__btn approval-card__btn--allow"
+          onClick={handleSave}
+          disabled={saving || !connectionId}
+        >
           {saving ? "保存中…" : "保存"}
         </button>
       </div>
@@ -894,18 +844,33 @@ export function SettingsModal({
   }
   const [section, setSection] = useState<SettingsSection>(initialSection);
   const [budgetInput, setBudgetInput] = useState(String(taskBudget));
-  // 「扩展 agent 的模态」开关：持久化于 settings(modality_extended)；开 → 露出视觉/音频块。
+  // 「扩展 agent 的模态」开关：持久化于 settings(modality_extended)；开 → 露出视觉块占位说明。
   const [modalityExtended, setModalityExtended] = useState(false);
-  // 主 provider 是否 deepseek 预设：决定账户区 DeepSeek 余额卡片是否显示。
+  // 主模型当前是否走 DeepSeek 预设（决定账户区 DeepSeek 余额卡片是否显示）。
+  // 0.0.59：从「连接库 + 角色分配」推导——取 main 角色生效连接的 preset。
   const [mainIsDeepseek, setMainIsDeepseek] = useState(false);
+
+  /** 重新推导「主模型是否 DeepSeek」：交叉 get_role_assignments 与 list_connections。 */
+  const refreshMainPreset = () => {
+    Promise.all([
+      invoke<RoleAssignmentView[]>("get_role_assignments"),
+      invoke<ConnectionView[]>("list_connections"),
+    ])
+      .then(([assigns, conns]) => {
+        const main = assigns.find((a) => a.role === "main");
+        // main 自身引用的连接 id；据此查 preset。未配＝按默认 deepseek 不误伤。
+        const conn = main?.connectionId ? conns.find((c) => c.id === main.connectionId) : undefined;
+        const hasMain = !!main?.effective.modelId;
+        setMainIsDeepseek(hasMain && (conn?.preset ?? "deepseek") === "deepseek");
+      })
+      .catch(() => {});
+  };
 
   useEffect(() => {
     invoke<string | null>("get_app_setting", { key: "modality_extended" })
       .then((v) => setModalityExtended(v === "1"))
       .catch(() => {});
-    invoke<ProviderConfig | null>("get_model_provider_config", { role: "main" })
-      .then((cfg) => setMainIsDeepseek((cfg?.preset ?? "deepseek") === "deepseek" && !!cfg))
-      .catch(() => {});
+    refreshMainPreset();
   }, []);
 
   // 进入「权限规则」分类时拉取最近被拦动作（Plan27 #9）。
@@ -919,16 +884,16 @@ export function SettingsModal({
   async function handleToggleModality(next: boolean) {
     setModalityExtended(next);
     await invoke("set_app_setting", { key: "modality_extended", value: next ? "1" : "" }).catch(() => {});
-    // 关闭模态：移除视觉 provider，使图像门禁回到「无视觉」态。
+    // 关闭模态：清除视觉角色分配，使图像门禁回到「无视觉」态。
     if (!next) {
-      await invoke("remove_model_provider", { role: "vision" }).catch(() => {});
+      await invoke("clear_role_assignment", { role: "vision" }).catch(() => {});
     }
   }
 
   const NAV: Array<{ id: typeof section; label: string }> = [
     { id: "account", label: "账户" },
-    { id: "provider", label: "模型供应商" },
-    { id: "routing", label: "角色路由" },
+    { id: "connections", label: "模型连接" },
+    { id: "assignments", label: "模型分配" },
     { id: "lsp", label: "语言服务器" },
     { id: "permission", label: "权限" },
     { id: "rules", label: "权限规则" },
@@ -971,7 +936,7 @@ export function SettingsModal({
                 <span className="settings-row__label">DeepSeek API Key</span>
                 <span className="settings-row__value">{apiKeyLabel}</span>
               </div>
-              <p className="settings-desc">API Key 在「<b>模型供应商</b>」选项卡中配置，存于本地，不上传云端。</p>
+              <p className="settings-desc">API Key 在「<b>模型连接</b>」选项卡中配置，存于本地，不上传云端。</p>
 
               {/* 余额查询门禁（Plan21 #5）：仅 DeepSeek 主供应商支持余额查询；
                   其他供应商后端会返回 Err，此处直接以提示替代，不触发刷新。 */}
@@ -1028,36 +993,35 @@ export function SettingsModal({
             </>
           )}
 
-          {section === "provider" && (
-            <>
-              <h3 className="settings-content__h">模型供应商</h3>
-              <p className="settings-desc" style={{ marginTop: 0, marginBottom: 8 }}>
-                配置主模型供应商（OpenAI 兼容）：选预设、填 API Key 与模型 ID 即可。Base URL 留空走预设官方端点，自托管/代理可在高级设置里覆盖。
-              </p>
-              <ProviderCard
-                role="main"
-                title="主模型"
-                onSaved={() => {
-                  // 保存后刷新「DeepSeek 余额卡片是否显示」与顶栏 key 状态，并消除首屏未配引导。
-                  onMainConfiguredChange(true);
-                  invoke<ProviderConfig | null>("get_model_provider_config", { role: "main" })
-                    .then((cfg) => setMainIsDeepseek((cfg?.preset ?? "deepseek") === "deepseek" && !!cfg))
-                    .catch(() => {});
-                }}
-              />
+          {section === "connections" && (
+            <ConnectionsSettings
+              onChanged={() => {
+                // 连接变更后刷新主模型预设推导与首屏未配引导（连接本身不决定是否「已配主模型」，
+                // 但删/改可能间接影响，保守刷新一次）。
+                refreshMainPreset();
+                void invoke<RoleAssignmentView[]>("get_role_assignments")
+                  .then((a) => onMainConfiguredChange(!!a.find((x) => x.role === "main")?.effective.modelId))
+                  .catch(() => {});
+              }}
+            />
+          )}
 
+          {section === "assignments" && (
+            <>
+              <AssignmentsSettings />
+
+              {/* 扩展模态开关：vision 已是分配矩阵中的一个角色；此开关额外露出音频占位并在关闭时清空视觉分配。 */}
               <label className="toggle provider-modality-toggle">
                 <input
                   type="checkbox"
                   checked={modalityExtended}
                   onChange={(e) => handleToggleModality(e.target.checked)}
                 />
-                <span><b>扩展 agent 的模态</b>　开启后可接入视觉/音频模型扩展能力</span>
+                <span><b>扩展 agent 的模态</b>　开启后可为「视觉」角色分配识图模型（上方矩阵）</span>
               </label>
 
               {modalityExtended && (
                 <div className="provider-modality">
-                  <ProviderCard role="vision" title="视觉（识图）" />
                   <div className="provider-card provider-card--disabled">
                     <div className="provider-card__head">
                       <span className="provider-card__title">
@@ -1074,8 +1038,6 @@ export function SettingsModal({
               )}
             </>
           )}
-
-          {section === "routing" && <RoleRoutingSettings />}
 
           {section === "lsp" && <LspServerSettings />}
 
