@@ -5,6 +5,7 @@
 //! - [`messages`]：工作区上下文消息构建 + 项目长期记忆读取。
 //! - [`compaction`]：上下文压缩软上限常量与推导。
 //! - [`verification`]：写后验证命令探测（识别 Cargo.toml/package.json/.mdga/diagnostics，不执行）。
+//! - [`loop_guard`]：R6 陈旧读检测（文件指纹比对）+ 序列级 doom-loop 检测。
 //! - [`usage`]：token usage 合并。
 //!
 //! 这些条目从桌面端整体迁入，逻辑一字不改，仅换位置并提升可见性；桌面端改为 `use mdga_agent_core::...`。
@@ -12,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 mod compaction;
+mod loop_guard;
 mod messages;
 mod prompt;
 mod test_report;
@@ -20,6 +22,7 @@ mod verification;
 
 // 内核公开面：桌面端按既有引用路径 `mdga_agent_core::<名>` 直接取用。
 pub use compaction::{context_soft_limit_for, CONTEXT_SOFT_LIMIT_TOKENS};
+pub use loop_guard::{is_stale, FileFingerprint, SequenceLoopDetector};
 pub use messages::{messages_with_workspace_context, read_workspace_memory};
 pub use prompt::{CODE_OF_CONDUCT, IDENTITY_ANCHOR, TOOL_DISCIPLINE};
 pub use test_report::{

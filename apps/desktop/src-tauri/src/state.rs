@@ -2,8 +2,10 @@
 //!
 //! 从 main.rs 抽出（Plan16 阶段1）：纯结构/静态量搬移，无行为变更。
 
+use mdga_agent_core::{FileFingerprint, SequenceLoopDetector};
 use mdga_mcp_client::McpClient;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -47,6 +49,22 @@ pub(crate) struct AppState {
     pub(crate) command_sandbox: AtomicBool,
     /// 单次任务 token 预算（累计 total_tokens 上限）；0 = 不限。超出则暂停工具循环。
     pub(crate) task_token_budget: AtomicU64,
+    /// R6 循环护栏状态：按 conversation_id 索引的「陈旧读指纹表 + 序列级 doom-loop 检测器」。
+    /// 工具循环在 read_file 成功后记录指纹、在写类编辑前比对、按每轮调用签名喂检测器。
+    /// 会话结束（send_message 收尾）时清理，避免跨任务串味。
+    pub(crate) loop_guards: Mutex<HashMap<String, ConversationLoopGuard>>,
+}
+
+/// 一个会话的循环护栏状态（R6）。
+///
+/// - `read_fingerprints`：键为该文件在磁盘上的绝对路径（canonical），值为 read_file 当时的
+///   mtime+size 指纹；写类编辑前据此判断底层文件是否在读后被改动（陈旧读）。
+/// - `loop_detector`：序列级 doom-loop 检测器，吃每轮的 (tool,args) 调用签名，
+///   命中「窗口循环重复」即让工具循环走既有 agent-stuck 暂停路径。
+#[derive(Default)]
+pub(crate) struct ConversationLoopGuard {
+    pub(crate) read_fingerprints: HashMap<PathBuf, FileFingerprint>,
+    pub(crate) loop_detector: SequenceLoopDetector,
 }
 
 /// 一个托管的后台 shell 进程状态。
