@@ -64,18 +64,27 @@ pub struct CodemapResult {
     pub note: String,
 }
 
-/// 构建仓库地图。永不硬失败:工作区不存在或无源码时返回空 map + 说明。
-pub fn build_repo_map(workspace_root: &str, request: &CodemapRequest) -> CodemapResult {
-    let root = PathBuf::from(workspace_root);
+/// 发现 + 抽取 + 排名的共享核心:既供 `build_repo_map` 渲染地图,也供 `analyze_repo`
+/// 产出结构化数据,确保二者基于**完全一致**的发现/解析/排名口径(单一真相来源)。
+/// 返回 None 表示软失败(工作区不存在或无可扫描源文件),附带给上层的说明文案。
+struct PipelineOutput {
+    rel_paths: Vec<String>,
+    file_tags: Vec<tags::FileTags>,
+    ranks: graph::GraphRanks,
+    total_definitions: usize,
+    discover_truncated: bool,
+}
+
+fn run_pipeline(root: &std::path::Path, request: &CodemapRequest) -> Result<PipelineOutput, String> {
     if !root.is_dir() {
-        return empty_result("工作区路径不存在或不是目录");
+        return Err("工作区路径不存在或不是目录".to_string());
     }
 
     // 1) gitignore 感知地发现受支持源文件。
     let mut rel_paths: Vec<String> = Vec::new();
     let mut abs_paths: Vec<PathBuf> = Vec::new();
     let mut discover_truncated = false;
-    let walker = WalkBuilder::new(&root)
+    let walker = WalkBuilder::new(root)
         .hidden(true)
         .parents(true)
         // 硬排除重目录:对目录项按名字过滤,filter_entry 会连同其整棵子树一起剪掉,
@@ -107,16 +116,17 @@ pub fn build_repo_map(workspace_root: &str, request: &CodemapRequest) -> Codemap
             discover_truncated = true;
             break;
         }
-        let rel = path.strip_prefix(&root).unwrap_or(path);
+        let rel = path.strip_prefix(root).unwrap_or(path);
         rel_paths.push(to_forward_slashes(rel));
         abs_paths.push(path.to_path_buf());
     }
 
     if rel_paths.is_empty() {
-        return empty_result(
+        return Err(
             "工作区内未发现可扫描的文本源文件\
              (含 tree-sitter 精确解析的 rust/python/js/ts/go/java/c/c++/c#/ruby/php/bash/lua/scala,\
-             及其它文本文件的启发式回退;仅二进制/媒体/锁文件等被排除)",
+             及其它文本文件的启发式回退;仅二进制/媒体/锁文件等被排除)"
+                .to_string(),
         );
     }
 
@@ -137,6 +147,29 @@ pub fn build_repo_map(workspace_root: &str, request: &CodemapRequest) -> Codemap
     let focus = resolve_focus(&request.focus_files, &rel_paths);
     let mentioned = parse_query(request.query.as_deref());
     let ranks = graph::rank(&file_tags, &focus, &mentioned);
+
+    Ok(PipelineOutput {
+        rel_paths,
+        file_tags,
+        ranks,
+        total_definitions,
+        discover_truncated,
+    })
+}
+
+/// 构建仓库地图。永不硬失败:工作区不存在或无源码时返回空 map + 说明。
+pub fn build_repo_map(workspace_root: &str, request: &CodemapRequest) -> CodemapResult {
+    let root = PathBuf::from(workspace_root);
+    let PipelineOutput {
+        rel_paths,
+        file_tags,
+        ranks,
+        total_definitions,
+        discover_truncated,
+    } = match run_pipeline(&root, request) {
+        Ok(out) => out,
+        Err(note) => return empty_result(&note),
+    };
 
     // 4) 预算内渲染。
     let budget = normalize_tokens(request.max_tokens);
@@ -182,6 +215,147 @@ pub fn repo_map_for_context(workspace_root: &str, max_tokens: usize) -> String {
         },
     );
     result.map
+}
+
+// ── 结构化分析 API（供 R11 仓库 wiki 等下游消费）─────────────────────────────
+//
+// `build_repo_map` 把分析结果渲染成「token 预算内的字符串」给模型直读;但下游若要
+// **按目录组织、持久化、可查询**,需要的是结构化数据而非要再解析的字符串。`analyze_repo`
+// 复用同一条发现/解析/排名流水线,把每个文件的路径、PageRank 分、按重要度排序的顶层符号
+// (名/行/签名/定义级流入分)如实导出,让 wiki 层只做「组织 + 持久化 + 检索」、不重做符号抽取。
+
+/// 单个符号(定义)的结构化条目。`score` 为 PageRank 摊回该定义的「被引用重要度」流入分。
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolEntry {
+    /// 符号名(节点文本)。
+    pub name: String,
+    /// 定义名所在行(1 基,与渲染地图一致,便于直接 read_file 定位)。
+    pub line: usize,
+    /// 该定义所在行去空白后的源文本(已含 fn/struct/class 等关键字,种类隐含其中)。
+    pub signature: String,
+    /// 该定义的引用流入分(越高表示被越多重要文件引用)。
+    pub score: f64,
+}
+
+/// 单个源文件的结构化分析:路径 + 文件级 PageRank + 按重要度降序的顶层符号。
+#[derive(Debug, Clone, Serialize)]
+pub struct FileAnalysis {
+    /// 工作区相对路径(正斜杠)。
+    pub path: String,
+    /// 文件级 PageRank 分(越高越「核心/被依赖」)。
+    pub file_rank: f64,
+    /// 本文件定义总数(可能多于 `top_symbols` 因后者按上限截断)。
+    pub definition_count: usize,
+    /// 按定义级流入分降序、平局按行号升序挑出的顶层符号(已截到 `max_symbols_per_file`)。
+    pub top_symbols: Vec<SymbolEntry>,
+}
+
+/// 整仓结构化分析结果。文件按 `file_rank` 降序排列(确定性:平局按路径)。
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoAnalysis {
+    /// 按重要度降序的每文件分析(已剔除无定义的文件)。
+    pub files: Vec<FileAnalysis>,
+    /// 扫描到的受支持源文件总数。
+    pub total_files: usize,
+    /// 提取到的定义符号总数。
+    pub total_definitions: usize,
+    /// 是否因文件数上限发生截断。
+    pub truncated: bool,
+}
+
+/// 单文件保留的顶层符号数上限,与 render 的口径一致,避免某个大文件挤占整张分析。
+const MAX_SYMBOLS_PER_FILE: usize = 40;
+
+/// 结构化分析整个工作区。永不硬失败:工作区不存在或无源码时返回空 `files`。
+///
+/// 与 `build_repo_map` 共用同一条发现/解析/排名流水线,但导出结构化数据而非渲染字符串。
+/// `request.focus_files` / `request.query` 同样会个性化排名(收敛到关注区域)。
+pub fn analyze_repo(workspace_root: &str, request: &CodemapRequest) -> RepoAnalysis {
+    let root = PathBuf::from(workspace_root);
+    let PipelineOutput {
+        rel_paths,
+        file_tags,
+        ranks,
+        total_definitions,
+        discover_truncated,
+    } = match run_pipeline(&root, request) {
+        Ok(out) => out,
+        Err(_) => {
+            return RepoAnalysis {
+                files: Vec::new(),
+                total_files: 0,
+                total_definitions: 0,
+                truncated: false,
+            }
+        }
+    };
+    let total_files = rel_paths.len();
+
+    // 仅保留有定义的文件(无定义的文件对 wiki 摘要无信息量),按 file_rank 降序、平局按路径升序。
+    let mut order: Vec<usize> = (0..file_tags.len())
+        .filter(|&i| !file_tags[i].defs.is_empty())
+        .collect();
+    order.sort_by(|&a, &b| {
+        let ra = ranks.file_rank.get(a).copied().unwrap_or(0.0);
+        let rb = ranks.file_rank.get(b).copied().unwrap_or(0.0);
+        rb.partial_cmp(&ra)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| rel_paths[a].cmp(&rel_paths[b]))
+    });
+
+    let mut files: Vec<FileAnalysis> = Vec::with_capacity(order.len());
+    for fi in order {
+        let tags = &file_tags[fi];
+        // 定义按流入分降序、平局按行号升序;再截到单文件上限。
+        let mut def_idx: Vec<usize> = (0..tags.defs.len()).collect();
+        def_idx.sort_by(|&x, &y| {
+            let sx = ranks
+                .def_score
+                .get(&(fi, tags.defs[x].name.clone()))
+                .copied()
+                .unwrap_or(0.0);
+            let sy = ranks
+                .def_score
+                .get(&(fi, tags.defs[y].name.clone()))
+                .copied()
+                .unwrap_or(0.0);
+            sy.partial_cmp(&sx)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| tags.defs[x].line.cmp(&tags.defs[y].line))
+        });
+        def_idx.truncate(MAX_SYMBOLS_PER_FILE);
+
+        let top_symbols: Vec<SymbolEntry> = def_idx
+            .into_iter()
+            .map(|di| {
+                let d = &tags.defs[di];
+                SymbolEntry {
+                    name: d.name.clone(),
+                    line: d.line + 1,
+                    signature: d.sig.clone(),
+                    score: ranks
+                        .def_score
+                        .get(&(fi, d.name.clone()))
+                        .copied()
+                        .unwrap_or(0.0),
+                }
+            })
+            .collect();
+
+        files.push(FileAnalysis {
+            path: rel_paths[fi].clone(),
+            file_rank: ranks.file_rank.get(fi).copied().unwrap_or(0.0),
+            definition_count: tags.defs.len(),
+            top_symbols,
+        });
+    }
+
+    RepoAnalysis {
+        files,
+        total_files,
+        total_definitions,
+        truncated: discover_truncated,
+    }
 }
 
 fn resolve_focus(focus_files: &[String], rel_paths: &[String]) -> Vec<usize> {
@@ -471,6 +645,52 @@ mod tests {
             result.map
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 结构化分析:与渲染地图共用同一流水线,应导出按 file_rank 降序的每文件结构化符号。
+    /// hub.rs 被 a.rs/b.rs 引用 → file_rank 最高 → 排在 files[0];其顶层符号含 shared/Widget。
+    #[test]
+    fn analyze_repo_exports_structured_ranked_symbols() {
+        let dir = make_fixture();
+        let analysis = analyze_repo(dir.to_str().unwrap(), &default_req());
+        assert_eq!(analysis.total_files, 4, "应扫描到 4 个源文件");
+        assert!(analysis.total_definitions >= 6, "定义数应≥6");
+        assert!(!analysis.files.is_empty(), "结构化分析不应为空");
+
+        // 被最多引用的 hub.rs 应排在最前。
+        assert_eq!(
+            analysis.files[0].path, "hub.rs",
+            "hub.rs 应按 file_rank 排在最前,实得:{:?}",
+            analysis.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        // file_rank 应随排序单调不增。
+        for w in analysis.files.windows(2) {
+            assert!(
+                w[0].file_rank >= w[1].file_rank,
+                "files 应按 file_rank 降序"
+            );
+        }
+        // 每个符号带 1 基行号(>=1)与非空签名,且行号与签名口径一致。
+        let hub = &analysis.files[0];
+        assert!(
+            hub.top_symbols.iter().any(|s| s.name == "shared"),
+            "hub.rs 顶层符号应含 shared,实得:{:?}",
+            hub.top_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        for s in &hub.top_symbols {
+            assert!(s.line >= 1, "行号应为 1 基,实得 {}", s.line);
+            assert!(!s.signature.is_empty(), "签名不应为空");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 结构化分析对缺失工作区应软失败:空 files、零计数,绝不 panic。
+    #[test]
+    fn analyze_repo_missing_workspace_is_soft_failure() {
+        let analysis = analyze_repo("C:/definitely/not/here/mdga-wiki-x", &default_req());
+        assert!(analysis.files.is_empty());
+        assert_eq!(analysis.total_files, 0);
+        assert_eq!(analysis.total_definitions, 0);
     }
 
     /// 二进制/资源类扩展名不应被发现阶段收录(避免把 .png 等当文本送启发式)。
