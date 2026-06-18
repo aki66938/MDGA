@@ -50,9 +50,10 @@ pub(crate) fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability
         "delete_file" | "delete_dir" => Ok(ToolCapability::FileDelete),
         // 注册 MCP 会拉起外部进程/网络服务，按命令执行级别裁决（FullAccess 或审批）。
         "run_command" | "add_mcp_server" => Ok(ToolCapability::CommandRun),
-        "web_fetch" | "web_search" | "list_mcp_resources" | "read_mcp_resource" => {
-            Ok(ToolCapability::NetworkAccess)
-        }
+        // git_push/git_pr 为远端/网络操作（推送到远端、经 gh 创建 PR），按 NetworkAccess 裁决
+        // （R4 后续）：Workspace Auto 逐次审批、Full Access 放行；绝不自动放行。git_push 永不 force。
+        "web_fetch" | "web_search" | "list_mcp_resources" | "read_mcp_resource" | "git_push"
+        | "git_pr" => Ok(ToolCapability::NetworkAccess),
         // R7：浏览器 / computer-use 工具——无头 Chrome 驱动会触达网络（即便多为 localhost），
         // 按 NetworkAccess 裁决：Workspace Auto 逐次审批、Full Access 放行。
         "browser_navigate" | "browser_screenshot" | "browser_click" | "browser_fill"
@@ -336,6 +337,15 @@ fn approval_preview(tool_name: &str, arguments: &str) -> String {
     let raw = match tool_name {
         "run_command" => get("command"),
         "git_commit" => get("message"),
+        "git_pr" => {
+            let title = get("title");
+            let base = get("base");
+            if base.is_empty() {
+                title
+            } else {
+                format!("[base: {base}] {title}")
+            }
+        }
         "write_file" | "create_file" => get("content"),
         "apply_patch" | "edit_file" => {
             let diff = get("diff");

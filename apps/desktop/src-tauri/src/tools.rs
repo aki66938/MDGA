@@ -8,12 +8,13 @@ use crate::web::{execute_web_fetch, execute_web_search};
 use mdga_sandbox_runtime::SessionSecurityContext;
 use mdga_tool_runtime::{
     apply_multi_patch, code_overview, create_file, delete_dir, delete_file, edit_file, git_add,
-    git_branch, git_commit, git_diff, git_log, git_status, glob_files, list_dir, make_dir,
-    move_path, read_file, run_command, search_text, stat_path, write_file, CodeOverviewRequest,
-    CreateFileRequest, DeleteDirRequest, DeleteFileRequest, EditFileRequest, GitAddRequest,
-    GitBranchRequest, GitCommitRequest, GitDiffRequest, GitLogRequest, GitStatusRequest,
-    GlobFilesRequest, ListDirRequest, MakeDirRequest, MovePathRequest, MultiEditRequest,
-    ReadFileRequest, RunCommandRequest, SearchTextRequest, StatPathRequest, WriteFileRequest,
+    git_branch, git_commit, git_diff, git_log, git_pr, git_push, git_status, glob_files, list_dir,
+    make_dir, move_path, read_file, run_command, search_text, stat_path, write_file,
+    CodeOverviewRequest, CreateFileRequest, DeleteDirRequest, DeleteFileRequest, EditFileRequest,
+    GitAddRequest, GitBranchRequest, GitCommitRequest, GitDiffRequest, GitLogRequest, GitPrRequest,
+    GitPushRequest, GitStatusRequest, GlobFilesRequest, ListDirRequest, MakeDirRequest,
+    MovePathRequest, MultiEditRequest, ReadFileRequest, RunCommandRequest, SearchTextRequest,
+    StatPathRequest, WriteFileRequest,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -761,6 +762,38 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_push",
+                "description": "Push the CURRENT branch to its remote (REMOTE/NETWORK operation). Pushes `<remote> <current-branch>`; remote defaults to 'origin'. Set setUpstream=true on the first push of a new branch to establish tracking (`--set-upstream`). This NEVER force-pushes and has no force option — it will not overwrite remote history. Commit your work first (git_commit). Requires the branch's remote to be configured and push credentials to be available.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "remote": { "type": "string", "description": "Remote name to push to. Default 'origin'." },
+                        "setUpstream": { "type": "boolean", "description": "Add --set-upstream to establish tracking for a new branch's first push. Default false." }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_pr",
+                "description": "Create a GitHub Pull Request for the current branch via the gh CLI (`gh pr create`) — a REMOTE/NETWORK operation. Push the branch first (git_push). Returns the new PR URL. Requires the gh CLI installed, on PATH, and authenticated (`gh auth login`); if gh is missing you get a clear error.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "PR title." },
+                        "body": { "type": "string", "description": "PR description body (may be empty)." },
+                        "base": { "type": "string", "description": "Optional base branch to merge into (e.g. main). Defaults to the repository's default branch." }
+                    },
+                    "required": ["title", "body"],
+                    "additionalProperties": false
+                }
+            }
+        }),
         // R1：LSP 编译器级代码智能——4 个只读工具（go-to-def / references / hover / diagnostics）。
         serde_json::json!({
             "type": "function",
@@ -1103,6 +1136,19 @@ pub(crate) fn execute_builtin_tool_call(
             let request = serde_json::from_str::<GitCommitRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
             serde_json::to_value(git_commit(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        // R4 后续：git 远端工具（push / PR），按 NetworkAccess 门控（见 permissions.rs）。
+        "git_push" => {
+            let request = serde_json::from_str::<GitPushRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_push(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
+        "git_pr" => {
+            let request = serde_json::from_str::<GitPrRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(git_pr(workspace_path, request).map_err(|err| err.to_string())?)
                 .map_err(|err| err.to_string())
         }
         // R1：LSP 只读工具（编译器级代码智能）。

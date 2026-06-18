@@ -31,22 +31,34 @@ const GIT_TIMEOUT_SECS: u64 = 60;
 /// `.exe`/`.cmd`/`.bat`（外加 PATHEXT 里列出的其余扩展名）；非 Windows 仅取无扩展名且
 /// 校验可执行位。返回首个命中的绝对路径；都没命中返回 None（调用方据此回传清晰错误）。
 fn resolve_git_path() -> Option<PathBuf> {
+    resolve_in_path("git")
+}
+
+/// 在 PATH 里按 which 风格解析出 `gh`（GitHub CLI）的绝对路径。
+///
+/// 与 `resolve_git_path` 同一套「不让 cwd 抢占」的安全语义，仅命令名不同——git_pr 需要它。
+fn resolve_gh_path() -> Option<PathBuf> {
+    resolve_in_path("gh")
+}
+
+/// 通用：在 PATH 各目录里按 which 风格解析 `stem` 命令的绝对路径（复用同一防 cwd 抢占语义）。
+fn resolve_in_path(stem: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         // 空分量在 Windows 上历史语义等同当前目录——这正是我们要规避的攻击面，跳过。
         if dir.as_os_str().is_empty() {
             continue;
         }
-        if let Some(hit) = find_git_in_dir(&dir) {
+        if let Some(hit) = find_in_dir(&dir, stem) {
             return Some(hit);
         }
     }
     None
 }
 
-/// 在单个目录里寻找名为 `git` 的可执行文件，命中返回其绝对路径。
-fn find_git_in_dir(dir: &Path) -> Option<PathBuf> {
-    for candidate in git_candidate_names() {
+/// 在单个目录里寻找名为 `stem` 的可执行文件，命中返回其绝对路径。
+fn find_in_dir(dir: &Path, stem: &str) -> Option<PathBuf> {
+    for candidate in candidate_names(stem) {
         let full = dir.join(&candidate);
         if is_executable_file(&full) {
             return Some(full);
@@ -55,17 +67,17 @@ fn find_git_in_dir(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// 待尝试的文件名列表（含平台相关的可执行扩展名）。
-fn git_candidate_names() -> Vec<String> {
+/// 为命令 `stem` 生成待尝试的文件名列表（含平台相关的可执行扩展名）。
+fn candidate_names(stem: &str) -> Vec<String> {
     #[cfg(windows)]
     {
         // 默认四件套：无扩展名 + 常见可执行扩展；再并入 PATHEXT 里声明的其余扩展名，
         // 不区分大小写去重。无扩展名放最前以兼容罕见的无后缀分发。
         let mut names: Vec<String> = vec![
-            "git".to_string(),
-            "git.exe".to_string(),
-            "git.cmd".to_string(),
-            "git.bat".to_string(),
+            stem.to_string(),
+            format!("{stem}.exe"),
+            format!("{stem}.cmd"),
+            format!("{stem}.bat"),
         ];
         if let Some(pathext) = std::env::var_os("PATHEXT") {
             if let Some(s) = pathext.to_str() {
@@ -81,7 +93,7 @@ fn git_candidate_names() -> Vec<String> {
                     } else {
                         ext
                     };
-                    let cand = format!("git.{ext}");
+                    let cand = format!("{stem}.{ext}");
                     if !names.iter().any(|n| n.eq_ignore_ascii_case(&cand)) {
                         names.push(cand);
                     }
@@ -92,7 +104,7 @@ fn git_candidate_names() -> Vec<String> {
     }
     #[cfg(not(windows))]
     {
-        vec!["git".to_string()]
+        vec![stem.to_string()]
     }
 }
 
@@ -179,6 +191,29 @@ pub struct GitCommitRequest {
     /// 为 true 时先暂存已跟踪文件的改动再提交（`git commit -a`），不含未跟踪文件。
     #[serde(default)]
     pub all: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPushRequest {
+    /// 远端名（默认 "origin"）。
+    #[serde(default)]
+    pub remote: Option<String>,
+    /// 为 true 时带 `--set-upstream`，把当前分支与远端建立跟踪关系（首次推送常用）。
+    #[serde(default)]
+    pub set_upstream: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPrRequest {
+    /// PR 标题（必填，非空）。
+    pub title: String,
+    /// PR 正文（必填，可为空字符串以建空描述 PR）。
+    pub body: String,
+    /// 可选：目标基底分支（如 main）；缺省由 gh 取仓库默认分支。
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 // ── 结果类型 ────────────────────────────────────────────────────────────────
@@ -307,6 +342,35 @@ pub struct GitCommitResult {
     pub summary: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPushResult {
+    /// 推送到的远端名。
+    pub remote: String,
+    /// 推送的本地分支名（detached HEAD 时为 None，此时直接报错不推）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// 是否带了 --set-upstream。
+    pub set_upstream: bool,
+    /// git push 的概要输出（人读；push 进度走 stderr，这里合并便于模型确认结果）。
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPrResult {
+    /// gh 创建 PR 后回显的 URL（解析自 stdout；解析不到则为 None）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// PR 标题。
+    pub title: String,
+    /// 目标基底分支（未指定时为 None，由 gh 取默认分支）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// gh 的概要输出（人读）。
+    pub summary: String,
+}
+
 // ── 命令执行底座 ──────────────────────────────────────────────────────────────
 
 struct GitOutput {
@@ -403,6 +467,80 @@ fn run_git_checked(workspace: &Path, args: &[&str]) -> Result<GitOutput, ToolRun
     Ok(out)
 }
 
+/// 在工作区目录下以参数向量调用 `gh`（GitHub CLI，不经 shell），抽干管道、带超时。
+///
+/// 与 `run_git` 同骨架：先把 `gh` 解析成 PATH 绝对路径再派生（绕开 cwd 抢占）；擦除密钥环境；
+/// `GIT_TERMINAL_PROMPT=0` + `GH_PROMPT_DISABLED=1` 杜绝凭据/交互挂死。gh 缺失时回传清晰错误。
+/// 网络操作：超时沿用 `GIT_TIMEOUT_SECS`，给远端 API 往返留足余量。
+fn run_gh(workspace: &Path, args: &[&str]) -> Result<GitOutput, ToolRuntimeError> {
+    let gh_path = resolve_gh_path().ok_or_else(|| {
+        ToolRuntimeError::CommandFailed(
+            "未安装 gh CLI（GitHub CLI）/不在 PATH 中（请安装 gh 并确保在 PATH 中，再 `gh auth login` 登录）"
+                .to_string(),
+        )
+    })?;
+    let mut builder = Command::new(&gh_path);
+    builder
+        .args(args)
+        .current_dir(workspace)
+        // 防御：绝不因凭据/编辑器/确认交互而挂死（gh 也会触达底层 git 的凭据流程）。
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::scrub_secret_env(&mut builder);
+
+    let mut child = builder.spawn().map_err(|e| {
+        ToolRuntimeError::CommandFailed(format!(
+            "无法启动 gh（请确认已安装 gh CLI 且在 PATH 中）: {e}"
+        ))
+    })?;
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_handle = std::thread::spawn(move || crate::drain_pipe_streaming(stdout_pipe, None));
+    let err_handle = std::thread::spawn(move || crate::drain_pipe_streaming(stderr_pipe, None));
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(GIT_TIMEOUT_SECS);
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    timed_out = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(ToolRuntimeError::CommandFailed(e.to_string())),
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|e| ToolRuntimeError::CommandFailed(e.to_string()))?;
+    let (stdout, truncated) = out_handle.join().unwrap_or((String::new(), false));
+    let (stderr, _) = err_handle.join().unwrap_or((String::new(), false));
+
+    if timed_out {
+        return Err(ToolRuntimeError::CommandFailed(format!(
+            "gh 命令超时（>{GIT_TIMEOUT_SECS}s）: gh {}",
+            args.join(" ")
+        )));
+    }
+    Ok(GitOutput {
+        code: status.code(),
+        stdout,
+        stderr,
+        truncated,
+    })
+}
+
 /// 校验并规整一个工作区内相对路径，转为 git 可用的正斜杠形式（拒绝绝对路径 / `..` 逃逸）。
 fn safe_git_relpath(path: &str) -> Result<String, ToolRuntimeError> {
     let rel = crate::validate_relative_path(path)?;
@@ -426,6 +564,25 @@ fn valid_branch_name(name: &str) -> Result<String, ToolRuntimeError> {
     if n.chars().any(char::is_whitespace) {
         return Err(ToolRuntimeError::CommandFailed(
             "分支名不能包含空白字符".to_string(),
+        ));
+    }
+    Ok(n.to_string())
+}
+
+/// 校验远端名：非空、不以 `-` 开头（避免被当作 git 选项）、不含空白。
+fn valid_remote_name(name: &str) -> Result<String, ToolRuntimeError> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err(ToolRuntimeError::CommandFailed("远端名不能为空".to_string()));
+    }
+    if n.starts_with('-') {
+        return Err(ToolRuntimeError::CommandFailed(
+            "远端名不能以 - 开头".to_string(),
+        ));
+    }
+    if n.chars().any(char::is_whitespace) {
+        return Err(ToolRuntimeError::CommandFailed(
+            "远端名不能包含空白字符".to_string(),
         ));
     }
     Ok(n.to_string())
@@ -790,6 +947,137 @@ pub fn git_commit(
     })
 }
 
+/// 当前 HEAD 所在分支名；detached HEAD（`rev-parse --abbrev-ref HEAD` 输出 "HEAD"）时返回 None。
+fn current_branch(workspace: &Path) -> Result<Option<String>, ToolRuntimeError> {
+    let out = run_git_checked(workspace, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let name = out.stdout.trim();
+    if name.is_empty() || name == "HEAD" {
+        Ok(None)
+    } else {
+        Ok(Some(name.to_string()))
+    }
+}
+
+/// 构造 `git push` 的参数向量（不含子命令前缀外的副作用）。抽出便于单测覆盖参数组装。
+///
+/// 安全：永不加入任何 force 语义（`--force` / `-f` / `--force-with-lease`）。固定形态为
+/// `push [--set-upstream] <remote> <branch>`——显式带上 remote 与 branch，避免依赖
+/// push.default 配置造成意外推送目标。
+fn build_push_args<'a>(remote: &'a str, branch: &'a str, set_upstream: bool) -> Vec<&'a str> {
+    let mut args: Vec<&str> = vec!["push"];
+    if set_upstream {
+        args.push("--set-upstream");
+    }
+    args.push(remote);
+    args.push(branch);
+    args
+}
+
+/// git_push：把当前分支推送到其远端（默认 origin）。
+///
+/// 远端/网络操作：调用方在 permissions 里按 NetworkAccess 门控。绝不 force——本函数不接受、
+/// 也不构造任何 force 选项。detached HEAD 无分支可推时直接报清晰错误。
+pub fn git_push(
+    workspace_root: impl AsRef<Path>,
+    request: GitPushRequest,
+) -> Result<GitPushResult, ToolRuntimeError> {
+    let ws = crate::canonical_workspace(workspace_root)?;
+    let remote = match request.remote.as_deref() {
+        Some(r) => valid_remote_name(r)?,
+        None => "origin".to_string(),
+    };
+    let branch = current_branch(&ws)?.ok_or_else(|| {
+        ToolRuntimeError::CommandFailed(
+            "当前处于 detached HEAD，没有分支可推送；请先切到/创建一个分支".to_string(),
+        )
+    })?;
+
+    let args = build_push_args(&remote, &branch, request.set_upstream);
+    let out = run_git_checked(&ws, &args)?;
+
+    // push 进度与结果多走 stderr；合并 stdout/stderr 给模型一段可读概要。
+    let mut summary = out.stdout.trim().to_string();
+    let err = out.stderr.trim();
+    if !err.is_empty() {
+        if summary.is_empty() {
+            summary = err.to_string();
+        } else {
+            summary.push('\n');
+            summary.push_str(err);
+        }
+    }
+
+    Ok(GitPushResult {
+        remote,
+        branch: Some(branch),
+        set_upstream: request.set_upstream,
+        summary,
+    })
+}
+
+/// 构造 `gh pr create` 的参数向量。抽出便于单测覆盖参数组装与 base 透传。
+fn build_pr_args<'a>(title: &'a str, body: &'a str, base: Option<&'a str>) -> Vec<&'a str> {
+    let mut args: Vec<&str> = vec!["pr", "create", "--title", title, "--body", body];
+    if let Some(b) = base {
+        args.push("--base");
+        args.push(b);
+    }
+    args
+}
+
+/// git_pr：通过 gh CLI 创建 Pull Request（`gh pr create --title ... --body ... [--base ...]`）。
+///
+/// 远端/网络操作：调用方在 permissions 里按 NetworkAccess 门控。gh 缺失由 run_gh 回传清晰错误。
+pub fn git_pr(
+    workspace_root: impl AsRef<Path>,
+    request: GitPrRequest,
+) -> Result<GitPrResult, ToolRuntimeError> {
+    let ws = crate::canonical_workspace(workspace_root)?;
+    let title = request.title.trim();
+    if title.is_empty() {
+        return Err(ToolRuntimeError::CommandFailed(
+            "PR 标题不能为空".to_string(),
+        ));
+    }
+    let base = match request.base.as_deref() {
+        Some(b) => Some(valid_branch_name(b)?),
+        None => None,
+    };
+
+    let args = build_pr_args(title, &request.body, base.as_deref());
+    let out = run_gh(&ws, &args)?;
+    if out.code != Some(0) {
+        let msg = if !out.stderr.trim().is_empty() {
+            out.stderr.trim().to_string()
+        } else if !out.stdout.trim().is_empty() {
+            out.stdout.trim().to_string()
+        } else {
+            format!("gh pr create 失败（退出码 {:?}）", out.code)
+        };
+        return Err(ToolRuntimeError::CommandFailed(msg));
+    }
+
+    // gh 成功后把 PR URL 打到 stdout；取首个以 http 开头的行作为 URL。
+    let url = out
+        .stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("http"))
+        .map(str::to_string);
+    let mut summary = out.stdout.trim().to_string();
+    let err = out.stderr.trim();
+    if summary.is_empty() && !err.is_empty() {
+        summary = err.to_string();
+    }
+
+    Ok(GitPrResult {
+        url,
+        title: title.to_string(),
+        base,
+        summary,
+    })
+}
+
 // ── 单元测试（纯解析逻辑，不依赖系统 git） ────────────────────────────────────
 
 #[cfg(test)]
@@ -804,6 +1092,116 @@ mod tests {
         assert!(valid_branch_name("   ").is_err());
         assert!(valid_branch_name("-rf").is_err());
         assert!(valid_branch_name("has space").is_err());
+    }
+
+    #[test]
+    fn remote_name_validation() {
+        assert_eq!(valid_remote_name("origin").unwrap(), "origin");
+        assert_eq!(valid_remote_name("  upstream  ").unwrap(), "upstream");
+        assert!(valid_remote_name("").is_err());
+        assert!(valid_remote_name("   ").is_err());
+        // 不能以 - 开头：杜绝被当作 git 选项注入（如 "--exec=..."）。
+        assert!(valid_remote_name("-x").is_err());
+        assert!(valid_remote_name("has space").is_err());
+    }
+
+    #[test]
+    fn push_args_never_force_and_carry_remote_branch() {
+        // 默认：push <remote> <branch>，不带 set-upstream。
+        let args = build_push_args("origin", "feat/x", false);
+        assert_eq!(args, vec!["push", "origin", "feat/x"]);
+
+        // set_upstream：push --set-upstream <remote> <branch>。
+        let args = build_push_args("origin", "feat/x", true);
+        assert_eq!(args, vec!["push", "--set-upstream", "origin", "feat/x"]);
+
+        // 安全不变量：无论如何都不得出现任何 force 语义。
+        for su in [false, true] {
+            let args = build_push_args("up", "main", su);
+            assert!(
+                !args.iter().any(|a| {
+                    let a = a.to_ascii_lowercase();
+                    a == "-f"
+                        || a == "--force"
+                        || a.starts_with("--force-with-lease")
+                        || a.starts_with("--force-if-includes")
+                }),
+                "push 参数绝不允许任何 force 选项: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_args_construction_with_and_without_base() {
+        // 无 base：仅 title/body。
+        let args = build_pr_args("My title", "body text", None);
+        assert_eq!(
+            args,
+            vec!["pr", "create", "--title", "My title", "--body", "body text"]
+        );
+
+        // 带 base：追加 --base <base>。
+        let args = build_pr_args("T", "B", Some("main"));
+        assert_eq!(
+            args,
+            vec!["pr", "create", "--title", "T", "--body", "B", "--base", "main"]
+        );
+
+        // 标题/正文作为独立 argv 元素传入（不经 shell），即便含空格也不拆分、无注入面。
+        let args = build_pr_args("a b c", "line1\nline2", None);
+        assert_eq!(args[3], "a b c");
+        assert_eq!(args[5], "line1\nline2");
+    }
+
+    #[test]
+    fn gh_candidate_names_match_platform() {
+        let names = candidate_names("gh");
+        // 无扩展名总在候选里且置首，兼容 *nix 与罕见无后缀分发。
+        assert_eq!(names.first().map(String::as_str), Some("gh"));
+        #[cfg(windows)]
+        {
+            for want in ["gh.exe", "gh.cmd", "gh.bat"] {
+                assert!(
+                    names.iter().any(|n| n == want),
+                    "Windows gh 候选应含 {want}，实际: {names:?}"
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(names, vec!["gh".to_string()]);
+        }
+    }
+
+    #[test]
+    fn resolve_gh_finds_executable_in_dir() {
+        // 与 git 同一套 which 风格解析：在临时目录放一枚假 gh，find_in_dir 应解析出绝对路径。
+        let dir = unique_temp_dir("gh-found");
+        #[cfg(windows)]
+        let name = "gh.exe";
+        #[cfg(not(windows))]
+        let name = "gh";
+        let p = dir.join(name);
+        std::fs::write(&p, b"#!/bin/sh\nexit 0\n").expect("write fake gh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&p, perms).unwrap();
+        }
+        let hit = find_in_dir(&dir, "gh").expect("fake gh should be found");
+        assert!(hit.is_absolute(), "解析结果应为绝对路径: {hit:?}");
+        assert_eq!(hit, p);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_gh_misses_empty_dir() {
+        // 空目录里没有 gh 候选，应解析失败（git_pr 据此回传「未安装 gh CLI」错误）。
+        let dir = unique_temp_dir("gh-empty");
+        assert!(find_in_dir(&dir, "gh").is_none(), "空目录不应解析出 gh");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -909,8 +1307,8 @@ mod tests {
         let dir = unique_temp_dir("found");
         let fake = write_fake_git(&dir);
 
-        // find_git_in_dir 应在该目录里解析出绝对路径，且指向我们刚写的文件。
-        let hit = find_git_in_dir(&dir).expect("fake git should be found");
+        // find_in_dir 应在该目录里解析出绝对路径，且指向我们刚写的文件。
+        let hit = find_in_dir(&dir, "git").expect("fake git should be found");
         assert!(hit.is_absolute(), "解析结果应为绝对路径: {hit:?}");
         assert_eq!(hit, fake);
 
@@ -922,7 +1320,7 @@ mod tests {
         // 空目录里没有任何 git 候选，应解析失败（调用方据此回传清晰错误）。
         let dir = unique_temp_dir("empty");
         assert!(
-            find_git_in_dir(&dir).is_none(),
+            find_in_dir(&dir, "git").is_none(),
             "空目录不应解析出 git"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -938,7 +1336,7 @@ mod tests {
         let decoy = dir.join("git");
         std::fs::create_dir_all(&decoy).expect("create decoy dir");
         assert!(
-            find_git_in_dir(&dir).is_none(),
+            find_in_dir(&dir, "git").is_none(),
             "同名目录不应被当作可执行命中"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -946,7 +1344,7 @@ mod tests {
 
     #[test]
     fn git_candidate_names_cover_expected_exts() {
-        let names = git_candidate_names();
+        let names = candidate_names("git");
         // 无扩展名总在候选里，且放在最前以兼容罕见无后缀分发。
         assert_eq!(names.first().map(String::as_str), Some("git"));
         #[cfg(windows)]
