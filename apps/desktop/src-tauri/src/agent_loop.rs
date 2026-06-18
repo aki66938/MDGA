@@ -34,8 +34,8 @@ use crate::{commands::permission_mode_from_str, record_tool_event};
 // Plan28 P3-9：内核纯逻辑（消息构建 / 记忆读取 / 压缩软上限 / 验证探测 / usage 合并）已迁入 agent-core。
 use mdga_agent_core::{
     context_soft_limit_for, detect_verification_plan, focused_command, format_verify_feedback,
-    merge_usage, messages_with_workspace_context, parse_report, read_workspace_memory,
-    report_signature, VerifyKind,
+    is_stale, merge_usage, messages_with_workspace_context, parse_report, read_workspace_memory,
+    report_signature, FileFingerprint, VerifyKind,
 };
 use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMessage, StreamChunk};
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
@@ -356,6 +356,10 @@ pub(crate) async fn send_message(
         }
         if let Ok(mut steering) = state.steering.lock() {
             steering.remove(&conversation_id);
+        }
+        // R6：本轮结束清掉循环护栏状态（陈旧读指纹表 + 序列检测器历史），避免跨任务串味。
+        if let Ok(mut guards) = state.loop_guards.lock() {
+            guards.remove(&conversation_id);
         }
     }
 
@@ -926,6 +930,14 @@ async fn chat_with_builtin_tools(
         // 边执行边落库:assistant 已声明 tool_calls,工具执行前先落——崩溃在工具执行中也能从 DB 重建到此。
         persist_wire(app, conversation_id, &wire_messages);
 
+        // R6 序列级 doom-loop：把本轮 (tool,args) 调用签名喂进会话的序列检测器；命中「窗口循环
+        // 连续重复」即走既有 agent-stuck 暂停路径，迫使模型重新规划而非反复打转。放在工具执行前，
+        // 早于真正动手，避免在确认陷入循环后还白跑一轮工具。两条分支（并行只读 / 串行）共用这道闸。
+        if sequence_loop_tripped(app, conversation_id, &tool_calls) {
+            emit_sequence_loop(app, conversation_id);
+            return Ok(usage);
+        }
+
         // 卡死检测（Plan25 #5③）本轮状态：是否有任意工具成功执行 + 本轮最后一次失败的「工具+参数」签名。
         let mut round_had_success = false;
         let mut round_failure_signature: Option<String> = None;
@@ -981,6 +993,11 @@ async fn chat_with_builtin_tools(
                 );
                 if result.is_ok() {
                     round_had_success = true;
+                    // R6 陈旧读：并行只读批次里的 read_file 成功后，记录该路径当时的磁盘指纹，
+                    // 供后续写类编辑前比对（这是 read 进入护栏的两条路径之一，另一条在串行分支）。
+                    if call.function.name == "read_file" {
+                        record_read_fingerprint(app, conversation_id, workspace_path, &call.function.arguments);
+                    }
                 } else {
                     round_failure_signature =
                         Some(format!("{}|{}", call.function.name, call.function.arguments));
@@ -1107,6 +1124,15 @@ async fn chat_with_builtin_tools(
                 workspace_path,
             );
 
+            // R6 陈旧读：写类编辑（edit_file/apply_patch/write_file）执行前，先比对「上次读取该文件
+            // 时的指纹」与「当前磁盘指纹」。必须在执行前算——编辑本身会改 mtime/size，事后比对永远「已变」。
+            // 命中则得到一条警告，下方拼进成功输出（warn 不拦，模型自行决定是否重读）。
+            let stale_warning = if matches!(tool_name.as_str(), "edit_file" | "apply_patch" | "write_file") {
+                stale_read_warning(app, conversation_id, workspace_path, &arguments)
+            } else {
+                None
+            };
+
             // 特殊工具走专用执行器：MCP 外部工具 / todo / 技能 / 子任务 / 命令（流式 + 后台）。
             let mcp_binding = mcp_bindings.iter().find(|b| b.fn_name == tool_name);
             let result = if let Some(binding) = mcp_binding {
@@ -1171,6 +1197,14 @@ async fn chat_with_builtin_tools(
                     // 卡死检测（Plan25 #5③）：有工具成功即视为本轮有进展。
                     round_had_success = true;
                     let mut out = serde_json::json!({ "ok": true, "result": value });
+                    // R6 陈旧读：read_file 成功后记录该路径当时的磁盘指纹，供后续写类编辑前比对。
+                    if tool_name == "read_file" {
+                        record_read_fingerprint(app, conversation_id, workspace_path, &arguments);
+                    }
+                    // R6 陈旧读：写前比对命中的警告附进成功结果（warn 而非拦截），提示模型可能基于旧内容编辑。
+                    if let Some(warning) = stale_warning.as_ref() {
+                        out["staleReadWarning"] = serde_json::Value::String(warning.clone());
+                    }
                     // 标记本轮发生过文件改动（驱动收尾前的验证回路 #7）。
                     if capture.is_some() {
                         edits_made = true;
@@ -1331,6 +1365,128 @@ fn verify_stall_hit(sig: &str, prev: &mut Option<String>, stall: &mut usize) -> 
         }
     }
     *stall >= VERIFY_STALL_THRESHOLD
+}
+
+/// R6 陈旧读：把工具参数里的相对 `path` 解析为磁盘上的绝对路径键。
+///
+/// 与 tool-runtime 的解析口径对齐：工作区根 canonical 后 join 相对路径；目标存在则再 canonicalize
+/// （消解符号链接/大小写差异，得到稳定键），不存在则用 join 结果（写新文件场景）。
+/// 参数无 `path` 字段、解析失败或路径越界时返回 None（调用方据此跳过记录/比对）。
+fn resolve_tool_path(workspace_path: &str, arguments: &str) -> Option<std::path::PathBuf> {
+    let rel = serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get("path")
+        .and_then(|p| p.as_str())
+        .map(str::to_string)?;
+    if rel.trim().is_empty() {
+        return None;
+    }
+    let workspace = std::path::Path::new(workspace_path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(workspace_path));
+    let joined = workspace.join(&rel);
+    let resolved = joined.canonicalize().unwrap_or(joined);
+    // 越界保护：解析后仍须落在工作区内，避免把任意外部路径记进指纹表。
+    if !resolved.starts_with(&workspace) {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// R6 陈旧读：read_file 成功后记录该路径当时的磁盘指纹（mtime+size）到会话护栏。
+/// 取不到指纹（文件已不在/非普通文件）时清掉旧记录，避免留陈旧条目。
+fn record_read_fingerprint(app: &AppHandle, conversation_id: &str, workspace_path: &str, arguments: &str) {
+    let Some(abs) = resolve_tool_path(workspace_path, arguments) else {
+        return;
+    };
+    let fp = FileFingerprint::of_path(&abs);
+    let state = app.state::<AppState>();
+    let mut guards = match state.loop_guards.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let guard = guards.entry(conversation_id.to_string()).or_default();
+    match fp {
+        Some(fp) => {
+            guard.read_fingerprints.insert(abs, fp);
+        }
+        None => {
+            guard.read_fingerprints.remove(&abs);
+        }
+    }
+}
+
+/// R6 陈旧读：写类编辑（edit_file/apply_patch/write_file）执行前，比对该路径「上次读取时的指纹」
+/// 与「当前磁盘指纹」。若文件在读后被改动（后台 shell / hook / steering 等改写了它），
+/// 返回一条中文警告；否则返回 None。不硬拦——只把警告交给调用方拼进工具结果，让模型自行决定是否重读。
+///
+/// 仅在「曾经读过该文件」且「现在磁盘上仍能取到指纹」且「两者不一致」时告警，
+/// 避免对从未读过的文件或新建文件误报。比对后即丢弃该条记录（编辑会改变文件，旧指纹失去意义）。
+fn stale_read_warning(
+    app: &AppHandle,
+    conversation_id: &str,
+    workspace_path: &str,
+    arguments: &str,
+) -> Option<String> {
+    let abs = resolve_tool_path(workspace_path, arguments)?;
+    let current = FileFingerprint::of_path(&abs)?;
+    let state = app.state::<AppState>();
+    let mut guards = state.loop_guards.lock().ok()?;
+    let guard = guards.get_mut(conversation_id)?;
+    // 取出（并移除）该路径上次读取时的指纹：编辑后旧指纹无意义，避免重复告警。
+    let recorded = guard.read_fingerprints.remove(&abs)?;
+    if is_stale(&recorded, &current) {
+        let shown = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .as_ref()
+            .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(str::to_string))
+            .unwrap_or_else(|| abs.to_string_lossy().to_string());
+        Some(format!(
+            "⚠️ {shown} 自上次读取后已被改动（磁盘上的 mtime/大小与你读到的版本不一致），\
+             你可能在基于旧内容编辑；请重新 read_file 确认后再写，以免覆盖掉外部改动。"
+        ))
+    } else {
+        None
+    }
+}
+
+/// R6 序列级 doom-loop：把本轮所有 (tool,args) 调用签名喂进会话的序列检测器，
+/// 命中「窗口循环连续重复」返回 true。命中后调用方应走既有 agent-stuck 暂停路径，迫使模型重新规划。
+fn sequence_loop_tripped(
+    app: &AppHandle,
+    conversation_id: &str,
+    tool_calls: &[mdga_deepseek_client::ToolCall],
+) -> bool {
+    let state = app.state::<AppState>();
+    let Ok(mut guards) = state.loop_guards.lock() else {
+        return false;
+    };
+    let guard = guards.entry(conversation_id.to_string()).or_default();
+    let mut tripped = false;
+    for call in tool_calls {
+        let sig = format!("{}|{}", call.function.name, call.function.arguments);
+        // 逐个 record：record 内部命中即返回 true 并清空历史，故只要任一命中就算本轮触发。
+        if guard.loop_detector.record(sig) {
+            tripped = true;
+        }
+    }
+    tripped
+}
+
+/// R6 序列级 doom-loop：命中后复用卡死的 `agent-stuck` 事件通道，emit 通知并向前端发暂停提示。
+fn emit_sequence_loop(app: &AppHandle, conversation_id: &str) {
+    let reason = "检测到重复的调用循环（同一组工具调用反复循环、未见收敛）";
+    let _ = app.emit(
+        "agent-stuck",
+        serde_json::json!({
+            "conversationId": conversation_id,
+            "reason": reason,
+        }),
+    );
+    let _ = app.emit(
+        "chat-chunk",
+        format!("\n\n（{reason}，已暂停以等待你介入。请重新规划，或调整需求/提供更多信息后让我继续。）"),
+    );
 }
 
 /// R3 验证停滞升级：复用卡死的 `agent-stuck` 事件通道，emit 通知并向前端发提示，等待用户介入。

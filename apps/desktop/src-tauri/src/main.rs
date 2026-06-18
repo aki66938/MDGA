@@ -129,6 +129,7 @@ fn main() {
                 bg_tasks: Mutex::new(HashMap::new()),
                 command_sandbox: AtomicBool::new(true),
                 task_token_budget: AtomicU64::new(0),
+                loop_guards: Mutex::new(HashMap::new()),
             });
 
             // 启动时后台连接所有已启用的 MCP server，不阻塞窗口加载。
