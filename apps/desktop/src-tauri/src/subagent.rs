@@ -1,4 +1,5 @@
-//! 子代理与后台任务：run_subtask 只读探索子代理（前台/后台）与后台任务控制工具
+//! 子代理与后台任务：run_subtask 子代理（0.0.65 起**默认可干活**——可读/写/跑命令、受主链路权限门控
+//! + 检查点保护；`mode:"read"` 或 background 时锁为只读探索沙箱）与后台任务控制工具
 //! （get_task_output / kill_task / list_tasks）。
 //!
 //! 从 main.rs 抽出（Plan16）：纯代码搬移，无行为变更。
@@ -74,6 +75,21 @@ fn is_guarded_write_tool(name: &str) -> bool {
     SUBTASK_WRITE_TOOLS.contains(&name)
 }
 
+/// 纯函数（0.0.65）：据 `mode` 与是否请求 `background`，决定子任务的 `(write_mode, background)`。
+///
+/// 安全不变量：
+/// - 默认（无 `mode`）= **可干活**（write_mode=true）——与主代理同权限、可读写跑命令、逐次审批 + 检查点；
+/// - 显式 `mode:"read"` ⇒ 只读探索沙箱（write_mode=false）；
+/// - 请求 `background` ⇒ **强制只读**（异步无法交互审批），故默认子任务遇 background 降为只读；
+/// - 但显式 `mode:"write"` 始终可写且**忽略 background**（强制前台，保证每个写/命令都能被审批）。
+fn resolve_subtask_modes(mode: Option<&str>, background_requested: bool) -> (bool, bool) {
+    let write_mode = matches!(mode, Some("write"))
+        || (!matches!(mode, Some("read")) && !background_requested);
+    // background 只在只读子任务上成立：可写子任务一律前台，避免无人审批的后台写。
+    let background = background_requested && !write_mode;
+    (write_mode, background)
+}
+
 const SUBTASK_MAX_ROUNDS: usize = 15;
 
 /// run_subtask 工具：用独立上下文跑一个探索 / 工作子代理，返回简明报告与消耗的 usage。
@@ -103,8 +119,13 @@ pub(crate) async fn execute_run_subtask(
     let Some(description) = parsed.get("description").and_then(|v| v.as_str()) else {
         return (Err("run_subtask 缺少 description".to_string()), None);
     };
-    // mode：read（默认）只读探索；write 可写 / 跑命令（受权限与检查点保护）。
-    let write_mode = matches!(parsed.get("mode").and_then(|v| v.as_str()), Some("write"));
+    // mode（0.0.65 翻转默认）：**默认「可干活」**——子代理可读 / 写 / 跑命令,与主代理**同一套权限门控
+    // + 检查点**(每个写 / 删 / 命令逐次审批、可回退),避免「默认只读 → 跑不了命令」这个让用户困惑的陷阱。
+    // 仅显式 `mode:"read"` 才锁成只读探索沙箱(Restricted + 断网 + 只读工具)。`background` 异步无法交互
+    // 审批,故默认子任务一旦请求 background 自动降为只读;但**显式 `mode:"write"` 保持前台可写、忽略 background**。
+    let mode_str = parsed.get("mode").and_then(|v| v.as_str());
+    let background_requested = parsed.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+    let (write_mode, background) = resolve_subtask_modes(mode_str, background_requested);
     // 自定义子代理类型：agentType 指向 .mdga/agents/<type>.md，其内容作为子代理 system prompt。
     let custom_agent = parsed
         .get("agentType")
@@ -136,9 +157,7 @@ pub(crate) async fn execute_run_subtask(
         }
     };
 
-    // 后台模式只允许 read：写模式忽略 background 强制前台，避免无人审批的后台写（Plan25 C-3）。
-    let background =
-        parsed.get("background").and_then(|v| v.as_bool()).unwrap_or(false) && !write_mode;
+    // background 由 resolve_subtask_modes 算出（仅在只读子任务上为真；可写子任务强制前台以便逐次审批）。
     if background {
         // 注册后台任务并 spawn 独立 loop；立即返回 taskId，主循环不等待。
         let task_id = format!("task-{}", BG_TASK_SEQ.fetch_add(1, Ordering::SeqCst));
@@ -1130,6 +1149,29 @@ pub(crate) async fn execute_bg_task_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 0.0.65：run_subtask 模式判定（翻转默认为「可干活」）的安全不变量测试。
+    #[test]
+    fn subtask_mode_defaults_to_capable() {
+        // 默认（无 mode、无 background）= 可干活、前台。
+        assert_eq!(resolve_subtask_modes(None, false), (true, false));
+        // 显式 write 同样可干活、前台。
+        assert_eq!(resolve_subtask_modes(Some("write"), false), (true, false));
+    }
+    #[test]
+    fn subtask_mode_read_is_readonly() {
+        // 显式 read = 只读、前台。
+        assert_eq!(resolve_subtask_modes(Some("read"), false), (false, false));
+        // read + background = 只读、后台。
+        assert_eq!(resolve_subtask_modes(Some("read"), true), (false, true));
+    }
+    #[test]
+    fn subtask_background_forces_readonly() {
+        // 默认 + 请求 background ⇒ 强制降为只读、真后台（异步无法审批）。
+        assert_eq!(resolve_subtask_modes(None, true), (false, true));
+        // 但显式 write + background ⇒ 仍可写、强制前台（忽略 background，保证可审批）。
+        assert_eq!(resolve_subtask_modes(Some("write"), true), (true, false));
+    }
 
     // P1（0.0.58）：并行编排器参数解析/校验的纯逻辑测试（无需 AppHandle/LLM/git）。
 
