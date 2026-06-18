@@ -226,9 +226,10 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   { id: "custom", label: "自定义", baseUrl: null, defaultModelId: "" },
 ];
 
-// ── 模型连接库 + 角色分配（0.0.59）──────────────────────────────────────────
-// 旧的 role-keyed provider 表（每角色含 api_key，强制逐角色重填）被拆为两层：
-// 可复用的「连接」(端点+密钥，配一次) 与纯「角色分配」引用 (role → 连接 + 模型，无密钥)。
+// ── 模型连接库 + 用户登记的模型 + 角色分配（0.0.60）──────────────────────────
+// 三层：可复用的「连接」(端点+密钥，配一次) → 用户在每个连接下登记的「模型」(connection→model 一对多)
+// → 纯「角色分配」(role → 某个已登记模型的 id，无密钥)。
+// 0.0.60 在 0.0.59 的「连接 + 引用」之间补回了用户**主动登记模型**的一层，角色从这些登记的模型里选。
 
 /** 一个连接的前端视图（list_connections / save_connection 返回）。绝不含 apiKey 明文；
  *  以 hasKey 表明是否已配密钥。base_url 空＝走 preset 官方端点。 */
@@ -243,18 +244,37 @@ export type ConnectionView = {
   updatedAt?: number;
 };
 
+/** 用户在某连接下登记的一个模型（list_models / list_models_for_connection / add_model / update_model 返回）。
+ *  这是「我用到的模型」库的一行：一个连接可登记多个模型（一对多）。角色分配从这些 id 里选。 */
+export type CuratedModelView = {
+  /** 模型记录 id（models.id）；角色分配的 modelRef 引用它。 */
+  id: string;
+  /** 所属连接 id。 */
+  connectionId: string;
+  /** 所属连接的展示名（label 优先，否则 preset，再否则连接 id）；连接已删时缺。 */
+  connectionLabel?: string;
+  /** 实际 API 模型串（如 deepseek-chat）。 */
+  modelId: string;
+  /** 可选展示名/别名。 */
+  label?: string;
+  /** 可选上下文窗口（tokens）。 */
+  contextWindow?: number;
+};
+
 /** 一个角色当前的「分配」概览（get_role_assignments 返回）。无密钥。
- *  connectionId/modelId/... 为该角色**自身**引用（缺＝跟随主模型）；effective 为回退后的实际生效。 */
+ *  modelRef/modelId/... 为该角色**自身**引用的已登记模型（缺＝跟随主模型）；effective 为回退后的实际生效。 */
 export type RoleAssignmentView = {
   /** main|action|plan|critique|vision|subagent|embed。 */
   role: string;
-  /** 该角色自身引用的连接 id（None/缺＝跟随主模型）。 */
-  connectionId?: string;
-  /** 自身引用连接的展示名（便于直接渲染）。 */
-  connectionLabel?: string;
-  /** 自身引用的模型 ID。 */
+  /** 该角色自身引用的已登记模型 id（models.id；None/缺＝跟随主模型）。 */
+  modelRef?: string;
+  /** 自身引用模型的实际 API 模型串。 */
   modelId?: string;
-  /** 自身引用的上下文窗口（tokens，可选）。 */
+  /** 自身引用模型的展示名（label）。 */
+  modelLabel?: string;
+  /** 自身引用模型所属连接的展示名（便于直接渲染）。 */
+  connectionLabel?: string;
+  /** 自身引用模型的上下文窗口（tokens，可选）。 */
   contextWindow?: number;
   /** 自身引用是否启用（无自身引用则 false）。 */
   enabled: boolean;

@@ -2230,6 +2230,171 @@ h1 {
   pointer-events: none;
 }
 
+/* ── 「我用到的模型」子区（0.0.60，嵌在连接卡内）── */
+.provider-models {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.provider-models__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.provider-models__title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.provider-models__count {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.provider-models__list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.provider-models__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.provider-models__id {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12.5px;
+}
+
+.provider-models__id code {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.provider-models__label {
+  color: var(--text-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.provider-models__ctx {
+  font-size: 11px;
+  color: var(--text-3);
+  padding: 1px 6px;
+  border-radius: var(--radius-tag);
+  background: var(--surface-3);
+  white-space: nowrap;
+}
+
+.provider-models__del {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  padding: 3px;
+  border-radius: 5px;
+}
+
+.provider-models__del:hover {
+  color: var(--danger);
+  background: var(--surface-3);
+}
+
+.provider-models__add {
+  margin-top: 2px;
+}
+
+.provider-models__addrow {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.provider-models__addrow .provider-input {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+.provider-models__addrow .approval-card__btn {
+  flex-shrink: 0;
+}
+
+.provider-models__advanced {
+  display: flex;
+  gap: 8px;
+}
+
+.provider-models__advanced .provider-input {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+.provider-models__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.provider-models__chips-hint {
+  font-size: 11.5px;
+  color: var(--text-3);
+  width: 100%;
+}
+
+.provider-chip {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.provider-chip:hover:not(:disabled) {
+  border-color: var(--brand);
+  color: var(--brand);
+}
+
+.provider-chip:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.provider-chip--on {
+  color: var(--success);
+  border-color: var(--success);
+  background: var(--diff-add-bg);
+}
+
 .changes-list {
   display: flex;
   flex-direction: column;

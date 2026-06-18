@@ -43,8 +43,8 @@ use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMes
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
 use mdga_shared::PermissionMode;
 use mdga_storage::{
-    get_conversation, get_messages, get_role_assignment, list_permission_rules,
-    resolve_role_provider, save_token_ledger_entry, ROLE_ACTION, ROLE_MAIN, ROLE_PLAN, ROLE_VISION,
+    get_conversation, get_messages, get_role_model, list_permission_rules, resolve_role_provider,
+    save_token_ledger_entry, ROLE_ACTION, ROLE_MAIN, ROLE_PLAN, ROLE_VISION,
 };
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use mdga_tool_runtime::RunCommandRequest;
@@ -144,8 +144,9 @@ pub(crate) async fn send_message(
         } else {
             // 要求 enabled：新 UI 关闭视觉走 clear_role_assignment(删行)、从不写 enabled=0 的 vision 行,
             // 故「enabled 检查」实际等价于「存在性检查」;此处显式要求 enabled 是更直观/安全的契约。
-            match get_role_assignment(&db, ROLE_VISION) {
-                Ok(Some(a)) if a.enabled => resolve_role_provider(&db, ROLE_VISION).ok().flatten(),
+            // 0.0.60：门改读新真源 role_models（自身分配），与 resolve 同源，避免误判已配视觉为未配。
+            match get_role_model(&db, ROLE_VISION) {
+                Ok(Some(rm)) if rm.enabled => resolve_role_provider(&db, ROLE_VISION).ok().flatten(),
                 _ => None,
             }
         };
@@ -485,8 +486,9 @@ async fn execute_ask_vision(
         };
         let images = collect_conversation_images(&messages);
         // 0.0.59：视觉不回退 main——未单独配置 vision 即视为未配置（下方走优雅降级提示）。
-        let vp = match get_role_assignment(&db, ROLE_VISION) {
-            Ok(Some(a)) if a.enabled => resolve_role_provider(&db, ROLE_VISION).ok().flatten(),
+        // 0.0.60：门改读新真源 role_models（自身分配），与 resolve 同源。
+        let vp = match get_role_model(&db, ROLE_VISION) {
+            Ok(Some(rm)) if rm.enabled => resolve_role_provider(&db, ROLE_VISION).ok().flatten(),
             _ => None,
         };
         (images, vp)

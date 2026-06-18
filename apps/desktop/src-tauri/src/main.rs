@@ -35,9 +35,9 @@ use commands::{
     set_conversation_workspace, set_task_budget, set_workspace_path, toggle_mcp_server,
 };
 use commands::{
-    delete_connection, get_app_setting, list_connections, list_models_for_connection,
-    save_connection, set_app_setting, smoke_test_tool_call,
-    smoke_test_tool_call_for_connection, test_connection,
+    add_model, delete_connection, delete_model, fetch_available_models, get_app_setting,
+    list_connections, list_models, list_models_for_connection, save_connection, set_app_setting,
+    smoke_test_tool_call, smoke_test_tool_call_for_connection, test_connection, update_model,
 };
 use commands::{
     clear_role_assignment, get_lsp_known_servers, get_lsp_server_config, get_role_assignments,
@@ -237,6 +237,11 @@ fn main() {
             delete_connection,
             test_connection,
             list_models_for_connection,
+            list_models,
+            add_model,
+            update_model,
+            delete_model,
+            fetch_available_models,
             smoke_test_tool_call,
             smoke_test_tool_call_for_connection,
             get_role_assignments,

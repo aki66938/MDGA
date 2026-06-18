@@ -9,7 +9,7 @@ use crate::checkpoint::apply_checkpoint_revert;
 use crate::mcp::spawn_mcp_connect;
 use crate::state::AppState;
 use mdga_deepseek_client::{
-    detect_api_key_status, get_user_balance, probe_tool_call, resolve_base_url,
+    detect_api_key_status, fetch_models, get_user_balance, probe_tool_call, resolve_base_url,
     test_connection as test_connection_impl, UserBalance,
 };
 use mdga_shared::{ApiKeyStatus, PermissionMode};
@@ -25,9 +25,10 @@ use mdga_storage::{
     ActivityEventRecord, Conversation, FileCheckpoint, StoredMessage, Workspace,
 };
 use mdga_storage::{
-    delete_role_assignment, get_connection, get_lsp_server_config_json, get_role_assignment,
-    get_setting, resolve_role_provider, set_lsp_server_config_json, set_setting, upsert_connection,
-    upsert_role_assignment, ProviderConnection, ALL_ROLES, ROLE_MAIN,
+    delete_role_model, get_connection, get_lsp_server_config_json, get_model, get_role_model,
+    get_setting, list_models_for_connection as storage_list_models_for_connection,
+    resolve_role_provider, set_lsp_server_config_json, set_setting, upsert_connection, upsert_model,
+    upsert_role_model, CuratedModel, ProviderConnection, ALL_ROLES, ROLE_MAIN,
 };
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -168,44 +169,155 @@ pub(crate) async fn test_connection(
         .map_err(|e| e.to_string())
 }
 
-/// 列出某连接「预设」对应的已知模型 ID 列表，供 UI 下拉；custom/未知预设返回空（UI 自由输入）。
-///
-/// 这些是各家公开的常用模型清单（精选、可增补）；连接的 api_key 不参与（不发网络），纯本地查表。
+// ── 模型层（curated models）命令（0.0.60）─────────────────────────────────────
+//
+// 0.0.60 在「连接」与「角色」之间插入用户自建的「模型」层：一个连接（端点 + 密钥）下可登记多个
+// 模型（同一把 key 同时跑 pro 与 flash）。这些命令均不回显 api_key；fetch_available_models 仅把 key
+// 作为 Bearer 头打一次 GET /models，绝不回传也不记录。
+
+/// 一个 curated model 的前端视图：附其所属连接的展示名，便于 UI 直接渲染。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CuratedModelView {
+    pub id: String,
+    pub connection_id: String,
+    /// 所属连接的展示名（label 优先，否则 preset，再否则连接 id）。连接已删时为 None。
+    pub connection_label: Option<String>,
+    pub model_id: String,
+    pub label: Option<String>,
+    pub context_window: Option<i64>,
+}
+
+/// 把一个 [`CuratedModel`] 包成前端视图，连接展示名按 `db` 现状解析。
+fn model_to_view(db: &rusqlite::Connection, m: CuratedModel) -> CuratedModelView {
+    let connection_label = get_connection(db, &m.connection_id)
+        .ok()
+        .flatten()
+        .map(|c| c.label.or(c.preset).unwrap_or_else(|| c.id));
+    CuratedModelView {
+        id: m.id,
+        connection_id: m.connection_id,
+        connection_label,
+        model_id: m.model_id,
+        label: m.label,
+        context_window: m.context_window,
+    }
+}
+
+/// 列出全部已登记模型（跨所有连接），每条附其连接展示名。
+#[tauri::command]
+pub(crate) fn list_models(state: State<AppState>) -> Result<Vec<CuratedModelView>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let models = mdga_storage::list_models(&db).map_err(|e| e.to_string())?;
+    Ok(models.into_iter().map(|m| model_to_view(&db, m)).collect())
+}
+
+/// 列出某连接下用户登记的全部模型（0.0.60：curated 列表，**非**硬编码预设清单）。
 #[allow(non_snake_case)]
 #[tauri::command]
 pub(crate) fn list_models_for_connection(
     state: State<AppState>,
     connectionId: String,
-) -> Result<Vec<String>, String> {
-    let conn = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        get_connection(&db, &connectionId).map_err(|e| e.to_string())?
-    };
-    let preset = conn.as_ref().and_then(|c| c.preset.as_deref()).unwrap_or("");
-    Ok(known_models_for_preset(preset))
+) -> Result<Vec<CuratedModelView>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let models =
+        storage_list_models_for_connection(&db, &connectionId).map_err(|e| e.to_string())?;
+    Ok(models.into_iter().map(|m| model_to_view(&db, m)).collect())
 }
 
-/// 各内置预设的已知模型 ID 列表（精选，可增补）；custom/未知 → 空（UI 自由输入）。
-fn known_models_for_preset(preset: &str) -> Vec<String> {
-    let list: &[&str] = match preset {
-        "deepseek" => &["deepseek-chat", "deepseek-reasoner"],
-        "zhipu" => &["glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4-plus", "glm-4-flash", "glm-4v"],
-        "moonshot" => &[
-            "kimi-k2-0905-preview",
-            "moonshot-v1-8k",
-            "moonshot-v1-32k",
-            "moonshot-v1-128k",
-        ],
-        "qwen" => &[
-            "qwen-max",
-            "qwen-plus",
-            "qwen-turbo",
-            "qwen2.5-coder-32b-instruct",
-            "qwen-vl-max",
-        ],
-        _ => &[],
+/// 在某连接下登记一个模型（modelId 为实际 API 模型串）。
+///
+/// 同 (connectionId, modelId) 已存在则更新其 label/contextWindow（dedup，不插重复）。
+/// connectionId 必须指向一个真实连接。返回写入后的模型视图。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) fn add_model(
+    state: State<AppState>,
+    connectionId: String,
+    modelId: String,
+    label: Option<String>,
+    contextWindow: Option<i64>,
+) -> Result<CuratedModelView, String> {
+    let model_id = modelId.trim();
+    if model_id.is_empty() {
+        return Err("请填写模型 ID".to_string());
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    if get_connection(&db, &connectionId)
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        return Err("所选连接不存在，请先创建连接".to_string());
+    }
+    let saved = upsert_model(
+        &db,
+        "",
+        &connectionId,
+        model_id,
+        label.as_deref(),
+        contextWindow.filter(|&cw| cw > 0),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(model_to_view(&db, saved))
+}
+
+/// 更新一个已登记模型的 label / contextWindow（id 必须指向已存在的模型）。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) fn update_model(
+    state: State<AppState>,
+    id: String,
+    label: Option<String>,
+    contextWindow: Option<i64>,
+) -> Result<CuratedModelView, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    // 读出现有模型以保持 connection_id / model_id 不变（本命令只改 label/contextWindow）。
+    let existing = get_model(&db, &id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "模型不存在".to_string())?;
+    let saved = upsert_model(
+        &db,
+        &id,
+        &existing.connection_id,
+        &existing.model_id,
+        label.as_deref(),
+        contextWindow.filter(|&cw| cw > 0),
+    )
+    .map_err(|e| e.to_string())?;
+    // 改 main/embed 角色所用模型的 context_window 可能影响压缩软上限；保守刷新 embedding 快照。
+    crate::embedding::refresh_embedding_config(&db);
+    Ok(model_to_view(&db, saved))
+}
+
+/// 删除一个模型。若仍被任意角色（role_models）引用，拒绝删除并返回人话化错误。
+#[tauri::command]
+pub(crate) fn delete_model(state: State<AppState>, id: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    mdga_storage::delete_model(&db, &id).map_err(|e| e.to_string())
+}
+
+/// 拉取某连接端点真实可用的模型 id 列表（0.0.60）：GET {base}/models（连接的 key 作 Bearer）。
+///
+/// 服务端按 connectionId 取出端点/密钥（前端从不接触明文 key）；OpenAI 兼容解析
+/// `{"data":[{"id":...}]}`（也接受裸数组）。10–12s 超时。任何失败（端点无 /models、网络、
+/// 鉴权、解析）返回 Err，UI 据此回退到手动输入。**key 绝不回传也不记录**，仅作 Bearer 头。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) async fn fetch_available_models(
+    state: State<'_, AppState>,
+    connectionId: String,
+) -> Result<Vec<String>, String> {
+    let connection = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        get_connection(&db, &connectionId)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "连接不存在".to_string())?
     };
-    list.iter().map(|s| s.to_string()).collect()
+    let base = resolve_base_url(connection.base_url.as_deref(), connection.preset.as_deref())
+        .ok_or_else(|| "无法解析端点（自定义 preset 需填 base_url）".to_string())?;
+    fetch_models(&base, &connection.api_key)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// 对某 role 的供应商做一次「工具调用冒烟探测」（Plan25 C-1，#3）：发一个极小请求并提供一个
@@ -369,44 +481,50 @@ pub(crate) fn save_lsp_server_config(
     Ok(())
 }
 
-// ── 角色引用（role → 连接 + 模型）设置（0.0.59）──────────────────────────────
+// ── 角色分配（role → curated model）设置（0.0.60）─────────────────────────────
+//
+// 0.0.60：角色不再直接绑「连接 + 自由输入模型串」，而是引用一个**已登记的模型**（role_models →
+// models → connections）。视图同时给出 modelRef（角色自身引用的模型 id）与实际生效（回退 main）。
 
-/// 一个角色当前的引用状态视图（无密钥）：自身引用 + 实际生效（回退 main 后）。
+/// 一个角色当前的分配状态视图（无密钥）：自身引用的模型 + 实际生效（回退 main 后）。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RoleAssignmentView {
     /// 角色：main|action|plan|critique|vision|subagent|embed。
     pub role: String,
-    /// 该角色**自身**引用指向的连接 id（无自身引用则 None ⇒ 回退 main）。
-    pub connection_id: Option<String>,
-    /// 该连接的展示名（便于 UI 直接渲染，免再查一次）。None＝无自身引用或连接已不存在。
-    pub connection_label: Option<String>,
-    /// 自身引用的模型 ID（无自身引用则 None）。
+    /// 该角色**自身**引用的 curated model id（models.id）。无自身分配则 None ⇒ 回退 main。
+    pub model_ref: Option<String>,
+    /// 自身引用模型的 model_id（实际 API 模型串）。无自身分配则 None。
     pub model_id: Option<String>,
-    /// 自身引用的上下文窗口（tokens，可空）。
+    /// 自身引用模型的展示名（label）。无自身分配则 None。
+    pub model_label: Option<String>,
+    /// 自身引用模型所属连接的展示名。无自身分配或连接已删则 None。
+    pub connection_label: Option<String>,
+    /// 自身引用模型的上下文窗口（tokens，可空；0.0.60 起在模型粒度）。
     pub context_window: Option<i64>,
-    /// 自身引用是否启用（无自身引用则 false）。
+    /// 自身分配是否启用（无自身分配则 false）。
     pub enabled: bool,
     /// 实际生效（经回退）：用于 UI 展示「跟随 main」。
     pub effective: EffectiveRef,
 }
 
-/// 实际生效的引用（resolve 后）：连接展示名 + 模型 + 来源（self=用自身；main=回退主模型）。
+/// 实际生效的分配（resolve 后）：模型串 + 连接展示名 + 来源（self=用自身；main=回退主模型）。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EffectiveRef {
-    /// 实际生效连接的展示名（None＝连 main 都没配）。
-    pub connection_label: Option<String>,
     /// 实际生效模型 ID（None＝连 main 都没配）。
     pub model_id: Option<String>,
-    /// 来源：'self'＝用了角色自身引用；'main'＝回退到主模型；'none'＝主模型也没配。
+    /// 实际生效连接的展示名（None＝连 main 都没配）。
+    pub connection_label: Option<String>,
+    /// 来源：'self'＝用了角色自身分配；'main'＝回退到主模型；'none'＝主模型也没配。
     pub source: String,
 }
 
-/// 读取全部角色（main|action|plan|critique|vision|subagent|embed）的引用概览。
+/// 读取全部角色（main|action|plan|critique|vision|subagent|embed）的分配概览。
 ///
-/// 每个角色返回：自身引用（connectionId/modelId/contextWindow/enabled，None＝跟随 main）+ 实际生效
-/// （effective：经 resolve_role_provider 回退后的连接名/模型 + source）。绝不回显任何 api_key。
+/// 每个角色返回：自身引用（modelRef/modelId/modelLabel/connectionLabel/contextWindow/enabled，
+/// None＝跟随 main）+ 实际生效（effective：经 resolve_role_provider 回退后的模型/连接名 + source）。
+/// 绝不回显任何 api_key。
 #[tauri::command]
 pub(crate) fn get_role_assignments(
     state: State<AppState>,
@@ -414,28 +532,30 @@ pub(crate) fn get_role_assignments(
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(ALL_ROLES.len());
     for &role in ALL_ROLES {
-        // 自身引用（不回退）。
-        let own = get_role_assignment(&db, role).map_err(|e| e.to_string())?;
-        let (own_conn_id, own_conn_label, own_model, own_ctx, own_enabled) = match &own {
-            Some(a) => {
-                let label = get_connection(&db, &a.connection_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|c| c.label.or(c.preset));
+        // 自身分配（不回退）：role_models → models → connection 展示名。
+        let own = get_role_model(&db, role).map_err(|e| e.to_string())?;
+        let (own_ref, own_model_id, own_label, own_conn_label, own_ctx, own_enabled) = match &own {
+            Some(rm) => {
+                let model = get_model(&db, &rm.model_ref).ok().flatten();
+                let conn_label = model.as_ref().and_then(|m| {
+                    get_connection(&db, &m.connection_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|c| c.label.or(c.preset))
+                });
                 (
-                    Some(a.connection_id.clone()),
-                    label,
-                    Some(a.model_id.clone()),
-                    a.context_window,
-                    a.enabled,
+                    Some(rm.model_ref.clone()),
+                    model.as_ref().map(|m| m.model_id.clone()),
+                    model.as_ref().and_then(|m| m.label.clone()),
+                    conn_label,
+                    model.as_ref().and_then(|m| m.context_window),
+                    rm.enabled,
                 )
             }
-            None => (None, None, None, None, false),
+            None => (None, None, None, None, None, false),
         };
-        // 实际生效（回退 main）。resolve 合成出的 ModelProvider 带 preset/label/model_id；
-        // 用其 preset/label 推连接展示名。source 由「自身是否启用且存在」判定。
-        let effective_provider =
-            resolve_role_provider(&db, role).map_err(|e| e.to_string())?;
+        // 实际生效（回退 main）。resolve 合成出的 ModelProvider 带 preset/label/model_id。
+        let effective_provider = resolve_role_provider(&db, role).map_err(|e| e.to_string())?;
         let source = if own_enabled && own.is_some() {
             "self"
         } else if effective_provider.is_some() {
@@ -444,17 +564,18 @@ pub(crate) fn get_role_assignments(
             "none"
         };
         let effective = EffectiveRef {
+            model_id: effective_provider.as_ref().map(|p| p.model_id.clone()),
             connection_label: effective_provider
                 .as_ref()
                 .and_then(|p| p.label.clone().or_else(|| p.preset.clone())),
-            model_id: effective_provider.as_ref().map(|p| p.model_id.clone()),
             source: source.to_string(),
         };
         out.push(RoleAssignmentView {
             role: role.to_string(),
-            connection_id: own_conn_id,
+            model_ref: own_ref,
+            model_id: own_model_id,
+            model_label: own_label,
             connection_label: own_conn_label,
-            model_id: own_model,
             context_window: own_ctx,
             enabled: own_enabled,
             effective,
@@ -463,55 +584,40 @@ pub(crate) fn get_role_assignments(
     Ok(out)
 }
 
-/// 设置某角色的引用：把 role 绑到某连接 + 模型（纯引用，无密钥）。role 必须是允许的角色之一。
+/// 设置某角色的分配：把 role 指向一个已登记的 curated model（0.0.60，modelRef → models.id）。
 ///
-/// connectionId 必须指向一个已存连接；model_id 必填。enabled 缺省为 true。覆盖该角色已有引用。
-/// 改 main 会影响 embedding（复用 main provider）；保守刷新一次快照。
+/// role 必须是允许的角色之一；modelRef 必须指向一个真实存在的已登记模型。enabled 缺省 true。
+/// 覆盖该角色已有分配。改 main/embed 可能影响 embedding（复用 main provider）；保守刷新一次快照。
 #[allow(non_snake_case)]
 #[tauri::command]
 pub(crate) fn set_role_assignment(
     state: State<AppState>,
     role: String,
-    connectionId: String,
-    modelId: String,
-    contextWindow: Option<i64>,
+    modelRef: String,
     enabled: Option<bool>,
 ) -> Result<(), String> {
     if !ALL_ROLES.contains(&role.as_str()) {
         return Err(format!("不支持的角色: {role}"));
     }
-    if modelId.trim().is_empty() {
-        return Err("请填写模型 ID".to_string());
+    if modelRef.trim().is_empty() {
+        return Err("请选择一个模型".to_string());
     }
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    // 引用必须指向一个真实存在的连接。
-    if get_connection(&db, &connectionId)
-        .map_err(|e| e.to_string())?
-        .is_none()
-    {
-        return Err("所选连接不存在，请先创建连接".to_string());
-    }
-    upsert_role_assignment(
-        &db,
-        &role,
-        &connectionId,
-        modelId.trim(),
-        contextWindow.filter(|&cw| cw > 0),
-        enabled.unwrap_or(true),
-    )
-    .map_err(|e| e.to_string())?;
-    // main 引用变更可能改 embedding 端点/凭据/模型；保守刷新（其它角色无副作用）。
+    // upsert_role_model 内部已校验 model_ref 存在；这里直接调用并把人话化错误透传。
+    upsert_role_model(&db, &role, modelRef.trim(), enabled.unwrap_or(true))
+        .map_err(|e| e.to_string())?;
+    // main 分配变更可能改 embedding 端点/凭据/模型；保守刷新（其它角色无副作用）。
     if role == ROLE_MAIN || role == mdga_storage::ROLE_EMBED {
         crate::embedding::refresh_embedding_config(&db);
     }
     Ok(())
 }
 
-/// 清除某角色的引用，使其回退到主模型。拒绝清除 role==main（main 不可清）。
+/// 清除某角色的分配，使其回退到主模型。拒绝清除 role==main（main 不可清）。
 #[tauri::command]
 pub(crate) fn clear_role_assignment(state: State<AppState>, role: String) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    delete_role_assignment(&db, &role).map_err(|e| e.to_string())?;
+    delete_role_model(&db, &role).map_err(|e| e.to_string())?;
     if role == mdga_storage::ROLE_EMBED {
         crate::embedding::refresh_embedding_config(&db);
     }
