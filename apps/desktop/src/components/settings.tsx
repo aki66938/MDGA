@@ -1,14 +1,15 @@
-// 设置弹窗：模型连接库（Connections）+ 角色分配（Assignments）+ 其它分类（0.0.59）。
+// 设置弹窗：模型连接库（Connections）+ 我用到的模型（Models）+ 角色分配（Assignments）+ 其它分类（0.0.60）。
 
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock, Trash2, Pencil, Wrench } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock, Trash2, Pencil, Wrench, Plus, Download } from "lucide-react";
 import { getPermissionModeLabel, type PermissionMode } from "@mdga/ui";
 import {
   PERMISSION_MODES,
   PROVIDER_PRESETS,
   ASSIGNABLE_ROLES,
   type ConnectionView,
+  type CuratedModelView,
   type RoleAssignmentView,
   type AppInfo,
   type BalanceState,
@@ -77,12 +78,14 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
     }
   }
 
-  /** 测试某连接：弹一个模型 ID（已知模型作提示）后调 test_connection。 */
+  /** 测试某连接：弹一个模型 ID（用户登记的模型作提示）后调 test_connection。 */
   async function handleTest(c: ConnectionView) {
     setError(null);
     let known: string[] = [];
     try {
-      known = await invoke<string[]>("list_models_for_connection", { connectionId: c.id });
+      // 0.0.60：list_models_for_connection 现返回该连接已登记的 curated 模型，取其 modelId 作建议。
+      const curated = await invoke<CuratedModelView[]>("list_models_for_connection", { connectionId: c.id });
+      known = curated.map((m) => m.modelId);
     } catch {
       known = [];
     }
@@ -113,7 +116,8 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
     setError(null);
     let known: string[] = [];
     try {
-      known = await invoke<string[]>("list_models_for_connection", { connectionId: c.id });
+      const curated = await invoke<CuratedModelView[]>("list_models_for_connection", { connectionId: c.id });
+      known = curated.map((m) => m.modelId);
     } catch {
       known = [];
     }
@@ -169,7 +173,8 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
       <h3 className="settings-content__h">模型连接</h3>
       <p className="settings-desc" style={{ marginTop: 0, marginBottom: 8 }}>
         在这里集中配置可复用的<b>模型连接</b>（端点 + 密钥，配一次即可）。每个连接 = 名称 + 供应商预设 +
-        Base URL + API Key + API 格式。这是<b>唯一</b>录入 API Key 的地方；配好后到「模型分配」把各角色指到某个连接 + 模型。
+        Base URL + API Key + API 格式。这是<b>唯一</b>录入 API Key 的地方。配好后在每个连接卡下的「<b>我用到的模型</b>」里
+        登记你会用到的模型（一个连接可登记多个），再到「模型分配」把各角色指到其中一个模型。
       </p>
 
       {loading ? (
@@ -215,6 +220,9 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
                   <Trash2 size={14} /> 删除
                 </button>
               </div>
+
+              {/* 0.0.60：在每个连接卡下登记「我用到的模型」（一个连接可登记多个模型，一对多）。 */}
+              <ConnectionModels connection={c} />
             </div>
           );
         })
@@ -228,6 +236,227 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
         </button>
       </div>
     </>
+  );
+}
+
+/**
+ * 「我用到的模型」子区（0.0.60）：嵌在每个连接卡内，登记**该连接下**用户实际会用到的模型。
+ * 这是连接 ↔ 模型「一对多」显式化的地方，也是角色分配可选模型的来源。
+ *
+ * 列表来自 list_models_for_connection（现返回 curated 模型，**非**旧的预设字符串清单）。
+ * 添加：手填 modelId + 可选 label + 可选 contextWindow（高级），经 add_model（按 连接+modelId 去重，重复＝更新）。
+ * 「拉取可用模型」：调 fetch_available_models 实时 GET 端点 /models；成功把返回的 id 列为快速添加 chip；
+ * 失败（throws）显示「该端点不支持自动拉取，请手动填写模型 ID」并保留手动录入。
+ * 删除：调 delete_model；若该模型仍被某角色引用，后端拒绝并返回中文错误，此处原样提示。
+ */
+function ConnectionModels({ connection }: { connection: ConnectionView }) {
+  const [models, setModels] = useState<CuratedModelView[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  // 添加表单：模型 ID + 可选别名 + 可选上下文窗口（高级，仅在展开时录入）。
+  const [modelId, setModelId] = useState("");
+  const [label, setLabel] = useState("");
+  const [ctxWindow, setCtxWindow] = useState("");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [adding, setAdding] = useState(false);
+  // 「拉取可用模型」状态：fetching=进行中；fetched=端点返回的 id 列表（作快速添加 chip）；notice=失败提示。
+  const [fetching, setFetching] = useState(false);
+  const [fetched, setFetched] = useState<string[] | null>(null);
+  const [fetchNotice, setFetchNotice] = useState<string | null>(null);
+
+  const refresh = () => {
+    setLoading(true);
+    invoke<CuratedModelView[]>("list_models_for_connection", { connectionId: connection.id })
+      .then((list) => setModels(Array.isArray(list) ? list : []))
+      .catch((e) => setError(humanizeError(String(e))))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { refresh(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [connection.id]);
+
+  /** 已登记的 modelId 集合（小写归一），用于「拉取」结果里标注哪些已添加。 */
+  const existingIds = new Set(models.map((m) => m.modelId.trim().toLowerCase()));
+
+  /** 添加一个模型（手填或来自拉取 chip）。可带 label/contextWindow；add_model 按 连接+modelId 去重。 */
+  async function addModel(id: string, opts?: { label?: string; contextWindow?: number }) {
+    const trimmed = id.trim();
+    if (!trimmed) { setError("请填写模型 ID"); return; }
+    setError(null);
+    setAdding(true);
+    try {
+      await invoke<CuratedModelView>("add_model", {
+        connectionId: connection.id,
+        modelId: trimmed,
+        label: opts?.label?.trim() || null,
+        contextWindow: opts?.contextWindow ?? null,
+      });
+      refresh();
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  /** 手动添加表单提交：读 modelId + 可选 label + 可选 contextWindow（高级），添加后清空表单。 */
+  async function handleAddManual() {
+    const ctx = ctxWindow.trim() ? parseInt(ctxWindow.trim(), 10) : undefined;
+    if (ctx != null && (Number.isNaN(ctx) || ctx <= 0)) { setError("上下文窗口需为正整数"); return; }
+    const id = modelId;
+    await addModel(id, { label, contextWindow: ctx });
+    setModelId("");
+    setLabel("");
+    setCtxWindow("");
+  }
+
+  /** 删除一个已登记模型；若被某角色引用，后端拒绝并返回中文错误，此处原样提示（含建议先去「模型分配」改引用）。 */
+  async function handleDelete(m: CuratedModelView) {
+    setError(null);
+    try {
+      await invoke("delete_model", { id: m.id });
+      refresh();
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    }
+  }
+
+  /** 「拉取可用模型」：实时 GET 端点 /models。成功→把返回 id 列为快速添加 chip；失败→提示手动填写。 */
+  async function handleFetch() {
+    setError(null);
+    setFetchNotice(null);
+    setFetched(null);
+    setFetching(true);
+    try {
+      const ids = await invoke<string[]>("fetch_available_models", { connectionId: connection.id });
+      setFetched(Array.isArray(ids) ? ids : []);
+      if (!ids || ids.length === 0) {
+        setFetchNotice("该端点未返回任何模型，请手动填写模型 ID。");
+      }
+    } catch {
+      // 端点无 /models / 网络 / 鉴权 / 解析失败：回退手动录入。
+      setFetchNotice("该端点不支持自动拉取，请手动填写模型 ID。");
+    } finally {
+      setFetching(false);
+    }
+  }
+
+  return (
+    <div className="provider-models">
+      <div className="provider-models__head">
+        <span className="provider-models__title">我用到的模型</span>
+        <span className="provider-models__count">{models.length} 个</span>
+      </div>
+
+      {loading ? (
+        <p className="settings-row__value" style={{ margin: "2px 0" }}>加载中…</p>
+      ) : models.length === 0 ? (
+        <p className="settings-desc" style={{ margin: "2px 0 6px" }}>
+          还没有登记模型。点「拉取可用模型」自动获取，或在下方手动添加。
+        </p>
+      ) : (
+        <ul className="provider-models__list">
+          {models.map((m) => (
+            <li key={m.id} className="provider-models__item">
+              <span className="provider-models__id" title={m.modelId}>
+                <code>{m.modelId}</code>
+                {m.label && m.label.trim() && <span className="provider-models__label">{m.label}</span>}
+                {m.contextWindow ? (
+                  <span className="provider-models__ctx">{(m.contextWindow / 1000).toLocaleString()}K ctx</span>
+                ) : null}
+              </span>
+              <button
+                type="button"
+                className="provider-models__del"
+                title="删除该模型"
+                aria-label={`删除模型 ${m.modelId}`}
+                onClick={() => handleDelete(m)}
+              >
+                <Trash2 size={13} />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {/* 拉取可用模型 + 手动添加 */}
+      <div className="provider-models__add">
+        <div className="provider-models__addrow">
+          <input
+            className="conv-search provider-input"
+            type="text"
+            value={modelId}
+            placeholder="模型 ID，如 deepseek-chat"
+            onChange={(e) => setModelId(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void handleAddManual(); } }}
+          />
+          <button
+            type="button"
+            className="approval-card__btn approval-card__btn--allow"
+            onClick={() => void handleAddManual()}
+            disabled={adding || !modelId.trim()}
+          >
+            <Plus size={14} /> 添加
+          </button>
+          <button type="button" className="approval-card__btn" onClick={handleFetch} disabled={fetching}>
+            <Download size={14} /> {fetching ? "拉取中…" : "拉取可用模型"}
+          </button>
+        </div>
+
+        <button
+          type="button"
+          className="provider-advanced-toggle"
+          onClick={() => setAdvancedOpen((v) => !v)}
+        >
+          {advancedOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          高级（别名 / 上下文窗口，可选）
+        </button>
+        <div className={`provider-advanced${advancedOpen ? " provider-advanced--open" : ""}`}>
+          <div className="provider-advanced__inner provider-models__advanced">
+            <input
+              className="conv-search provider-input"
+              type="text"
+              value={label}
+              placeholder="别名（可选，列表中展示）"
+              onChange={(e) => setLabel(e.target.value)}
+            />
+            <input
+              className="conv-search provider-input"
+              type="number"
+              min={1}
+              value={ctxWindow}
+              placeholder="上下文窗口 tokens（可选，如 128000）"
+              onChange={(e) => setCtxWindow(e.target.value)}
+            />
+          </div>
+        </div>
+
+        {/* 拉取结果：快速添加 chip（已登记的标灰禁用）；失败提示在下方。 */}
+        {fetchNotice && (
+          <p className="settings-desc" style={{ margin: "6px 0 0", color: "var(--warning)" }}>{fetchNotice}</p>
+        )}
+        {fetched && fetched.length > 0 && (
+          <div className="provider-models__chips">
+            <span className="provider-models__chips-hint">点击添加（端点返回 {fetched.length} 个）：</span>
+            {fetched.map((id) => {
+              const already = existingIds.has(id.trim().toLowerCase());
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  className={`provider-chip${already ? " provider-chip--on" : ""}`}
+                  disabled={already || adding}
+                  title={already ? "已登记" : `添加 ${id}`}
+                  onClick={() => void addModel(id)}
+                >
+                  {already ? "✓ " : "+ "}{id}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {error && <p className="settings-row__value" style={{ color: "var(--danger)", marginTop: 4 }}>{error}</p>}
+    </div>
   );
 }
 
@@ -552,27 +781,31 @@ function LspServerSettings() {
   );
 }
 
-// ── 角色分配（Assignments，0.0.59）───────────────────────────────────────────
+// ── 角色分配（Assignments，0.0.60）───────────────────────────────────────────
 
 /**
- * 角色 → 连接/模型 分配矩阵：每个角色一行 [连接 ▾][模型 ▾]，非主角色可选「跟随主模型」。
- * **本页绝无 API Key 输入**——密钥只在「模型连接」配。挂载拉 get_role_assignments + list_connections；
- * 设置经 set_role_assignment、「跟随主模型」经 clear_role_assignment（main 不可清，故主行不提供）。
+ * 角色 → 模型 分配矩阵：每个角色一行，一个**单一下拉**列出全部已登记模型（list_models），
+ * 非主角色额外含「跟随主模型」选项。**本页绝无 API Key 输入**，也不再自由填模型 ID——
+ * 只能从「模型连接」里登记过的模型中选。
+ *
+ * 挂载拉 get_role_assignments + list_models；选模型经 set_role_assignment({ role, modelRef })，
+ * 「跟随主模型」经 clear_role_assignment（main 不可清，故主行不提供）。
+ * 尚无任何已登记模型时，给出「请先到『模型连接』为某个连接添加模型」的引导。
  */
 function AssignmentsSettings() {
   const [assignments, setAssignments] = useState<RoleAssignmentView[]>([]);
-  const [connections, setConnections] = useState<ConnectionView[]>([]);
+  const [models, setModels] = useState<CuratedModelView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = () => {
     Promise.all([
       invoke<RoleAssignmentView[]>("get_role_assignments"),
-      invoke<ConnectionView[]>("list_connections"),
+      invoke<CuratedModelView[]>("list_models"),
     ])
-      .then(([a, c]) => {
+      .then(([a, m]) => {
         setAssignments(Array.isArray(a) ? a : []);
-        setConnections(Array.isArray(c) ? c : []);
+        setModels(Array.isArray(m) ? m : []);
       })
       .catch((e) => setError(humanizeError(String(e))))
       .finally(() => setLoading(false));
@@ -588,17 +821,15 @@ function AssignmentsSettings() {
     <>
       <h3 className="settings-content__h">模型分配</h3>
       <p className="settings-desc" style={{ marginTop: 0, marginBottom: 8 }}>
-        把每个<b>角色</b>指到一个已配置的<b>连接</b> + <b>模型</b>。未单独分配的角色自动<b>跟随主模型</b>。
-        此处只选连接与模型，<b>不输入任何 API Key</b>（密钥在「模型连接」配）。
+        把每个<b>角色</b>指到一个<b>已登记的模型</b>（在「模型连接」的「我用到的模型」里登记）。未单独分配的角色自动<b>跟随主模型</b>。
+        此处只选模型，<b>不输入任何 API Key</b>（密钥在「模型连接」配）。
       </p>
 
-      {connections.length === 0 && !loading && (
+      {models.length === 0 && !loading ? (
         <p className="settings-row__value" style={{ color: "var(--warning)" }}>
-          还没有任何连接。请先到「模型连接」新增一个连接（填 API Key），再回来分配角色。
+          还没有任何已登记的模型。请先到「<b>模型连接</b>」为某个连接添加模型，再回来分配角色。
         </p>
-      )}
-
-      {loading ? (
+      ) : loading ? (
         <p className="settings-row__value">加载中…</p>
       ) : (
         // 按 ASSIGNABLE_ROLES 顺序渲染（缺失的角色用空占位行，理论上后端会全量返回）。
@@ -612,7 +843,7 @@ function AssignmentsSettings() {
               assignment={a}
               title={metaOf(meta.id).label}
               desc={metaOf(meta.id).desc}
-              connections={connections}
+              models={models}
               onChanged={refresh}
               onError={setError}
             />
@@ -625,47 +856,43 @@ function AssignmentsSettings() {
   );
 }
 
+/** 一个已登记模型在下拉里的展示文本：「连接名 / modelId」，有别名时附「（别名）」。 */
+function curatedOptionLabel(m: CuratedModelView): string {
+  const conn = m.connectionLabel?.trim() || "未知连接";
+  const alias = m.label && m.label.trim() ? `（${m.label.trim()}）` : "";
+  return `${conn} / ${m.modelId}${alias}`;
+}
+
 /**
- * 单角色分配行：[连接 ▾][模型 ▾]（+ 非主角色的「跟随主模型」选项）。
- * 连接下拉来自 list_connections（按展示名）；选中后用 list_models_for_connection 拉已知模型；
- * 列表为空（custom / 未知预设）则模型框降级为自由文本输入。
+ * 单角色分配行：一个下拉列出全部已登记模型（值＝模型 id / modelRef），非主角色含「跟随主模型」。
+ * 选中即保存——选模型调 set_role_assignment({ role, modelRef })；选「跟随主模型」调 clear_role_assignment。
  * main 行：无「跟随主模型」选项（它就是默认；后端也拒绝清 main）。
  */
 function AssignmentRow({
   assignment,
   title,
   desc,
-  connections,
+  models,
   onChanged,
   onError,
 }: {
   assignment: RoleAssignmentView;
   title: string;
   desc: string;
-  connections: ConnectionView[];
+  models: CuratedModelView[];
   onChanged: () => void;
   onError: (msg: string | null) => void;
 }) {
   const role = assignment.role;
   const isMain = role === "main";
-  // 本行选择态。"" = 跟随主模型（仅非主角色）。回填自身引用（若有）。
-  const [connectionId, setConnectionId] = useState<string>(assignment.connectionId ?? "");
-  const [modelId, setModelId] = useState<string>(assignment.modelId ?? "");
-  // 当前所选连接的已知模型清单（空＝自由文本输入）。
-  const [knownModels, setKnownModels] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
 
-  // 选连接后拉该连接预设的已知模型（空数组＝自由文本兜底）。
-  useEffect(() => {
-    let alive = true;
-    if (!connectionId) { setKnownModels([]); return; }
-    invoke<string[]>("list_models_for_connection", { connectionId })
-      .then((list) => { if (alive) setKnownModels(Array.isArray(list) ? list : []); })
-      .catch(() => { if (alive) setKnownModels([]); });
-    return () => { alive = false; };
-  }, [connectionId]);
-
   const eff = assignment.effective;
+  // 当前下拉值：自身引用的 modelRef（有则选中该模型），否则 ""（＝跟随主模型 / 未选）。
+  const selected = assignment.modelRef ?? "";
+  // 若自身引用的模型已不在清单里（连接被删等），仍补一行占位以免下拉空选。
+  const refMissing = !!selected && !models.some((m) => m.id === selected);
+
   // 「跟随主模型」生效时，把实际生效连接/模型展示出来（source==="main"）。
   const followingMain = !isMain && eff.source === "main";
   const badgeText = isMain
@@ -678,42 +905,17 @@ function AssignmentRow({
     ? "○ 跟随主模型"
     : "⚠ 主模型未配置";
 
-  function handleConnectionChange(next: string) {
-    onError(null);
-    setConnectionId(next);
-    setModelId(""); // 换连接后清模型，避免跨预设残留无效模型。
-  }
-
-  async function handleSave() {
-    onError(null);
-    if (!connectionId) { onError("请选择一个连接"); return; }
-    if (!modelId.trim()) { onError("请选择或填写模型 ID"); return; }
-    setSaving(true);
-    try {
-      await invoke("set_role_assignment", {
-        role,
-        connectionId,
-        modelId: modelId.trim(),
-        // contextWindow 作为可选高级项，本行保持简单不暴露（留给连接/默认）。
-        contextWindow: assignment.contextWindow ?? null,
-        enabled: true,
-      });
-      onChanged();
-    } catch (e) {
-      onError(humanizeError(String(e)));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  // 「跟随主模型」：清除该角色自身引用（main 不可清，故主行无此按钮）。
-  async function handleFollowMain() {
+  /** 下拉变更：空值＝跟随主模型（clear_role_assignment）；否则设为该模型（set_role_assignment）。 */
+  async function handleSelect(next: string) {
     onError(null);
     setSaving(true);
     try {
-      await invoke("clear_role_assignment", { role });
-      setConnectionId("");
-      setModelId("");
+      if (!next) {
+        // 仅非主角色会出现空值选项；main 无「跟随主模型」。
+        await invoke("clear_role_assignment", { role });
+      } else {
+        await invoke("set_role_assignment", { role, modelRef: next, enabled: true });
+      }
       onChanged();
     } catch (e) {
       onError(humanizeError(String(e)));
@@ -738,60 +940,27 @@ function AssignmentRow({
       </p>
 
       <div className="provider-grid">
-        <label className="provider-field">
-          <span className="provider-field__label">连接</span>
+        <label className="provider-field provider-field--full">
+          <span className="provider-field__label">模型</span>
           <select
             className="model-select"
-            value={connectionId}
-            onChange={(e) => handleConnectionChange(e.target.value)}
+            value={selected}
+            disabled={saving}
+            onChange={(e) => void handleSelect(e.target.value)}
           >
+            {isMain && selected === "" && <option value="">（请选择模型）</option>}
             {!isMain && <option value="">跟随主模型</option>}
-            {isMain && connectionId === "" && <option value="">（请选择连接）</option>}
-            {connections.map((c) => (
-              <option key={c.id} value={c.id}>{connectionDisplayName(c)}</option>
+            {models.map((m) => (
+              <option key={m.id} value={m.id}>{curatedOptionLabel(m)}</option>
             ))}
+            {/* 自身引用的模型已不在清单（连接被删等）：补一行占位，保留可见、可改选别的。 */}
+            {refMissing && (
+              <option value={selected}>
+                {(assignment.connectionLabel?.trim() || "已失效连接") + " / " + (assignment.modelId ?? selected)}（已失效）
+              </option>
+            )}
           </select>
         </label>
-
-        <label className="provider-field">
-          <span className="provider-field__label">模型</span>
-          {connectionId && knownModels.length > 0 ? (
-            <select className="model-select" value={modelId} onChange={(e) => { onError(null); setModelId(e.target.value); }}>
-              <option value="">（选择模型）</option>
-              {knownModels.map((m) => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-              {/* 自由补充：已回填一个不在已知清单里的模型时，仍可显示并保留它。 */}
-              {modelId && !knownModels.includes(modelId) && <option value={modelId}>{modelId}（自定义）</option>}
-            </select>
-          ) : (
-            // 已知清单为空（custom / 未知预设）或尚未选连接：自由文本输入模型 ID。
-            <input
-              className="conv-search provider-input"
-              type="text"
-              value={modelId}
-              placeholder={connectionId ? "输入模型 ID，如 deepseek-chat" : "请先选择连接"}
-              disabled={!connectionId}
-              onChange={(e) => { onError(null); setModelId(e.target.value); }}
-            />
-          )}
-        </label>
-      </div>
-
-      <div className="provider-card__actions">
-        {!isMain && assignment.connectionId && (
-          <button type="button" className="approval-card__btn" onClick={handleFollowMain} disabled={saving}>
-            跟随主模型
-          </button>
-        )}
-        <button
-          type="button"
-          className="approval-card__btn approval-card__btn--allow"
-          onClick={handleSave}
-          disabled={saving || !connectionId}
-        >
-          {saving ? "保存中…" : "保存"}
-        </button>
       </div>
     </div>
   );
@@ -900,11 +1069,14 @@ export function SettingsModal({
     Promise.all([
       invoke<RoleAssignmentView[]>("get_role_assignments"),
       invoke<ConnectionView[]>("list_connections"),
+      invoke<CuratedModelView[]>("list_models"),
     ])
-      .then(([assigns, conns]) => {
+      .then(([assigns, conns, models]) => {
         const main = assigns.find((a) => a.role === "main");
-        // main 自身引用的连接 id；据此查 preset。未配＝按默认 deepseek 不误伤。
-        const conn = main?.connectionId ? conns.find((c) => c.id === main.connectionId) : undefined;
+        // 0.0.60：main 引用的是已登记模型 id（modelRef）；经 list_models 解析出所属连接，再查 preset。
+        // 未配＝按默认 deepseek 不误伤。
+        const model = main?.modelRef ? models.find((m) => m.id === main.modelRef) : undefined;
+        const conn = model ? conns.find((c) => c.id === model.connectionId) : undefined;
         const hasMain = !!main?.effective.modelId;
         setMainIsDeepseek(hasMain && (conn?.preset ?? "deepseek") === "deepseek");
       })

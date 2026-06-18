@@ -43,6 +43,7 @@ import {
   type ToolEvent,
   type DraftWorkspace,
   type ConnectionView,
+  type CuratedModelView,
   type RoleAssignmentView,
   type SettingsSection,
 } from "./types";
@@ -194,17 +195,20 @@ export function App() {
   /** 拉取主模型配置（Plan20 🔴1 / 0.0.59 连接库改造）：刷新 mainConfigured 与 mainModelId，
    *  并把 model 透传值同步为 main 角色实际生效的 model_id。预设经交叉 list_connections 推导。 */
   async function refreshMainModel() {
-    const [assigns, conns] = await Promise.all([
+    const [assigns, conns, models] = await Promise.all([
       invoke<RoleAssignmentView[]>("get_role_assignments").catch(() => [] as RoleAssignmentView[]),
       invoke<ConnectionView[]>("list_connections").catch(() => [] as ConnectionView[]),
+      invoke<CuratedModelView[]>("list_models").catch(() => [] as CuratedModelView[]),
     ]);
     const main = assigns.find((a) => a.role === "main");
     const id = (main?.effective.modelId ?? "").trim();
     setMainConfigured(!!id);
     setMainModelId(id);
     if (id) setModel(id);
-    // 缓存主模型预设（Plan21 #5）：取 main 引用连接的 preset；未配/缺省回落 deepseek，供余额门禁与成本金额位判断。
-    const conn = main?.connectionId ? conns.find((c) => c.id === main.connectionId) : undefined;
+    // 缓存主模型预设（Plan21 #5 / 0.0.60）：main 引用的是已登记模型 id（modelRef），
+    // 经 list_models 解析出其所属连接，再取连接 preset；未配/缺省回落 deepseek，供余额门禁与成本金额位判断。
+    const model = main?.modelRef ? models.find((m) => m.id === main.modelRef) : undefined;
+    const conn = model ? conns.find((c) => c.id === model.connectionId) : undefined;
     setMainPreset((conn?.preset ?? "deepseek") || "deepseek");
   }
 
