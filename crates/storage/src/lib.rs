@@ -1348,6 +1348,46 @@ pub fn delete_connection(conn: &Connection, id: &str) -> SqlResult<()> {
     Ok(())
 }
 
+/// 强制级联删除一个连接（0.0.62）：删除连接、其旗下全部模型，以及任何指向这些模型的角色分配。
+///
+/// 与拒绝式 [`delete_connection`] 不同——本函数**不拒绝**被引用的连接，而是把被波及的角色分配
+/// 一并清掉（**含 `main`**：直接 SQL DELETE role_models 行，不走 [`delete_role_model`]——后者拒删 main）。
+/// 清掉 main 的分配后 main 变为「未配置」，`resolve_role_provider(main)` 返回 None，由 app 既有的
+/// 「请先配置主模型」处理接管（这是预期行为，给「唯一连接被 main+其它角色占用」的用户一条删除出路）。
+///
+/// 返回被本次级联**解除分配**的角色名（去重排序）；前端据此提示「这些角色将被取消分配」。
+/// 整个操作在**单事务**内（BEGIN/COMMIT，出错 ROLLBACK），保证无半删状态：要么连接 + 模型 +
+/// 角色分配一起消失，要么全不动。
+pub fn delete_connection_cascade(conn: &Connection, id: &str) -> SqlResult<Vec<String>> {
+    // 先算出受影响角色（即返回值）；与事务内 DELETE 用同一连接条件，读写口径一致。
+    let affected = connection_referenced_by(conn, id)?;
+
+    conn.execute_batch("BEGIN")?;
+    let result = (|| -> SqlResult<()> {
+        // (a→b) 删掉所有指向「本连接旗下模型」的角色分配（含 main，直接 SQL，不经 delete_role_model）。
+        conn.execute(
+            "DELETE FROM role_models
+             WHERE model_ref IN (SELECT id FROM models WHERE connection_id = ?1)",
+            params![id],
+        )?;
+        // (c) 删本连接旗下全部模型。
+        conn.execute("DELETE FROM models WHERE connection_id = ?1", params![id])?;
+        // (d) 删连接本身。
+        conn.execute("DELETE FROM connections WHERE id = ?1", params![id])?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(affected)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 // ── 角色引用（role_assignments）CRUD（0.0.59）───────────────────────────────
 
 /// 列出全部角色引用。
@@ -1568,6 +1608,37 @@ pub fn delete_model(conn: &Connection, id: &str) -> SqlResult<()> {
     }
     conn.execute("DELETE FROM models WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+/// 强制级联删除一个模型（0.0.62）：删除该模型，以及任何指向它的角色分配。
+///
+/// 与拒绝式 [`delete_model`] 不同——本函数**不拒绝**被引用的模型，而是把指向它的角色分配一并清掉
+/// （**含 `main`**：直接 SQL DELETE role_models 行，不走拒删 main 的 [`delete_role_model`]）。清掉 main
+/// 后 main 变「未配置」、`resolve_role_provider(main)` 返回 None，交 app 既有「请先配置主模型」处理（预期）。
+///
+/// 返回被解除分配的角色名（去重排序）。整个操作在**单事务**内（出错 ROLLBACK），无半删状态。
+pub fn delete_model_cascade(conn: &Connection, id: &str) -> SqlResult<Vec<String>> {
+    // 受影响角色（即返回值）；与事务内 DELETE 用同一 model_ref 条件，读写口径一致。
+    let affected = model_referenced_by(conn, id)?;
+
+    conn.execute_batch("BEGIN")?;
+    let result = (|| -> SqlResult<()> {
+        // 删指向本模型的全部角色分配（含 main，直接 SQL，不经 delete_role_model）。
+        conn.execute("DELETE FROM role_models WHERE model_ref = ?1", params![id])?;
+        // 删模型本身。
+        conn.execute("DELETE FROM models WHERE id = ?1", params![id])?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(affected)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 // ── 角色分配（role_models）CRUD（0.0.60，运行时真源）───────────────────────────
@@ -2960,6 +3031,113 @@ mod tests {
             "glm-4"
         );
         assert_eq!(list_models(&conn).expect("models3").len(), 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // ── 0.0.62：级联删除（连接 / 模型）──────────────────────────────────────────
+
+    #[test]
+    fn delete_connection_cascade_unassigns_roles_including_main() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db");
+
+        // 一个连接，旗下两个模型：main→modelA、action→modelB（都在本连接）；plan 不设（跟随 main）。
+        let c = upsert_connection(&conn, "", Some("DS"), Some("deepseek"), None, "sk-1", "openai")
+            .expect("conn");
+        let model_a = upsert_model(&conn, "", &c.id, "model-a", None, Some(128_000)).expect("model A");
+        let model_b = upsert_model(&conn, "", &c.id, "model-b", None, None).expect("model B");
+        upsert_role_model(&conn, ROLE_MAIN, &model_a.id, true).expect("assign main");
+        upsert_role_model(&conn, ROLE_ACTION, &model_b.id, true).expect("assign action");
+
+        // 前置 sanity：拒绝式 delete_connection 此时会被拒（被 main+action 引用）。
+        assert!(delete_connection(&conn, &c.id).is_err(), "被引用连接拒删（拒绝式）");
+        // plan 未配，经回退链解析到 main（modelA）。
+        assert_eq!(
+            resolve_role_provider(&conn, ROLE_PLAN).expect("q").expect("plan via main").model_id,
+            "model-a"
+        );
+
+        // 级联删：返回被解除分配的角色（排序）= ["action","main"]（含 main，尽管 delete_role_model 拒删 main）。
+        let affected = delete_connection_cascade(&conn, &c.id).expect("cascade");
+        assert_eq!(affected, vec!["action".to_string(), "main".to_string()]);
+
+        // 之后：连接没了；旗下模型清空；main/action 分配清掉；main 变未配置 ⇒ resolve(main)=None。
+        assert!(get_connection(&conn, &c.id).expect("get conn").is_none(), "连接已删");
+        assert!(
+            list_models_for_connection(&conn, &c.id).expect("list models").is_empty(),
+            "旗下模型已级联删"
+        );
+        assert!(get_model(&conn, &model_a.id).expect("ma").is_none());
+        assert!(get_model(&conn, &model_b.id).expect("mb").is_none());
+        assert!(get_role_model(&conn, ROLE_MAIN).expect("rm main").is_none(), "main 分配已清");
+        assert!(get_role_model(&conn, ROLE_ACTION).expect("rm action").is_none(), "action 分配已清");
+        assert!(
+            resolve_role_provider(&conn, ROLE_MAIN).expect("q").is_none(),
+            "main 未配置 ⇒ 解析为 None（交 app 既有「请先配置主模型」处理）"
+        );
+        // action 也不再解析（main 都没了，回退无处可去）。
+        assert!(resolve_role_provider(&conn, ROLE_ACTION).expect("q").is_none());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn delete_model_cascade_unassigns_main() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db");
+
+        let c = upsert_connection(&conn, "", Some("DS"), Some("deepseek"), None, "sk-1", "openai")
+            .expect("conn");
+        let model_a = upsert_model(&conn, "", &c.id, "model-a", None, Some(64_000)).expect("model A");
+        upsert_role_model(&conn, ROLE_MAIN, &model_a.id, true).expect("assign main");
+
+        // 拒绝式 delete_model 会被拒（被 main 引用）。
+        assert!(delete_model(&conn, &model_a.id).is_err(), "被引用模型拒删（拒绝式）");
+
+        // 级联删模型：返回 ["main"]（清掉了 main 的分配，尽管 delete_role_model 拒删 main）。
+        let affected = delete_model_cascade(&conn, &model_a.id).expect("cascade");
+        assert_eq!(affected, vec!["main".to_string()]);
+
+        // 模型没了；main 分配清掉；main 未配置 ⇒ resolve(main)=None。连接本身保留（只删模型）。
+        assert!(get_model(&conn, &model_a.id).expect("get model").is_none(), "模型已删");
+        assert!(get_role_model(&conn, ROLE_MAIN).expect("rm main").is_none(), "main 分配已清");
+        assert!(resolve_role_provider(&conn, ROLE_MAIN).expect("q").is_none(), "main 未配置");
+        assert!(get_connection(&conn, &c.id).expect("get conn").is_some(), "连接本身仍在（只删模型）");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn cascades_are_transactional_no_partial_state() {
+        // 结构性 sanity：级联在单事务里完成，正常路径下提交后无残留；且对「不存在的 id」是安全 no-op
+        // （受影响角色为空、什么都不删、不留半状态）。出错路径（execute_batch ROLLBACK）由实现保证原子。
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db");
+
+        // 删不存在的连接/模型：返回空、无副作用、不报错（事务正常提交）。
+        assert!(delete_connection_cascade(&conn, "no-such-conn").expect("noop conn").is_empty());
+        assert!(delete_model_cascade(&conn, "no-such-model").expect("noop model").is_empty());
+
+        // 两个连接，各配一个角色。级联删 c1 不应碰 c2 的模型/分配（事务作用域限定在 c1）。
+        let c1 = upsert_connection(&conn, "", Some("A"), Some("deepseek"), None, "sk-a", "openai")
+            .expect("c1");
+        let c2 = upsert_connection(&conn, "", Some("B"), Some("zhipu"), None, "sk-b", "openai")
+            .expect("c2");
+        let m1 = upsert_model(&conn, "", &c1.id, "m1", None, None).expect("m1");
+        let m2 = upsert_model(&conn, "", &c2.id, "m2", None, None).expect("m2");
+        upsert_role_model(&conn, ROLE_MAIN, &m1.id, true).expect("main→m1");
+        upsert_role_model(&conn, ROLE_ACTION, &m2.id, true).expect("action→m2");
+
+        let affected = delete_connection_cascade(&conn, &c1.id).expect("cascade c1");
+        assert_eq!(affected, vec!["main".to_string()]);
+        // c2 / m2 / action 分配完好（事务只动了 c1 相关行，无越界删除、无半状态）。
+        assert!(get_connection(&conn, &c2.id).expect("c2").is_some());
+        assert!(get_model(&conn, &m2.id).expect("m2").is_some());
+        assert_eq!(
+            get_role_model(&conn, ROLE_ACTION).expect("rm action").expect("present").model_ref,
+            m2.id
+        );
 
         let _ = std::fs::remove_file(db_path);
     }

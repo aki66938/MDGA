@@ -130,13 +130,29 @@ pub(crate) fn save_connection(
     Ok(ConnectionView::from(saved))
 }
 
-/// 删除一个连接。若仍被任意角色引用，拒绝删除并返回「仍被某些角色引用」错误。
+/// 删除一个连接（0.0.62 支持 `force` 级联）。
+///
+/// - `force == false`：保持旧的**拒绝式**语义——若该连接旗下任一模型仍被某角色引用，返回
+///   「该连接下的模型仍被某些角色引用：…」错误（前端据此弹确认框）；未被引用则直接删除，返回 `Ok([])`。
+/// - `force == true`：**级联删除**——连同被波及的角色分配（含 `main`）一并清掉，返回被解除分配的
+///   角色名列表（去重排序）。清掉 main 后 main 变未配置，交 app 既有「请先配置主模型」处理。
+///
+/// 两条路径都不触碰任何 api_key（既不读也不回显）。删除后刷新 embedding 快照（embed/main 解析可能变）。
 #[tauri::command]
-pub(crate) fn delete_connection(state: State<AppState>, id: String) -> Result<(), String> {
+pub(crate) fn delete_connection(
+    state: State<AppState>,
+    id: String,
+    force: bool,
+) -> Result<Vec<String>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    mdga_storage::delete_connection(&db, &id).map_err(|e| e.to_string())?;
+    let affected = if force {
+        mdga_storage::delete_connection_cascade(&db, &id).map_err(|e| e.to_string())?
+    } else {
+        mdga_storage::delete_connection(&db, &id).map_err(|e| e.to_string())?;
+        Vec::new()
+    };
     crate::embedding::refresh_embedding_config(&db);
-    Ok(())
+    Ok(affected)
 }
 
 /// 对某连接做一次「测试连接」：复用既有 test_connection 逻辑，针对**已存连接**与一个待测模型。
@@ -292,11 +308,29 @@ pub(crate) fn update_model(
     Ok(model_to_view(&db, saved))
 }
 
-/// 删除一个模型。若仍被任意角色（role_models）引用，拒绝删除并返回人话化错误。
+/// 删除一个模型（0.0.62 支持 `force` 级联）。
+///
+/// - `force == false`：保持旧的**拒绝式**语义——若该模型仍被任意角色（role_models）引用，返回
+///   「该模型仍被某些角色引用：…」错误（前端据此弹确认框）；未被引用则直接删除，返回 `Ok([])`。
+/// - `force == true`：**级联删除**——连同指向它的角色分配（含 `main`）一并清掉，返回被解除分配的
+///   角色名列表（去重排序）。清掉 main 后 main 变未配置，交 app 既有「请先配置主模型」处理。
+///
+/// 不触碰任何 api_key。删除后刷新 embedding 快照（embed/main 解析可能变，镜像 update_model 的做法）。
 #[tauri::command]
-pub(crate) fn delete_model(state: State<AppState>, id: String) -> Result<(), String> {
+pub(crate) fn delete_model(
+    state: State<AppState>,
+    id: String,
+    force: bool,
+) -> Result<Vec<String>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    mdga_storage::delete_model(&db, &id).map_err(|e| e.to_string())
+    let affected = if force {
+        mdga_storage::delete_model_cascade(&db, &id).map_err(|e| e.to_string())?
+    } else {
+        mdga_storage::delete_model(&db, &id).map_err(|e| e.to_string())?;
+        Vec::new()
+    };
+    crate::embedding::refresh_embedding_config(&db);
+    Ok(affected)
 }
 
 /// 拉取某连接端点真实可用的模型 id 列表（0.0.60）：GET {base}/models（连接的 key 作 Bearer）。

@@ -41,6 +41,28 @@ function connectionDisplayName(c: ConnectionView): string {
 }
 
 /**
+ * 角色 → 简洁中文名（用于级联删除确认/提示文案）。
+ * 源用 ASSIGNABLE_ROLES（main=主模型（Main）…），去掉「（English）」后缀只留中文：主模型 / 行动 / 计划 / 评审 / 视觉 / 子代理 / 嵌入。
+ * 后端返回的受影响角色是裸 role id（如 "main"/"action"），不在表里时原样回显。
+ */
+function roleLabel(role: string): string {
+  const meta = ASSIGNABLE_ROLES.find((r) => r.id === role);
+  if (!meta) return role;
+  return meta.label.replace(/（[^）]*）/g, "").trim() || meta.label;
+}
+
+/**
+ * 级联删除后的成功提示（连接/模型通用）：returnedRoles＝后端清除分配的角色 id 列表。
+ * 无清除＝「已删除。」；有清除＝列出受影响角色中文名；若含 main，附「（主模型现未配置，请重新指定）」。
+ */
+function cascadeDeleteNotice(returnedRoles: string[]): string {
+  if (returnedRoles.length === 0) return "已删除。";
+  const names = returnedRoles.map(roleLabel).join("、");
+  const mainCleared = returnedRoles.includes("main");
+  return `已删除；已清除分配：${names}${mainCleared ? "（主模型现未配置，请重新指定）" : ""}`;
+}
+
+/**
  * 模型连接库设置（Connections）：一个连接 = 名称 + 预设 + Base URL + API Key + API 格式。
  * 这是**唯一**录入 API Key 的地方。列表展示每个连接，可新增 / 编辑 / 删除 / 测试连接。
  *
@@ -51,6 +73,8 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
   const [connections, setConnections] = useState<ConnectionView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // 级联删除成功后的内联提示（例如「已清除分配：行动、主模型…」）。下一次操作会清掉。
+  const [notice, setNotice] = useState<string | null>(null);
   // 编辑器状态：null=未打开；{ conn: undefined }=新增；{ conn }=编辑既有连接。
   const [editing, setEditing] = useState<{ conn?: ConnectionView } | null>(null);
   // 测试连接：针对某连接就地展示结果。key=连接 id。
@@ -65,15 +89,52 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
   };
   useEffect(() => { refresh(); }, []);
 
+  /**
+   * 删除连接（0.0.62 级联）：先算出本连接旗下模型被哪些角色引用，按是否有引用给出不同确认文案；
+   * 确认后 force=true 级联删（删连接+旗下模型+清这些角色分配，含 main）。返回被清角色 → 内联成功提示。
+   * 主模型若被清，提示其「现未配置，请重新指定」。onChanged 让依赖 UI（App 主模型徽标等）刷新。
+   */
   async function handleDelete(c: ConnectionView) {
     setError(null);
-    if (!window.confirm(`删除连接「${connectionDisplayName(c)}」？此操作不可撤销。`)) return;
+    setNotice(null);
+    const name = connectionDisplayName(c);
+
+    // 算受影响角色：本连接旗下模型 id 集合 ∩ 各角色 modelRef。
+    let affectedRoles: string[] = [];
+    let modelCount = 0;
     try {
-      await invoke("delete_connection", { id: c.id });
+      const [curated, assigns] = await Promise.all([
+        invoke<CuratedModelView[]>("list_models_for_connection", { connectionId: c.id }),
+        invoke<RoleAssignmentView[]>("get_role_assignments"),
+      ]);
+      modelCount = curated.length;
+      const modelIds = new Set(curated.map((m) => m.id));
+      affectedRoles = assigns.filter((a) => a.modelRef && modelIds.has(a.modelRef)).map((a) => a.role);
+    } catch (e) {
+      setError(humanizeError(String(e)));
+      return;
+    }
+
+    let message: string;
+    if (affectedRoles.length === 0) {
+      message = `删除连接「${name}」及其下的模型？此操作不可撤销。`;
+    } else {
+      const names = affectedRoles.map(roleLabel).join("、");
+      const mainAffected = affectedRoles.includes("main");
+      message =
+        `删除连接「${name}」将一并删除其下 ${modelCount} 个模型，并清除这些角色的模型分配：${names}。\n` +
+        `其中：行动/计划等角色会回到「跟随主模型」，` +
+        (mainAffected ? `★ 主模型会变为「未配置」（需重新指定一个主模型）。\n` : ``) +
+        `确定删除？`;
+    }
+    if (!window.confirm(message)) return;
+
+    try {
+      const cleared = await invoke<string[]>("delete_connection", { id: c.id, force: true });
       refresh();
       onChanged?.();
+      setNotice(cascadeDeleteNotice(cleared));
     } catch (e) {
-      // 后端「仍被某角色引用」拒绝在此原样提示（含建议先去「模型分配」改引用）。
       setError(humanizeError(String(e)));
     }
   }
@@ -221,13 +282,15 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
                 </button>
               </div>
 
-              {/* 0.0.60：在每个连接卡下登记「加载模型」（一个连接可登记多个模型，一对多）。 */}
-              <ConnectionModels connection={c} />
+              {/* 0.0.60：在每个连接卡下登记「加载模型」（一个连接可登记多个模型，一对多）。
+                  0.0.62：级联删模型可能清掉 main，故把 onChanged 透传给上层刷新（主模型徽标等）。 */}
+              <ConnectionModels connection={c} onChanged={onChanged} />
             </div>
           );
         })
       )}
 
+      {notice && <p className="settings-row__value" style={{ color: "var(--success)" }}>{notice}</p>}
       {error && <p className="settings-row__value" style={{ color: "var(--danger)" }}>{error}</p>}
 
       <div className="provider-card__actions" style={{ justifyContent: "flex-start" }}>
@@ -249,10 +312,12 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
  * 失败（throws）显示「该端点不支持自动拉取，请手动填写模型 ID」并保留手动录入。
  * 删除：调 delete_model；若该模型仍被某角色引用，后端拒绝并返回中文错误，此处原样提示。
  */
-function ConnectionModels({ connection }: { connection: ConnectionView }) {
+function ConnectionModels({ connection, onChanged }: { connection: ConnectionView; onChanged?: () => void }) {
   const [models, setModels] = useState<CuratedModelView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // 级联删除单个模型成功后的内联提示（例如「已清除分配：主模型…」）。
+  const [notice, setNotice] = useState<string | null>(null);
   // 添加表单：模型 ID + 可选别名（行内即可，不再用「高级」折叠）。上下文窗口改为登记后在列表行内就地编辑。
   const [modelId, setModelId] = useState("");
   const [label, setLabel] = useState("");
@@ -353,12 +418,43 @@ function ConnectionModels({ connection }: { connection: ConnectionView }) {
     }
   }
 
-  /** 删除一个已登记模型；若被某角色引用，后端拒绝并返回中文错误，此处原样提示（含建议先去「模型分配」改引用）。 */
+  /**
+   * 删除一个已登记模型（0.0.62 级联）：先算出本模型被哪些角色引用，按有无引用给不同确认文案；
+   * 确认后 force=true 级联删（删模型 + 清这些角色分配，含 main）。返回被清角色 → 内联成功提示。
+   * 主模型若被清，提示其「现未配置，请重新指定」；onChanged 让依赖 UI 刷新。
+   */
   async function handleDelete(m: CuratedModelView) {
     setError(null);
+    setNotice(null);
+
+    // 算受影响角色：modelRef === 本模型 id 的角色。
+    let affectedRoles: string[] = [];
     try {
-      await invoke("delete_model", { id: m.id });
+      const assigns = await invoke<RoleAssignmentView[]>("get_role_assignments");
+      affectedRoles = assigns.filter((a) => a.modelRef === m.id).map((a) => a.role);
+    } catch (e) {
+      setError(humanizeError(String(e)));
+      return;
+    }
+
+    let message: string;
+    if (affectedRoles.length === 0) {
+      message = `删除模型「${m.modelId}」？`;
+    } else {
+      const names = affectedRoles.map(roleLabel).join("、");
+      const mainAffected = affectedRoles.includes("main");
+      message =
+        `删除模型「${m.modelId}」将清除这些角色的分配：${names}` +
+        (mainAffected ? `（其中主模型会变未配置，需重新指定）` : ``) +
+        `。确定？`;
+    }
+    if (!window.confirm(message)) return;
+
+    try {
+      const cleared = await invoke<string[]>("delete_model", { id: m.id, force: true });
       refresh();
+      onChanged?.();
+      setNotice(cascadeDeleteNotice(cleared));
     } catch (e) {
       setError(humanizeError(String(e)));
     }
@@ -538,6 +634,7 @@ function ConnectionModels({ connection }: { connection: ConnectionView }) {
         )}
       </div>
 
+      {notice && <p className="settings-row__value" style={{ color: "var(--success)", marginTop: 4 }}>{notice}</p>}
       {error && <p className="settings-row__value" style={{ color: "var(--danger)", marginTop: 4 }}>{error}</p>}
     </div>
   );
