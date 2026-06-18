@@ -289,6 +289,37 @@ fn render_wire_message_for_summary(message: &serde_json::Value) -> String {
     format!("[{role}] {truncated}")
 }
 
+/// 把单条 wire 消息渲染成供情景记忆归档的「完整」文本（角色 + 完整正文 + 完整工具调用名与参数，
+/// 均不截断）。与 [`render_wire_message_for_summary`] 的唯一区别是**不做任何长度上限**——
+/// 归档必须保留完整原文,才能兑现摘要指针「可用 read_file 翻阅被压掉的完整历史」的承诺,
+/// 守住 R12「被丢出工作记忆的内容不可逆丢失为零」的不变量(摘要给模型的 transcript 仍走截断版)。
+fn render_wire_message_for_archive(message: &serde_json::Value) -> String {
+    let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+    let mut body = message
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Some(calls) = message.get("tool_calls").and_then(|c| c.as_array()) {
+        let names: Vec<String> = calls
+            .iter()
+            .map(|call| {
+                let name = call
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let args = call
+                    .pointer("/function/arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                format!("{name}({args})")
+            })
+            .collect();
+        body = format!("{body} [调用工具: {}]", names.join(", "));
+    }
+    format!("[{role}] {body}")
+}
+
 /// 跨轮摘要压缩（auto-compact）：把较早的对话历史压缩成任务进度摘要，替换原文继续任务。
 ///
 /// 这是 Claude Code / Codex 同款思路：摘要式而非删除式。保留开头 system 消息与最近
@@ -322,11 +353,13 @@ pub(crate) async fn summarize_wire_history(
         .join("\n");
 
     // 情景记忆归档：把整段即将被摘要替换的原始历史逐条追加到归档（丢弃前先存）。
-    // 用渲染后的紧凑单行作为归档正文（已含角色/正文/工具调用名），单条空则跳过。
+    // 关键:归档用**完整不截断**的渲染（render_wire_message_for_archive），而非喂给摘要模型的
+    // 600 字截断版——否则 >600 字的消息在工作记忆(被摘要替换)与归档(被截断)中都不完整,
+    // 字节 600→末尾将不可逆丢失,违背摘要指针「完整原始历史可 read_file 翻阅」的承诺。
     // 任一条失败即视为本次归档不可用（fail-soft）：archive_ref 保持 None，摘要不带指针。
     let mut archive_ref: Option<String> = None;
     for message in &wire_messages[first_non_system..cut] {
-        let line = render_wire_message_for_summary(message);
+        let line = render_wire_message_for_archive(message);
         match archive_dropped_content(workspace_path, conversation_id, "summary", "history", &line) {
             Some(rel) => archive_ref = Some(rel),
             None if archive_ref.is_some() => {
@@ -442,9 +475,9 @@ fn is_stub_with_pointer(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_line, compact_tool_outputs, condense_key_fact, condense_tool_outputs,
-        extract_key_fact, render_wire_message_for_summary, sanitize_conversation_id,
-        summary_split_points,
+        archive_dropped_content, archive_line, compact_tool_outputs, condense_key_fact,
+        condense_tool_outputs, extract_key_fact, render_wire_message_for_archive,
+        render_wire_message_for_summary, sanitize_conversation_id, summary_split_points,
     };
     use crate::COMPACTED_TOOL_STUB;
 
@@ -633,5 +666,44 @@ mod tests {
         assert!(line.starts_with("[assistant]"));
         assert!(line.contains("我来读取文件"));
         assert!(line.contains("read_file"));
+    }
+
+    // R12 不变量回归:摘要层归档必须保留**完整原文**(>600 字也不丢),否则摘要指针
+    // 「完整原始历史可 read_file 翻阅」的承诺落空。验证 archive 渲染不截断、summary 渲染截断。
+    #[test]
+    fn archive_render_preserves_full_body_beyond_summary_cap() {
+        let long = "X".repeat(1500);
+        let tail = "结尾标记_TAIL";
+        let content = format!("{long}{tail}");
+        let msg = serde_json::json!({ "role": "user", "content": content });
+
+        // 归档版:完整保留,含 600 字之后的尾部标记。
+        let archived = render_wire_message_for_archive(&msg);
+        assert!(archived.starts_with("[user]"));
+        assert!(
+            archived.contains(tail),
+            "归档渲染必须保留 600 字之后的内容（不可逆丢失为零）"
+        );
+        assert!(archived.chars().count() >= 1500 + tail.chars().count());
+
+        // 摘要版（喂模型）:仍按 600 字截断,不含尾部标记 —— 二者职责区分。
+        let summarized = render_wire_message_for_summary(&msg);
+        assert!(
+            !summarized.contains(tail),
+            "摘要渲染仍应截断,尾部标记不应出现在喂模型的 transcript 里"
+        );
+
+        // 端到端:归档落盘后整条 content 完整可回查（含尾部标记）。
+        let tmp = std::env::temp_dir().join(format!("mdga_r12_archive_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ws = tmp.to_string_lossy().to_string();
+        let rel = archive_dropped_content(&ws, "conv_r12", "summary", "history", &archived)
+            .expect("archive should write");
+        let written = std::fs::read_to_string(tmp.join(&rel)).expect("archive file exists");
+        assert!(
+            written.contains(tail),
+            "落盘的归档 JSONL 必须含完整原文尾部"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

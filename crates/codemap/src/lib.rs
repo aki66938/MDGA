@@ -69,9 +69,8 @@ pub struct CodemapResult {
     pub note: String,
 }
 
-/// 发现 + 抽取 + 排名的共享核心:既供 `build_repo_map` 渲染地图,也供 `analyze_repo`
-/// 产出结构化数据,确保二者基于**完全一致**的发现/解析/排名口径(单一真相来源)。
-/// 返回 None 表示软失败(工作区不存在或无可扫描源文件),附带给上层的说明文案。
+/// 发现 + 抽取 + 排名流水线的共享中间产物:既供 `build_repo_map` 渲染地图,也供
+/// `analyze_repo` 产出结构化数据,确保二者基于**完全一致**的发现/解析/排名口径(单一真相来源)。
 struct PipelineOutput {
     rel_paths: Vec<String>,
     file_tags: Vec<tags::FileTags>,
@@ -80,6 +79,9 @@ struct PipelineOutput {
     discover_truncated: bool,
 }
 
+/// 跑「发现 → 抽取标签 → PageRank 排名」共享核心。软失败(工作区不存在或无可扫描源文件)
+/// 时返回 `Err(说明文案)`,成功时返回 `Ok(PipelineOutput)`;由上层 `build_repo_map`/`analyze_repo`
+/// 各自把 `Err` 落成空地图/空分析。
 fn run_pipeline(root: &std::path::Path, request: &CodemapRequest) -> Result<PipelineOutput, String> {
     if !root.is_dir() {
         return Err("工作区路径不存在或不是目录".to_string());
