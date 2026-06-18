@@ -828,6 +828,83 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        // R7：浏览器 / computer-use 工具——让 Agent 在无头 Chrome 里验证它构建的 Web UI。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "browser_navigate",
+                "description": "Open/load a URL in a headless Chrome browser and return its final URL and page title. Use this to start verifying a web UI you built (typically your own app on localhost, e.g. http://localhost:5173). Only http/https URLs are allowed. The browser session persists, so subsequent browser_* tools act on this page. After navigating, use browser_screenshot to SEE the page, browser_read_text to read its text, or browser_click/browser_fill to interact.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "http/https URL to open (a bare host like localhost:5173 is treated as http://). file://, about:, data:, javascript: are rejected." }
+                    },
+                    "required": ["url"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "browser_screenshot",
+                "description": "Capture a PNG screenshot of the CURRENT page (after browser_navigate) and return it as base64 so the vision model can inspect how the UI actually renders. Use this to visually verify layout, content, and that a web UI looks correct. Set fullPage=true to capture the whole scrollable page instead of just the viewport.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "fullPage": { "type": "boolean", "description": "Capture the full scrollable page instead of just the viewport. Default false." }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "browser_click",
+                "description": "Click the element matching a CSS selector on the current page (after browser_navigate). Use this to drive a web UI you are verifying (e.g. click a button or link). May trigger navigation; the result reports the resulting URL.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "selector": { "type": "string", "description": "CSS selector of the element to click, e.g. \"button.submit\" or \"#login\"." }
+                    },
+                    "required": ["selector"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "browser_fill",
+                "description": "Type text into the input/textarea matching a CSS selector on the current page (after browser_navigate). Clears the existing value first, then types. Use this to fill forms while verifying a web UI.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "selector": { "type": "string", "description": "CSS selector of the input/textarea to fill, e.g. \"input[name=email]\"." },
+                        "text": { "type": "string", "description": "Text to type into the field." }
+                    },
+                    "required": ["selector", "text"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "browser_read_text",
+                "description": "Return the visible text of the current page (document.body.innerText), truncated if very long. Use this to check that expected content actually rendered, without needing a screenshot. Requires a page to be open (browser_navigate first).",
+                "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "browser_console",
+                "description": "Return the tail of the current page's captured console messages (log/warn/error captured since navigation) plus any detected failed network resource loads (HTTP >= 400). Use this to check for JavaScript errors or failed requests when a web UI you built misbehaves. Requires a page to be open (browser_navigate first).",
+                "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+            }
+        }),
     ]
 }
 
@@ -1062,6 +1139,68 @@ pub(crate) fn execute_builtin_tool_call(
             .map_err(|err| err.to_string())
         }
         other => Err(format!("未知工具: {other}")),
+    }
+}
+
+/// R7：浏览器 / computer-use 工具派发。
+///
+/// `headless_chrome` 是同步（阻塞）API，且 CDP 操作可能耗时——放进 `spawn_blocking`，
+/// 不阻塞 agent 的 async 工具循环。每个工具解析自己的请求，执行后把结构化结果转 JSON。
+/// 与 web_fetch/web_search 一样在 agent_loop 的网络工具分支里 await 调用。
+pub(crate) async fn execute_browser_call(
+    tool_name: &str,
+    arguments: &str,
+) -> Result<serde_json::Value, String> {
+    let tool_name = tool_name.to_string();
+    let arguments = arguments.to_string();
+    let join = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, String> {
+        use mdga_browser::*;
+        let parse_err = |e: serde_json::Error| format!("工具参数解析失败: {e}");
+        // 空参数（"" / "{}"）按默认请求处理（多数浏览器工具无必填参数）。
+        let args = arguments.trim();
+        let args = if args.is_empty() { "{}" } else { args };
+        match tool_name.as_str() {
+            "browser_navigate" => {
+                let req: BrowserNavigateRequest =
+                    serde_json::from_str(args).map_err(parse_err)?;
+                serde_json::to_value(browser_navigate(req).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())
+            }
+            "browser_screenshot" => {
+                let req: BrowserScreenshotRequest =
+                    serde_json::from_str(args).map_err(parse_err)?;
+                serde_json::to_value(browser_screenshot(req).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())
+            }
+            "browser_click" => {
+                let req: BrowserClickRequest = serde_json::from_str(args).map_err(parse_err)?;
+                serde_json::to_value(browser_click(req).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())
+            }
+            "browser_fill" => {
+                let req: BrowserFillRequest = serde_json::from_str(args).map_err(parse_err)?;
+                serde_json::to_value(browser_fill(req).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())
+            }
+            "browser_read_text" => {
+                let req: BrowserReadTextRequest =
+                    serde_json::from_str(args).map_err(parse_err)?;
+                serde_json::to_value(browser_read_text(req).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())
+            }
+            "browser_console" => {
+                let req: BrowserConsoleRequest =
+                    serde_json::from_str(args).map_err(parse_err)?;
+                serde_json::to_value(browser_console(req).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())
+            }
+            other => Err(format!("未知浏览器工具: {other}")),
+        }
+    })
+    .await;
+    match join {
+        Ok(result) => result,
+        Err(e) => Err(format!("浏览器工具执行线程异常: {e}")),
     }
 }
 
