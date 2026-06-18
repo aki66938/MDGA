@@ -96,8 +96,20 @@ impl LspSession {
                 spec.command
             ))
         })?;
+        Self::start_with_exe(spec, &exe, workspace)
+    }
 
-        let mut builder = Command::new(&exe);
+    /// 用**显式二进制路径** `exe` 启动 `spec` 指定的服务器（路径来自用户设置里的「路径覆盖」，
+    /// 调用方已校验其为现存文件）。除「跳过 PATH 解析、直接用给定 exe」外，与 [`start`] 完全一致：
+    /// 仍用 `spec.args`（编译期常量）作参数、cwd=工作区、擦除密钥环境变量。
+    ///
+    /// 安全：`exe` 只决定「在哪」，参数与协议握手不变；命令身份仍受 `spec`（注册表常量）约束。
+    pub fn start_with_exe(
+        spec: &ServerSpec,
+        exe: &Path,
+        workspace: &Path,
+    ) -> Result<Self, LspError> {
+        let mut builder = Command::new(exe);
         builder
             .args(spec.args)
             .current_dir(workspace)

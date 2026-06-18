@@ -38,6 +38,10 @@ use commands::{
     get_app_setting, get_model_provider_config, remove_model_provider, resolve_role_model_provider,
     save_model_provider, set_app_setting, smoke_test_tool_call, test_provider_connection,
 };
+use commands::{
+    clear_role_provider, get_lsp_known_servers, get_lsp_server_config, get_role_provider_config,
+    get_role_routing, save_lsp_server_config, save_role_provider,
+};
 
 // 注（Plan28 P3-9）：原 agent_prompt 模块（仅持有三个灵魂常量）已不再需要——常量权威定义
 // 迁入 mdga-agent-core，消息构建也已迁过去；桌面端不再有 crate::agent_prompt::* 引用，故移除该模块。
@@ -146,6 +150,22 @@ fn main() {
                     spawn_mcp_connect(&handle, record);
                 }
             }
+
+            // R-uicfg：从 DB 播种 LSP 服务器配置到进程级运行时缓存，使 lsp_* 工具按用户设置解析。
+            // 无配置/解析失败时回退默认（全部启用、走 PATH），与从前行为一致。
+            {
+                let state = app.state::<AppState>();
+                let lsp_json = state
+                    .db
+                    .lock()
+                    .ok()
+                    .and_then(|db| mdga_storage::get_lsp_server_config_json(&db).ok().flatten());
+                if let Some(json) = lsp_json {
+                    if let Ok(cfg) = serde_json::from_str::<mdga_lsp::LspServerConfig>(&json) {
+                        tools::set_lsp_server_config(cfg);
+                    }
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -207,6 +227,13 @@ fn main() {
             smoke_test_tool_call,
             get_app_setting,
             set_app_setting,
+            get_lsp_known_servers,
+            get_lsp_server_config,
+            save_lsp_server_config,
+            get_role_routing,
+            get_role_provider_config,
+            save_role_provider,
+            clear_role_provider,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run MDGA desktop app");

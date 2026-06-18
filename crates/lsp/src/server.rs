@@ -20,6 +20,9 @@ use crate::LspError;
 /// PATH 中的绝对路径（见 `crate::which`），以防工作区 cwd 下同名可执行被劫持。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerSpec {
+    /// 稳定的服务器**种类标识**（如 `rust-analyzer` / `typescript`），用于把用户设置（启用/路径覆盖）
+    /// 关联到这条**编译期常量**条目。该标识不是用户输入，也不参与拼接命令行——仅作配置查表的键。
+    pub kind: &'static str,
     /// 可执行程序名（在 PATH 中查找；硬编码常量，**非用户输入**）。
     pub command: &'static str,
     /// 启动参数（硬编码常量）。
@@ -34,6 +37,10 @@ pub struct ServerSpec {
 /// （如 `.ts`→typescript、`.tsx`→typescriptreact）。因此 `language_ids` 与 `extensions`
 /// 一一对应（同序、等长）：`extensions[i]` 命中时用 `language_ids[i]` 作为 LSP languageId。
 struct ServerEntry {
+    /// 稳定的服务器种类标识（编译期常量；同时作为设置里启用/路径覆盖的查表键，**非用户输入**）。
+    kind: &'static str,
+    /// 该种类在 UI 上的展示名（中文，编译期常量）。
+    display_name: &'static str,
     /// 该条目认领的扩展名（小写、不含点）。与 `language_ids` 同序等长。
     extensions: &'static [&'static str],
     /// 与 `extensions` 一一对应的 LSP languageId。
@@ -57,6 +64,8 @@ struct ServerEntry {
 const REGISTRY: &[ServerEntry] = &[
     // Rust：rust-analyzer（无参数，stdio）。
     ServerEntry {
+        kind: "rust-analyzer",
+        display_name: "Rust（rust-analyzer）",
         extensions: &["rs"],
         language_ids: &["rust"],
         command: "rust-analyzer",
@@ -64,6 +73,8 @@ const REGISTRY: &[ServerEntry] = &[
     },
     // TypeScript / JavaScript 家族：typescript-language-server --stdio。
     ServerEntry {
+        kind: "typescript",
+        display_name: "TypeScript / JavaScript（typescript-language-server）",
         extensions: &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
         language_ids: &[
             "typescript",
@@ -78,6 +89,8 @@ const REGISTRY: &[ServerEntry] = &[
     },
     // Python：pyright-langserver --stdio。
     ServerEntry {
+        kind: "pyright",
+        display_name: "Python（pyright-langserver）",
         extensions: &["py", "pyi"],
         language_ids: &["python", "python"],
         command: "pyright-langserver",
@@ -85,6 +98,8 @@ const REGISTRY: &[ServerEntry] = &[
     },
     // Go：gopls（无参数，默认 stdio）。
     ServerEntry {
+        kind: "gopls",
+        display_name: "Go（gopls）",
         extensions: &["go"],
         language_ids: &["go"],
         command: "gopls",
@@ -92,6 +107,8 @@ const REGISTRY: &[ServerEntry] = &[
     },
     // C / C++：clangd（无参数，stdio）。覆盖常见源/头扩展名。
     ServerEntry {
+        kind: "clangd",
+        display_name: "C / C++（clangd）",
         extensions: &["c", "h", "cpp", "cc", "cxx", "hpp", "hh"],
         language_ids: &[
             "c",
@@ -107,6 +124,8 @@ const REGISTRY: &[ServerEntry] = &[
     },
     // Ruby：ruby-lsp（无参数，stdio）。
     ServerEntry {
+        kind: "ruby-lsp",
+        display_name: "Ruby（ruby-lsp）",
         extensions: &["rb"],
         language_ids: &["ruby"],
         command: "ruby-lsp",
@@ -114,6 +133,8 @@ const REGISTRY: &[ServerEntry] = &[
     },
     // PHP：intelephense --stdio。
     ServerEntry {
+        kind: "intelephense",
+        display_name: "PHP（intelephense）",
         extensions: &["php"],
         language_ids: &["php"],
         command: "intelephense",
@@ -121,6 +142,8 @@ const REGISTRY: &[ServerEntry] = &[
     },
     // Lua：lua-language-server（无参数，stdio）。
     ServerEntry {
+        kind: "lua-language-server",
+        display_name: "Lua（lua-language-server）",
         extensions: &["lua"],
         language_ids: &["lua"],
         command: "lua-language-server",
@@ -173,6 +196,7 @@ pub fn resolve_server(path: &str) -> Result<ServerSpec, LspError> {
     for entry in REGISTRY {
         if let Some(idx) = entry.extensions.iter().position(|e| *e == ext) {
             return Ok(ServerSpec {
+                kind: entry.kind,
                 command: entry.command,
                 args: entry.args,
                 // language_ids 与 extensions 同序等长；命中下标即对应 languageId。
@@ -185,6 +209,48 @@ pub fn resolve_server(path: &str) -> Result<ServerSpec, LspError> {
         "扩展名 `.{ext}` 暂无受支持的语言服务器（支持: {}）",
         supported_extensions_summary()
     )))
+}
+
+/// 暴露给设置 UI 的一条**已知服务器**描述（编译期常量的只读快照）。
+///
+/// 这是把硬编码注册表「展示给用户」的安全形态：用户能看到有哪些已知服务器、对应命令与扩展名，
+/// 从而启用/禁用某个**已知**服务器或为它指定二进制路径——但**无法**借此引入一条全新命令，
+/// 因为 `kind` / `command` / `args` / `extensions` 全部来自本表的编译期常量。
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownServer {
+    /// 稳定种类标识（设置查表键）。
+    pub kind: String,
+    /// UI 展示名（中文）。
+    pub display_name: String,
+    /// 可执行程序名（PATH 解析的目标；展示给用户参考，**不可**被用户改写）。
+    pub command: String,
+    /// 启动参数（展示用）。
+    pub args: Vec<String>,
+    /// 该服务器认领的文件扩展名（不含点）。
+    pub extensions: Vec<String>,
+}
+
+/// 返回**全部**已知语言服务器的只读描述列表，供设置页渲染「LSP 服务器注册表」。
+///
+/// 安全不变量：返回的每一项都源自编译期常量 `REGISTRY`，调用方/前端**只能**据此勾选启用与填写
+/// 路径覆盖；命令身份（kind/command/args/extensions）恒为常量，UI 无法新增任意服务器命令。
+pub fn known_servers() -> Vec<KnownServer> {
+    REGISTRY
+        .iter()
+        .map(|e| KnownServer {
+            kind: e.kind.to_string(),
+            display_name: e.display_name.to_string(),
+            command: e.command.to_string(),
+            args: e.args.iter().map(|a| a.to_string()).collect(),
+            extensions: e.extensions.iter().map(|x| x.to_string()).collect(),
+        })
+        .collect()
+}
+
+/// 某个 `kind` 是否对应一条**已知**注册表条目（用于校验配置键不被注入未知种类）。
+pub fn is_known_kind(kind: &str) -> bool {
+    REGISTRY.iter().any(|e| e.kind == kind)
 }
 
 /// 生成「当前支持的扩展名」摘要，用于报错文案（按注册表实际内容，自动跟随扩展）。
@@ -210,6 +276,7 @@ mod tests {
     fn registry_entries_are_consistent() {
         // 不变量：每条目 extensions 与 language_ids 同序等长，且扩展名全局唯一（无重复认领）。
         let mut seen: Vec<&str> = Vec::new();
+        let mut seen_kinds: Vec<&str> = Vec::new();
         for entry in REGISTRY {
             assert_eq!(
                 entry.extensions.len(),
@@ -217,6 +284,13 @@ mod tests {
                 "entry `{}` extensions/language_ids 长度不一致",
                 entry.command
             );
+            // kind 全局唯一（设置查表键不可碰撞）。
+            assert!(
+                !seen_kinds.contains(&entry.kind),
+                "服务器种类 `{}` 被多条注册表条目重复声明",
+                entry.kind
+            );
+            seen_kinds.push(entry.kind);
             for ext in entry.extensions {
                 assert!(
                     !seen.contains(ext),
@@ -225,6 +299,27 @@ mod tests {
                 seen.push(ext);
             }
         }
+    }
+
+    #[test]
+    fn known_servers_snapshot_matches_registry() {
+        // 对外快照应一一对应注册表，且 kind 都被 is_known_kind 认账。
+        let servers = known_servers();
+        assert_eq!(servers.len(), REGISTRY.len(), "known_servers 应覆盖全部注册表条目");
+        for s in &servers {
+            assert!(is_known_kind(&s.kind), "kind `{}` 应被认作已知种类", s.kind);
+            assert!(!s.command.is_empty());
+            assert!(!s.extensions.is_empty());
+        }
+        // 防御：未知 kind 不被认账。
+        assert!(!is_known_kind("definitely-not-a-server"));
+    }
+
+    #[test]
+    fn resolve_server_populates_kind() {
+        assert_eq!(resolve_server("a.rs").unwrap().kind, "rust-analyzer");
+        assert_eq!(resolve_server("a.ts").unwrap().kind, "typescript");
+        assert_eq!(resolve_server("a.go").unwrap().kind, "gopls");
     }
 
     #[test]

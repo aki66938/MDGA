@@ -1043,6 +1043,26 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> SqlResult<()> {
     Ok(())
 }
 
+// ── LSP 服务器注册表配置（R-uicfg / 0.0.57）──────────────────────────────────
+//
+// 持久化形态：直接把整份配置序列化为 JSON，存进 app_settings 的单行（key = LSP_SERVER_CONFIG_KEY）。
+// 选 KV-JSON 而非新建表：配置是一份「按已知种类查表的稀疏覆盖」，整存整取最简单，无需新增 schema 迁移。
+// 安全：这里只负责存/取**字符串 JSON**；其语义（只能调节已知服务器的启用/路径、命令身份恒为常量）
+// 由 mdga-lsp::LspServerConfig 在解析与使用时强制。storage 不感知具体结构，保持与 lsp crate 解耦。
+
+/// LSP 服务器配置在 app_settings 里的键名。
+pub const LSP_SERVER_CONFIG_KEY: &str = "lsp_server_config";
+
+/// 读取 LSP 服务器配置原始 JSON（未配置返回 None，调用方据此回退默认「全部启用、走 PATH」）。
+pub fn get_lsp_server_config_json(conn: &Connection) -> SqlResult<Option<String>> {
+    get_setting(conn, LSP_SERVER_CONFIG_KEY)
+}
+
+/// 写入 LSP 服务器配置原始 JSON（upsert）。JSON 的结构合法性由调用方（命令层）先行校验。
+pub fn set_lsp_server_config_json(conn: &Connection, json: &str) -> SqlResult<()> {
+    set_setting(conn, LSP_SERVER_CONFIG_KEY, json)
+}
+
 // ── Permission Rule CRUD ─────────────────────────────────────────────────
 
 /// 保存一条「总是允许」权限规则（如 `cmd:git push`、`tool:write_file`）；重复插入幂等。

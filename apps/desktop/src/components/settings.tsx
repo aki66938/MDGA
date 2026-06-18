@@ -9,12 +9,17 @@ import {
   PROVIDER_PRESETS,
   VISION_PRESET_MODEL,
   PRESET_CONTEXT_WINDOW,
+  ROUTING_ROLES,
   type ProviderConfig,
   type AppInfo,
   type BalanceState,
   type McpServer,
   type DeniedAction,
   type SettingsSection,
+  type LspKnownServer,
+  type LspServerConfig,
+  type LspServerSetting,
+  type RoleRouting,
 } from "../types";
 import { humanizeError } from "../utils";
 import { useFocusTrap } from "./dialogs";
@@ -404,6 +409,399 @@ export function ProviderCard({
   );
 }
 
+// ── LspServerSettings（R-uicfg / 0.0.57）──────────────────────────────────────
+
+/**
+ * LSP 语言服务器注册表设置：把后端硬编码的 8 个已知服务器列出，每个可启用/禁用，并可选填
+ * 二进制路径覆盖（其位置，非命令本身）。安全：服务器种类与命令身份恒为后端常量，UI 无法新增任意命令；
+ * 路径覆盖是用户显式录入的本地路径，留空即回退默认 PATH 解析。
+ *
+ * 挂载时拉 get_lsp_known_servers + get_lsp_server_config；保存整份配置经 save_lsp_server_config。
+ */
+function LspServerSettings() {
+  const [servers, setServers] = useState<LspKnownServer[]>([]);
+  const [config, setConfig] = useState<LspServerConfig>({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimer.current) clearTimeout(savedTimer.current); }, []);
+
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      invoke<LspKnownServer[]>("get_lsp_known_servers"),
+      invoke<{ [k: string]: LspServerSetting } | LspServerConfig>("get_lsp_server_config"),
+    ])
+      .then(([known, cfg]) => {
+        if (!alive) return;
+        setServers(Array.isArray(known) ? known : []);
+        // 后端 LspServerConfig 经 serde(transparent) 序列化为裸 map { kind: {enabled, pathOverride} }。
+        setConfig((cfg as LspServerConfig) ?? {});
+      })
+      .catch((e) => { if (alive) setError(humanizeError(String(e))); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, []);
+
+  /** 取某 kind 的当前设置（缺省＝启用、无覆盖）。 */
+  function settingOf(kind: string): LspServerSetting {
+    return config[kind] ?? { enabled: true, pathOverride: null };
+  }
+
+  function setEnabled(kind: string, enabled: boolean) {
+    setSaved(false);
+    setConfig((prev) => ({ ...prev, [kind]: { ...settingOf(kind), enabled } }));
+  }
+
+  function setPathOverride(kind: string, pathOverride: string) {
+    setSaved(false);
+    setConfig((prev) => ({ ...prev, [kind]: { ...settingOf(kind), pathOverride } }));
+  }
+
+  async function handleSave() {
+    setError(null);
+    setSaving(true);
+    try {
+      // 归一化：空白路径覆盖回传 null（后端视为无覆盖）。仅回传已知 kind。
+      const out: LspServerConfig = {};
+      for (const s of servers) {
+        const cur = settingOf(s.kind);
+        const path = (cur.pathOverride ?? "").trim();
+        out[s.kind] = { enabled: cur.enabled, pathOverride: path || null };
+      }
+      await invoke("save_lsp_server_config", { config: out });
+      if (savedTimer.current) clearTimeout(savedTimer.current);
+      setSaved(true);
+      savedTimer.current = setTimeout(() => setSaved(false), 2600);
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      <h3 className="settings-content__h">语言服务器（LSP）</h3>
+      <p className="settings-desc" style={{ marginTop: 0 }}>
+        启用/停用下列<b>已知</b>语言服务器，决定 Agent 的代码智能工具（定义跳转 / 引用 / 悬浮 / 诊断）对哪些语言生效。
+        可选为某个服务器指定其<b>二进制路径</b>（当它不在 PATH 中时）。出于安全，服务器种类与命令固定，无法新增任意命令；
+        路径仅指明已知二进制的位置，留空即按 PATH 自动查找。
+      </p>
+      {loading ? (
+        <p className="settings-row__value">加载中…</p>
+      ) : (
+        <>
+          {servers.map((s) => {
+            const cur = settingOf(s.kind);
+            return (
+              <div key={s.kind} className="provider-card" style={{ marginBottom: 10 }}>
+                <div className="provider-card__head">
+                  <span className="provider-card__title">{s.displayName}</span>
+                  <label className="toggle" style={{ marginBottom: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={cur.enabled}
+                      onChange={(e) => setEnabled(s.kind, e.target.checked)}
+                    />
+                    <span>{cur.enabled ? "已启用" : "已停用"}</span>
+                  </label>
+                </div>
+                <p className="settings-desc" style={{ marginTop: 2, marginBottom: 6 }}>
+                  命令 <code>{s.command}{s.args.length ? " " + s.args.join(" ") : ""}</code>
+                  ｜扩展名 {s.extensions.map((x) => "." + x).join(" ")}
+                </p>
+                <label className="provider-field provider-field--full">
+                  <span className="provider-field__label">二进制路径覆盖（可选）</span>
+                  <input
+                    className="conv-search provider-input"
+                    type="text"
+                    value={cur.pathOverride ?? ""}
+                    placeholder={`留空＝在 PATH 中自动查找 ${s.command}`}
+                    disabled={!cur.enabled}
+                    onChange={(e) => setPathOverride(s.kind, e.target.value)}
+                  />
+                </label>
+              </div>
+            );
+          })}
+          {error && <p className="settings-row__value" style={{ color: "var(--danger)" }}>{error}</p>}
+          <div className="provider-card__actions">
+            {saved && (
+              <span className="provider-saved" role="status" style={{ color: "var(--success)" }}>
+                已保存 ✓
+              </span>
+            )}
+            <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={handleSave} disabled={saving}>
+              {saving ? "保存中…" : "保存"}
+            </button>
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+// ── RoleRoutingSettings（R8 角色→模型路由，R-uicfg / 0.0.57）──────────────────
+
+/**
+ * 角色→模型路由设置：为 action / plan / critique 三个功能角色各绑定一个模型+供应商；不设＝回退主模型。
+ * 概览经 get_role_routing；每个角色的表单回填 get_role_provider_config，保存经 save_role_provider，
+ * 清除（回退主模型）经 clear_role_provider。api_key 不回显明文（留空＝保留已存 key）。
+ */
+function RoleRoutingSettings() {
+  const [routing, setRouting] = useState<RoleRouting[]>([]);
+
+  const refresh = () => {
+    invoke<RoleRouting[]>("get_role_routing")
+      .then((r) => setRouting(Array.isArray(r) ? r : []))
+      .catch(() => setRouting([]));
+  };
+  useEffect(() => { refresh(); }, []);
+
+  function routingOf(role: string): RoleRouting | undefined {
+    return routing.find((r) => r.role === role);
+  }
+
+  return (
+    <>
+      <h3 className="settings-content__h">角色 → 模型路由</h3>
+      <p className="settings-desc" style={{ marginTop: 0 }}>
+        为不同<b>功能角色</b>绑定各自的模型与供应商：未设置的角色自动回退到「主模型」（与从前行为一致）。
+        例如可让「规划」用更强的推理模型、「行动」用更快更省的模型。
+      </p>
+      {ROUTING_ROLES.map((r) => {
+        const cur = routingOf(r.id);
+        return (
+          <RoleRoutingCard
+            key={r.id}
+            role={r.id}
+            title={r.label}
+            desc={r.desc}
+            routing={cur}
+            onChanged={refresh}
+          />
+        );
+      })}
+    </>
+  );
+}
+
+/** 单个角色的路由卡片：状态徽标（自身/回退主模型）+ 供应商/模型/Key 表单 + 保存/回退主模型。 */
+function RoleRoutingCard({
+  role,
+  title,
+  desc,
+  routing,
+  onChanged,
+}: {
+  role: "action" | "plan" | "critique";
+  title: string;
+  desc: string;
+  routing?: RoleRouting;
+  onChanged: () => void;
+}) {
+  const [preset, setPreset] = useState<string>("deepseek");
+  const [modelId, setModelId] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [configured, setConfigured] = useState(false);
+  const [keyTouched, setKeyTouched] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimer.current) clearTimeout(savedTimer.current); }, []);
+
+  const presetMeta = PROVIDER_PRESETS.find((p) => p.id === preset) ?? PROVIDER_PRESETS[0];
+  const isCustom = preset === "custom";
+
+  // 挂载回填该角色自身配置（不回退 main；apiKey 脱敏为空）。
+  useEffect(() => {
+    let alive = true;
+    invoke<ProviderConfig | null>("get_role_provider_config", { role })
+      .then((cfg) => {
+        if (!alive || !cfg) return;
+        const p = cfg.preset ?? "deepseek";
+        setPreset(p);
+        setModelId(cfg.modelId || (PROVIDER_PRESETS.find((x) => x.id === p)?.defaultModelId ?? ""));
+        setBaseUrl(cfg.baseUrl ?? "");
+        setConfigured(true);
+        if (cfg.baseUrl || p === "custom") setAdvancedOpen(true);
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [role]);
+
+  function handlePresetChange(next: string) {
+    setPreset(next);
+    const meta = PROVIDER_PRESETS.find((p) => p.id === next);
+    setModelId(meta?.defaultModelId ?? "");
+    if (next === "custom") setAdvancedOpen(true);
+    else { setAdvancedOpen(false); setBaseUrl(""); }
+  }
+
+  async function handleSave() {
+    setError(null);
+    if (isCustom && !baseUrl.trim()) {
+      setError("自定义供应商必须填写 Base URL");
+      setAdvancedOpen(true);
+      return;
+    }
+    if (!modelId.trim()) { setError("请填写模型 ID"); return; }
+    // 首配必须填 key；已配且未改动 key 时留空＝保留已存。
+    if (!configured && !apiKey.trim()) { setError("请填写 API Key"); return; }
+    if (keyTouched && !apiKey.trim()) { setError("请填写 API Key"); return; }
+    setSaving(true);
+    try {
+      await invoke("save_role_provider", {
+        role,
+        preset,
+        label: presetMeta.label,
+        baseUrl: baseUrl.trim() || null,
+        apiKey: keyTouched ? apiKey.trim() : "",
+        modelId: modelId.trim(),
+        contextWindow: null,
+      });
+      setConfigured(true);
+      setKeyTouched(false);
+      setApiKey("");
+      if (savedTimer.current) clearTimeout(savedTimer.current);
+      setSaved(true);
+      savedTimer.current = setTimeout(() => setSaved(false), 2600);
+      onChanged();
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleClear() {
+    setError(null);
+    setSaving(true);
+    try {
+      await invoke("clear_role_provider", { role });
+      setConfigured(false);
+      setApiKey("");
+      setKeyTouched(false);
+      onChanged();
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // 状态文案：自身配置 / 回退主模型 / 主模型未配。
+  const source = routing?.source ?? "main";
+  const effective = routing?.effectiveModel;
+  const badgeText =
+    source === "self" ? "● 使用专属模型" : source === "main" ? "○ 回退主模型" : "⚠ 主模型未配置";
+  const keyPlaceholder = configured && !keyTouched ? "已配置 ••••（如需更换请重新输入）" : "sk-...";
+
+  return (
+    <div className="provider-card" style={{ marginBottom: 10 }}>
+      <div className="provider-card__head">
+        <span className="provider-card__title">{title}</span>
+        <span className={`provider-badge${source === "self" ? " provider-badge--on" : ""}`}>{badgeText}</span>
+      </div>
+      <p className="settings-desc" style={{ marginTop: 2, marginBottom: 6 }}>
+        {desc}
+        {source !== "self" && effective ? `　当前实际：${effective}` : ""}
+      </p>
+
+      <div className="provider-grid">
+        <label className="provider-field">
+          <span className="provider-field__label">供应商</span>
+          <select className="model-select" value={preset} onChange={(e) => handlePresetChange(e.target.value)}>
+            {PROVIDER_PRESETS.map((p) => (
+              <option key={p.id} value={p.id}>{p.label}</option>
+            ))}
+          </select>
+        </label>
+        <label className="provider-field">
+          <span className="provider-field__label">模型</span>
+          <input
+            className="conv-search provider-input"
+            type="text"
+            value={modelId}
+            placeholder={presetMeta.defaultModelId || "model-id"}
+            onChange={(e) => setModelId(e.target.value)}
+          />
+        </label>
+
+        <label className="provider-field provider-field--full">
+          <span className="provider-field__label">API Key</span>
+          <span className="provider-key">
+            <input
+              className="conv-search provider-input"
+              type={showKey ? "text" : "password"}
+              value={apiKey}
+              placeholder={keyPlaceholder}
+              onChange={(e) => { setApiKey(e.target.value); setKeyTouched(true); }}
+            />
+            <button type="button" className="provider-key__eye" title={showKey ? "隐藏" : "显示"} onClick={() => setShowKey((v) => !v)}>
+              {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
+            </button>
+          </span>
+        </label>
+
+        <div className="provider-field--full">
+          <button
+            type="button"
+            className="provider-advanced-toggle"
+            onClick={() => !isCustom && setAdvancedOpen((v) => !v)}
+            disabled={isCustom}
+            title={isCustom ? "自定义供应商必须填写 Base URL" : undefined}
+          >
+            {advancedOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            高级设置（自定义 Base URL）
+          </button>
+          <div className={`provider-advanced${advancedOpen ? " provider-advanced--open" : ""}`}>
+            <div className="provider-advanced__inner">
+              <input
+                className="conv-search provider-input"
+                type="text"
+                value={baseUrl}
+                placeholder={presetMeta.baseUrl ?? "https://your-endpoint/v1"}
+                onChange={(e) => setBaseUrl(e.target.value)}
+              />
+              <p className="settings-desc" style={{ marginTop: 4 }}>
+                {isCustom
+                  ? "自定义供应商必须填写 Base URL（自托管/代理）。"
+                  : `留空即使用 ${presetMeta.label} 官方端点；自托管/代理可填。`}
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {error && <p className="settings-row__value" style={{ color: "var(--danger)" }}>{error}</p>}
+
+      <div className="provider-card__actions">
+        {saved && (
+          <span className="provider-saved" role="status" style={{ color: "var(--success)" }}>
+            已保存 ✓
+          </span>
+        )}
+        {configured && (
+          <button type="button" className="approval-card__btn" onClick={handleClear} disabled={saving}>
+            回退主模型
+          </button>
+        )}
+        <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={handleSave} disabled={saving}>
+          {saving ? "保存中…" : "保存"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── SettingsModal ───────────────────────────────────────────────────────────
 
 export function SettingsModal({
@@ -530,6 +928,8 @@ export function SettingsModal({
   const NAV: Array<{ id: typeof section; label: string }> = [
     { id: "account", label: "账户" },
     { id: "provider", label: "模型供应商" },
+    { id: "routing", label: "角色路由" },
+    { id: "lsp", label: "语言服务器" },
     { id: "permission", label: "权限" },
     { id: "rules", label: "权限规则" },
     { id: "mcp", label: "MCP 服务器" },
@@ -674,6 +1074,10 @@ export function SettingsModal({
               )}
             </>
           )}
+
+          {section === "routing" && <RoleRoutingSettings />}
+
+          {section === "lsp" && <LspServerSettings />}
 
           {section === "permission" && (
             <>
