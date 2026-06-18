@@ -1264,6 +1264,17 @@ async fn chat_with_builtin_tools(
                     usage = merge_usage(usage, task_usage);
                     task_result
                 }
+                // repo_wiki 的 enrich build（P3，opt-in）走 LLM 摘要专用入口（需 provider key + 异步运行时）；
+                // 其余 repo_wiki（query / enrich=false 的 build）仍走下方确定性同步路径，零行为变化。
+                "repo_wiki" => match crate::tools::RepoWikiArgs::parse(&arguments) {
+                    Ok(wiki_args) if wiki_args.wants_enriched_build() => {
+                        crate::tools::execute_repo_wiki_enriched(
+                            workspace_path, &wiki_args, base_url, api_key, model,
+                        )
+                    }
+                    Ok(_) => execute_builtin_tool_call(&security_context, &tool_name, &arguments),
+                    Err(e) => Err(e),
+                },
                 _ => execute_builtin_tool_call(&security_context, &tool_name, &arguments),
                 }
             };

@@ -39,6 +39,12 @@ pub struct WikiSection {
     pub key_files: Vec<String>,
     /// 顶层符号（按重要度降序，已截断）。
     pub symbols: Vec<WikiSymbol>,
+    /// 可选的 LLM 散文摘要（P3：opt-in enrich）。**纯附加**：
+    /// `None` 时本字段不参与序列化（`skip_serializing_if`），区段的 JSON/markdown 与
+    /// 0.0.57 逐字节一致；只有用户显式 enrich 才会被填充。它**不参与内容指纹**，
+    /// 故指纹仍只表征确定性结构事实（见 `store::fingerprint`），enrich 不影响增量幂等。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// 取一个工作区相对路径的父目录（正斜杠；根目录文件返回 "."）。
@@ -110,6 +116,8 @@ pub fn group_into_sections(files: &[FileAnalysis]) -> Vec<WikiSection> {
             file_count,
             key_files,
             symbols,
+            // 确定性结构区段不带摘要；enrich 是后续的纯附加步骤（见 lib::build_wiki_enriched）。
+            summary: None,
         });
     }
 
