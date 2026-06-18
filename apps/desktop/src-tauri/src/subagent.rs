@@ -32,6 +32,7 @@ const SUBTASK_WRITE_TOOLS: &[&str] = &[
     "write_file",
     "edit_file",
     "apply_patch",
+    "apply_multi_patch",
     "make_dir",
     "move_path",
     "delete_file",
