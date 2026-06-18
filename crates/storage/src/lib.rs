@@ -1140,8 +1140,10 @@ fn synthesize_role_provider(conn: &Connection, role: &str) -> SqlResult<Option<M
         role: role.to_string(),
         preset: c.preset,
         label: c.label,
-        // 空串 base_url 归一为 None，与旧表「NULL=走 preset 官方端点」语义一致。
-        base_url: c.base_url.filter(|s| !s.trim().is_empty()),
+        // base_url 原样透传(写入侧 upsert_connection / 0.0.59 迁移已把空白归一为 None,故连接里不会
+        // 存纯空白值);不再读侧二次 filter,避免「纯空白→None」与旧 get_model_provider 原样读的字节差异。
+        // 下游 resolve_base_url 仍会 trim+filter,空/空白都回退 preset 官方端点,行为一致。
+        base_url: c.base_url,
         api_key: c.api_key,
         model_id: m.model_id,
         api_format: c.api_format,
@@ -1676,10 +1678,21 @@ fn migrate_to_models_layer_0060(conn: &Connection) -> SqlResult<()> {
     let result = (|| -> SqlResult<()> {
         for a in &assignments {
             // dedup：同 (connection_id, model_id) 复用一条 model；首次创建时 carry context_window，
-            // label 缺省为 model_id。后续同 (连接,模型) 的角色复用，不改已建 model 的 context_window
-            //（同一模型其上下文窗口一致，0.0.59 同 (连接,模型) 不同角色的 context_window 也一致）。
+            // label 缺省为 model_id。新模型「上下文窗口」是 per-model 属性,而旧库可能给同一 (连接,模型)
+            // 的不同角色配了不一致的 context_window;迭代是 role ASC,"action"<"main" 会让 action 先建、
+            // main 后复用 → 若不处理就丢掉 main 的窗口。而 main 的窗口**驱动压缩软上限**(agent_loop 取
+            // main 的 context_window 推导 ×0.8 压缩点),丢失会导致迁移后压缩点漂移(过早/过晚压缩)。
+            // 故:**main 角色复用已建 model 时,以 main 的窗口为准覆盖**(main 权威),保证 main 窗口不丢。
             let model_ref = match find_model_id(conn, &a.connection_id, &a.model_id)? {
-                Some(existing) => existing,
+                Some(existing) => {
+                    if a.role == ROLE_MAIN && a.context_window.is_some() {
+                        conn.execute(
+                            "UPDATE models SET context_window = ?2, updated_at = ?3 WHERE id = ?1",
+                            params![existing, a.context_window, now_ts()],
+                        )?;
+                    }
+                    existing
+                }
                 None => {
                     let created = upsert_model(
                         conn,
@@ -2894,6 +2907,28 @@ mod tests {
         assert_eq!(get_role_assignments(&conn).expect("ra").len(), 4, "role_assignments 未动");
         assert_eq!(list_model_providers(&conn).expect("mp").len(), 0, "model_providers 未被本迁移写入");
 
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // 回归(审查 HIGH):旧库给同 (连接,模型) 的 main 与 action 配了**不同** context_window 时,
+    // dedup 复用一条 model;role ASC 迭代下 action 先建,若不处理 main 复用会丢掉 main 的窗口
+    //(main 窗口驱动压缩软上限)。本测试锁:迁移后 main 解析出的 context_window 必须是 main 的值(main 权威)。
+    #[test]
+    fn migration_0060_main_context_window_wins_on_dedup() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db");
+        let c = upsert_connection(&conn, "", Some("A"), Some("deepseek"), None, "sk-a", "openai")
+            .expect("conn");
+        // main=128k、action=64k,同一 (连接, deepseek-chat)。action 字母序在前、先建 model。
+        seed_role_assignment(&conn, "main", &c.id, "deepseek-chat", Some(128_000), true);
+        seed_role_assignment(&conn, "action", &c.id, "deepseek-chat", Some(64_000), true);
+
+        migrate_to_models_layer_0060(&conn).expect("migrate 0060");
+
+        // 同 (连接,模型) ⇒ 1 个 model 行;其 context_window 须为 main 的 128k(覆盖 action 先建的 64k)。
+        assert_eq!(list_models(&conn).expect("models").len(), 1, "同 conn+model_id 应 dedup 为 1 行");
+        let main_p = resolve_role_provider(&conn, ROLE_MAIN).expect("q").expect("main");
+        assert_eq!(main_p.context_window, Some(128_000), "main 的 context_window 必须不丢(main 权威)");
         let _ = std::fs::remove_file(db_path);
     }
 
