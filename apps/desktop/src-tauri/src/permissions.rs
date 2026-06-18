@@ -34,10 +34,12 @@ pub(crate) fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability
         // 只读或纯 UI / 后台控制类工具：自动放行，不打断用户。remember 仅追加项目记忆文件，低风险。
         // code_overview（Plan28 P0-2，Lane B 新增）只读取并统计代码结构，与 read_file / search_text 同列。
         // repo_map（R2）只解析源码构建符号地图，同属只读。
+        // code_search（R2 L 阶段）本地语义检索源码、回代码块，离线无副作用，同属只读。
         // git_status/git_diff/git_log 为只读 git 工具，与 read_file/search_text 同列自动放行（R4）。
         // lsp_* 为只读 LSP 工具（仅查询语言服务器、不改文件），同列自动放行（R1）。
         "list_dir" | "read_file" | "stat_path" | "search_text" | "glob_files" | "code_overview"
-        | "repo_map" | "todo_write" | "ask_user" | "run_subtask" | "load_skill" | "remember"
+        | "repo_map" | "code_search" | "todo_write" | "ask_user" | "run_subtask" | "load_skill"
+        | "remember"
         | "list_shells" | "get_shell_output" | "kill_shell" | "get_task_output" | "kill_task"
         | "list_tasks" | "git_status" | "git_diff" | "git_log" | "lsp_definition"
         | "lsp_references" | "lsp_hover" | "lsp_diagnostics" => Ok(ToolCapability::FileRead),
