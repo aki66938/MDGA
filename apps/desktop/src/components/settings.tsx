@@ -525,7 +525,7 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
                     {editing ? (
                       <span className="provider-param__edit">
                         <input
-                          className="conv-search provider-input provider-param__input"
+                          className="provider-param__input"
                           type="number"
                           min={1}
                           autoFocus
@@ -546,7 +546,7 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
                           aria-label={saving ? "保存中" : "保存"}
                           onClick={() => void saveCtx(m)}
                         >
-                          <Check size={15} />
+                          <Check size={13} />
                         </button>
                         <button
                           type="button"
@@ -556,7 +556,7 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
                           aria-label="取消"
                           onClick={cancelEditCtx}
                         >
-                          <X size={15} />
+                          <X size={13} />
                         </button>
                       </span>
                     ) : (
