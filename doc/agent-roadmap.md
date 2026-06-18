@@ -4,6 +4,8 @@
 > 用途:作为「下一步做什么」的对照表 + 多会话并行开发的**协调/认领看板**(每条路线在「认领状态」里标明谁在做、什么分支)。
 
 > **2026-06-18 收官:R1–R12 全部落地(0.0.51→0.0.57)。** 高优先 R1-R5 + 中优先 R6-R10 + 低优先 R11-R12 + 各特性后续(LSP 用户可配置注册表 + 设置 UI、codemap L 向量阶段、R8 角色 UI、git push/PR、R7 加测、R10 worktree 隔离原语)均已实现并经对抗式审查合并。版本对照见文末各行「认领状态」。后续为打磨增量(R10 自动 fan-out 编排、code_search 可选 embedding 重排、wiki LLM 摘要增强等),非缺口。
+>
+> **0.0.58 打磨增量已落地**(4 项,全部严格 opt-in、0.0.57 默认行为逐字节不变,经对抗式审查):① R10 自动 fan-out —— `run_parallel_subtasks` 显式开关式并行可写子代理编排(拒污染前置:具名分支+干净树才跑;并发隔离 worktree 写、按序合并、冲突上报不自动解、RAII 清理;默认单子代理路径不变);② code_search 可选 embedding 重排(`useEmbedding` 默认 OFF,失败静默回退本地);③ repo_wiki 可选 LLM 摘要(`enrich` 默认 false,指纹缓存,确定性区段回退);④ git push/pr e2e 测试落地 + LSP 池 Drop 移出锁外。审查修复 2 处 low(merge --abort 失败不再谎报已还原 + code_search 离线 JSON 不再多带 embedding_reranked 键)。gh 2.94.0 已装并真机验证 git_push/git_pr(真建 PR 需用户 `gh auth login`)。后续仍可深化:R10 retained 分支自动 GC、embedding/LLM 增强的设置页 UI、enrich 用量计入账本。
 
 ## 一句话结论
 
