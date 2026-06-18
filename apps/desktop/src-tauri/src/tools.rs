@@ -164,6 +164,7 @@ pub(crate) const PARALLEL_READONLY_TOOLS: &[&str] = &[
     "stat_path",
     "code_overview",
     "repo_map",
+    "code_search",
     "web_fetch",
     "web_search",
     // R4：git 只读工具，无副作用、可并行。
@@ -387,6 +388,23 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                         "maxTokens": { "type": "integer", "description": "Optional token budget for the rendered map (default 1500, clamped to 200–20000)." }
                     },
                     "required": [],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        // code_search（R2 L 阶段）：本地语义代码检索——给一句话/关键词，回最相关的代码块。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "code_search",
+                "description": "Semantic-ish LOCAL code search: given a natural-language or keyword QUERY, return the top-N most relevant code CHUNKS (file path + line range + the actual snippet + why it ranked). Runs fully OFFLINE — no embedding provider, no API key, no network. It reuses the same tree-sitter parsing and PageRank graph as repo_map to chunk sources at symbol/block granularity (falling back to fixed line windows for files without a grammar), then ranks chunks with a local hybrid of BM25 lexical scoring (identifiers split on camelCase/snake_case), the file's PageRank importance, and an exact-identifier-match bonus. Use this to FIND CODE BY INTENT (e.g. \"where is login validated\", \"retry with backoff\") when you don't know the symbol name — it complements search_text/glob_files (literal name/text match) and repo_map (whole-repo symbol map). Read-only; bounded; snippets are length-capped and the result says if anything was truncated.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Natural-language description or keywords of the code you want to find. Required, non-empty." },
+                        "topK": { "type": "integer", "description": "Number of most-relevant chunks to return (default 8, clamped to 1–50)." }
+                    },
+                    "required": ["query"],
                     "additionalProperties": false
                 }
             }
@@ -1110,6 +1128,7 @@ pub(crate) fn execute_builtin_tool_call(
             .map_err(|err| err.to_string())
         }
         "repo_map" => execute_repo_map(workspace_path, arguments),
+        "code_search" => execute_code_search(workspace_path, arguments),
         "move_path" => {
             let request = serde_json::from_str::<MovePathRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
@@ -1311,6 +1330,31 @@ fn execute_repo_map(workspace_path: &str, arguments: &str) -> Result<serde_json:
         max_tokens: args.max_tokens,
     };
     serde_json::to_value(mdga_codemap::build_repo_map(workspace_path, &request))
+        .map_err(|err| err.to_string())
+}
+
+/// code_search 工具（R2 L 阶段）：本地语义代码检索，给 query 回最相关代码块。
+/// 离线、无 embedding、无网络;只读、无副作用。
+fn execute_code_search(workspace_path: &str, arguments: &str) -> Result<serde_json::Value, String> {
+    #[derive(serde::Deserialize, Default)]
+    struct CodeSearchArgs {
+        #[serde(default)]
+        query: String,
+        #[serde(rename = "topK", default)]
+        top_k: usize,
+    }
+    let trimmed = arguments.trim();
+    let args = if trimmed.is_empty() {
+        CodeSearchArgs::default()
+    } else {
+        serde_json::from_str::<CodeSearchArgs>(trimmed)
+            .map_err(|err| format!("工具参数解析失败: {err}"))?
+    };
+    let request = mdga_codemap::CodeSearchRequest {
+        query: args.query,
+        top_k: args.top_k,
+    };
+    serde_json::to_value(mdga_codemap::code_search(workspace_path, &request))
         .map_err(|err| err.to_string())
 }
 

@@ -11,7 +11,12 @@ mod graph;
 mod heuristic;
 mod lang;
 mod render;
+mod search;
 mod tags;
+
+pub use search::{
+    code_search, CodeSearchChunk, CodeSearchRequest, CodeSearchResult, Embedder,
+};
 
 use ignore::WalkBuilder;
 use serde::Serialize;
@@ -71,46 +76,12 @@ pub fn build_repo_map(workspace_root: &str, request: &CodemapRequest) -> Codemap
         return empty_result("工作区路径不存在或不是目录");
     }
 
-    // 1) gitignore 感知地发现受支持源文件。
-    let mut rel_paths: Vec<String> = Vec::new();
-    let mut abs_paths: Vec<PathBuf> = Vec::new();
-    let mut discover_truncated = false;
-    let walker = WalkBuilder::new(&root)
-        .hidden(true)
-        .parents(true)
-        // 硬排除重目录:对目录项按名字过滤,filter_entry 会连同其整棵子树一起剪掉,
-        // 与 gitignore 无关——即便仓库未忽略 node_modules/target 也照样跳过。
-        .filter_entry(|entry| {
-            if entry.file_type().is_some_and(|t| t.is_dir()) {
-                if let Some(name) = entry.file_name().to_str() {
-                    return !HARD_EXCLUDED_DIRS.contains(&name);
-                }
-            }
-            true
-        })
-        .build();
-    for result in walker {
-        let Ok(entry) = result else { continue };
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default();
-        if !lang::should_scan_extension(&ext) {
-            continue;
-        }
-        if rel_paths.len() >= MAX_FILES {
-            discover_truncated = true;
-            break;
-        }
-        let rel = path.strip_prefix(&root).unwrap_or(path);
-        rel_paths.push(to_forward_slashes(rel));
-        abs_paths.push(path.to_path_buf());
-    }
+    // 1) gitignore 感知地发现受支持源文件（与 code_search 共用同一套发现/硬排除口径）。
+    let Discovered {
+        rel_paths,
+        abs_paths,
+        truncated: discover_truncated,
+    } = discover_source_files(&root);
 
     if rel_paths.is_empty() {
         return empty_result(
@@ -182,6 +153,63 @@ pub fn repo_map_for_context(workspace_root: &str, max_tokens: usize) -> String {
         },
     );
     result.map
+}
+
+/// gitignore 感知的源文件发现结果：相对路径与绝对路径一一对应（同序）。
+pub(crate) struct Discovered {
+    pub rel_paths: Vec<String>,
+    pub abs_paths: Vec<PathBuf>,
+    /// 是否因 MAX_FILES 上限而截断。
+    pub truncated: bool,
+}
+
+/// 发现工作区内全部「可扫描的文本源文件」，硬排除依赖/构建/VCS 重目录并遵守 gitignore。
+/// repo_map 与 code_search 共用此口径，保证两者「看到的文件集合」完全一致。
+pub(crate) fn discover_source_files(root: &std::path::Path) -> Discovered {
+    let mut rel_paths: Vec<String> = Vec::new();
+    let mut abs_paths: Vec<PathBuf> = Vec::new();
+    let mut truncated = false;
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .parents(true)
+        // 硬排除重目录:对目录项按名字过滤,filter_entry 会连同其整棵子树一起剪掉,
+        // 与 gitignore 无关——即便仓库未忽略 node_modules/target 也照样跳过。
+        .filter_entry(|entry| {
+            if entry.file_type().is_some_and(|t| t.is_dir()) {
+                if let Some(name) = entry.file_name().to_str() {
+                    return !HARD_EXCLUDED_DIRS.contains(&name);
+                }
+            }
+            true
+        })
+        .build();
+    for result in walker {
+        let Ok(entry) = result else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !lang::should_scan_extension(&ext) {
+            continue;
+        }
+        if rel_paths.len() >= MAX_FILES {
+            truncated = true;
+            break;
+        }
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        rel_paths.push(to_forward_slashes(rel));
+        abs_paths.push(path.to_path_buf());
+    }
+    Discovered {
+        rel_paths,
+        abs_paths,
+        truncated,
+    }
 }
 
 fn resolve_focus(focus_files: &[String], rel_paths: &[String]) -> Vec<usize> {
