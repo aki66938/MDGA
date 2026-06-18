@@ -664,6 +664,37 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        // P1（0.0.58）：并行可写子代理编排器（显式 opt-in）。把多个独立的写任务各自跑在隔离 git
+        // 工作树里并发执行，再串行合并回当前分支；冲突一律停下并上报，绝不自动选边/force。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "run_parallel_subtasks",
+                "description": "Run MULTIPLE writable sub-agents CONCURRENTLY, each in its own isolated git worktree+branch, then merge their branches back into the current branch SEQUENTIALLY. Use this ONLY for several INDEPENDENT write tasks that touch DISJOINT files (e.g. 'add tests to module A' + 'fix typo in module B' + 'update docs in C') so they can run in parallel without stepping on each other. Each sub-agent's writes/commands go through the same user approval gating and checkpoints as the main agent. After all finish, branches merge back one at a time; if any branch CONFLICTS, merging STOPS at that point, the parent working tree is restored clean (the conflict is never auto-resolved, never forced), and the conflicting + remaining sub-agents' branches are RETAINED for you to resolve manually (see retainedBranch / conflictPaths in the result). REQUIREMENTS: the workspace must be a git repo, currently on a NAMED branch (not detached HEAD), with a CLEAN working tree (commit or stash your changes first) — otherwise this tool refuses to run to avoid corrupting your work. For a single task, or tasks that share files, use run_subtask (mode='write') instead.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subtasks": {
+                            "type": "array",
+                            "description": "2-4 independent write subtasks touching disjoint files. Each runs concurrently in its own isolated worktree.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string", "description": "Short human-readable label for this subtask (used to name its isolated branch). Optional." },
+                                    "description": { "type": "string", "description": "Clear, self-contained description of what this sub-agent should do. Keep its file scope disjoint from the other subtasks to avoid merge conflicts." }
+                                },
+                                "required": ["description"],
+                                "additionalProperties": false
+                            },
+                            "minItems": 1,
+                            "maxItems": 4
+                        }
+                    },
+                    "required": ["subtasks"],
+                    "additionalProperties": false
+                }
+            }
+        }),
         serde_json::json!({
             "type": "function",
             "function": {
