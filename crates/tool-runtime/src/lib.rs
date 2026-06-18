@@ -7,6 +7,10 @@ mod appcontainer_win;
 mod git;
 pub use git::*;
 
+// R10：可写子代理的 git-worktree 隔离原语（隔离工作树 + 临时分支 + RAII 清理 + 冲突上抛）。
+mod worktree;
+pub use worktree::{IsolatedWorktree, MergeOutcome};
+
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};

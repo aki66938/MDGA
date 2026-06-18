@@ -451,6 +451,159 @@ async fn run_subtask_loop(
     (capped, usage)
 }
 
+// ── R10：可写子代理的 git-worktree 隔离集成缝（GUARDED / opt-in，默认不接管现有路径） ──
+//
+// 现状：上面的 write 模式子代理与主链路**共用同一个工作区**，多个写子代理并行 fan-out 会互踩。
+// 下面这个 helper 提供安全的隔离编排——但**它不被默认 run_subtask 路径调用**：默认写子代理仍走
+// run_subtask_loop（原行为不变）。要启用隔离并行写，由调用方显式调 `run_isolated_write_subtask`。
+//
+// 为什么是显式 opt-in：把默认路径静默改道到隔离工作树是高风险的（合并冲突、清理时序、与主链路
+// 检查点/权限门控的交互都需要更宽的契约）。本缝先把「隔离 + 合并 + 清理」这一最危险的 git 管道做对、
+// 做实测，留作可被上层（如未来的并行 fan-out 编排器）调用的积木；端到端自动接管留作后续增量。
+
+/// 一次隔离写子代理编排的结果：报告 + 消耗 + 合并结局（干净 / 冲突路径）。
+///
+/// `merge` 为 `None` 表示因（A）未开启自动合并或（B）子代理未在隔离分支上产生任何提交而未尝试合并；
+/// `Some(MergeOutcome::Conflict { .. })` 表示合并冲突已被**结构化抛出**，隔离分支与改动均**保留**待
+/// 人工处理（此时不清理工作树/分支，交由调用方决定），其余情况隔离工作树在函数返回时经 RAII 清理。
+#[allow(dead_code)] // opt-in 积木的返回类型：默认路径不消费它，留给上层并行 fan-out 编排器。
+pub(crate) struct IsolatedSubtaskResult {
+    pub report: String,
+    pub usage: Option<mdga_shared::RawUsage>,
+    pub merge: Option<mdga_tool_runtime::MergeOutcome>,
+    /// 冲突保留时，隔离分支名（供调用方提示用户人工合并）；非冲突保留时为 None。
+    pub retained_branch: Option<String>,
+}
+
+/// GUARDED / opt-in：把一个**可写**子代理跑在隔离的 git 工作树里，完成后把它的改动合并回父分支，
+/// 冲突一律向上抛出（绝不静默强解、绝不 force）。隔离工作树/临时分支由 RAII 守卫清理。
+///
+/// 流程：
+/// 1. 在 `workspace_path`（须为 git 仓库工作树根）当前 HEAD 上创建隔离工作树 + 临时分支。
+/// 2. 让 write 模式子代理 loop 跑在**隔离目录**里（其文件改动只落隔离工作树，不碰主工作区）。
+/// 3. 子代理结束后，在隔离工作树里 `add -A && commit` 把改动固化到隔离分支（无改动则跳过提交与合并）。
+/// 4. 若 `auto_merge` 且确有提交：把隔离分支合并回 `target_branch`（默认父仓库当前分支）。
+///    - 干净合并：返回 `Clean`，随后 RAII 清理隔离工作树/分支。
+///    - 冲突：返回 `Conflict { paths }` 并**保留**隔离工作树/分支（`std::mem::forget` 守卫），
+///      交由调用方提示用户人工 `git merge`；绝不静默选边。
+///
+/// 安全：合并/清理全部复用 tool-runtime 的 `IsolatedWorktree`（绝对路径、`-c core.autocrlf=false`、
+/// 绝不 force、绝不 `-X ours|theirs`）。本函数不改动权限门控语义——子代理 loop 内仍逐次门控 + 检查点。
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // opt-in 积木：默认路径不调用它，留给上层并行 fan-out 编排器接入。
+pub(crate) async fn run_isolated_write_subtask(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    workspace_path: &str,
+    system_prompt: &str,
+    description: &str,
+    app: &AppHandle,
+    conversation_id: &str,
+    cancel: Option<Arc<AtomicBool>>,
+    permission: PermissionMode,
+    permission_rules: &[String],
+    label: &str,
+    auto_merge: bool,
+    target_branch: Option<&str>,
+    commit_message: &str,
+) -> Result<IsolatedSubtaskResult, String> {
+    // 1. 创建隔离工作树（失败即清晰报错，不残留半成品）。
+    // 不需 mut：提交/合并都走 &self，清理交给 RAII Drop（或冲突路径上的 mem::forget）。
+    let guard = mdga_tool_runtime::IsolatedWorktree::create(workspace_path, label)
+        .map_err(|e| format!("创建隔离工作树失败: {e}"))?;
+    let isolated_path = guard.path().to_string_lossy().to_string();
+
+    // 2. 写子代理 loop 跑在隔离目录里（write_mode=true，继承主链路权限；门控/检查点在 loop 内逐次执行）。
+    let (report, usage) = run_subtask_loop(
+        base_url,
+        api_key,
+        model,
+        &isolated_path,
+        system_prompt,
+        description,
+        app,
+        conversation_id,
+        cancel,
+        true,
+        permission,
+        permission_rules,
+    )
+    .await;
+
+    // 3. 把隔离工作树里的改动固化到隔离分支；无改动则不提交、也不合并（guard 在返回时清理）。
+    let committed = match guard.commit_all(commit_message) {
+        Ok(_hash) => true,
+        Err(e) => {
+            // 「nothing to commit」属正常无改动；其余错误也只记入报告，不阻断（仍走清理）。
+            let _ = e;
+            false
+        }
+    };
+
+    if !committed || !auto_merge {
+        return Ok(IsolatedSubtaskResult {
+            report,
+            usage,
+            merge: None,
+            retained_branch: None,
+        });
+    }
+
+    // 4. 合并回目标分支（默认父仓库当前分支）。冲突一律上抛，绝不强解。
+    let outcome = match target_branch {
+        Some(b) => guard.merge_into(b),
+        None => {
+            // 未指定目标：取父仓库当前分支作为合并目标。
+            match current_repo_branch(workspace_path) {
+                Ok(b) => guard.merge_into(&b),
+                Err(e) => Err(e),
+            }
+        }
+    };
+
+    match outcome {
+        Ok(mdga_tool_runtime::MergeOutcome::Conflict { paths }) => {
+            // 冲突：保留隔离工作树 + 分支，交由用户人工处理；forget 守卫以阻止 Drop 清理。
+            let branch = guard.branch().to_string();
+            std::mem::forget(guard);
+            Ok(IsolatedSubtaskResult {
+                report,
+                usage,
+                merge: Some(mdga_tool_runtime::MergeOutcome::Conflict { paths }),
+                retained_branch: Some(branch),
+            })
+        }
+        Ok(clean) => {
+            // 干净合并：guard 在返回时 RAII 清理隔离工作树/分支。
+            Ok(IsolatedSubtaskResult {
+                report,
+                usage,
+                merge: Some(clean),
+                retained_branch: None,
+            })
+        }
+        Err(e) => Err(format!("合并隔离分支失败: {e}")),
+    }
+}
+
+/// 取某 git 仓库工作树当前分支名（detached 时返回错误，调用方据此要求显式指定 target）。
+fn current_repo_branch(repo: &str) -> Result<String, mdga_tool_runtime::ToolRuntimeError> {
+    // 复用 git_branch(list) 的 current 字段，避免在 subagent 里重造 git 解析。
+    let res = mdga_tool_runtime::git_branch(
+        repo,
+        mdga_tool_runtime::GitBranchRequest {
+            action: Some("list".to_string()),
+            ..Default::default()
+        },
+    )?;
+    res.current.ok_or_else(|| {
+        mdga_tool_runtime::ToolRuntimeError::CommandFailed(
+            "父仓库处于 detached HEAD，请显式指定合并目标分支".to_string(),
+        )
+    })
+}
+
 /// 后台子代理任务工具：get_task_output / kill_task / list_tasks。
 /// get_task_output 在任务完成且未结算时返回其 usage，供主循环并入会话账本（只结算一次）。
 pub(crate) async fn execute_bg_task_tool(
