@@ -82,6 +82,11 @@ pub struct CodeSearchChunk {
 }
 
 /// `code_search` 结果。
+/// serde `skip_serializing_if` 谓词：bool 为 false 时跳过序列化（签名须 `fn(&bool) -> bool`）。
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeSearchResult {
     /// 按相关度降序的结果块(最多 top_k 个)。
@@ -94,7 +99,8 @@ pub struct CodeSearchResult {
     pub truncated: bool,
     /// 是否对本地候选施加了 provider embedding 余弦重排(默认 false=纯本地;
     /// 即便调用方传入 embedder,任一失败也会静默回退本地并保持 false)。
-    #[serde(default)]
+    /// false 时不序列化该字段——保证离线默认路径的结果 JSON 与 0.0.57 逐字节一致(opt-in 保真)。
+    #[serde(default, skip_serializing_if = "is_false")]
     pub embedding_reranked: bool,
     /// 给模型的口径说明。
     pub note: String,
@@ -951,6 +957,12 @@ mod tests {
             assert!((a.score - b.score).abs() < 1e-12);
             assert_eq!(a.why, b.why);
         }
+        // opt-in 保真:离线默认结果的序列化 JSON **不得**含 embedding_reranked 键(与 0.0.57 逐字节一致)。
+        let v = serde_json::to_value(&local).expect("serialize");
+        assert!(
+            v.get("embedding_reranked").is_none(),
+            "离线默认 code_search 结果不应序列化 embedding_reranked 键"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

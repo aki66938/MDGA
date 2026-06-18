@@ -408,7 +408,17 @@ impl IsolatedWorktree {
         let conflicts = list_unmerged_paths(merge_cwd)?;
         if !conflicts.is_empty() {
             // 冲突：中止合并，把父工作树还原干净，绝不留半合并状态、绝不自动选边。
-            let _ = run_git_in(merge_cwd, &["merge", "--abort"]);
+            // 中止本身若失败（index.lock / IO / 半状态），父工作树可能仍残留冲突——绝不谎报
+            // 「已还原干净」，如实抛错让上层提示人工清理。
+            let abort = run_git_in(merge_cwd, &["merge", "--abort"])?;
+            if abort.code != Some(0) {
+                return Err(ToolRuntimeError::CommandFailed(format!(
+                    "合并冲突后 `git merge --abort` 失败（退出码 {:?}）：父工作树可能仍残留冲突/半合并状态，\
+                     请手动执行 `git merge --abort` 清理。冲突文件: {}",
+                    abort.code,
+                    conflicts.join(", ")
+                )));
+            }
             return Ok(MergeOutcome::Conflict { paths: conflicts });
         }
 

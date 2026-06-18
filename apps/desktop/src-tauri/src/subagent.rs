@@ -645,6 +645,9 @@ pub(crate) struct ParallelOrchestrationResult {
     pub usage: Option<mdga_shared::RawUsage>,
     /// 是否存在冲突导致提前停止合并（true 时其后子代理的 merge 为 None，分支被保留待人工处理）。
     pub stopped_on_conflict: bool,
+    /// 是否因「合并错误」（非冲突，如 merge --abort 失败/锁/IO）停止：true 时父工作树**可能仍不干净**，
+    /// 需人工 `git merge --abort` / 清理后再处理保留分支——故此时绝不向用户宣称「已还原干净」。
+    pub stopped_on_error: bool,
 }
 
 /// 一个待编排的并行子代理：标签 + 委托描述。
@@ -806,6 +809,9 @@ pub(crate) async fn run_parallel_write_subtasks(
     // 3. 串行合并阶段：逐个把已提交的隔离分支合并回 target_branch；任一冲突/错误即停止其余合并。
     let mut items: Vec<ParallelSubtaskItem> = Vec::with_capacity(prepared.len());
     let mut stopped = false;
+    // 区分两种停止：真冲突（原语已 merge --abort 确认还原干净）vs 合并错误（abort 失败/锁/IO，
+    // 父工作树可能仍不干净）——后者绝不能向用户谎报「已还原干净」。
+    let mut merge_error = false;
     for p in prepared {
         if !p.committed {
             // 无改动：不合并。守卫在 item push 后随 p 被 Drop 清理（隔离工作树/分支移除）。
@@ -856,8 +862,10 @@ pub(crate) async fn run_parallel_write_subtasks(
                 });
             }
             Err(e) => {
-                // 非冲突类合并错误（如锁/IO）：保守起见也视为停止信号，保留分支并记入报告。
+                // 非冲突类合并错误（如 merge --abort 失败/锁/IO）：保守起见也视为停止信号，保留分支
+                // 并记入报告；置 merge_error 让上层提示「父工作树可能不干净、需人工清理」，不谎报已还原。
                 stopped = true;
+                merge_error = true;
                 let branch = p.guard.branch().to_string();
                 std::mem::forget(p.guard);
                 items.push(ParallelSubtaskItem {
@@ -875,7 +883,8 @@ pub(crate) async fn run_parallel_write_subtasks(
         target_branch,
         items,
         usage: total_usage,
-        stopped_on_conflict: stopped,
+        stopped_on_conflict: stopped && !merge_error,
+        stopped_on_error: merge_error,
     })
 }
 
@@ -999,7 +1008,12 @@ pub(crate) async fn execute_run_parallel_subtasks(
                     })
                 })
                 .collect();
-            let note = if orch.stopped_on_conflict {
+            let note = if orch.stopped_on_error {
+                // 合并错误（含 merge --abort 失败）：父工作树可能仍残留半合并/冲突状态——不谎报已还原。
+                "合并过程中发生错误（非内容冲突，如 merge --abort 失败 / 索引锁 / IO）：已停止后续合并，\
+但**父工作树可能仍残留半合并或冲突状态**。请先在目标工作区手动执行 `git merge --abort` 并 `git status` \
+确认干净后，再查看各 subtask 报告里的 [合并失败] 原因与 retainedBranch 决定如何处理。"
+            } else if orch.stopped_on_conflict {
                 "存在合并冲突：已在第一个冲突处停止后续合并，父工作树被还原干净（绝未强解/选边）。\
 请查看 conflictPaths 与 retainedBranch——可手动 `git merge <retainedBranch>` 解决冲突，\
 或让对应子代理重做以避开冲突文件。冲突子代理及其后未合并的子代理分支均已保留待你处理。"
@@ -1010,6 +1024,7 @@ pub(crate) async fn execute_run_parallel_subtasks(
                 Ok(serde_json::json!({
                     "targetBranch": orch.target_branch,
                     "stoppedOnConflict": orch.stopped_on_conflict,
+                    "stoppedOnError": orch.stopped_on_error,
                     "subtasks": items,
                     "note": note,
                 })),
