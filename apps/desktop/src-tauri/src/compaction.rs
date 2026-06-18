@@ -58,8 +58,8 @@ pub(crate) fn maybe_persist_large_output(workspace_path: &str, output_str: &str)
     }
 }
 
-// 注（Plan28 P3-9）：软上限常量 CONTEXT_SOFT_LIMIT_TOKENS 与推导函数 context_soft_limit_for
-// 已迁入 mdga-agent-core（compaction 子模块，逻辑一字不改），其单测亦随之迁过去；本文件不再保留。
+// 注（0.0.61）：软上限推导函数 context_soft_limit_for 在 mdga-agent-core（compaction 子模块），
+// 其单测亦在该处。context_window 改为纯用户自定义后已删除旧 app 默认常量；主模型未填窗口 ⇒ 软上限 None。
 
 // ===== R12 情景记忆（episodic）：磁盘归档层 =====
 

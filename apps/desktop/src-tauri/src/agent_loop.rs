@@ -707,9 +707,11 @@ async fn chat_with_builtin_tools(
     let mut last_failure_signature: Option<String> = None;
     let mut repeated_failure_count: usize = 0;
 
-    // Plan27 C2 #2：本轮压缩软上限——主供应商有 context_window 则用其 × 0.8，否则回退默认（env 仍优先）。
-    // 整轮恒定，故循环外算一次：既用于压缩触发判断，也作为 context-usage 事件的 softLimit。
-    let soft_limit = context_soft_limit_for(context_window);
+    // 0.0.61：本轮压缩软上限——主模型（始终以 ROLE_MAIN 为准，与当前角色无关）用户自定义的
+    // context_window 直接作为阈值；主模型未填则为 None（不做窗口驱动压缩，端点自身默认值兜底）。env 仍优先。
+    // 此处 context_window 即上方从 ROLE_MAIN 解析出的 main_context_window（见函数顶部 resolve_role_provider(ROLE_MAIN)）。
+    // 整轮恒定，故循环外算一次：既用于压缩触发判断，也作为 context-usage 事件的 softLimit（None ⇒ 前端隐藏指示器）。
+    let soft_limit: Option<u64> = context_soft_limit_for(context_window);
 
     let mut round: usize = 0;
     loop {
@@ -741,7 +743,10 @@ async fn chat_with_builtin_tools(
         //   ② 短桩：再不够则把更早的大结果换成短桩（彻底丢语义，但已归档可重读）；
         //   ③ 摘要：连桩都无可压仍超限，触发 auto-compact 把旧历史压成任务进度摘要。
         // 工作记忆（wire_messages）由此被有界约束，情景记忆（.mdga/archive）累积全量、永不回灌但可检索。
-        if last_prompt_tokens > soft_limit {
+        // 0.0.61：soft_limit 为 Option——仅当主模型有用户自定义窗口（Some(limit)）时才做窗口驱动压缩；
+        // None（主模型未填窗口）⇒ 跳过整段压缩，由端点自身上下文上限兜底。
+        if let Some(limit) = soft_limit {
+        if last_prompt_tokens > limit {
             let condensed = condense_tool_outputs(
                 workspace_path,
                 conversation_id,
@@ -789,6 +794,7 @@ async fn chat_with_builtin_tools(
                     );
                 }
             }
+        }
         }
 
         // 推送轮次进度与思考状态，让前端展示「第 N 轮 · 思考中」而非黑盒等待。
@@ -855,6 +861,8 @@ async fn chat_with_builtin_tools(
         if let Some(round_usage) = completion.usage.as_ref() {
             last_prompt_tokens = round_usage.prompt_tokens;
             // 推送上下文用量，前端常驻显示占用百分比（对标 CC/Codex 的 context 指示器）。
+            // 0.0.61：softLimit 为可空——soft_limit: Option<u64> 经 serde 序列化为「Some ⇒ number / None ⇒ null」。
+            // null ⇒ 主模型无用户自定义 context_window ⇒ 前端隐藏该指示器。
             let _ = app.emit(
                 "context-usage",
                 serde_json::json!({
