@@ -558,6 +558,19 @@ fn truncate_chars(s: &str, max: usize) -> (String, bool) {
 mod tests {
     use super::*;
 
+    /// 串行化所有「真正驱动浏览器」的端到端测试。
+    ///
+    /// 浏览器会话是进程级单例（[`session_cell`]），多个 e2e 测试若并行运行会互相
+    /// 抢占同一个 tab、并被彼此的 [`shutdown`] 打断（导致 navigate/find_element 错配）。
+    /// cargo 默认并行跑测试，故用一把进程内锁把它们串起来。锁可能因某个测试 panic 而
+    /// 中毒，但我们只关心「互斥」语义、不在意被守护的数据，因此 into_inner 忽略中毒继续。
+    fn browser_e2e_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn validate_url_accepts_http_and_https() {
         assert_eq!(
@@ -632,6 +645,7 @@ mod tests {
     /// 无 Chrome 时优雅跳过。整个驱动调用放到独立线程并配看门狗超时，杜绝因导航异常而挂死测试。
     #[test]
     fn browser_smoke_navigate_read_screenshot() {
+        let _guard = browser_e2e_guard();
         if !chrome_available() {
             eprintln!("跳过：本机未找到 Chrome/Chromium，浏览器冒烟测试 skip");
             return;
@@ -677,6 +691,104 @@ mod tests {
             Ok(Ok(())) => {}
             Ok(Err(e)) => panic!("浏览器端到端冒烟失败：{e}"),
             Err(_) => panic!("浏览器端到端冒烟超时（>90s），疑似挂死"),
+        }
+    }
+
+    /// 端到端：browser_fill + browser_click 的交互闭环。仅当本机存在 Chrome/Chromium 时运行。
+    ///
+    /// 页面构造：
+    /// - `#inp` 输入框 + `#echo` 回显区——监听 input 事件把当前值写进 `#echo`，
+    ///   于是 fill 后能从可见文本里读到键入的内容（同时也验证了 fill 触发真实的输入事件）。
+    /// - `#btn` 按钮——inline onclick 把 `#status` 文本改成确定的标记串，
+    ///   于是 click 后能从可见文本里读到点击效果。
+    ///
+    /// 断言走 browser_read_text（document.body.innerText）：填入的文本被回显、按钮的点击副作用生效。
+    /// 复用冒烟测试同款「独立线程跑驱动 + 主线程看门狗超时」骨架，杜绝某步 CDP 调用挂起拖死测试。
+    #[test]
+    fn browser_fill_and_click_reflect_in_page() {
+        let _guard = browser_e2e_guard();
+        if !chrome_available() {
+            eprintln!("跳过：本机未找到 Chrome/Chromium，fill/click 端到端测试 skip");
+            return;
+        }
+        let typed = "hello";
+        let clicked_marker = "CLICKED_OK";
+        // input 事件把当前值回显进 #echo；按钮 onclick 把 #status 设为确定标记。
+        let html = format!(
+            "<!doctype html><html><head><title>R7 FillClick</title></head><body>\
+             <input id=\"inp\" oninput=\"document.getElementById('echo').textContent = this.value;\">\
+             <div id=\"echo\"></div>\
+             <button id=\"btn\" onclick=\"document.getElementById('status').textContent = '{clicked_marker}';\">go</button>\
+             <div id=\"status\"></div>\
+             </body></html>"
+        );
+        let url = serve_forever(&html);
+
+        // 在独立线程里跑整条交互链路；主线程用带超时的 recv 当看门狗。
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let typed_owned = typed.to_string();
+        let clicked_owned = clicked_marker.to_string();
+        std::thread::spawn(move || {
+            let run = || -> Result<(), String> {
+                let _nav = browser_navigate(BrowserNavigateRequest { url: url.clone() })
+                    .map_err(|e| format!("navigate: {e}"))?;
+
+                // 填写输入框：应触发 input 事件，从而把值回显进 #echo。
+                browser_fill(BrowserFillRequest {
+                    selector: "#inp".to_string(),
+                    text: typed_owned.clone(),
+                })
+                .map_err(|e| format!("fill: {e}"))?;
+
+                let after_fill = browser_read_text(BrowserReadTextRequest {})
+                    .map_err(|e| format!("read_text(after fill): {e}"))?;
+                if !after_fill.text.contains(&typed_owned) {
+                    return Err(format!(
+                        "fill 后页面文本应含键入值 {typed_owned:?}，实得 {:?}",
+                        after_fill.text
+                    ));
+                }
+                // 点击效果尚未发生，此时不应出现点击标记。
+                if after_fill.text.contains(&clicked_owned) {
+                    return Err(format!(
+                        "点击前不应出现点击标记 {clicked_owned:?}，实得 {:?}",
+                        after_fill.text
+                    ));
+                }
+
+                // 点击按钮：onclick 把 #status 设为标记串。
+                browser_click(BrowserClickRequest {
+                    selector: "#btn".to_string(),
+                })
+                .map_err(|e| format!("click: {e}"))?;
+
+                let after_click = browser_read_text(BrowserReadTextRequest {})
+                    .map_err(|e| format!("read_text(after click): {e}"))?;
+                if !after_click.text.contains(&clicked_owned) {
+                    return Err(format!(
+                        "click 后页面文本应含点击标记 {clicked_owned:?}，实得 {:?}",
+                        after_click.text
+                    ));
+                }
+                // 填入的值在点击后仍应在页面上（点击未清空回显）。
+                if !after_click.text.contains(&typed_owned) {
+                    return Err(format!(
+                        "click 后键入值 {typed_owned:?} 仍应可见，实得 {:?}",
+                        after_click.text
+                    ));
+                }
+                Ok(())
+            };
+            let _ = tx.send(run());
+        });
+
+        // 看门狗：90s 仍无结果即判定挂死、测试失败。无论如何最后都 shutdown 回收 chrome。
+        let outcome = rx.recv_timeout(Duration::from_secs(90));
+        shutdown();
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("fill/click 端到端失败：{e}"),
+            Err(_) => panic!("fill/click 端到端超时（>90s），疑似挂死"),
         }
     }
 }
