@@ -1,0 +1,10 @@
+[package]
+name = "mdga-wiki"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+mdga-codemap = { path = "../codemap" }
+serde.workspace = true
+serde_json.workspace = true

@@ -11,7 +11,8 @@ members = [
   "crates/shared",
   "crates/storage",
   "crates/token-accounting",
-  "crates/tool-runtime"
+  "crates/tool-runtime",
+  "crates/wiki"
 ]
 resolver = "2"
 

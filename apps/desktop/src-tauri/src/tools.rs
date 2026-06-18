@@ -165,6 +165,9 @@ pub(crate) const PARALLEL_READONLY_TOOLS: &[&str] = &[
     "code_overview",
     "repo_map",
     "code_search",
+    // repo_wiki（R11）刻意不在此列:其 build 动作会重写 .mdga/wiki 缓存(清旧 .md + 原子写),
+    // 并发 build 可能在同一缓存目录上交错,故保持 repo_wiki 串行执行(query 虽纯读,但工具名
+    // 粒度无法区分 action,从严按可写处理)。
     "web_fetch",
     "web_search",
     // R4：git 只读工具，无副作用、可并行。
@@ -405,6 +408,25 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                         "topK": { "type": "integer", "description": "Number of most-relevant chunks to return (default 8, clamped to 1–50)." }
                     },
                     "required": ["query"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        // repo_wiki（R11）：基于 repo_map 的结构化分析,自动生成可查询、可离线的仓库 wiki。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "repo_wiki",
+                "description": "Build and query a DURABLE, queryable wiki of the codebase structure, so you don't re-derive 'what is this repo / where does the core code live / what is each directory for' every turn. Fully deterministic and OFFLINE (no model/network call): it reuses repo_map's tree-sitter + PageRank analysis, groups it per directory into sections (key files, top symbols with line numbers, a structurally-inferred role), and persists them as markdown + JSONL under .mdga/wiki/ (derived data, regenerable). action='build' walks the repo and writes/updates the wiki (incremental & idempotent — unchanged content is skipped); pass force=true to rebuild regardless. action='query' takes a free-text question and returns the most relevant directory sections with their key source files (read_file them for detail) and matched symbols; it degrades gracefully to a live analysis if the wiki hasn't been built yet. Read-only with respect to your source code — build only writes the .mdga/wiki cache. Use build once when orienting in a new/large repo, then query to navigate.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["build", "query"], "description": "'build' generates/updates the wiki cache; 'query' searches it. Defaults to 'query'." },
+                        "question": { "type": "string", "description": "For action='query': the free-text question or keywords to find relevant directory sections (e.g. 'where is the agent loop' or a symbol name)." },
+                        "limit": { "type": "integer", "description": "For action='query': max sections to return (default 5)." },
+                        "force": { "type": "boolean", "description": "For action='build': rebuild even if content is unchanged. Defaults to false (incremental)." }
+                    },
+                    "required": [],
                     "additionalProperties": false
                 }
             }
@@ -1129,6 +1151,7 @@ pub(crate) fn execute_builtin_tool_call(
         }
         "repo_map" => execute_repo_map(workspace_path, arguments),
         "code_search" => execute_code_search(workspace_path, arguments),
+        "repo_wiki" => execute_repo_wiki(workspace_path, arguments),
         "move_path" => {
             let request = serde_json::from_str::<MovePathRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
@@ -1356,6 +1379,43 @@ fn execute_code_search(workspace_path: &str, arguments: &str) -> Result<serde_js
     };
     serde_json::to_value(mdga_codemap::code_search(workspace_path, &request))
         .map_err(|err| err.to_string())
+}
+
+/// repo_wiki 工具（R11）：基于 repo_map 的结构化分析生成 / 查询持久仓库 wiki。
+/// build 只写 .mdga/wiki 缓存(派生数据、不碰源码)；query 词法检索区段。只读能力档位。
+fn execute_repo_wiki(workspace_path: &str, arguments: &str) -> Result<serde_json::Value, String> {
+    #[derive(serde::Deserialize, Default)]
+    struct RepoWikiArgs {
+        #[serde(default)]
+        action: Option<String>,
+        #[serde(default)]
+        question: Option<String>,
+        #[serde(default)]
+        limit: usize,
+        #[serde(default)]
+        force: bool,
+    }
+    let trimmed = arguments.trim();
+    let args = if trimmed.is_empty() {
+        RepoWikiArgs::default()
+    } else {
+        serde_json::from_str::<RepoWikiArgs>(trimmed)
+            .map_err(|err| format!("工具参数解析失败: {err}"))?
+    };
+    // 默认动作为 query（更轻、最常用）；未知 action 报错以免静默误解意图。
+    let action = args.action.as_deref().unwrap_or("query");
+    match action {
+        "build" => serde_json::to_value(mdga_wiki::build_wiki(workspace_path, args.force))
+            .map_err(|err| err.to_string()),
+        "query" => {
+            let question = args.question.unwrap_or_default();
+            serde_json::to_value(mdga_wiki::query_wiki(workspace_path, &question, args.limit))
+                .map_err(|err| err.to_string())
+        }
+        other => Err(format!(
+            "未知 action: {other}（应为 \"build\" 或 \"query\"）"
+        )),
+    }
 }
 
 pub(crate) fn execute_create_file_tool_call(

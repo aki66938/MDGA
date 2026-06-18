@@ -16,6 +16,7 @@ mdga-shared = { path = "../../../crates/shared" }
 mdga-storage = { path = "../../../crates/storage" }
 mdga-token-accounting = { path = "../../../crates/token-accounting" }
 mdga-tool-runtime = { path = "../../../crates/tool-runtime" }
+mdga-wiki = { path = "../../../crates/wiki" }
 rusqlite.workspace = true
 similar.workspace = true
 serde.workspace = true
