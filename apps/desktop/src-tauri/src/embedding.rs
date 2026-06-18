@@ -106,7 +106,11 @@ pub(crate) fn refresh_embedding_config(conn: &rusqlite::Connection) {
     let model = mdga_storage::get_setting(conn, EMBEDDING_MODEL_KEY)
         .ok()
         .flatten();
-    let provider = mdga_storage::get_model_provider(conn, "main").ok().flatten();
+    // 0.0.59：embedding 端点/凭据从 ROLE_EMBED 解析（未配置 embed ⇒ 回退 main，与从前逐字节一致）。
+    // 仅 provider 的 base_url/preset/api_key 取自该解析结果；embedding 模型名仍取上面的设置项。
+    let provider = mdga_storage::resolve_role_provider(conn, mdga_storage::ROLE_EMBED)
+        .ok()
+        .flatten();
     let config = match provider {
         Some(p) => resolve_embedding_config(
             enabled.as_deref(),

@@ -35,12 +35,12 @@ use commands::{
     set_conversation_workspace, set_task_budget, set_workspace_path, toggle_mcp_server,
 };
 use commands::{
-    get_app_setting, get_model_provider_config, remove_model_provider, resolve_role_model_provider,
-    save_model_provider, set_app_setting, smoke_test_tool_call, test_provider_connection,
+    delete_connection, get_app_setting, list_connections, list_models_for_connection,
+    save_connection, set_app_setting, smoke_test_tool_call, test_connection,
 };
 use commands::{
-    clear_role_provider, get_lsp_known_servers, get_lsp_server_config, get_role_provider_config,
-    get_role_routing, save_lsp_server_config, save_role_provider,
+    clear_role_assignment, get_lsp_known_servers, get_lsp_server_config, get_role_assignments,
+    save_lsp_server_config, set_role_assignment,
 };
 
 // 注（Plan28 P3-9）：原 agent_prompt 模块（仅持有三个灵魂常量）已不再需要——常量权威定义
@@ -231,21 +231,20 @@ fn main() {
             clear_workspace,
             check_update,
             install_update,
-            get_model_provider_config,
-            save_model_provider,
-            remove_model_provider,
-            resolve_role_model_provider,
-            test_provider_connection,
+            list_connections,
+            save_connection,
+            delete_connection,
+            test_connection,
+            list_models_for_connection,
             smoke_test_tool_call,
+            get_role_assignments,
+            set_role_assignment,
+            clear_role_assignment,
             get_app_setting,
             set_app_setting,
             get_lsp_known_servers,
             get_lsp_server_config,
             save_lsp_server_config,
-            get_role_routing,
-            get_role_provider_config,
-            save_role_provider,
-            clear_role_provider,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run MDGA desktop app");

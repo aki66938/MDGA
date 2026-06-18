@@ -9,14 +9,14 @@ use crate::checkpoint::apply_checkpoint_revert;
 use crate::mcp::spawn_mcp_connect;
 use crate::state::AppState;
 use mdga_deepseek_client::{
-    detect_api_key_status, get_user_balance, probe_tool_call, resolve_base_url, test_connection,
-    UserBalance,
+    detect_api_key_status, get_user_balance, probe_tool_call, resolve_base_url,
+    test_connection as test_connection_impl, UserBalance,
 };
 use mdga_shared::{ApiKeyStatus, PermissionMode};
 use mdga_storage::{
     add_mcp_server, add_permission_rule, clear_active_workspace, create_conversation,
     create_conversation_with_workspace, delete_conversation, delete_messages, get_active_workspace,
-    get_activity_events, get_conversation, get_messages, get_model_provider,
+    get_activity_events, get_conversation, get_messages,
     get_token_ledger_entries, list_conversations,
     list_file_checkpoints,
     list_mcp_servers, list_permission_rules, mark_checkpoint_reverted, remove_mcp_server,
@@ -25,9 +25,9 @@ use mdga_storage::{
     ActivityEventRecord, Conversation, FileCheckpoint, StoredMessage, Workspace,
 };
 use mdga_storage::{
-    delete_model_provider, get_lsp_server_config_json, get_setting, set_lsp_server_config_json,
-    set_setting, upsert_model_provider, ModelProvider, ROLE_ACTION, ROLE_CRITIQUE, ROLE_MAIN,
-    ROLE_PLAN,
+    delete_role_assignment, get_connection, get_lsp_server_config_json, get_role_assignment,
+    get_setting, resolve_role_provider, set_lsp_server_config_json, set_setting, upsert_connection,
+    upsert_role_assignment, ProviderConnection, ALL_ROLES, ROLE_MAIN,
 };
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -38,171 +38,181 @@ use tauri_plugin_updater::UpdaterExt;
 #[tauri::command]
 pub(crate) fn get_deepseek_api_key_status(state: State<AppState>) -> ApiKeyStatus {
     // Plan17 D3：纯以 DB 主 provider 是否已配置为准，不再读环境变量。
+    // 0.0.59：经 resolve_role_provider 从「连接库 + 角色引用」解析 main（合成出含 api_key 的 provider）。
     let key = state
         .db
         .lock()
         .ok()
-        .and_then(|db| get_model_provider(&db, "main").ok().flatten().map(|p| p.api_key));
+        .and_then(|db| resolve_role_provider(&db, ROLE_MAIN).ok().flatten().map(|p| p.api_key));
     detect_api_key_status(key.as_deref())
 }
 
-// ── 模型供应商（Plan17）─────────────────────────────────────────────────────
+// ── 连接库 + 角色引用（0.0.59）───────────────────────────────────────────────
+//
+// 把旧的「每角色一份完整 provider（含 key）」拆成两层：
+//   · connection = 一份「端点 + 密钥」接入（配一次，可被多个角色引用）；
+//   · role_assignment = 一条「角色 → 模型」纯引用（无 key，指向某 connection）。
+// 命令层：连接读出一律脱敏 api_key（回 ""）+ 一个 `hasKey: bool`；存时空 key=保留旧 key；
+// key 只流向真正的 provider HTTP Bearer，绝不回显、绝不记日志。
 
-/// 按角色读取 provider（main / vision）。api_key 脱敏为空：仅表明已配置 + 回传非密字段。
-#[tauri::command]
-pub(crate) fn get_model_provider_config(
-    state: State<AppState>,
-    role: String,
-) -> Result<Option<ModelProvider>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let mut provider = get_model_provider(&db, &role).map_err(|e| e.to_string())?;
-    if let Some(p) = provider.as_mut() {
-        p.api_key = String::new(); // 不回显明文 key（Plan17 §6.2）
-    }
-    Ok(provider)
+/// 连接的前端视图：脱敏（无 api_key 明文），附 `hasKey` 表明是否已配密钥。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConnectionView {
+    pub id: String,
+    pub label: Option<String>,
+    pub preset: Option<String>,
+    /// 自定义端点；None/空＝走 preset 官方端点。
+    pub base_url: Option<String>,
+    pub api_format: String,
+    /// 是否已配置密钥（明文绝不回传，仅以此布尔表明「已配」）。
+    pub has_key: bool,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
 }
 
-/// 保存（upsert）某角色的 provider。base_url 留空＝用 preset 官方端点。
-#[allow(clippy::too_many_arguments)]
+impl From<ProviderConnection> for ConnectionView {
+    fn from(c: ProviderConnection) -> Self {
+        ConnectionView {
+            id: c.id,
+            label: c.label,
+            preset: c.preset,
+            base_url: c.base_url,
+            api_format: c.api_format,
+            has_key: !c.api_key.trim().is_empty(),
+            created_at: c.created_at,
+            updated_at: c.updated_at,
+        }
+    }
+}
+
+/// 列出全部连接（脱敏，绝不回 api_key 明文）。
 #[tauri::command]
-pub(crate) fn save_model_provider(
-    state: State<AppState>,
-    role: String,
-    preset: Option<String>,
-    label: Option<String>,
-    base_url: Option<String>,
-    api_key: String,
-    model_id: String,
-    api_format: Option<String>,
-    context_window: Option<i64>,
-) -> Result<(), String> {
+pub(crate) fn list_connections(state: State<AppState>) -> Result<Vec<ConnectionView>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    // api_format 仅视觉 provider 有意义（openai|anthropic），主模型恒 openai；缺省落回 openai。
-    let api_format = api_format.as_deref().unwrap_or("openai");
-    // Plan27 C2 #2：上下文窗口（tokens，可选）。非正值视为未配置，归一为 None。
-    let context_window = context_window.filter(|&cw| cw > 0);
-    // F1（Plan22）：密钥留空＝保留该 role 已存的 key，不覆盖为空。
-    // UI 占位「已配置 ••••（如需更换请重新输入）」暗示"留空即保留"，此前 upsert 直接写空会清掉凭据，
-    // 导致"不重输 key 再保存一次就失效"。无既有 provider（首次配置）时留空仍为空（前端已拦首配空 key）。
-    let api_key = if api_key.trim().is_empty() {
-        get_model_provider(&db, &role)
-            .ok()
-            .flatten()
-            .map(|p| p.api_key)
-            .unwrap_or_default()
-    } else {
-        api_key.trim().to_string()
-    };
-    upsert_model_provider(
+    let conns = mdga_storage::list_connections(&db).map_err(|e| e.to_string())?;
+    Ok(conns.into_iter().map(ConnectionView::from).collect())
+}
+
+/// 新建或更新一个连接。
+///
+/// `id` 空＝创建；非空＝更新该连接。`api_key` 空＝保留该连接已存密钥（更新场景；首配空 key 由前端拦截）。
+/// base_url 空串归一为「走 preset 官方端点」。返回脱敏后的连接视图。
+/// 若被更新的连接是某些角色（含主链路/embedding）引用的 main 连接，刷新 embedding 快照。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) fn save_connection(
+    state: State<AppState>,
+    id: Option<String>,
+    label: Option<String>,
+    preset: Option<String>,
+    baseUrl: Option<String>,
+    apiKey: Option<String>,
+    apiFormat: Option<String>,
+) -> Result<ConnectionView, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let id = id.as_deref().unwrap_or("");
+    let api_key = apiKey.as_deref().unwrap_or("");
+    let api_format = apiFormat.as_deref().unwrap_or("openai");
+    let saved = upsert_connection(
         &db,
-        &role,
-        preset.as_deref(),
+        id,
         label.as_deref(),
-        base_url.as_deref().filter(|s| !s.trim().is_empty()),
-        &api_key,
-        model_id.trim(),
+        preset.as_deref(),
+        baseUrl.as_deref(),
+        api_key,
         api_format,
-        context_window,
     )
     .map_err(|e| e.to_string())?;
-    // P2 / 0.0.58:主 provider 变更会改 embedding 端点/凭据,刷新快照(其它角色变更无副作用)。
-    if role == mdga_storage::ROLE_MAIN {
-        crate::embedding::refresh_embedding_config(&db);
-    }
+    // 连接端点/凭据可能改变了 main（embedding 复用 main provider）；保守刷新一次快照（无副作用）。
+    crate::embedding::refresh_embedding_config(&db);
+    Ok(ConnectionView::from(saved))
+}
+
+/// 删除一个连接。若仍被任意角色引用，拒绝删除并返回「仍被某些角色引用」错误。
+#[tauri::command]
+pub(crate) fn delete_connection(state: State<AppState>, id: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    mdga_storage::delete_connection(&db, &id).map_err(|e| e.to_string())?;
+    crate::embedding::refresh_embedding_config(&db);
     Ok(())
 }
 
-/// 删除某角色的 provider（如关闭模态扩展时移除视觉 provider）。
-#[tauri::command]
-pub(crate) fn remove_model_provider(state: State<AppState>, role: String) -> Result<(), String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    delete_model_provider(&db, &role).map_err(|e| e.to_string())?;
-    // 主 provider 被删 → embedding 端点不可用,刷新快照(将回退关闭)。
-    if role == mdga_storage::ROLE_MAIN {
-        crate::embedding::refresh_embedding_config(&db);
-    }
-    Ok(())
-}
-
-/// R8 角色多模型路由：解析某功能角色（action / plan / critique）实际生效的 provider。
+/// 对某连接做一次「测试连接」：复用既有 test_connection 逻辑，针对**已存连接**与一个待测模型。
 ///
-/// 与 get_model_provider_config 的差别：该命令带「回退主模型」语义——角色未单独配置（或被禁用）时
-/// 返回主模型 provider，使前端能展示「该角色当前实际用哪个模型」（自身配置 vs 回退 main）。
-/// api_key 同样脱敏为空（不回显明文）。角色未配置且连 main 都没配时返回 None。
+/// 入参 connectionId 指向某连接（base_url/api_key/api_format 取该连接），model 为待测模型 ID
+/// （连接本身不含模型；测试需指定一个）。成功返回「连接成功」，失败返回人话化错误。
+#[allow(non_snake_case)]
 #[tauri::command]
-pub(crate) fn resolve_role_model_provider(
-    state: State<AppState>,
-    role: String,
-) -> Result<Option<ModelProvider>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let mut provider =
-        mdga_storage::resolve_role_provider(&db, &role).map_err(|e| e.to_string())?;
-    if let Some(p) = provider.as_mut() {
-        p.api_key = String::new(); // 不回显明文 key
-    }
-    Ok(provider)
-}
-
-/// 对某 role 的供应商做一次「测试连接」（Plan19 C-A）：用极小请求探测端点连通与鉴权是否可用。
-///
-/// 入参为前端表单的当前值;任一项为空则回退到 DB 已存 provider（支持「已配状态下不重输 Key 直接测试」，
-/// 以及 base_url 留空走 preset 官方端点）。成功返回「连接成功」，失败返回人话化错误文案。
-#[tauri::command]
-pub(crate) async fn test_provider_connection(
+pub(crate) async fn test_connection(
     state: State<'_, AppState>,
-    role: String,
-    base_url: String,
-    api_key: String,
+    connectionId: String,
     model: String,
-    api_format: String,
 ) -> Result<String, String> {
-    // 读已存 provider 作为各字段的回退来源。
-    let stored = {
+    let conn = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        get_model_provider(&db, &role).ok().flatten()
+        get_connection(&db, &connectionId)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "连接不存在".to_string())?
     };
-    // base_url：优先用入参；为空则用已存 base_url/preset 解析官方端点。
-    let resolved_base = {
-        let explicit = base_url.trim();
-        if !explicit.is_empty() {
-            explicit.trim_end_matches('/').to_string()
-        } else if let Some(p) = &stored {
-            resolve_base_url(p.base_url.as_deref(), p.preset.as_deref()).unwrap_or_default()
-        } else {
-            String::new()
-        }
-    };
-    // api_key / model / api_format：入参为空则回退已存值。
-    let key = if api_key.trim().is_empty() {
-        stored.as_ref().map(|p| p.api_key.clone()).unwrap_or_default()
-    } else {
-        api_key
-    };
-    let model = if model.trim().is_empty() {
-        stored.as_ref().map(|p| p.model_id.clone()).unwrap_or_default()
-    } else {
-        model
-    };
-    let api_format = if api_format.trim().is_empty() {
-        stored
-            .as_ref()
-            .map(|p| p.api_format.clone())
-            .unwrap_or_else(|| "openai".to_string())
-    } else {
-        api_format
-    };
-
-    test_connection(&resolved_base, &key, &model, &api_format)
+    let resolved_base = resolve_base_url(conn.base_url.as_deref(), conn.preset.as_deref())
+        .ok_or_else(|| "无法解析端点：请填写 Base URL 或选择内置预设".to_string())?;
+    // 测试用模型：入参优先；为空则报错（连接不含模型，无法兜底）。
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("请提供一个待测模型 ID".to_string());
+    }
+    test_connection_impl(&resolved_base, &conn.api_key, model, &conn.api_format)
         .await
         .map(|_| "连接成功".to_string())
         .map_err(|e| e.to_string())
+}
+
+/// 列出某连接「预设」对应的已知模型 ID 列表，供 UI 下拉；custom/未知预设返回空（UI 自由输入）。
+///
+/// 这些是各家公开的常用模型清单（精选、可增补）；连接的 api_key 不参与（不发网络），纯本地查表。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) fn list_models_for_connection(
+    state: State<AppState>,
+    connectionId: String,
+) -> Result<Vec<String>, String> {
+    let conn = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        get_connection(&db, &connectionId).map_err(|e| e.to_string())?
+    };
+    let preset = conn.as_ref().and_then(|c| c.preset.as_deref()).unwrap_or("");
+    Ok(known_models_for_preset(preset))
+}
+
+/// 各内置预设的已知模型 ID 列表（精选，可增补）；custom/未知 → 空（UI 自由输入）。
+fn known_models_for_preset(preset: &str) -> Vec<String> {
+    let list: &[&str] = match preset {
+        "deepseek" => &["deepseek-chat", "deepseek-reasoner"],
+        "zhipu" => &["glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4-plus", "glm-4-flash", "glm-4v"],
+        "moonshot" => &[
+            "kimi-k2-0905-preview",
+            "moonshot-v1-8k",
+            "moonshot-v1-32k",
+            "moonshot-v1-128k",
+        ],
+        "qwen" => &[
+            "qwen-max",
+            "qwen-plus",
+            "qwen-turbo",
+            "qwen2.5-coder-32b-instruct",
+            "qwen-vl-max",
+        ],
+        _ => &[],
+    };
+    list.iter().map(|s| s.to_string()).collect()
 }
 
 /// 对某 role 的供应商做一次「工具调用冒烟探测」（Plan25 C-1，#3）：发一个极小请求并提供一个
 /// trivial 函数工具，判断该模型在当前端点能否返回 tool_call（原生 tool_calls 或正文被兜底
 /// 恢复出 tool_call 均算成功）。返回 true=支持工具调用，false=不支持。
 ///
-/// 字段回退逻辑与 [`test_provider_connection`] 完全一致：任一入参为空则回退 DB 已存 provider，
+/// 字段回退逻辑：任一入参为空则回退到该 role 经 resolve_role_provider 解析出的已存 provider，
 /// base_url 留空走 preset 官方端点；便于「已配状态下不重输 Key 直接测试」。
 #[tauri::command]
 pub(crate) async fn smoke_test_tool_call(
@@ -213,10 +223,10 @@ pub(crate) async fn smoke_test_tool_call(
     model: String,
     api_format: String,
 ) -> Result<bool, String> {
-    // 读已存 provider 作为各字段的回退来源。
+    // 读已存 provider 作为各字段的回退来源（0.0.59：经连接库+引用解析该角色）。
     let stored = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        get_model_provider(&db, &role).ok().flatten()
+        resolve_role_provider(&db, &role).ok().flatten()
     };
     // base_url：优先用入参；为空则用已存 base_url/preset 解析官方端点。
     let resolved_base = {
@@ -332,137 +342,153 @@ pub(crate) fn save_lsp_server_config(
     Ok(())
 }
 
-// ── R8 角色→模型路由设置（R-uicfg / 0.0.57）──────────────────────────────────
+// ── 角色引用（role → 连接 + 模型）设置（0.0.59）──────────────────────────────
 
-/// 一个功能角色当前的路由状态：是否有**自身**配置、以及实际生效的模型/供应商展示信息。
+/// 一个角色当前的引用状态视图（无密钥）：自身引用 + 实际生效（回退 main 后）。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RoleRouting {
-    /// 角色标识：action / plan / critique。
+pub(crate) struct RoleAssignmentView {
+    /// 角色：main|action|plan|critique|vision|subagent|embed。
     pub role: String,
-    /// 该角色是否有一条**自身**已配置且启用的 provider（false＝回退主模型）。
-    pub configured: bool,
-    /// 实际生效的供应商预设（如 deepseek / custom）；回退到 main 时即 main 的预设。None＝连 main 都没配。
-    pub effective_preset: Option<String>,
-    /// 实际生效的模型 ID（自身配置或回退 main 的模型）。None＝连 main 都没配。
-    pub effective_model: Option<String>,
-    /// 实际生效来源：'self'＝用了角色自身配置；'main'＝回退到主模型；'none'＝主模型也没配。
+    /// 该角色**自身**引用指向的连接 id（无自身引用则 None ⇒ 回退 main）。
+    pub connection_id: Option<String>,
+    /// 该连接的展示名（便于 UI 直接渲染，免再查一次）。None＝无自身引用或连接已不存在。
+    pub connection_label: Option<String>,
+    /// 自身引用的模型 ID（无自身引用则 None）。
+    pub model_id: Option<String>,
+    /// 自身引用的上下文窗口（tokens，可空）。
+    pub context_window: Option<i64>,
+    /// 自身引用是否启用（无自身引用则 false）。
+    pub enabled: bool,
+    /// 实际生效（经回退）：用于 UI 展示「跟随 main」。
+    pub effective: EffectiveRef,
+}
+
+/// 实际生效的引用（resolve 后）：连接展示名 + 模型 + 来源（self=用自身；main=回退主模型）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EffectiveRef {
+    /// 实际生效连接的展示名（None＝连 main 都没配）。
+    pub connection_label: Option<String>,
+    /// 实际生效模型 ID（None＝连 main 都没配）。
+    pub model_id: Option<String>,
+    /// 来源：'self'＝用了角色自身引用；'main'＝回退到主模型；'none'＝主模型也没配。
     pub source: String,
 }
 
-/// 读取三个功能角色（action / plan / critique）的路由概览，供设置页一屏展示「各角色当前用哪个模型」。
+/// 读取全部角色（main|action|plan|critique|vision|subagent|embed）的引用概览。
 ///
-/// 语义复用 resolve_role_provider（未配置/禁用即回退 main）。不回显任何 api_key。
+/// 每个角色返回：自身引用（connectionId/modelId/contextWindow/enabled，None＝跟随 main）+ 实际生效
+/// （effective：经 resolve_role_provider 回退后的连接名/模型 + source）。绝不回显任何 api_key。
 #[tauri::command]
-pub(crate) fn get_role_routing(state: State<AppState>) -> Result<Vec<RoleRouting>, String> {
+pub(crate) fn get_role_assignments(
+    state: State<AppState>,
+) -> Result<Vec<RoleAssignmentView>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for role in [ROLE_ACTION, ROLE_PLAN, ROLE_CRITIQUE] {
-        // 自身是否配置且启用。
-        let own = mdga_storage::get_model_provider(&db, role).map_err(|e| e.to_string())?;
-        let configured = own.as_ref().map(|p| p.enabled).unwrap_or(false);
-        // 实际生效（回退 main）。
-        let effective =
-            mdga_storage::resolve_role_provider(&db, role).map_err(|e| e.to_string())?;
-        let source = if configured {
+    let mut out = Vec::with_capacity(ALL_ROLES.len());
+    for &role in ALL_ROLES {
+        // 自身引用（不回退）。
+        let own = get_role_assignment(&db, role).map_err(|e| e.to_string())?;
+        let (own_conn_id, own_conn_label, own_model, own_ctx, own_enabled) = match &own {
+            Some(a) => {
+                let label = get_connection(&db, &a.connection_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|c| c.label.or(c.preset));
+                (
+                    Some(a.connection_id.clone()),
+                    label,
+                    Some(a.model_id.clone()),
+                    a.context_window,
+                    a.enabled,
+                )
+            }
+            None => (None, None, None, None, false),
+        };
+        // 实际生效（回退 main）。resolve 合成出的 ModelProvider 带 preset/label/model_id；
+        // 用其 preset/label 推连接展示名。source 由「自身是否启用且存在」判定。
+        let effective_provider =
+            resolve_role_provider(&db, role).map_err(|e| e.to_string())?;
+        let source = if own_enabled && own.is_some() {
             "self"
-        } else if effective.is_some() {
+        } else if effective_provider.is_some() {
             "main"
         } else {
             "none"
         };
-        out.push(RoleRouting {
-            role: role.to_string(),
-            configured,
-            effective_preset: effective.as_ref().and_then(|p| p.preset.clone()),
-            effective_model: effective.as_ref().map(|p| p.model_id.clone()),
+        let effective = EffectiveRef {
+            connection_label: effective_provider
+                .as_ref()
+                .and_then(|p| p.label.clone().or_else(|| p.preset.clone())),
+            model_id: effective_provider.as_ref().map(|p| p.model_id.clone()),
             source: source.to_string(),
+        };
+        out.push(RoleAssignmentView {
+            role: role.to_string(),
+            connection_id: own_conn_id,
+            connection_label: own_conn_label,
+            model_id: own_model,
+            context_window: own_ctx,
+            enabled: own_enabled,
+            effective,
         });
     }
     Ok(out)
 }
 
-/// 读取某功能角色**自身**已配置的 provider（不回退 main；用于路由设置页表单回填）。api_key 脱敏为空。
+/// 设置某角色的引用：把 role 绑到某连接 + 模型（纯引用，无密钥）。role 必须是允许的角色之一。
 ///
-/// 与 get_model_provider_config 等价但语义更明确（路由页用）；role 仅允许 action/plan/critique。
+/// connectionId 必须指向一个已存连接；model_id 必填。enabled 缺省为 true。覆盖该角色已有引用。
+/// 改 main 会影响 embedding（复用 main provider）；保守刷新一次快照。
+#[allow(non_snake_case)]
 #[tauri::command]
-pub(crate) fn get_role_provider_config(
+pub(crate) fn set_role_assignment(
     state: State<AppState>,
     role: String,
-) -> Result<Option<ModelProvider>, String> {
-    if !matches!(role.as_str(), ROLE_ACTION | ROLE_PLAN | ROLE_CRITIQUE) {
-        return Err(format!("不支持的路由角色: {role}（仅 action/plan/critique）"));
-    }
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let mut provider = mdga_storage::get_model_provider(&db, &role).map_err(|e| e.to_string())?;
-    if let Some(p) = provider.as_mut() {
-        p.api_key = String::new();
-    }
-    Ok(provider)
-}
-
-/// 设置某功能角色（action/plan/critique）绑定的模型+供应商；持久化经 upsert_model_provider。
-///
-/// 语义：role 仅允许三种功能角色（main/vision 走各自既有命令，不在此）。api_key 留空＝保留该角色已存 key
-/// （与 save_model_provider 一致）。保存后该角色即用自身模型；要回退主模型请调用 clear_role_provider。
-#[allow(clippy::too_many_arguments)]
-#[tauri::command]
-pub(crate) fn save_role_provider(
-    state: State<AppState>,
-    role: String,
-    preset: Option<String>,
-    label: Option<String>,
-    base_url: Option<String>,
-    api_key: String,
-    model_id: String,
-    context_window: Option<i64>,
+    connectionId: String,
+    modelId: String,
+    contextWindow: Option<i64>,
+    enabled: Option<bool>,
 ) -> Result<(), String> {
-    if !matches!(role.as_str(), ROLE_ACTION | ROLE_PLAN | ROLE_CRITIQUE) {
-        return Err(format!("不支持的路由角色: {role}（仅 action/plan/critique）"));
+    if !ALL_ROLES.contains(&role.as_str()) {
+        return Err(format!("不支持的角色: {role}"));
     }
-    if model_id.trim().is_empty() {
+    if modelId.trim().is_empty() {
         return Err("请填写模型 ID".to_string());
     }
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let context_window = context_window.filter(|&cw| cw > 0);
-    // 留空 key＝保留已存（避免清掉凭据）；首配空 key 由前端拦截。
-    let api_key = if api_key.trim().is_empty() {
-        mdga_storage::get_model_provider(&db, &role)
-            .ok()
-            .flatten()
-            .map(|p| p.api_key)
-            .unwrap_or_default()
-    } else {
-        api_key.trim().to_string()
-    };
-    // 功能角色恒为 openai 兼容（api_format 固定 openai）。
-    upsert_model_provider(
+    // 引用必须指向一个真实存在的连接。
+    if get_connection(&db, &connectionId)
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        return Err("所选连接不存在，请先创建连接".to_string());
+    }
+    upsert_role_assignment(
         &db,
         &role,
-        preset.as_deref(),
-        label.as_deref(),
-        base_url.as_deref().filter(|s| !s.trim().is_empty()),
-        &api_key,
-        model_id.trim(),
-        "openai",
-        context_window,
+        &connectionId,
+        modelId.trim(),
+        contextWindow.filter(|&cw| cw > 0),
+        enabled.unwrap_or(true),
     )
     .map_err(|e| e.to_string())?;
+    // main 引用变更可能改 embedding 端点/凭据/模型；保守刷新（其它角色无副作用）。
+    if role == ROLE_MAIN || role == mdga_storage::ROLE_EMBED {
+        crate::embedding::refresh_embedding_config(&db);
+    }
     Ok(())
 }
 
-/// 清除某功能角色的 provider，使其回退到主模型（R8 默认行为）。role 仅允许 action/plan/critique。
+/// 清除某角色的引用，使其回退到主模型。拒绝清除 role==main（main 不可清）。
 #[tauri::command]
-pub(crate) fn clear_role_provider(state: State<AppState>, role: String) -> Result<(), String> {
-    if !matches!(role.as_str(), ROLE_ACTION | ROLE_PLAN | ROLE_CRITIQUE) {
-        return Err(format!("不支持的路由角色: {role}（仅 action/plan/critique）"));
-    }
+pub(crate) fn clear_role_assignment(state: State<AppState>, role: String) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    // 防御：绝不允许经此删主模型。
-    if role == ROLE_MAIN {
-        return Err("不能清除主模型".to_string());
+    delete_role_assignment(&db, &role).map_err(|e| e.to_string())?;
+    if role == mdga_storage::ROLE_EMBED {
+        crate::embedding::refresh_embedding_config(&db);
     }
-    delete_model_provider(&db, &role).map_err(|e| e.to_string())
+    Ok(())
 }
 
 // ── 会话管理 ──────────────────────────────────────────────────────────────
@@ -740,7 +766,7 @@ pub(crate) fn pin_conversation(
 pub(crate) async fn get_account_balance(state: State<'_, AppState>) -> Result<UserBalance, String> {
     let api_key = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        let provider = get_model_provider(&db, "main")
+        let provider = resolve_role_provider(&db, ROLE_MAIN)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
         // Plan21 #5：余额查询仅 DeepSeek 端点支持。非 deepseek 主供应商直接门禁返回，
@@ -842,7 +868,8 @@ pub(crate) async fn compact_history(
     let (base_url, api_key, messages) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         // 主模型 provider（Plan17 D3）：一律从 DB 取，无主 provider 即报错引导去设置页。
-        let (base_url, api_key) = match get_model_provider(&db, "main") {
+        // 0.0.59：经 resolve_role_provider 从「连接库 + 角色引用」解析 main。
+        let (base_url, api_key) = match resolve_role_provider(&db, ROLE_MAIN) {
             Ok(Some(p)) => {
                 let bu = resolve_base_url(p.base_url.as_deref(), p.preset.as_deref())
                     .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;

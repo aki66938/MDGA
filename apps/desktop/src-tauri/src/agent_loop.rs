@@ -43,8 +43,8 @@ use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMes
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
 use mdga_shared::PermissionMode;
 use mdga_storage::{
-    get_conversation, get_messages, get_model_provider, list_permission_rules,
-    resolve_role_provider, save_token_ledger_entry, ROLE_ACTION, ROLE_PLAN,
+    get_conversation, get_messages, get_role_assignment, list_permission_rules,
+    resolve_role_provider, save_token_ledger_entry, ROLE_ACTION, ROLE_MAIN, ROLE_PLAN, ROLE_VISION,
 };
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use mdga_tool_runtime::RunCommandRequest;
@@ -121,7 +121,8 @@ pub(crate) async fn send_message(
         // Plan20 🔴1：model_id 一并取出，作为本轮唯一权威模型名——主链路 chat 与计价均以它为准，
         // 不再用入参 model（前端控制行写死的 DeepSeek 清单）决定模型，否则配非 DeepSeek 主供应商必失败。
         // Plan27 C2 #2：主模型 context_window 用于推导上下文压缩软上限（始终以主模型为准，与角色无关）。
-        let main_context_window = match get_model_provider(&db, "main") {
+        // 0.0.59：主模型经 resolve_role_provider 从「连接库 + 角色引用」解析（main 不回退）。
+        let main_context_window = match resolve_role_provider(&db, ROLE_MAIN) {
             Ok(Some(p)) => p.context_window,
             _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
         };
@@ -136,10 +137,15 @@ pub(crate) async fn send_message(
             _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
         };
         // 视觉 provider（Plan18）：仅在本轮带图时才需要；未配置则下方走「拒图」降级。
+        // 0.0.59：视觉角色**不回退 main**——保留「未单独配置 vision ⇒ 拒图降级」的原行为。
+        // 仅当 vision 有一条自身且启用的引用时，才经 resolve 合成出视觉 provider；否则 None。
         let vision_provider = if images.is_empty() {
             None
         } else {
-            get_model_provider(&db, "vision").ok().flatten()
+            match get_role_assignment(&db, ROLE_VISION) {
+                Ok(Some(a)) if a.enabled => resolve_role_provider(&db, ROLE_VISION).ok().flatten(),
+                _ => None,
+            }
         };
         (conversation, rules, base_url, api_key, model_id, main_context_window, vision_provider)
     };
@@ -476,7 +482,11 @@ async fn execute_ask_vision(
             Err(e) => return (Err(e.to_string()), None),
         };
         let images = collect_conversation_images(&messages);
-        let vp = get_model_provider(&db, "vision").ok().flatten();
+        // 0.0.59：视觉不回退 main——未单独配置 vision 即视为未配置（下方走优雅降级提示）。
+        let vp = match get_role_assignment(&db, ROLE_VISION) {
+            Ok(Some(a)) if a.enabled => resolve_role_provider(&db, ROLE_VISION).ok().flatten(),
+            _ => None,
+        };
         (images, vp)
     };
 
@@ -644,6 +654,26 @@ async fn chat_with_builtin_tools(
         NetworkMode::Disabled,
     )
     .map_err(|e| e.to_string())?;
+    // 0.0.59 子代理模型：解析 ROLE_SUBAGENT（回退 subagent → action → main）。**默认**（subagent/action
+    // 均未单独配置）解析出的端点/key/model 与「子代理继承主链路 action→main」逐字节一致——故未显式
+    // 配置 subagent 时行为不变；仅当用户显式给 subagent（或 action）配模型时，子代理才用那个模型。
+    // 解析失败（理论上仅当连 main 都没配，但主链路此前已保证 main 存在）则回退到本轮 base_url/api_key/model。
+    let (sub_base_url, sub_api_key, sub_model) = {
+        let st = app.state::<AppState>();
+        let resolved = st
+            .db
+            .lock()
+            .ok()
+            .and_then(|db| mdga_storage::resolve_subagent_provider(&db).ok().flatten())
+            .and_then(|p| {
+                resolve_base_url(p.base_url.as_deref(), p.preset.as_deref())
+                    .map(|bu| (bu, p.api_key, p.model_id))
+            });
+        resolved.unwrap_or_else(|| {
+            (base_url.to_string(), api_key.to_string(), model.to_string())
+        })
+    };
+
     // 工具 schema：Built-in + 已连接 MCP server 的外部工具。
     let tool_schemas: Vec<serde_json::Value> = all_builtin_tool_schemas()
         .into_iter()
@@ -1239,10 +1269,11 @@ async fn chat_with_builtin_tools(
                         serde_json::json!({ "state": "thinking", "round": round }),
                     );
                     // Plan25 C-3：补传本轮权限模式与权限规则,供可写子代理(mode="write")复用主链路门控/检查点。
+                    // 0.0.59：子代理用 ROLE_SUBAGENT 解析出的端点/key/model（默认＝action→main，行为不变）。
                     let (sub_result, sub_usage) = execute_run_subtask(
-                        base_url,
-                        api_key,
-                        model,
+                        &sub_base_url,
+                        &sub_api_key,
+                        &sub_model,
                         workspace_path,
                         &arguments,
                         app,
@@ -1263,9 +1294,9 @@ async fn chat_with_builtin_tools(
                         serde_json::json!({ "state": "thinking", "round": round }),
                     );
                     let (sub_result, sub_usage) = execute_run_parallel_subtasks(
-                        base_url,
-                        api_key,
-                        model,
+                        &sub_base_url,
+                        &sub_api_key,
+                        &sub_model,
                         workspace_path,
                         &arguments,
                         app,
