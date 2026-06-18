@@ -94,10 +94,12 @@ const SUBTASK_MAX_ROUNDS: usize = 15;
 
 /// run_subtask 工具：用独立上下文跑一个探索 / 工作子代理，返回简明报告与消耗的 usage。
 ///
-/// read 模式（默认）：子代理只能 list/read/search/stat，强制 Restricted + 断网。
-/// write 模式（Plan25 C-3）：子代理额外可写 / 编辑 / 跑命令，继承主链路传入的 `permission`，
-/// 每次写 / 删 / 命令类调用都复用主链路的门控（`gate_tool_decision` + `request_tool_approval`）与
-/// 检查点（`capture_checkpoint_before` / `persist_checkpoint`），绝不绕过权限。
+/// 可干活模式（0.0.65 起的**默认**；显式 `mode:"write"` 同此）：子代理可读 / 写 / 编辑 / 跑命令，
+/// 继承主链路传入的 `permission`，每次写 / 删 / 命令类调用都复用主链路的门控（`gate_tool_decision`
+/// + `request_tool_approval`,含「不可回退」强制审批）与检查点（`capture_checkpoint_before` /
+/// `persist_checkpoint`），命令走沙箱感知路径（`execute_run_command_tool`，遵循 command_sandbox 开关），
+/// **绝不绕过权限/沙箱**。
+/// read 模式（显式 `mode:"read"` 或请求 background 时）：子代理只能 list/read/search/stat，强制 Restricted + 断网。
 /// 工具事件以 `sub:` 前缀推给前端展示。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_run_subtask(
@@ -373,10 +375,32 @@ async fn run_subtask_loop(
             } else {
                 None
             };
+            // 不可回退（无法快照原内容，如 delete_dir / 删已存在文件快照失败）：与主链路一致——
+            // 即便被自动放行(Allow)也强制一次「不可回退」额外审批，审批弹窗带警告标(0.0.65 补齐)。
+            let irreversible = capture.as_ref().map(|c| !c.revertible).unwrap_or(false);
             if guarded {
                 let decision = gate_tool_decision(&security_context, name, args, permission_rules);
                 let proceed = match decision {
-                    ToolGate::Allow => true,
+                    ToolGate::Allow => {
+                        if irreversible {
+                            let approved = request_tool_approval(app, name, args, true).await;
+                            if !approved {
+                                feed_tool_denial(
+                                    app,
+                                    conversation_id,
+                                    &display_name,
+                                    args,
+                                    workspace_path,
+                                    "用户拒绝了该不可回退操作",
+                                    &call.id,
+                                    &mut wire,
+                                );
+                            }
+                            approved
+                        } else {
+                            true
+                        }
+                    }
                     ToolGate::Deny(reason) => {
                         feed_tool_denial(
                             app,
@@ -391,7 +415,7 @@ async fn run_subtask_loop(
                         false
                     }
                     ToolGate::Ask => {
-                        let approved = request_tool_approval(app, name, args, false).await;
+                        let approved = request_tool_approval(app, name, args, irreversible).await;
                         if !approved {
                             feed_tool_denial(
                                 app,
@@ -424,7 +448,13 @@ async fn run_subtask_loop(
                 workspace_path,
             );
             // 只读工具与已放行的写工具统一走内建执行器（execute_builtin_tool_call 内部再做工具名校验）。
-            let result = execute_builtin_tool_call(&security_context, name, args);
+            // 但 run_command 必须走与主代理一致的**沙箱感知**路径（读用户 command_sandbox 开关 + 会话网络
+            // 模式）——否则默认可干活子代理会在用户开了沙箱的情况下裸跑命令(隔离降级,与 R3 修复同因)。
+            let result = if name == "run_command" {
+                crate::command_run::execute_run_command_tool(app, &security_context, args)
+            } else {
+                execute_builtin_tool_call(&security_context, name, args)
+            };
             let (output, status, error) = match &result {
                 Ok(value) => {
                     // 写工具成功后落检查点（同主链路），供后续回退。
