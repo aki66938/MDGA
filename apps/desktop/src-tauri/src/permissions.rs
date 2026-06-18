@@ -43,8 +43,10 @@ pub(crate) fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability
         | "lsp_references" | "lsp_hover" | "lsp_diagnostics" => Ok(ToolCapability::FileRead),
         // git_add/git_commit/git_branch 改动暂存区/引用，与文件写同档（R4）：默认模式自动放行、
         // AskEveryTime 逐次审批、Restricted 拒绝；都在工作区内、可审计、可回滚。
-        "create_file" | "write_file" | "edit_file" | "apply_patch" | "make_dir" | "move_path"
-        | "git_add" | "git_commit" | "git_branch" => Ok(ToolCapability::FileWrite),
+        "create_file" | "write_file" | "edit_file" | "apply_patch" | "apply_multi_patch"
+        | "make_dir" | "move_path" | "git_add" | "git_commit" | "git_branch" => {
+            Ok(ToolCapability::FileWrite)
+        }
         "delete_file" | "delete_dir" => Ok(ToolCapability::FileDelete),
         // 注册 MCP 会拉起外部进程/网络服务，按命令执行级别裁决（FullAccess 或审批）。
         "run_command" | "add_mcp_server" => Ok(ToolCapability::CommandRun),
@@ -370,15 +372,27 @@ fn truncate_preview(text: &str) -> String {
 }
 
 /// 从工具参数中提取审批展示用的目标（path / from / command）。
+/// apply_multi_patch 无单一 path：汇总其 files[].path 作目标串，让审批弹窗能显示受影响文件。
 fn approval_target(arguments: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(arguments)
-        .ok()
-        .and_then(|value| {
-            ["path", "from", "command"]
-                .iter()
-                .find_map(|key| value.get(*key).and_then(|v| v.as_str()).map(str::to_string))
-        })
-        .unwrap_or_default()
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return String::new();
+    };
+    if let Some(found) = ["path", "from", "command"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(|v| v.as_str()).map(str::to_string))
+    {
+        return found;
+    }
+    if let Some(files) = value.get("files").and_then(|v| v.as_array()) {
+        let paths: Vec<String> = files
+            .iter()
+            .filter_map(|f| f.get("path").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        if !paths.is_empty() {
+            return paths.join(", ");
+        }
+    }
+    String::new()
 }
 
 /// 记录一次工具被拒绝（权限拒绝或用户拒绝），并把拒绝结果回灌给模型，让它换方案或说明。

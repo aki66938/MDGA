@@ -7,13 +7,13 @@ use crate::permissions::tool_capability_for_name;
 use crate::web::{execute_web_fetch, execute_web_search};
 use mdga_sandbox_runtime::SessionSecurityContext;
 use mdga_tool_runtime::{
-    code_overview, create_file, delete_dir, delete_file, edit_file, git_add, git_branch,
-    git_commit, git_diff, git_log, git_status, glob_files, list_dir, make_dir, move_path, read_file,
-    run_command, search_text, stat_path, write_file, CodeOverviewRequest, CreateFileRequest,
-    DeleteDirRequest, DeleteFileRequest, EditFileRequest, GitAddRequest, GitBranchRequest,
-    GitCommitRequest, GitDiffRequest, GitLogRequest, GitStatusRequest, GlobFilesRequest,
-    ListDirRequest, MakeDirRequest, MovePathRequest, ReadFileRequest, RunCommandRequest,
-    SearchTextRequest, StatPathRequest, WriteFileRequest,
+    apply_multi_patch, code_overview, create_file, delete_dir, delete_file, edit_file, git_add,
+    git_branch, git_commit, git_diff, git_log, git_status, glob_files, list_dir, make_dir,
+    move_path, read_file, run_command, search_text, stat_path, write_file, CodeOverviewRequest,
+    CreateFileRequest, DeleteDirRequest, DeleteFileRequest, EditFileRequest, GitAddRequest,
+    GitBranchRequest, GitCommitRequest, GitDiffRequest, GitLogRequest, GitStatusRequest,
+    GlobFilesRequest, ListDirRequest, MakeDirRequest, MovePathRequest, MultiEditRequest,
+    ReadFileRequest, RunCommandRequest, SearchTextRequest, StatPathRequest, WriteFileRequest,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -204,6 +204,47 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                         }
                     },
                     "required": ["path", "edits"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        // apply_multi_patch（R5）：跨多个文件的原子（全有或全无）精确替换，整批一个可回退单元。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "apply_multi_patch",
+                "description": "Apply a set of precise text replacements across MULTIPLE files ATOMICALLY (all-or-nothing). Provide a list of files, each with an ordered list of edits ({oldText, newText, replaceAll?}). ALL edits across ALL files are validated FIRST: each oldText must match in that file's current content (uniquely, unless replaceAll=true). If ANY edit is empty, missing, or non-unique (without replaceAll), or any file is missing/outside the workspace, the WHOLE batch fails and NOTHING is written — the error names which file and which edit failed. The whole multi-file change is recorded as ONE revertible checkpoint. Use this when one logical change spans several files (e.g. rename a symbol and update its callers); for a single file, prefer apply_patch.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "files": {
+                            "type": "array",
+                            "description": "Files to edit atomically. The same path must not appear twice.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": { "type": "string", "description": "Relative path of an existing UTF-8 text file inside the workspace." },
+                                    "edits": {
+                                        "type": "array",
+                                        "description": "Ordered replacements applied one after another to THIS file's content.",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "oldText": { "type": "string", "description": "Exact existing text to replace. Must be present (and unique unless replaceAll) in the current content when this edit runs." },
+                                                "newText": { "type": "string", "description": "Replacement text." },
+                                                "replaceAll": { "type": "boolean", "description": "Replace every occurrence in this file instead of requiring a unique match. Default false." }
+                                            },
+                                            "required": ["oldText", "newText"],
+                                            "additionalProperties": false
+                                        }
+                                    }
+                                },
+                                "required": ["path", "edits"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["files"],
                     "additionalProperties": false
                 }
             }
@@ -873,6 +914,14 @@ pub(crate) fn execute_builtin_tool_call(
                 .map_err(|err| err.to_string())
         }
         "apply_patch" => execute_apply_patch(workspace_path, arguments),
+        "apply_multi_patch" => {
+            let request = serde_json::from_str::<MultiEditRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(
+                apply_multi_patch(workspace_path, request).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())
+        }
         "read_file" => {
             let request = serde_json::from_str::<ReadFileRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;

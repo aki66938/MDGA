@@ -86,6 +86,55 @@ pub struct EditFileRequest {
     pub replace_all: bool,
 }
 
+/// R5 跨文件原子多文件编辑：一次请求里携带多个文件、每个文件多条精确替换。
+/// 语义为全有或全无——先在内存里对所有文件的所有 edit 校验唯一匹配，全部通过才一次性写盘；
+/// 任一条失败则一律不写（报告是哪个文件第几条、什么原因）。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiEdit {
+    pub old_text: String,
+    pub new_text: String,
+    /// 为 true 时替换该文件当前内容里全部匹配（计数仍要求 >=1）；否则要求恰好唯一。
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiEditFile {
+    /// 工作区内相对路径，须为已存在的 UTF-8 文本文件。
+    pub path: String,
+    /// 按顺序作用于该文件内容的替换列表（前一条结果是后一条的输入）。
+    pub edits: Vec<MultiEdit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiEditRequest {
+    /// 要原子编辑的文件集合（同一路径不可重复出现）。
+    pub files: Vec<MultiEditFile>,
+}
+
+/// 单个文件的多文件编辑结果（成功后回报）。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiEditFileResult {
+    pub relative_path: String,
+    pub absolute_path: String,
+    /// 该文件实际发生的替换次数（各 edit 累加）。
+    pub replacements: u64,
+    pub bytes_written: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiEditResult {
+    /// 是否全部应用成功（本类型只在成功时返回，恒为 true）。
+    pub ok: bool,
+    /// 涉及的文件数。
+    pub files: Vec<MultiEditFileResult>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MakeDirRequest {
@@ -436,6 +485,16 @@ pub enum ToolRuntimeError {
     PatternNotFound,
     #[error("替换文本出现多次，请提供更精确的 old_text 或启用 replace_all")]
     PatternNotUnique,
+    #[error("多文件编辑的 files 不能为空")]
+    MultiEditEmpty,
+    #[error("多文件编辑出现重复路径: {0}")]
+    MultiEditDuplicatePath(String),
+    #[error("多文件编辑失败（未写入任何文件）：文件 {path} 第 {edit} 条 edit {reason}")]
+    MultiEditFailed {
+        path: String,
+        edit: usize,
+        reason: String,
+    },
     #[error("目录非空，需显式 recursive=true 才能删除")]
     DirectoryNotEmpty,
     #[error("不能删除工作区根目录")]
@@ -595,6 +654,122 @@ pub fn edit_file(
         replacements: if request.replace_all { count as u64 } else { 1 },
         bytes_written: next.len() as u64,
     })
+}
+
+/// R5：对多个文件做一组精确替换，全有或全无（原子）。
+///
+/// 输入若干 `{ path, edits:[{old_text,new_text,replace_all?}] }`；语义：
+/// 1) 先对 **所有** 文件的 **所有** edit 在内存里完整校验并应用——每条 old_text 在该文件当前
+///    内容中须命中（replace_all=false 时还须唯一）；任一条失败（空串/未命中/多处命中）整体
+///    报错并 **不写任何文件**，错误指明是哪个文件第几条、什么原因；
+/// 2) 全部校验通过后才依次把每个文件的新内容写回磁盘。
+///
+/// 注意：本函数自身在「校验阶段失败 → 一律不写」这一意义上是原子的（失败即零副作用）。
+/// 实际写盘阶段若中途发生 I/O 错误（极少见），由上层的检查点系统（捕获了全部受影响文件的
+/// 原内容）作为一个可回退单元整体撤销。路径校验复用 `validate_relative_path` + 工作区内包含检查。
+pub fn apply_multi_patch(
+    workspace_root: impl AsRef<Path>,
+    request: MultiEditRequest,
+) -> Result<MultiEditResult, ToolRuntimeError> {
+    if request.files.is_empty() {
+        return Err(ToolRuntimeError::MultiEditEmpty);
+    }
+    let workspace = canonical_workspace(workspace_root)?;
+
+    // 第一遍：解析+校验所有路径、读入原文、在内存里应用所有 edit。任一失败即整体返回（零写盘）。
+    // pending 收集 (相对路径展示串, 绝对目标路径, 应用后新内容, 替换计数)。
+    struct Pending {
+        relative: String,
+        target: PathBuf,
+        new_content: String,
+        replacements: u64,
+    }
+    let mut pending: Vec<Pending> = Vec::with_capacity(request.files.len());
+    let mut seen_paths: Vec<String> = Vec::with_capacity(request.files.len());
+
+    for file in &request.files {
+        let relative = validate_relative_path(&file.path)?;
+        if relative.as_os_str().is_empty() {
+            return Err(ToolRuntimeError::EmptyPath);
+        }
+        let rel_norm = normalize_relative_path(&relative);
+        // 同一路径在一次请求里出现两次会让「当前内容」语义含糊（第二份基于磁盘旧内容），直接拒绝。
+        if seen_paths.iter().any(|p| p == &rel_norm) {
+            return Err(ToolRuntimeError::MultiEditDuplicatePath(rel_norm));
+        }
+        seen_paths.push(rel_norm.clone());
+
+        let candidate = workspace.join(&relative);
+        if !candidate.exists() {
+            return Err(ToolRuntimeError::MultiEditFailed {
+                path: rel_norm,
+                edit: 0,
+                reason: "目标文件不存在".to_string(),
+            });
+        }
+        let target = candidate.canonicalize()?;
+        if !target.starts_with(&workspace) {
+            return Err(ToolRuntimeError::PathOutsideWorkspace);
+        }
+
+        let mut content = read_utf8_file(&target, MAX_READ_BYTES)?;
+        let mut replacements: u64 = 0;
+        for (idx, edit) in file.edits.iter().enumerate() {
+            let no = idx + 1; // 面向模型用 1 基序号
+            if edit.old_text.is_empty() {
+                return Err(ToolRuntimeError::MultiEditFailed {
+                    path: rel_norm,
+                    edit: no,
+                    reason: "的 oldText 为空".to_string(),
+                });
+            }
+            let count = content.matches(&edit.old_text).count();
+            if count == 0 {
+                return Err(ToolRuntimeError::MultiEditFailed {
+                    path: rel_norm,
+                    edit: no,
+                    reason: "的 oldText 在（当前）文件中未命中".to_string(),
+                });
+            }
+            if count > 1 && !edit.replace_all {
+                return Err(ToolRuntimeError::MultiEditFailed {
+                    path: rel_norm,
+                    edit: no,
+                    reason: format!(
+                        "的 oldText 在（当前）文件中匹配到 {count} 处，必须唯一（或设 replaceAll）"
+                    ),
+                });
+            }
+            if edit.replace_all {
+                content = content.replace(&edit.old_text, &edit.new_text);
+                replacements += count as u64;
+            } else {
+                content = content.replacen(&edit.old_text, &edit.new_text, 1);
+                replacements += 1;
+            }
+        }
+
+        pending.push(Pending {
+            relative: rel_norm,
+            target,
+            new_content: content,
+            replacements,
+        });
+    }
+
+    // 第二遍：全部校验通过，依次写回。到这里所有 target 都已确认在工作区内的已存在文件。
+    let mut files = Vec::with_capacity(pending.len());
+    for p in pending {
+        std::fs::write(&p.target, p.new_content.as_bytes())?;
+        files.push(MultiEditFileResult {
+            relative_path: p.relative,
+            absolute_path: p.target.to_string_lossy().to_string(),
+            replacements: p.replacements,
+            bytes_written: p.new_content.len() as u64,
+        });
+    }
+
+    Ok(MultiEditResult { ok: true, files })
 }
 
 /// 删除工作区内单个文件。
@@ -2293,6 +2468,261 @@ mod tests {
         .expect_err("ambiguous edit should fail");
 
         assert!(matches!(err, ToolRuntimeError::PatternNotUnique));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    // ── R5 跨文件原子多文件编辑 ─────────────────────────────────────────────
+
+    #[test]
+    fn multi_patch_applies_edits_across_multiple_files() {
+        let workspace = temp_workspace();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/a.rs"), "fn alpha() { old_a }\n").unwrap();
+        std::fs::write(workspace.join("src/b.rs"), "fn beta() { old_b1 ; old_b2 }\n").unwrap();
+
+        let result = apply_multi_patch(
+            &workspace,
+            MultiEditRequest {
+                files: vec![
+                    MultiEditFile {
+                        path: "src/a.rs".to_string(),
+                        edits: vec![MultiEdit {
+                            old_text: "old_a".to_string(),
+                            new_text: "NEW_A".to_string(),
+                            replace_all: false,
+                        }],
+                    },
+                    MultiEditFile {
+                        path: "src/b.rs".to_string(),
+                        edits: vec![
+                            MultiEdit {
+                                old_text: "old_b1".to_string(),
+                                new_text: "NEW_B1".to_string(),
+                                replace_all: false,
+                            },
+                            MultiEdit {
+                                old_text: "old_b2".to_string(),
+                                new_text: "NEW_B2".to_string(),
+                                replace_all: false,
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+        .expect("multi patch should apply");
+
+        assert!(result.ok);
+        assert_eq!(result.files.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("src/a.rs")).unwrap(),
+            "fn alpha() { NEW_A }\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("src/b.rs")).unwrap(),
+            "fn beta() { NEW_B1 ; NEW_B2 }\n"
+        );
+        // 第二个文件累加了两条替换。
+        let b = result.files.iter().find(|f| f.relative_path == "src/b.rs").unwrap();
+        assert_eq!(b.replacements, 2);
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn multi_patch_replace_all_counts_all_matches() {
+        let workspace = temp_workspace();
+        std::fs::write(workspace.join("x.txt"), "dup dup dup").unwrap();
+
+        let result = apply_multi_patch(
+            &workspace,
+            MultiEditRequest {
+                files: vec![MultiEditFile {
+                    path: "x.txt".to_string(),
+                    edits: vec![MultiEdit {
+                        old_text: "dup".to_string(),
+                        new_text: "Z".to_string(),
+                        replace_all: true,
+                    }],
+                }],
+            },
+        )
+        .expect("replace_all should apply");
+
+        assert_eq!(result.files[0].replacements, 3);
+        assert_eq!(std::fs::read_to_string(workspace.join("x.txt")).unwrap(), "Z Z Z");
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn multi_patch_one_bad_edit_applies_nothing() {
+        let workspace = temp_workspace();
+        // 第一个文件本可成功；第二个文件的 edit 在文件中找不到，整体应失败、谁都不改。
+        std::fs::write(workspace.join("good.txt"), "hello here").unwrap();
+        std::fs::write(workspace.join("bad.txt"), "no target here").unwrap();
+        let good_before = std::fs::read_to_string(workspace.join("good.txt")).unwrap();
+        let bad_before = std::fs::read_to_string(workspace.join("bad.txt")).unwrap();
+
+        let err = apply_multi_patch(
+            &workspace,
+            MultiEditRequest {
+                files: vec![
+                    MultiEditFile {
+                        path: "good.txt".to_string(),
+                        edits: vec![MultiEdit {
+                            old_text: "hello".to_string(),
+                            new_text: "HI".to_string(),
+                            replace_all: false,
+                        }],
+                    },
+                    MultiEditFile {
+                        path: "bad.txt".to_string(),
+                        edits: vec![MultiEdit {
+                            old_text: "DOES_NOT_EXIST".to_string(),
+                            new_text: "x".to_string(),
+                            replace_all: false,
+                        }],
+                    },
+                ],
+            },
+        )
+        .expect_err("one bad edit should fail the whole batch");
+
+        match err {
+            ToolRuntimeError::MultiEditFailed { path, edit, .. } => {
+                assert_eq!(path, "bad.txt");
+                assert_eq!(edit, 1);
+            }
+            other => panic!("expected MultiEditFailed, got {other:?}"),
+        }
+        // 关键：第一个文件未被改动（全有或全无）。
+        assert_eq!(std::fs::read_to_string(workspace.join("good.txt")).unwrap(), good_before);
+        assert_eq!(std::fs::read_to_string(workspace.join("bad.txt")).unwrap(), bad_before);
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn multi_patch_ambiguous_edit_without_replace_all_applies_nothing() {
+        let workspace = temp_workspace();
+        std::fs::write(workspace.join("one.txt"), "alpha").unwrap();
+        std::fs::write(workspace.join("two.txt"), "same same").unwrap();
+        let one_before = std::fs::read_to_string(workspace.join("one.txt")).unwrap();
+
+        let err = apply_multi_patch(
+            &workspace,
+            MultiEditRequest {
+                files: vec![
+                    MultiEditFile {
+                        path: "one.txt".to_string(),
+                        edits: vec![MultiEdit {
+                            old_text: "alpha".to_string(),
+                            new_text: "beta".to_string(),
+                            replace_all: false,
+                        }],
+                    },
+                    MultiEditFile {
+                        path: "two.txt".to_string(),
+                        edits: vec![MultiEdit {
+                            old_text: "same".to_string(),
+                            new_text: "next".to_string(),
+                            replace_all: false,
+                        }],
+                    },
+                ],
+            },
+        )
+        .expect_err("ambiguous edit should fail batch");
+
+        assert!(matches!(err, ToolRuntimeError::MultiEditFailed { .. }));
+        // 第一个文件不应被写。
+        assert_eq!(std::fs::read_to_string(workspace.join("one.txt")).unwrap(), one_before);
+        assert_eq!(std::fs::read_to_string(workspace.join("two.txt")).unwrap(), "same same");
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn multi_patch_rejects_escape_and_missing_and_dup_and_empty() {
+        let workspace = temp_workspace();
+        std::fs::write(workspace.join("present.txt"), "data").unwrap();
+
+        // 空 files。
+        assert!(matches!(
+            apply_multi_patch(&workspace, MultiEditRequest { files: vec![] }).unwrap_err(),
+            ToolRuntimeError::MultiEditEmpty
+        ));
+
+        // 路径逃逸。
+        assert!(matches!(
+            apply_multi_patch(
+                &workspace,
+                MultiEditRequest {
+                    files: vec![MultiEditFile {
+                        path: "../escape.txt".to_string(),
+                        edits: vec![MultiEdit {
+                            old_text: "x".to_string(),
+                            new_text: "y".to_string(),
+                            replace_all: false,
+                        }],
+                    }],
+                },
+            )
+            .unwrap_err(),
+            ToolRuntimeError::PathOutsideWorkspace
+        ));
+
+        // 不存在的文件。
+        assert!(matches!(
+            apply_multi_patch(
+                &workspace,
+                MultiEditRequest {
+                    files: vec![MultiEditFile {
+                        path: "nope.txt".to_string(),
+                        edits: vec![MultiEdit {
+                            old_text: "x".to_string(),
+                            new_text: "y".to_string(),
+                            replace_all: false,
+                        }],
+                    }],
+                },
+            )
+            .unwrap_err(),
+            ToolRuntimeError::MultiEditFailed { edit: 0, .. }
+        ));
+
+        // 同一路径重复。
+        assert!(matches!(
+            apply_multi_patch(
+                &workspace,
+                MultiEditRequest {
+                    files: vec![
+                        MultiEditFile {
+                            path: "present.txt".to_string(),
+                            edits: vec![MultiEdit {
+                                old_text: "data".to_string(),
+                                new_text: "DATA".to_string(),
+                                replace_all: false,
+                            }],
+                        },
+                        MultiEditFile {
+                            path: "present.txt".to_string(),
+                            edits: vec![MultiEdit {
+                                old_text: "DATA".to_string(),
+                                new_text: "more".to_string(),
+                                replace_all: false,
+                            }],
+                        },
+                    ],
+                },
+            )
+            .unwrap_err(),
+            ToolRuntimeError::MultiEditDuplicatePath(_)
+        ));
+        // 重复路径被拒后，文件原样未动。
+        assert_eq!(std::fs::read_to_string(workspace.join("present.txt")).unwrap(), "data");
 
         let _ = std::fs::remove_dir_all(workspace);
     }

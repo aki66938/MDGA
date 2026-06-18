@@ -69,6 +69,39 @@ pub(crate) fn capture_checkpoint_before(
                 revertible,
             })
         }
+        // apply_multi_patch（R5）：跨文件原子编辑。把【所有】受影响文件的原文整批快照进 extra_json，
+        // 作为一个可回退单元。rel_path 仅取首个文件作展示；prev_content 不用（多文件时无单一原文）。
+        // 任一已存在文件快照失败（过大/非文本）即整批标记不可回退（无法保证全量恢复）。
+        "apply_multi_patch" => {
+            let files = args.get("files")?.as_array()?;
+            if files.is_empty() {
+                return None;
+            }
+            let mut snapshots: Vec<serde_json::Value> = Vec::with_capacity(files.len());
+            let mut revertible = true;
+            let mut first_rel: Option<String> = None;
+            for file in files {
+                let rel = file.get("path")?.as_str()?;
+                if first_rel.is_none() {
+                    first_rel = Some(rel.to_string());
+                }
+                let existed = safe_workspace_join(workspace, rel)
+                    .map(|p| p.exists())
+                    .unwrap_or(false);
+                let prev = read_prev(rel);
+                // 文件存在但快照失败 → 无法保证恢复，整批不可回退。
+                if existed && prev.is_none() {
+                    revertible = false;
+                }
+                snapshots.push(serde_json::json!({ "path": rel, "prev": prev }));
+            }
+            Some(CheckpointCapture {
+                rel_path: first_rel.unwrap_or_default(),
+                prev_content: None,
+                extra_json: Some(serde_json::json!({ "files": snapshots }).to_string()),
+                revertible,
+            })
+        }
         "delete_file" => {
             let rel = args.get("path")?.as_str()?;
             let prev = read_prev(rel);
@@ -209,6 +242,36 @@ pub(crate) fn apply_checkpoint_revert(
                     Ok(())
                 }
             }
+        }
+        // apply_multi_patch（R5）：从 extra_json 里逐个文件把原文写回（prev 为 null 表示当时不存在 → 删除）。
+        // 作为一个可回退单元整体撤销整批多文件编辑。
+        "apply_multi_patch" => {
+            let extra: serde_json::Value = checkpoint
+                .extra_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .ok_or("缺少多文件快照")?;
+            let files = extra
+                .get("files")
+                .and_then(|v| v.as_array())
+                .ok_or("多文件快照格式错误")?;
+            for file in files {
+                let rel = file.get("path").and_then(|v| v.as_str()).ok_or("快照缺少 path")?;
+                let path = safe_workspace_join(workspace, rel).ok_or("路径不安全")?;
+                match file.get("prev").and_then(|v| v.as_str()) {
+                    Some(content) => {
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        std::fs::write(&path, content).map_err(|e| e.to_string())?;
+                    }
+                    // prev 为 null：该文件在编辑前不存在，回退即删除。
+                    None => {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+            Ok(())
         }
         "delete_file" => {
             let path = safe_workspace_join(workspace, &checkpoint.rel_path)
