@@ -932,9 +932,9 @@ pub struct ModelProvider {
     /// 视觉 provider 的 API 格式：'openai' | 'anthropic'（Plan18 §4）。主模型恒为 openai 兼容，
     /// 此字段对其无意义；视觉调用据此分支端点/鉴权/消息结构。默认 'openai'。
     pub api_format: String,
-    /// 上下文窗口（tokens，可选；Plan27 C2 #2）：该供应商模型的最大上下文长度。
-    /// 主 provider 有值时，agent_loop / compaction 的软上限按 context_window × 0.8 推导，
-    /// 使非 DeepSeek 的小窗口模型也能在真实上限前触发压缩；None 表示沿用默认软上限。
+    /// 上下文窗口（tokens，可选）：该模型的最大上下文长度，纯用户自定义。
+    /// 0.0.61 起：主模型有值时**直接**作为 agent_loop / compaction 的软上限（不再 ×0.8）；
+    /// None / 非正值表示**不做窗口驱动的自动压缩**（交端点自身上限兜底，前端 ctx 指示器也随之隐藏）。
     pub context_window: Option<i64>,
     pub enabled: bool,
     pub updated_at: Option<i64>,

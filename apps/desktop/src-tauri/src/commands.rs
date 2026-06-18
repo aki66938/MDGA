@@ -275,12 +275,15 @@ pub(crate) fn update_model(
     let existing = get_model(&db, &id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "模型不存在".to_string())?;
+    // label 缺省（None）= 保留已有别名，不冲成 NULL——防止「只改 context 的调用方漏带 label」时丢别名
+    //（前端 saveCtx 已回传 label，这里再兜一层；改别名走 add_model 同 modelId 覆写路径）。
+    let label = label.as_deref().or(existing.label.as_deref());
     let saved = upsert_model(
         &db,
         &id,
         &existing.connection_id,
         &existing.model_id,
-        label.as_deref(),
+        label,
         contextWindow.filter(|&cw| cw > 0),
     )
     .map_err(|e| e.to_string())?;

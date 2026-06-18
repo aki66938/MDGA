@@ -328,14 +328,21 @@ function ConnectionModels({ connection }: { connection: ConnectionView }) {
     if (!raw) {
       next = null; // 清空 ⇒ 由端点默认
     } else {
+      // 严格只收正整数：拒掉 2e6 / 1.5e3 / 1.5 这类会被 parseInt 静默截断成 2/1 的写法（会把软上限改坏）。
+      if (!/^\d+$/.test(raw)) { setError("上下文窗口需为正整数（如 128000），或留空＝由端点默认"); return; }
       const n = parseInt(raw, 10);
-      if (Number.isNaN(n) || n <= 0) { setError("上下文窗口需为正整数，或留空＝由端点默认"); return; }
+      if (n <= 0) { setError("上下文窗口需为正整数，或留空＝由端点默认"); return; }
       next = n;
     }
     setError(null);
     setSavingCtxId(m.id);
     try {
-      await invoke<CuratedModelView>("update_model", { id: m.id, contextWindow: next });
+      // 关键：回传当前 label，避免只改 context 时把已有别名冲成 NULL（update_model 整行覆写）。
+      await invoke<CuratedModelView>("update_model", {
+        id: m.id,
+        label: m.label?.trim() || null,
+        contextWindow: next,
+      });
       setEditingCtxId(null);
       setCtxDraft("");
       refresh();
