@@ -105,6 +105,10 @@ pub(crate) fn save_model_provider(
         context_window,
     )
     .map_err(|e| e.to_string())?;
+    // P2 / 0.0.58:主 provider 变更会改 embedding 端点/凭据,刷新快照(其它角色变更无副作用)。
+    if role == mdga_storage::ROLE_MAIN {
+        crate::embedding::refresh_embedding_config(&db);
+    }
     Ok(())
 }
 
@@ -112,7 +116,12 @@ pub(crate) fn save_model_provider(
 #[tauri::command]
 pub(crate) fn remove_model_provider(state: State<AppState>, role: String) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    delete_model_provider(&db, &role).map_err(|e| e.to_string())
+    delete_model_provider(&db, &role).map_err(|e| e.to_string())?;
+    // 主 provider 被删 → embedding 端点不可用,刷新快照(将回退关闭)。
+    if role == mdga_storage::ROLE_MAIN {
+        crate::embedding::refresh_embedding_config(&db);
+    }
+    Ok(())
 }
 
 /// R8 角色多模型路由：解析某功能角色（action / plan / critique）实际生效的 provider。
@@ -263,7 +272,14 @@ pub(crate) fn set_app_setting(
     value: String,
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    set_setting(&db, &key, &value).map_err(|e| e.to_string())
+    set_setting(&db, &key, &value).map_err(|e| e.to_string())?;
+    // P2 / 0.0.58:embedding 开关或模型名变更时,刷新 code_search 的 embedding 配置快照。
+    if key == crate::embedding::EMBEDDING_ENABLED_KEY
+        || key == crate::embedding::EMBEDDING_MODEL_KEY
+    {
+        crate::embedding::refresh_embedding_config(&db);
+    }
+    Ok(())
 }
 
 // ── LSP 服务器注册表设置（R-uicfg / 0.0.57）──────────────────────────────────

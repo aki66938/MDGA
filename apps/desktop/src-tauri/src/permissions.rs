@@ -34,7 +34,11 @@ pub(crate) fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability
         // 只读或纯 UI / 后台控制类工具：自动放行，不打断用户。remember 仅追加项目记忆文件，低风险。
         // code_overview（Plan28 P0-2，Lane B 新增）只读取并统计代码结构，与 read_file / search_text 同列。
         // repo_map（R2）只解析源码构建符号地图，同属只读。
-        // code_search（R2 L 阶段）本地语义检索源码、回代码块，离线无副作用,同属只读。
+        // code_search（R2 L 阶段）本地语义检索源码、回代码块,默认离线无副作用,同属只读。
+        //   P2/0.0.58:当**用户在设置里显式开启** embedding 重排且已配置主 provider 时,它会额外向
+        //   **用户自己已配置、已信任的主 provider**(与 chat 同一端点、同一 key)发一次 /embeddings 请求,
+        //   仅用于对本地候选重排。网络目的地与凭据均非模型可控,仍属用户既有信任域;且默认关闭、失败静默
+        //   回退本地,故仍按 FileRead 自动放行,不因可选增强而改变离线默认场景(占绝大多数)的权限 UX。
         // repo_wiki（R11）从 repo_map 分析派生仓库 wiki：build 仅写 .mdga/wiki 派生缓存、不碰用户
         // 源码,query 纯读,故与 repo_map 同列只读自动放行（派生数据可随时重建）。
         // git_status/git_diff/git_log 为只读 git 工具，与 read_file/search_text 同列自动放行（R4）。

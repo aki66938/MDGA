@@ -103,6 +103,7 @@ mod command_run;
 mod subagent;
 mod compaction;
 mod chat;
+mod embedding;
 // 已完成模块 compaction.rs 通过 `crate::chat_completion_with_retry` 引用，保留 crate 根再导出。
 pub(crate) use chat::chat_completion_with_retry;
 
@@ -165,6 +166,17 @@ fn main() {
                         tools::set_lsp_server_config(cfg);
                     }
                 }
+            }
+
+            // P2 / 0.0.58:从 DB 播种 code_search 的可选 embedding 重排配置。
+            // 默认关闭(设置项缺失/非 on)——播种后快照为 None,code_search 行为与 0.0.57 一致。
+            {
+                let state = app.state::<AppState>();
+                let _ = state
+                    .db
+                    .lock()
+                    .ok()
+                    .map(|db| embedding::refresh_embedding_config(&db));
             }
             Ok(())
         })
