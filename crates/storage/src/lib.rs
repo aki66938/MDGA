@@ -981,6 +981,45 @@ pub fn delete_model_provider(conn: &Connection, role: &str) -> SqlResult<()> {
     Ok(())
 }
 
+// ── 角色多模型路由（R8）─────────────────────────────────────────────────────
+
+/// 主模型角色：所有未配置的功能角色（action/plan/critique）回退到它。
+pub const ROLE_MAIN: &str = "main";
+/// 行动角色：执行工具的常规循环用此模型（未配置回退 main）。
+pub const ROLE_ACTION: &str = "action";
+/// 规划角色：计划模式 / 规划步骤用此模型（未配置回退 main）。
+pub const ROLE_PLAN: &str = "plan";
+/// 评审角色：审查 / 批评步骤用此模型（未配置回退 main）。
+pub const ROLE_CRITIQUE: &str = "critique";
+/// 视觉角色：识图（已有，独立链路，不参与本回退逻辑）。
+pub const ROLE_VISION: &str = "vision";
+
+/// 按角色解析实际生效的 provider，未配置（或被禁用）时回退到主模型 `main`（R8）。
+///
+/// 语义：给定一个功能角色（如 "action" / "plan" / "critique"），若该角色有一条 *启用* 的 provider，
+/// 返回它；否则回退返回 "main" provider。这样在用户没有为任何角色单独配模型时，行为与从前完全一致
+/// （全部走 main），即「未配置即等价于关闭」的向后兼容保证。
+///
+/// 返回值语义：
+/// - `Ok(Some(p))`：解析到一个可用 provider（角色自身的，或回退后的 main）。
+/// - `Ok(None)`：角色未配置且连 main 也没配（调用方据此报「请先配置主模型」）。
+///
+/// 注意：role == "main" 时即直接返回 main（不存在二次回退）；被禁用（enabled=false）的角色 provider
+/// 视为「未配置」从而触发回退，避免误用一条被关掉的配置。视觉角色有独立链路，调用方一般不经此函数。
+pub fn resolve_role_provider(conn: &Connection, role: &str) -> SqlResult<Option<ModelProvider>> {
+    // 主角色：直接取 main，不回退。
+    if role == ROLE_MAIN {
+        return get_model_provider(conn, ROLE_MAIN);
+    }
+    // 功能角色：自身已配且启用则用之，否则回退 main。
+    if let Some(p) = get_model_provider(conn, role)? {
+        if p.enabled {
+            return Ok(Some(p));
+        }
+    }
+    get_model_provider(conn, ROLE_MAIN)
+}
+
 // ── App Settings (key-value) ──────────────────────────────────────────────
 
 /// 读取一项应用设置（如 modality_extended 模态扩展开关），不存在返回 None。
@@ -1400,6 +1439,69 @@ mod tests {
         delete_model_provider(&conn, "vision").expect("delete vision");
         assert!(get_model_provider(&conn, "vision").expect("query").is_none());
         assert_eq!(list_model_providers(&conn).expect("list").len(), 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn resolves_role_provider_with_fallback_to_main() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        // 一个角色都没配：任何角色都解析不到（连 main 都没有）。
+        assert!(resolve_role_provider(&conn, ROLE_ACTION).expect("query").is_none());
+        assert!(resolve_role_provider(&conn, ROLE_PLAN).expect("query").is_none());
+        assert!(resolve_role_provider(&conn, ROLE_MAIN).expect("query").is_none());
+
+        // 配主模型后，未配置的功能角色全部回退到 main（向后兼容：等价于关闭多模型路由）。
+        upsert_model_provider(
+            &conn, ROLE_MAIN, Some("deepseek"), Some("DeepSeek"), None, "sk-main", "main-model",
+            "openai", Some(128_000),
+        )
+        .expect("upsert main");
+        let action = resolve_role_provider(&conn, ROLE_ACTION).expect("query").expect("falls back");
+        assert_eq!(action.role, "main");
+        assert_eq!(action.model_id, "main-model");
+        let plan = resolve_role_provider(&conn, ROLE_PLAN).expect("query").expect("falls back");
+        assert_eq!(plan.model_id, "main-model");
+        let critique =
+            resolve_role_provider(&conn, ROLE_CRITIQUE).expect("query").expect("falls back");
+        assert_eq!(critique.model_id, "main-model");
+        // main 自身解析为 main。
+        assert_eq!(
+            resolve_role_provider(&conn, ROLE_MAIN).expect("query").expect("main").model_id,
+            "main-model"
+        );
+
+        // 为 plan 角色单独绑定一个模型：plan 用自己的，action/critique 仍回退 main。
+        upsert_model_provider(
+            &conn, ROLE_PLAN, Some("custom"), Some("Planner"), Some("https://plan.local/v1"),
+            "sk-plan", "plan-model", "openai", None,
+        )
+        .expect("upsert plan");
+        assert_eq!(
+            resolve_role_provider(&conn, ROLE_PLAN).expect("query").expect("plan").model_id,
+            "plan-model"
+        );
+        assert_eq!(
+            resolve_role_provider(&conn, ROLE_ACTION).expect("query").expect("action").model_id,
+            "main-model"
+        );
+        assert_eq!(
+            resolve_role_provider(&conn, ROLE_CRITIQUE).expect("query").expect("critique").model_id,
+            "main-model"
+        );
+
+        // 被禁用的角色 provider 视为未配置，触发回退到 main（避免误用被关掉的配置）。
+        conn.execute(
+            "UPDATE model_providers SET enabled = 0 WHERE role = ?1",
+            params![ROLE_PLAN],
+        )
+        .expect("disable plan");
+        assert_eq!(
+            resolve_role_provider(&conn, ROLE_PLAN).expect("query").expect("plan disabled").model_id,
+            "main-model"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }

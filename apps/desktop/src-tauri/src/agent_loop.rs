@@ -42,7 +42,7 @@ use mdga_sandbox_runtime::{session_security_context, NetworkMode};
 use mdga_shared::PermissionMode;
 use mdga_storage::{
     get_conversation, get_messages, get_model_provider, list_permission_rules,
-    save_token_ledger_entry,
+    resolve_role_provider, save_token_ledger_entry, ROLE_ACTION, ROLE_PLAN,
 };
 use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use mdga_tool_runtime::RunCommandRequest;
@@ -97,6 +97,9 @@ pub(crate) async fn send_message(
     // Plan25 C-4：「批准并执行」时为 true，本轮装配阶段注入「严格按上一条计划执行 + 先建 todo」system。
     let execute_plan = execute_plan.unwrap_or(false);
     let images = images.unwrap_or_default();
+    // R8 角色多模型路由：本轮生效的角色——计划模式用 'plan'，常规工具循环用 'action'。
+    // 二者均经 resolve_role_provider 解析：角色未单独配置时回退主模型，行为与从前一致（向后兼容）。
+    let active_role = if plan_mode { ROLE_PLAN } else { ROLE_ACTION };
     let (conversation, permission_rules, base_url, api_key, model_id, context_window, vision_provider) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let conversation = get_conversation(&db, &conversation_id)
@@ -107,12 +110,18 @@ pub(crate) async fn send_message(
         // DB 无主 provider 即报错引导去设置页，不再回退环境变量。
         // Plan20 🔴1：model_id 一并取出，作为本轮唯一权威模型名——主链路 chat 与计价均以它为准，
         // 不再用入参 model（前端控制行写死的 DeepSeek 清单）决定模型，否则配非 DeepSeek 主供应商必失败。
-        // Plan27 C2 #2：context_window 一并取出，用于推导上下文压缩软上限。
-        let (base_url, api_key, model_id, context_window) = match get_model_provider(&db, "main") {
+        // Plan27 C2 #2：主模型 context_window 用于推导上下文压缩软上限（始终以主模型为准，与角色无关）。
+        let main_context_window = match get_model_provider(&db, "main") {
+            Ok(Some(p)) => p.context_window,
+            _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
+        };
+        // R8：解析本轮角色对应的 provider（plan/action 未配置时回退 main）。回退保证了
+        // 不配任何角色时，base_url/api_key/model_id 与从前取 main 完全一致。
+        let (base_url, api_key, model_id) = match resolve_role_provider(&db, active_role) {
             Ok(Some(p)) => {
                 let bu = resolve_base_url(p.base_url.as_deref(), p.preset.as_deref())
                     .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
-                (bu, p.api_key, p.model_id, p.context_window)
+                (bu, p.api_key, p.model_id)
             }
             _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
         };
@@ -122,7 +131,7 @@ pub(crate) async fn send_message(
         } else {
             get_model_provider(&db, "vision").ok().flatten()
         };
-        (conversation, rules, base_url, api_key, model_id, context_window, vision_provider)
+        (conversation, rules, base_url, api_key, model_id, main_context_window, vision_provider)
     };
     // 入参 model 保留以不破坏前端命令签名，但本轮已不再用它决定模型（权威源为 model_id）。
     let _ = &model;

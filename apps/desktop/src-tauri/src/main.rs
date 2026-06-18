@@ -35,8 +35,8 @@ use commands::{
     set_conversation_workspace, set_task_budget, set_workspace_path, toggle_mcp_server,
 };
 use commands::{
-    get_app_setting, get_model_provider_config, remove_model_provider, save_model_provider,
-    set_app_setting, smoke_test_tool_call, test_provider_connection,
+    get_app_setting, get_model_provider_config, remove_model_provider, resolve_role_model_provider,
+    save_model_provider, set_app_setting, smoke_test_tool_call, test_provider_connection,
 };
 
 // 注（Plan28 P3-9）：原 agent_prompt 模块（仅持有三个灵魂常量）已不再需要——常量权威定义
@@ -202,6 +202,7 @@ fn main() {
             get_model_provider_config,
             save_model_provider,
             remove_model_provider,
+            resolve_role_model_provider,
             test_provider_connection,
             smoke_test_tool_call,
             get_app_setting,
