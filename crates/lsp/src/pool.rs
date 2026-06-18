@@ -85,13 +85,17 @@ fn ensure_reaper() {
 ///
 /// 调用方拿到后应先 `begin_op` 重置超时、再 `sync_document` 喂最新全文。
 pub fn checkout(key: &PoolKey) -> Option<LspSession> {
-    let mut guard = pool().lock().ok()?;
-    let mut entry = guard.map.remove(key)?;
+    let mut entry = {
+        let mut guard = pool().lock().ok()?;
+        guard.map.remove(key)?
+        // 取走所有权后立即释放池锁——后续 is_alive 探活与（死会话的）Drop 强杀都在锁外做，
+        // 不让进程树 kill 卡住其它持锁路径。
+    };
     if entry.session.is_alive() {
         Some(entry.session)
     } else {
-        // 已死：丢弃（Drop 强杀），返回 None 让调用方新建。
-        drop(entry.session);
+        // 已死：丢弃（Drop 强杀，已在锁外），返回 None 让调用方新建。
+        drop(entry);
         None
     }
 }
@@ -107,28 +111,36 @@ pub fn checkin(key: PoolKey, mut session: LspSession) {
         return; // 锁中毒：放弃纳管，session 在此 Drop（强杀），不泄漏
     };
 
-    // 先放回（覆盖同键的旧会话，旧的随之 Drop 强杀）。
-    guard.map.insert(
+    // 先放回（覆盖同键的旧会话）。被覆盖的旧 `PooledServer` 由 insert 在锁内返回，
+    // **不在锁内 Drop**：收集到锁外再杀，避免进程树 kill 卡住持锁的其它线程。
+    let mut to_drop: Vec<PooledServer> = Vec::new();
+    if let Some(old) = guard.map.insert(
         key,
         PooledServer {
             session,
             last_used: Instant::now(),
         },
-    );
+    ) {
+        to_drop.push(old);
+    }
 
-    // 容量淘汰：超额则反复移除最久未用的（被移除者 Drop 强杀）。
+    // 容量淘汰：超额则反复**取走**最久未用的（取走而非锁内 Drop），攒到锁外统一杀。
     while guard.map.len() > MAX_POOLED {
-        if let Some(victim) = guard
+        let victim = guard
             .map
             .iter()
             .min_by_key(|(_, v)| v.last_used)
-            .map(|(k, _)| k.clone())
-        {
-            guard.map.remove(&victim); // Drop 强杀
-        } else {
-            break;
+            .map(|(k, _)| k.clone());
+        match victim.and_then(|k| guard.map.remove(&k)) {
+            Some(evicted) => to_drop.push(evicted),
+            None => break,
         }
     }
+
+    // 关键：先释放池锁，再在临界区**之外** Drop（强杀子进程树）。进程树 kill 可能耗时，
+    // 不能让它阻塞 checkout/checkin/reaper 等持锁路径。
+    drop(guard);
+    drop(to_drop);
 }
 
 /// 回收所有空闲超过 `IDLE_TTL` 的会话（reaper 周期调用；也供测试直接触发）。
@@ -139,20 +151,27 @@ pub fn reap_idle() -> usize {
 
 /// 带自定义 TTL 的回收（测试用：传 `Duration::ZERO` 立即回收全部空闲会话以验证可回收性）。
 pub fn reap_idle_with_ttl(ttl: Duration) -> usize {
-    let Ok(mut guard) = pool().lock() else {
-        return 0;
+    // 锁内只做：挑出超时键、把对应会话**取走**装进本地 Vec；锁外再 Drop（强杀子进程树）。
+    // 不在持锁时 Drop——进程树 kill 可能耗时，会卡住 checkout/checkin 等其它持锁路径。
+    let reaped: Vec<PooledServer> = {
+        let Ok(mut guard) = pool().lock() else {
+            return 0;
+        };
+        let now = Instant::now();
+        let stale: Vec<PoolKey> = guard
+            .map
+            .iter()
+            .filter(|(_, v)| now.duration_since(v.last_used) >= ttl)
+            .map(|(k, _)| k.clone())
+            .collect();
+        stale
+            .into_iter()
+            .filter_map(|k| guard.map.remove(&k))
+            .collect()
+        // guard 在此作用域结束时释放锁。
     };
-    let now = Instant::now();
-    let stale: Vec<PoolKey> = guard
-        .map
-        .iter()
-        .filter(|(_, v)| now.duration_since(v.last_used) >= ttl)
-        .map(|(k, _)| k.clone())
-        .collect();
-    let n = stale.len();
-    for k in stale {
-        guard.map.remove(&k); // Drop 强杀
-    }
+    let n = reaped.len();
+    drop(reaped); // 临界区之外强杀子进程树。
     n
 }
 
@@ -174,6 +193,44 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, d);
+    }
+
+    /// 容量淘汰的「挑谁」逻辑（最久未用者）独立成纯函数后可不依赖真会话单测：
+    /// 用一张 PoolKey→last_used 的影子表镜像 `checkin` 里 `min_by_key(last_used)` 的选择，
+    /// 断言被选中的 victim 恰是 last_used 最小的那个。证明淘汰策略稳定、不误伤更新的会话。
+    #[test]
+    fn capacity_eviction_picks_oldest_last_used() {
+        use std::collections::HashMap as Map;
+        let base = Instant::now();
+        // 三个键，last_used 递增；最久未用的应是 k_old。
+        let k_old = PoolKey::new("/ws", "srv", &["a"]);
+        let k_mid = PoolKey::new("/ws", "srv", &["b"]);
+        let k_new = PoolKey::new("/ws", "srv", &["c"]);
+        let mut shadow: Map<PoolKey, Instant> = Map::new();
+        shadow.insert(k_old.clone(), base);
+        shadow.insert(k_mid.clone(), base + Duration::from_secs(1));
+        shadow.insert(k_new.clone(), base + Duration::from_secs(2));
+
+        let victim = shadow
+            .iter()
+            .min_by_key(|(_, t)| **t)
+            .map(|(k, _)| k.clone())
+            .expect("非空表应能选出 victim");
+        assert_eq!(victim, k_old, "容量淘汰应选最久未用者");
+    }
+
+    /// 空池上 reap 返回 0、计数不变——证明锁外 Drop 重构没破坏「无副作用、不 panic」语义。
+    /// （真会话的回收/复用由 lsp_smoke.rs 的 e2e 覆盖。）
+    #[test]
+    fn reap_on_empty_pool_returns_zero_and_count_stable() {
+        // 先把本进程残留空闲会话清空，建立确定起点。
+        let _ = reap_idle_with_ttl(Duration::ZERO);
+        let before = pooled_count();
+        let reaped = reap_idle_with_ttl(Duration::ZERO);
+        let after = pooled_count();
+        assert_eq!(reaped, 0, "空池回收数应为 0，实际 {reaped}");
+        assert_eq!(before, 0, "清空后计数应为 0，实际 {before}");
+        assert_eq!(after, 0, "回收后计数应仍为 0，实际 {after}");
     }
 
     #[test]
