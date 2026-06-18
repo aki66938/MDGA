@@ -7,8 +7,8 @@
 //! mdga-agent-core，本文件改为 `use mdga_agent_core::...` 调用，仅保留耦合 Tauri 的编排链路。
 
 use crate::chat::{
-    assistant_message_for_tool_calls, chat_messages_to_wire, recover_tool_calls_from_content,
-    stream_round_with_retry,
+    assistant_message_for_tool_calls, chat_completion_with_retry, chat_messages_to_wire,
+    recover_tool_calls_from_content, stream_round_with_retry,
 };
 use crate::checkpoint::{capture_checkpoint_before, persist_checkpoint, post_execution_diff};
 use crate::command_run::{execute_bg_shell_tool, execute_run_command_tool};
@@ -35,8 +35,9 @@ use crate::{commands::permission_mode_from_str, record_tool_event};
 // Plan28 P3-9：内核纯逻辑（消息构建 / 记忆读取 / 压缩软上限 / 验证探测 / usage 合并）已迁入 agent-core。
 use mdga_agent_core::{
     context_soft_limit_for, detect_verification_plan, focused_command, format_verify_feedback,
-    is_stale, merge_usage, messages_with_workspace_context, parse_report, read_workspace_memory,
-    report_signature, FileFingerprint, VerifyKind,
+    is_stale, merge_usage, messages_with_workspace_context, parse_report, parse_review,
+    read_workspace_memory, report_signature, FileFingerprint, ReviewVerdict, VerifyKind,
+    REVIEW_RUBRIC,
 };
 use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMessage, StreamChunk};
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
@@ -75,6 +76,9 @@ const STUCK_THRESHOLD: usize = 3;
 const VERIFY_MAX_ROUNDS: usize = 5;
 /// 验证 doom-loop 护栏阈值（R3）：连续相同「失败签名」轮数达到此值即判定停滞，升级用户而非继续空转。
 const VERIFY_STALL_THRESHOLD: usize = 2;
+/// R9 finalize 前评审最多回灌轮数：execution-free 评审至多回灌 1 轮让模型修复，之后无条件收尾，
+/// 永不成环（评审本身不再触发二次评审，由本上限 + review_done 标志双重兜底）。
+const REVIEW_MAX_ROUNDS: usize = 1;
 
 // ── DeepSeek ──────────────────────────────────────────────────────────────
 
@@ -652,6 +656,10 @@ async fn chat_with_builtin_tools(
     let mut verify_prev_sig: Option<String> = None;
     let mut verify_stall: usize = 0;
     let mut verify_failing: Vec<String> = Vec::new();
+    // R9 finalize 前 execution-free 评审：累计本轮所有写类工具产生的行级 diff（带文件/工具头），
+    // 收尾时整批交给主模型只读评审；review_rounds 限定至多回灌 1 轮（REVIEW_MAX_ROUNDS），永不成环。
+    let mut turn_diffs: Vec<String> = Vec::new();
+    let mut review_rounds: usize = 0;
     // 长任务跟踪（Plan25 #5①②）：维护最近一次 todo_write 的清单，每轮在 wire 末尾 user 之前注入轻量提醒，
     // 并在每次 todo_write 成功后落盘 <workspace>/.mdga/tasks/current.json。
     let mut current_todos: Option<Vec<serde_json::Value>> = None;
@@ -929,6 +937,27 @@ async fn chat_with_builtin_tools(
                     }
                     // 所有门通过：验证绿，正常收尾。
                 }
+            }
+            // R9 finalize 前 execution-free 评审：到此说明本轮要收尾、且（若有验证回路）验证已通过
+            //（验证失败会在上面 `continue`，根本走不到这里）。仅当本轮发生过写类改动（有累计 diff）
+            // 且尚未评审过（review_rounds < REVIEW_MAX_ROUNDS）时，跑一次纯模型只读评审：
+            // 命中确凿阻断问题 → 回灌让模型修复一轮并 continue；否则（含评审出错）放行收尾。
+            // 无写改时 turn_diffs 为空 → 整段是 no-op，零额外开销、对纯只读/纯叙述轮完全透明。
+            if !turn_diffs.is_empty() && review_rounds < REVIEW_MAX_ROUNDS {
+                review_rounds += 1;
+                if let Some(feedback) =
+                    run_finalize_review(base_url, api_key, model, &turn_diffs, app).await
+                {
+                    // 回灌评审问题（仿验证回路：作为 user 消息注入），并清空累计 diff，
+                    // 让模型据此修复；下一轮再到收尾时 REVIEW_MAX_ROUNDS 已用尽，不会二次评审，永不成环。
+                    turn_diffs.clear();
+                    wire_messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": feedback,
+                    }));
+                    continue;
+                }
+                // 评审干净或评审调用失败：fail-open，正常收尾。
             }
             return Ok(usage);
         }
@@ -1239,6 +1268,14 @@ async fn chat_with_builtin_tools(
                         if let Some((diff, added, removed)) =
                             post_execution_diff(workspace_path, &tool_name, &arguments, cap)
                         {
+                            // R9：把本次写改的 diff 收进本轮累计，供收尾前 execution-free 评审整批审阅。
+                            // 带「工具@路径」头便于评审定位；非文本写类（diff 为 None）天然跳过。
+                            if !diff.trim().is_empty() {
+                                turn_diffs.push(format!(
+                                    "### {tool_name} @ {}\n{diff}",
+                                    cap.rel_path
+                                ));
+                            }
                             out["diff"] = serde_json::Value::String(diff);
                             out["added"] = serde_json::json!(added);
                             out["removed"] = serde_json::json!(removed);
@@ -1380,6 +1417,52 @@ fn verify_stall_hit(sig: &str, prev: &mut Option<String>, stall: &mut usize) -> 
         }
     }
     *stall >= VERIFY_STALL_THRESHOLD
+}
+
+/// 评审给模型的变更 diff 总长上限（字符）：超长则截断尾部，避免单次评审请求过大烧 token。
+const REVIEW_DIFF_MAX_CHARS: usize = 16_000;
+
+/// R9 finalize 前 execution-free 评审：把本轮累计的写改 diff 连同 [`REVIEW_RUBRIC`] 交给主模型做
+/// 一次**只读**评审（不带任何工具，单次 chat_completion）。返回值语义：
+/// - `Some(feedback)`：评审发现确凿的阻断性问题，feedback 为回灌给模型的修复提示（含逐条问题）；
+/// - `None`：评审判定干净，**或**评审调用/解析过程出任何错（fail-open 收尾，绝不因评审失败卡住收尾）。
+///
+/// 设计：本调用是「附加保险」，必须非破坏——任何异常都回退到「直接收尾」的既有行为。
+async fn run_finalize_review(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    turn_diffs: &[String],
+    app: &AppHandle,
+) -> Option<String> {
+    // 拼接本轮全部 diff；过长则截尾（评审看趋势/问题点即可，无需完整字节）。
+    let mut joined = turn_diffs.join("\n\n");
+    if joined.chars().count() > REVIEW_DIFF_MAX_CHARS {
+        joined = joined.chars().take(REVIEW_DIFF_MAX_CHARS).collect::<String>()
+            + "\n…（diff 过长，已截断；仅就以上展示部分评审）";
+    }
+    let _ = app.emit("agent-status", serde_json::json!({ "state": "reviewing" }));
+    let messages = vec![
+        serde_json::json!({ "role": "system", "content": REVIEW_RUBRIC }),
+        serde_json::json!({
+            "role": "user",
+            "content": format!("以下是本轮 agent 对工作区所做改动的变更 diff，请据评审准则只读评审：\n\n{joined}"),
+        }),
+    ];
+    // 评审不带工具（execution-free）。任何错误都 fail-open（返回 None → 收尾）。
+    let completion =
+        match chat_completion_with_retry(base_url, api_key, messages, model, None, app).await {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+    let reply = completion.content.unwrap_or_default();
+    match parse_review(&reply) {
+        ReviewVerdict::Issues(body) => Some(format!(
+            "收尾前的自动代码评审在本轮改动中发现了需要先处理的问题：\n\n{body}\n\n\
+             请逐条核对并修复（确为误报的请简要说明理由），改完后再结束。",
+        )),
+        ReviewVerdict::Clean => None,
+    }
 }
 
 /// R6 陈旧读：把工具参数里的相对 `path` 解析为磁盘上的绝对路径键。
