@@ -221,6 +221,33 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
         CREATE INDEX IF NOT EXISTS idx_role_assignments_conn
             ON role_assignments (connection_id);
 
+        -- 0.0.60「模型层」：在 connection 与 role 之间插入用户自建的「模型」中间层。
+        -- 一个 connection（端点 + 密钥）下有多个 model（同一把 DeepSeek key 同时跑 pro 与 flash）；
+        -- model_id = 实际 API 模型串（如 'deepseek-chat'）;label 可选展示名;context_window 为模型粒度
+        --（从旧 role_assignments 下沉到此）。同 (connection_id, model_id) 唯一，避免重复登记。
+        CREATE TABLE IF NOT EXISTS models (
+            id              TEXT PRIMARY KEY,
+            connection_id   TEXT NOT NULL,
+            model_id        TEXT NOT NULL,
+            label           TEXT,
+            context_window  INTEGER,
+            created_at      INTEGER,
+            updated_at      INTEGER,
+            UNIQUE(connection_id, model_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_models_conn
+            ON models (connection_id);
+
+        -- 0.0.60 新「真源」角色分配表：role → 一个 curated model（model_ref → models.id）。
+        -- 取代 0.0.59 的 role_assignments 成为运行时解析来源；后者保留为惰性 legacy/回滚源。
+        CREATE TABLE IF NOT EXISTS role_models (
+            role        TEXT PRIMARY KEY,
+            model_ref   TEXT NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            updated_at  INTEGER
+        );
+
         CREATE TABLE IF NOT EXISTS app_settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -259,6 +286,10 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // 0.0.59：把旧的 role-keyed model_providers 迁到「连接库 + 角色引用」。
     // 一次性、幂等、改前备份 sqlite 文件；旧表保留一版作回滚路径。失败软处理，不阻断建库。
     migrate_to_connections_0059(&conn)?;
+    // 0.0.60：在 connection 与 role 之间插入「模型层」。必须在 0.0.59 迁移**之后**跑——
+    // 直接从 pre-0.0.59 升级时，0.0.59 先填好 role_assignments，本迁移再据其建 models + role_models。
+    // 一次性、幂等；不 drop/alter role_assignments / model_providers（惰性回滚源）。
+    migrate_to_models_layer_0060(&conn)?;
     Ok(conn)
 }
 
@@ -1058,8 +1089,8 @@ pub fn resolve_role_provider(conn: &Connection, role: &str) -> SqlResult<Option<
         return synthesize_role_provider(conn, ROLE_MAIN);
     }
     // 功能角色：自身已配且启用则用之，否则回退 main。
-    if let Some(assignment) = get_role_assignment(conn, role)? {
-        if assignment.enabled {
+    if let Some(rm) = get_role_model(conn, role)? {
+        if rm.enabled {
             if let Some(p) = synthesize_role_provider(conn, role)? {
                 return Ok(Some(p));
             }
@@ -1074,8 +1105,8 @@ pub fn resolve_role_provider(conn: &Connection, role: &str) -> SqlResult<Option<
 /// 仅当用户**显式**为 subagent（或 action）分配了模型时，子代理才用那个模型。返回 None 仅当连 main 都没配。
 pub fn resolve_subagent_provider(conn: &Connection) -> SqlResult<Option<ModelProvider>> {
     for role in [ROLE_SUBAGENT, ROLE_ACTION] {
-        if let Some(a) = get_role_assignment(conn, role)? {
-            if a.enabled {
+        if let Some(rm) = get_role_model(conn, role)? {
+            if rm.enabled {
                 if let Some(p) = synthesize_role_provider(conn, role)? {
                     return Ok(Some(p));
                 }
@@ -1085,32 +1116,38 @@ pub fn resolve_subagent_provider(conn: &Connection) -> SqlResult<Option<ModelPro
     synthesize_role_provider(conn, ROLE_MAIN)
 }
 
-/// 把某角色的 `role_assignments` 行与其 `connections` 行合成一个 [`ModelProvider`]（不做回退）。
+/// 把某角色的 `role_models` 行经 `models` 再到 `connections` 合成一个 [`ModelProvider`]（不做回退，0.0.60）。
 ///
-/// 无该角色引用、或引用指向的 connection 已不存在 → 返回 None。`enabled` 取引用行的 enabled。
-/// 合成出的 ModelProvider.role 即传入的 role，base_url/api_key/api_format 来自 connection，
-/// model_id/context_window 来自引用行，使其与旧 `get_model_provider` 返回形状逐字段对齐。
+/// 链路：role → role_models[role] → models[model_ref] → connections[model.connection_id]。
+/// 任一环缺失（无该角色分配 / model_ref 悬空 / connection 已不存在）→ 返回 None（视为未配置）。
+/// 合成出的 ModelProvider.role 即传入的 role；base_url/api_key/api_format 来自 connection，
+/// model_id/context_window 来自 model（0.0.60 起 context_window 在 model 粒度）；`enabled` 取 role_models 行。
+/// 返回形状与旧 `get_model_provider` 逐字段对齐，故运行时消费方（agent_loop/embedding）零改动。
 fn synthesize_role_provider(conn: &Connection, role: &str) -> SqlResult<Option<ModelProvider>> {
-    let Some(a) = get_role_assignment(conn, role)? else {
+    let Some(rm) = get_role_model(conn, role)? else {
         return Ok(None);
     };
-    let Some(c) = get_connection(conn, &a.connection_id)? else {
-        // 引用悬空（connection 被删但引用残留，理论上被 delete_connection 拦截）：视为未配置。
+    let Some(m) = get_model(conn, &rm.model_ref)? else {
+        // model_ref 悬空（model 被删但分配残留，理论上被 delete_model 拦截）：视为未配置。
+        return Ok(None);
+    };
+    let Some(c) = get_connection(conn, &m.connection_id)? else {
+        // connection 已不存在（理论上被 delete_connection 级联清理拦截）：视为未配置。
         return Ok(None);
     };
     Ok(Some(ModelProvider {
-        id: a.connection_id,
+        id: m.connection_id,
         role: role.to_string(),
         preset: c.preset,
         label: c.label,
         // 空串 base_url 归一为 None，与旧表「NULL=走 preset 官方端点」语义一致。
         base_url: c.base_url.filter(|s| !s.trim().is_empty()),
         api_key: c.api_key,
-        model_id: a.model_id,
+        model_id: m.model_id,
         api_format: c.api_format,
-        context_window: a.context_window,
-        enabled: a.enabled,
-        updated_at: a.updated_at,
+        context_window: m.context_window,
+        enabled: rm.enabled,
+        updated_at: rm.updated_at,
     }))
 }
 
@@ -1141,6 +1178,33 @@ pub struct RoleAssignment {
     pub connection_id: String,
     pub model_id: String,
     pub context_window: Option<i64>,
+    pub enabled: bool,
+    pub updated_at: Option<i64>,
+}
+
+/// 一条「用户登记的模型」（0.0.60 模型层）：属于某连接，model_id 为实际 API 模型串。
+///
+/// 一个连接（端点 + 密钥）下可登记多个模型（同一把 key 同时跑 pro 与 flash）。
+/// `label` 可选展示名；`context_window` 为该模型粒度的上下文窗口（从旧 role_assignments 下沉到此）。
+/// 同一连接下 (connection_id, model_id) 唯一。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CuratedModel {
+    pub id: String,
+    pub connection_id: String,
+    pub model_id: String,
+    pub label: Option<String>,
+    pub context_window: Option<i64>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+}
+
+/// 一条「角色 → curated model」分配（0.0.60 真源）：model_ref 指向 models.id。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleModel {
+    pub role: String,
+    pub model_ref: String,
     pub enabled: bool,
     pub updated_at: Option<i64>,
 }
@@ -1248,23 +1312,36 @@ pub fn upsert_connection(
     get_connection(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
-/// 返回引用了某连接的角色名列表（供「拒删被引用连接」判断与人话化错误）。
+/// 返回引用了某连接「旗下任一模型」的角色名列表（0.0.60：经 role_models → models → connection 反查）。
+///
+/// 供「拒删被引用连接」判断与人话化错误。结果按角色名去重排序。
 pub fn connection_referenced_by(conn: &Connection, id: &str) -> SqlResult<Vec<String>> {
-    let mut stmt = conn
-        .prepare("SELECT role FROM role_assignments WHERE connection_id = ?1 ORDER BY role ASC")?;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT rm.role
+         FROM role_models rm
+         JOIN models m ON m.id = rm.model_ref
+         WHERE m.connection_id = ?1
+         ORDER BY rm.role ASC",
+    )?;
     let rows = stmt.query_map([id], |row| row.get::<_, String>(0))?;
     rows.collect()
 }
 
-/// 删除一个连接。若仍有任意角色引用它，拒绝删除并返回 Err（调用方据此提示「仍被某些角色引用」）。
+/// 删除一个连接（0.0.60）。若该连接旗下任一模型仍被某角色（role_models）引用，拒绝删除并返回 Err；
+/// 否则删除连接，并级联删除其（此时已无人引用的）模型行。
 pub fn delete_connection(conn: &Connection, id: &str) -> SqlResult<()> {
     let refs = connection_referenced_by(conn, id)?;
     if !refs.is_empty() {
         return Err(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-            Some(format!("该连接仍被某些角色引用：{}", refs.join("、"))),
+            Some(format!(
+                "该连接下的模型仍被某些角色引用：{}，请先改这些角色的分配",
+                refs.join("、")
+            )),
         ));
     }
+    // 级联删旗下模型（此时均无 role_models 引用），再删连接。
+    conn.execute("DELETE FROM models WHERE connection_id = ?1", params![id])?;
     conn.execute("DELETE FROM connections WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -1344,6 +1421,291 @@ pub fn delete_role_assignment(conn: &Connection, role: &str) -> SqlResult<()> {
     }
     conn.execute("DELETE FROM role_assignments WHERE role = ?1", params![role])?;
     Ok(())
+}
+
+// ── 模型层（models）CRUD（0.0.60）───────────────────────────────────────────
+
+fn row_to_model(row: &rusqlite::Row) -> SqlResult<CuratedModel> {
+    Ok(CuratedModel {
+        id: row.get(0)?,
+        connection_id: row.get(1)?,
+        model_id: row.get(2)?,
+        label: row.get(3)?,
+        context_window: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+/// 列出全部登记模型（跨所有连接），按连接 + 创建时间正序。
+pub fn list_models(conn: &Connection) -> SqlResult<Vec<CuratedModel>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, connection_id, model_id, label, context_window, created_at, updated_at
+         FROM models
+         ORDER BY connection_id ASC, created_at ASC, id ASC",
+    )?;
+    let rows = stmt.query_map([], row_to_model)?;
+    rows.collect()
+}
+
+/// 列出某连接下用户登记的全部模型（0.0.60：curated 列表，**非**硬编码预设清单）。
+pub fn list_models_for_connection(
+    conn: &Connection,
+    connection_id: &str,
+) -> SqlResult<Vec<CuratedModel>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, connection_id, model_id, label, context_window, created_at, updated_at
+         FROM models
+         WHERE connection_id = ?1
+         ORDER BY created_at ASC, id ASC",
+    )?;
+    let rows = stmt.query_map([connection_id], row_to_model)?;
+    rows.collect()
+}
+
+/// 按 id 读取一个模型，未找到返回 None。
+pub fn get_model(conn: &Connection, id: &str) -> SqlResult<Option<CuratedModel>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, connection_id, model_id, label, context_window, created_at, updated_at
+         FROM models
+         WHERE id = ?1
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query([id])?;
+    match rows.next()? {
+        Some(row) => row_to_model(row).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// 按 (connection_id, model_id) 查一个已存模型的 id（dedup 用）。
+fn find_model_id(
+    conn: &Connection,
+    connection_id: &str,
+    model_id: &str,
+) -> SqlResult<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM models WHERE connection_id = ?1 AND model_id = ?2 LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![connection_id, model_id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+/// 新建或更新一个模型（0.0.60）。
+///
+/// - `id` 空：创建。但若同 (connection_id, model_id) 已存在一行，则改为 **更新那一行**
+///   （刷新 label / context_window）而非插重复，与 UNIQUE 约束语义一致。
+/// - `id` 非空：更新该 id 的行（id 不存在则报错）。
+///
+/// context_window 非正值归一为 None。label 空白归一为 None。返回写入后的完整 [`CuratedModel`]。
+pub fn upsert_model(
+    conn: &Connection,
+    id: &str,
+    connection_id: &str,
+    model_id: &str,
+    label: Option<&str>,
+    context_window: Option<i64>,
+) -> SqlResult<CuratedModel> {
+    let now = now_ts();
+    let model_id = model_id.trim();
+    let label = label.map(str::trim).filter(|s| !s.is_empty());
+    let context_window = context_window.filter(|&cw| cw > 0);
+
+    // 决定要更新的 id：显式 id 优先；否则按 (connection, model_id) dedup 命中已存行；都没有则新建。
+    let target_id = if !id.trim().is_empty() {
+        // 确认该 id 存在。
+        get_model(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        Some(id.to_string())
+    } else {
+        find_model_id(conn, connection_id, model_id)?
+    };
+
+    match target_id {
+        Some(existing_id) => {
+            // 更新：connection_id 与 model_id 也一并写（允许改 id 路径下重新指定，但通常不变）。
+            conn.execute(
+                "UPDATE models
+                 SET connection_id = ?2, model_id = ?3, label = ?4, context_window = ?5, updated_at = ?6
+                 WHERE id = ?1",
+                params![existing_id, connection_id, model_id, label, context_window, now],
+            )?;
+            get_model(conn, &existing_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+        }
+        None => {
+            let new_id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO models
+                 (id, connection_id, model_id, label, context_window, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![new_id, connection_id, model_id, label, context_window, now],
+            )?;
+            get_model(conn, &new_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+        }
+    }
+}
+
+/// 返回引用了某模型的角色名列表（供「拒删被引用模型」判断与人话化错误）。
+pub fn model_referenced_by(conn: &Connection, id: &str) -> SqlResult<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT role FROM role_models WHERE model_ref = ?1 ORDER BY role ASC")?;
+    let rows = stmt.query_map([id], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// 删除一个模型。若仍被任意角色（role_models）引用，拒绝删除并返回 Err（与 delete_connection 同款）。
+pub fn delete_model(conn: &Connection, id: &str) -> SqlResult<()> {
+    let refs = model_referenced_by(conn, id)?;
+    if !refs.is_empty() {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(format!("该模型仍被某些角色引用：{}", refs.join("、"))),
+        ));
+    }
+    conn.execute("DELETE FROM models WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+// ── 角色分配（role_models）CRUD（0.0.60，运行时真源）───────────────────────────
+
+fn row_to_role_model(row: &rusqlite::Row) -> SqlResult<RoleModel> {
+    Ok(RoleModel {
+        role: row.get(0)?,
+        model_ref: row.get(1)?,
+        enabled: row.get::<_, i64>(2)? != 0,
+        updated_at: row.get(3)?,
+    })
+}
+
+/// 列出全部角色分配。
+pub fn get_role_models(conn: &Connection) -> SqlResult<Vec<RoleModel>> {
+    let mut stmt = conn.prepare(
+        "SELECT role, model_ref, enabled, updated_at
+         FROM role_models
+         ORDER BY role ASC",
+    )?;
+    let rows = stmt.query_map([], row_to_role_model)?;
+    rows.collect()
+}
+
+/// 读取某角色的分配，未配置返回 None。
+pub fn get_role_model(conn: &Connection, role: &str) -> SqlResult<Option<RoleModel>> {
+    let mut stmt = conn.prepare(
+        "SELECT role, model_ref, enabled, updated_at
+         FROM role_models
+         WHERE role = ?1
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query([role])?;
+    match rows.next()? {
+        Some(row) => row_to_role_model(row).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// 新建或覆盖某角色的分配（role 为主键，UPSERT 覆盖）。校验 model_ref 指向一个真实存在的模型。
+pub fn upsert_role_model(
+    conn: &Connection,
+    role: &str,
+    model_ref: &str,
+    enabled: bool,
+) -> SqlResult<RoleModel> {
+    // 校验 model_ref 存在，避免建出悬空分配。
+    if get_model(conn, model_ref)?.is_none() {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("所选模型不存在，请先登记模型".to_string()),
+        ));
+    }
+    let now = now_ts();
+    conn.execute(
+        "INSERT INTO role_models (role, model_ref, enabled, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(role) DO UPDATE SET
+             model_ref = excluded.model_ref,
+             enabled = excluded.enabled,
+             updated_at = excluded.updated_at",
+        params![role, model_ref, enabled as i64, now],
+    )?;
+    get_role_model(conn, role)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// 删除某角色的分配（使其回退到 main）。拒绝删除 role==main（main 不可清）。
+pub fn delete_role_model(conn: &Connection, role: &str) -> SqlResult<()> {
+    if role == ROLE_MAIN {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("不能清除主模型（main）".to_string()),
+        ));
+    }
+    conn.execute("DELETE FROM role_models WHERE role = ?1", params![role])?;
+    Ok(())
+}
+
+// ── 0.0.60 数据迁移：role_assignments → models + role_models ──────────────────
+
+/// 把 0.0.59 的 role_assignments 升级为「模型层」：去重出 models，并把角色改指 role_models。
+///
+/// **一次性、幂等**——可在每次 `init_db` 调用，但只在「`role_models` 为空 且 `role_assignments`
+/// 非空」时才真正搬数据。门保证：已迁库（role_models 非空）跳过；全新库（role_assignments 为空）
+/// 也跳过——此时 models / role_models 由 `CREATE TABLE IF NOT EXISTS` 建出但保持为空，用户从新表配。
+///
+/// dedup：对每条 role_assignments 行，按 (connection_id, model_id) 找/建一条 models 行——
+/// 同一 (连接, 模型) 跨多个角色只产生**一条** model（carry context_window 到 model；label 缺省为 model_id）。
+/// 然后为该角色 upsert 一条 role_models 指向该 model。
+///
+/// 回滚：整个搬运在**单事务**内（出错即 ROLLBACK），且**绝不** drop/alter role_assignments /
+/// model_providers——它们原封保留为惰性回滚源（与 0.0.59 同纪律，不另落明文密钥文件备份）。
+fn migrate_to_models_layer_0060(conn: &Connection) -> SqlResult<()> {
+    // 门 1：已有任意角色分配 ⇒ 已迁过（或用户已用新表配置），不再迁。
+    let role_model_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM role_models", [], |r| r.get(0))?;
+    if role_model_count > 0 {
+        return Ok(());
+    }
+    // 门 2：旧 role_assignments 无行 ⇒ 全新库 / 无可迁数据，无需迁移。
+    let assignments = get_role_assignments(conn)?;
+    if assignments.is_empty() {
+        return Ok(());
+    }
+
+    // 在单事务里做完 dedup + 写入，避免半迁状态。
+    conn.execute_batch("BEGIN")?;
+    let result = (|| -> SqlResult<()> {
+        for a in &assignments {
+            // dedup：同 (connection_id, model_id) 复用一条 model；首次创建时 carry context_window，
+            // label 缺省为 model_id。后续同 (连接,模型) 的角色复用，不改已建 model 的 context_window
+            //（同一模型其上下文窗口一致，0.0.59 同 (连接,模型) 不同角色的 context_window 也一致）。
+            let model_ref = match find_model_id(conn, &a.connection_id, &a.model_id)? {
+                Some(existing) => existing,
+                None => {
+                    let created = upsert_model(
+                        conn,
+                        "",
+                        &a.connection_id,
+                        &a.model_id,
+                        Some(&a.model_id),
+                        a.context_window,
+                    )?;
+                    created.id
+                }
+            };
+            upsert_role_model(conn, &a.role, &model_ref, a.enabled)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 // ── 0.0.59 数据迁移：model_providers → connections + role_assignments ────────
@@ -2082,33 +2444,38 @@ mod tests {
         assert_eq!(updated2.api_key, "sk-2");
         assert_eq!(updated2.base_url.as_deref(), Some("https://proxy/v1"));
 
-        // 角色引用：建 main 引用指向该连接。
-        let a = upsert_role_assignment(&conn, ROLE_MAIN, &c.id, "deepseek-chat", Some(64_000), true)
-            .expect("assign main");
+        // 0.0.60 模型层：在连接下登记一个模型，再把 main 角色指向该模型。
+        let m = upsert_model(&conn, "", &c.id, "deepseek-chat", Some("DS Chat"), Some(64_000))
+            .expect("add model");
+        assert_eq!(m.connection_id, c.id);
+        assert_eq!(m.context_window, Some(64_000));
+        let a = upsert_role_model(&conn, ROLE_MAIN, &m.id, true).expect("assign main");
         assert_eq!(a.role, "main");
-        assert_eq!(a.connection_id, c.id);
-        assert_eq!(a.context_window, Some(64_000));
+        assert_eq!(a.model_ref, m.id);
 
-        // 引用计数：删被引用的连接应被拒。
+        // 引用计数：删被引用模型/连接均应被拒。
         let refs = connection_referenced_by(&conn, &c.id).expect("refs");
         assert_eq!(refs, vec!["main".to_string()]);
         assert!(delete_connection(&conn, &c.id).is_err(), "被引用连接不可删");
+        assert!(delete_model(&conn, &m.id).is_err(), "被引用模型不可删");
 
-        // 清 main 引用应被拒（main 不可清）。
-        assert!(delete_role_assignment(&conn, ROLE_MAIN).is_err(), "main 不可清");
+        // 清 main 分配应被拒（main 不可清）。
+        assert!(delete_role_model(&conn, ROLE_MAIN).is_err(), "main 不可清");
 
-        // 改指到非 main 角色后即可删连接。
-        upsert_role_assignment(&conn, ROLE_PLAN, &c.id, "deepseek-reasoner", None, true)
-            .expect("assign plan");
-        delete_role_assignment(&conn, ROLE_PLAN).expect("clear plan");
-        // 仍有 main 引用 ⇒ 还是不能删。
+        // 改 plan 指向同一模型后再清 plan：连接仍有 main 引用 ⇒ 不能删。
+        upsert_role_model(&conn, ROLE_PLAN, &m.id, true).expect("assign plan");
+        delete_role_model(&conn, ROLE_PLAN).expect("clear plan");
         assert!(delete_connection(&conn, &c.id).is_err());
-        // 清掉 main 之外都没了，但 main 不可清——所以建第二个连接、把 main 改指它，再删 c。
+
+        // 建第二个连接 + 模型，把 main 改指它，则 c 已无人引用 ⇒ 可删（级联删其模型）。
         let c2 = upsert_connection(&conn, "", Some("Z"), Some("zhipu"), None, "sk-z", "openai")
             .expect("c2");
-        upsert_role_assignment(&conn, ROLE_MAIN, &c2.id, "glm-4", None, true).expect("remap main");
+        let m2 = upsert_model(&conn, "", &c2.id, "glm-4", None, None).expect("add model 2");
+        upsert_role_model(&conn, ROLE_MAIN, &m2.id, true).expect("remap main");
         delete_connection(&conn, &c.id).expect("now deletable");
         assert!(get_connection(&conn, &c.id).expect("get").is_none());
+        // 级联：c 旗下模型 m 也被删。
+        assert!(get_model(&conn, &m.id).expect("get model").is_none());
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -2122,13 +2489,14 @@ mod tests {
         assert!(resolve_role_provider(&conn, ROLE_ACTION).expect("q").is_none());
         assert!(resolve_role_provider(&conn, ROLE_MAIN).expect("q").is_none());
 
-        // 配 main 连接 + 引用：未配置的功能角色全部回退 main。
+        // 配 main 连接 + 模型 + 分配：未配置的功能角色全部回退 main。
         let main_conn = upsert_connection(
             &conn, "", Some("DeepSeek"), Some("deepseek"), None, "sk-main", "openai",
         )
         .expect("main conn");
-        upsert_role_assignment(&conn, ROLE_MAIN, &main_conn.id, "main-model", Some(128_000), true)
-            .expect("assign main");
+        let main_model = upsert_model(&conn, "", &main_conn.id, "main-model", None, Some(128_000))
+            .expect("main model");
+        upsert_role_model(&conn, ROLE_MAIN, &main_model.id, true).expect("assign main");
 
         let action = resolve_role_provider(&conn, ROLE_ACTION).expect("q").expect("falls back");
         // 回退时合成出的 role 即被回退到的 main（与旧约定一致：source=main 时 role 显示 "main"）。
@@ -2136,6 +2504,7 @@ mod tests {
         assert_eq!(action.model_id, "main-model");
         assert_eq!(action.api_key, "sk-main");
         assert_eq!(action.preset.as_deref(), Some("deepseek"));
+        assert_eq!(action.context_window, Some(128_000));
         assert_eq!(
             resolve_role_provider(&conn, ROLE_SUBAGENT).expect("q").expect("sub").model_id,
             "main-model"
@@ -2149,13 +2518,14 @@ mod tests {
             "main-model"
         );
 
-        // 为 plan 单独绑一个连接：plan 用自己的，action 仍回退 main。
+        // 为 plan 单独绑一个连接 + 模型：plan 用自己的，action 仍回退 main。
         let plan_conn = upsert_connection(
             &conn, "", Some("Planner"), Some("custom"), Some("https://plan/v1"), "sk-plan", "openai",
         )
         .expect("plan conn");
-        upsert_role_assignment(&conn, ROLE_PLAN, &plan_conn.id, "plan-model", None, true)
-            .expect("assign plan");
+        let plan_model =
+            upsert_model(&conn, "", &plan_conn.id, "plan-model", None, None).expect("plan model");
+        upsert_role_model(&conn, ROLE_PLAN, &plan_model.id, true).expect("assign plan");
         let plan = resolve_role_provider(&conn, ROLE_PLAN).expect("q").expect("plan");
         assert_eq!(plan.model_id, "plan-model");
         assert_eq!(plan.api_key, "sk-plan");
@@ -2165,9 +2535,8 @@ mod tests {
             "main-model"
         );
 
-        // 禁用 plan 引用 ⇒ 回退 main。
-        upsert_role_assignment(&conn, ROLE_PLAN, &plan_conn.id, "plan-model", None, false)
-            .expect("disable plan");
+        // 禁用 plan 分配 ⇒ 回退 main。
+        upsert_role_model(&conn, ROLE_PLAN, &plan_model.id, false).expect("disable plan");
         assert_eq!(
             resolve_role_provider(&conn, ROLE_PLAN).expect("q").expect("plan disabled").model_id,
             "main-model"
@@ -2196,8 +2565,8 @@ mod tests {
             .map(|p| (p.role.clone(), p))
             .collect();
 
-        // 跑迁移。
-        migrate_to_connections_0059(&conn).expect("migrate");
+        // 跑链式迁移：pre-0.0.59 → 0.0.59（connections + role_assignments）→ 0.0.60（models + role_models）。
+        migrate_to_connections_0059(&conn).expect("migrate 0059");
 
         // dedup：main/action/plan 三角色 → 1 个连接；critique → 另 1 个 ⇒ 共 2 个连接。
         let conns = list_connections(&conn).expect("list conns");
@@ -2211,16 +2580,29 @@ mod tests {
         assert_eq!(main_a.connection_id, action_a.connection_id, "main/action 共连接");
         assert_eq!(main_a.connection_id, plan_a.connection_id, "main/plan 共连接");
         assert_ne!(main_a.connection_id, crit_a.connection_id, "critique 独立连接");
-        // model_id / context_window 按角色各自保留（即便共连接，引用各自不同 model）。
-        assert_eq!(main_a.model_id, "deepseek-chat");
-        assert_eq!(main_a.context_window, Some(128_000));
-        assert_eq!(plan_a.model_id, "deepseek-reasoner");
-        assert_eq!(plan_a.context_window, None);
-        assert_eq!(crit_a.model_id, "crit-model");
-        assert_eq!(crit_a.context_window, Some(32_000));
+
+        // 0.0.60 迁移：role_assignments → models（按 (connection, model_id) dedup）+ role_models。
+        migrate_to_models_layer_0060(&conn).expect("migrate 0060");
+
+        // models dedup：main/action 共 (deepseek 连接, deepseek-chat) ⇒ 1 个 model；
+        // plan 同连接但 model_id 不同(deepseek-reasoner) ⇒ 另 1 个 model；critique 独立连接 ⇒ 第 3 个 model。
+        let models = list_models(&conn).expect("list models");
+        assert_eq!(models.len(), 3, "main/action 同 model dedup；plan 异 model_id；critique 独立 ⇒ 3");
+        // main 与 action 指向同一 model_ref；plan 不同（同连接异 model_id）。
+        let main_rm = get_role_model(&conn, "main").expect("q").expect("main");
+        let action_rm = get_role_model(&conn, "action").expect("q").expect("action");
+        let plan_rm = get_role_model(&conn, "plan").expect("q").expect("plan");
+        let crit_rm = get_role_model(&conn, "critique").expect("q").expect("crit");
+        assert_eq!(main_rm.model_ref, action_rm.model_ref, "main/action 共 model");
+        assert_ne!(main_rm.model_ref, plan_rm.model_ref, "plan 异 model（同连接异 model_id）");
+        assert_ne!(main_rm.model_ref, crit_rm.model_ref, "critique 独立 model");
+        // context_window 下沉到 model：deepseek-chat=128000, deepseek-reasoner=None, crit-model=32000。
+        assert_eq!(get_model(&conn, &main_rm.model_ref).unwrap().unwrap().context_window, Some(128_000));
+        assert_eq!(get_model(&conn, &plan_rm.model_ref).unwrap().unwrap().context_window, None);
+        assert_eq!(get_model(&conn, &crit_rm.model_ref).unwrap().unwrap().context_window, Some(32_000));
 
         // resolve_role_provider 对每个角色返回与迁移前逐字段等价（base_url/api_key/model_id/
-        // api_format/context_window）。
+        // api_format/context_window）——经新的 role_models → models → connections 链路。
         for role in ["main", "action", "plan", "critique"] {
             let before = &pre[role];
             let after = resolve_role_provider(&conn, role).expect("resolve").expect("present");
@@ -2240,17 +2622,26 @@ mod tests {
             resolve_role_provider(&conn, ROLE_EMBED).expect("q").expect("embed").api_key,
             "sk-shared"
         );
+        // 子代理回退链（subagent→action→main）经 role_models 仍成立。
+        assert_eq!(
+            resolve_subagent_provider(&conn).expect("q").expect("sub chain").model_id,
+            "deepseek-chat"
+        );
 
-        // 幂等：再跑一次迁移什么都不应改变（连接数 / 引用不变）。
-        migrate_to_connections_0059(&conn).expect("migrate twice");
-        assert_eq!(list_connections(&conn).expect("conns2").len(), 2, "二次迁移不应新增连接");
-        assert_eq!(get_role_assignments(&conn).expect("assigns2").len(), 4, "二次迁移不应改引用");
+        // 幂等：再跑 0.0.60 迁移什么都不应改变（models / role_models 数量不变）。
+        migrate_to_models_layer_0060(&conn).expect("migrate 0060 twice");
+        assert_eq!(list_models(&conn).expect("models2").len(), 3, "二次迁移不应新增 model");
+        assert_eq!(get_role_models(&conn).expect("rm2").len(), 4, "二次迁移不应改分配");
+        // 0.0.59 迁移再跑也仍 no-op（role_assignments 已非空）。
+        migrate_to_connections_0059(&conn).expect("migrate 0059 twice");
+        assert_eq!(list_connections(&conn).expect("conns2").len(), 2, "二次 0.0.59 迁移不应新增连接");
 
         // main 不可清（防御）。
-        assert!(delete_role_assignment(&conn, ROLE_MAIN).is_err());
+        assert!(delete_role_model(&conn, ROLE_MAIN).is_err());
 
-        // 旧表保留（回滚路径）：model_providers 仍有原始 4 行。
-        assert_eq!(list_model_providers(&conn).expect("old still there").len(), 4);
+        // 旧表保留（回滚路径）：model_providers 与 role_assignments 均原封未动。
+        assert_eq!(list_model_providers(&conn).expect("old providers still there").len(), 4);
+        assert_eq!(get_role_assignments(&conn).expect("legacy assignments still there").len(), 4);
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -2266,7 +2657,8 @@ mod tests {
         // 只配 main：subagent 默认落到 main（与「继承 action→main」逐字节一致）。
         let main_c = upsert_connection(&conn, "", Some("M"), Some("deepseek"), None, "sk-main", "openai")
             .expect("main conn");
-        upsert_role_assignment(&conn, ROLE_MAIN, &main_c.id, "main-model", None, true).expect("main");
+        let main_m = upsert_model(&conn, "", &main_c.id, "main-model", None, None).expect("main model");
+        upsert_role_model(&conn, ROLE_MAIN, &main_m.id, true).expect("main");
         assert_eq!(
             resolve_subagent_provider(&conn).expect("q").expect("main").model_id,
             "main-model"
@@ -2275,7 +2667,8 @@ mod tests {
         // 配 action：subagent 未配 ⇒ 用 action。
         let act_c = upsert_connection(&conn, "", Some("A"), Some("custom"), Some("https://a/v1"), "sk-act", "openai")
             .expect("act conn");
-        upsert_role_assignment(&conn, ROLE_ACTION, &act_c.id, "action-model", None, true).expect("action");
+        let act_m = upsert_model(&conn, "", &act_c.id, "action-model", None, None).expect("act model");
+        upsert_role_model(&conn, ROLE_ACTION, &act_m.id, true).expect("action");
         assert_eq!(
             resolve_subagent_provider(&conn).expect("q").expect("action").model_id,
             "action-model"
@@ -2284,13 +2677,14 @@ mod tests {
         // 显式配 subagent：优先用它。
         let sub_c = upsert_connection(&conn, "", Some("S"), Some("custom"), Some("https://s/v1"), "sk-sub", "openai")
             .expect("sub conn");
-        upsert_role_assignment(&conn, ROLE_SUBAGENT, &sub_c.id, "sub-model", None, true).expect("sub");
+        let sub_m = upsert_model(&conn, "", &sub_c.id, "sub-model", None, None).expect("sub model");
+        upsert_role_model(&conn, ROLE_SUBAGENT, &sub_m.id, true).expect("sub");
         let p = resolve_subagent_provider(&conn).expect("q").expect("sub");
         assert_eq!(p.model_id, "sub-model");
         assert_eq!(p.api_key, "sk-sub");
 
         // 禁用 subagent ⇒ 回退 action。
-        upsert_role_assignment(&conn, ROLE_SUBAGENT, &sub_c.id, "sub-model", None, false).expect("disable sub");
+        upsert_role_model(&conn, ROLE_SUBAGENT, &sub_m.id, false).expect("disable sub");
         assert_eq!(
             resolve_subagent_provider(&conn).expect("q").expect("action again").model_id,
             "action-model"
@@ -2304,23 +2698,230 @@ mod tests {
         let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
         let conn = init_db(&db_path).expect("db");
 
-        // 已经有一条角色引用（模拟「已迁过 / 用户已用新表配置」）。
+        // 已经用 0.0.60 模型层配好 main（模拟「已迁过 / 用户已用新表配置」）。
         let c = upsert_connection(&conn, "", Some("Z"), Some("zhipu"), None, "sk-new", "openai")
             .expect("conn");
-        upsert_role_assignment(&conn, ROLE_MAIN, &c.id, "glm-4", None, true).expect("assign");
+        let m = upsert_model(&conn, "", &c.id, "glm-4", None, None).expect("model");
+        upsert_role_model(&conn, ROLE_MAIN, &m.id, true).expect("assign");
 
-        // 旧表里也塞一行——迁移因「已有引用」这道门而完全跳过，不污染已有配置。
+        // 旧 model_providers 与 0.0.59 role_assignments 里也各塞数据——两道迁移都应因各自的门而跳过。
         seed_old_provider(&conn, "main", Some("deepseek"), Some("DS"), None, "sk-old", "deepseek-chat", "openai", None);
-        migrate_to_connections_0059(&conn).expect("migrate no-op");
+        let c_old = upsert_connection(&conn, "", Some("Old"), Some("deepseek"), None, "sk-ra", "openai")
+            .expect("old conn");
+        upsert_role_assignment(&conn, ROLE_ACTION, &c_old.id, "deepseek-chat", None, true)
+            .expect("legacy assignment");
 
-        // 仍只有 1 个连接、1 条引用，且都是新表里那条（未被旧行覆盖）。
-        assert_eq!(list_connections(&conn).expect("conns").len(), 1);
-        let main_a = get_role_assignment(&conn, "main").expect("q").expect("main");
-        assert_eq!(main_a.model_id, "glm-4");
+        // 0.0.59 迁移：role_assignments 已非空 ⇒ no-op。0.0.60 迁移：role_models 已非空 ⇒ no-op。
+        migrate_to_connections_0059(&conn).expect("0059 no-op");
+        migrate_to_models_layer_0060(&conn).expect("0060 no-op");
+
+        // 仍是新表里那条配置（未被旧行污染）：main 经模型层解析到 sk-new / glm-4。
+        let main_rm = get_role_model(&conn, "main").expect("q").expect("main");
+        assert_eq!(get_model(&conn, &main_rm.model_ref).unwrap().unwrap().model_id, "glm-4");
         assert_eq!(
             resolve_role_provider(&conn, ROLE_MAIN).expect("q").expect("main").api_key,
             "sk-new"
         );
+        // 0.0.60 没有从 role_assignments 多造 model/role_model（门拦住了）：仅手配的 1 个 model、1 条分配。
+        assert_eq!(list_models(&conn).expect("models").len(), 1, "0.0.60 门生效，未从旧表造 model");
+        assert_eq!(get_role_models(&conn).expect("rm").len(), 1, "0.0.60 门生效，未从旧表造分配");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn upsert_model_dedupes_by_connection_and_model_id() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db");
+        let c = upsert_connection(&conn, "", Some("DS"), Some("deepseek"), None, "sk", "openai")
+            .expect("conn");
+
+        // 新建（id 空）。
+        let m1 = upsert_model(&conn, "", &c.id, "deepseek-chat", Some("Chat"), Some(64_000))
+            .expect("create");
+        assert!(!m1.id.is_empty());
+        assert_eq!(m1.label.as_deref(), Some("Chat"));
+        assert_eq!(m1.context_window, Some(64_000));
+
+        // 同 (connection, model_id) 再 upsert（id 空）⇒ 更新同一行而非插重复。
+        let m1b = upsert_model(&conn, "", &c.id, "deepseek-chat", Some("Chat v2"), Some(128_000))
+            .expect("dedupe update");
+        assert_eq!(m1b.id, m1.id, "同连接同 model_id 应复用同一行");
+        assert_eq!(m1b.label.as_deref(), Some("Chat v2"));
+        assert_eq!(m1b.context_window, Some(128_000));
+        assert_eq!(list_models_for_connection(&conn, &c.id).expect("list").len(), 1);
+
+        // 同连接、不同 model_id ⇒ 第二行。
+        let m2 = upsert_model(&conn, "", &c.id, "deepseek-reasoner", None, None).expect("second");
+        assert_ne!(m2.id, m1.id);
+        assert_eq!(list_models_for_connection(&conn, &c.id).expect("list").len(), 2);
+        // label 缺省（空白归一为 None）。
+        assert_eq!(m2.label, None);
+
+        // 显式 id 更新（仅改 label/context_window）。
+        let m2b = upsert_model(&conn, &m2.id, &c.id, "deepseek-reasoner", Some("R1"), Some(32_000))
+            .expect("update by id");
+        assert_eq!(m2b.id, m2.id);
+        assert_eq!(m2b.label.as_deref(), Some("R1"));
+
+        // upsert_role_model 校验 model_ref 存在；指向不存在 ⇒ Err。
+        assert!(upsert_role_model(&conn, ROLE_MAIN, "nonexistent-id", true).is_err());
+        upsert_role_model(&conn, ROLE_MAIN, &m1.id, true).expect("assign main to m1");
+        // 被引用模型不可删；改指走后可删。
+        assert!(delete_model(&conn, &m1.id).is_err(), "被引用模型不可删");
+        upsert_role_model(&conn, ROLE_MAIN, &m2.id, true).expect("remap main");
+        delete_model(&conn, &m1.id).expect("now deletable");
+        assert!(get_model(&conn, &m1.id).expect("get").is_none());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    /// 直接把一行 0.0.59 role_assignments 写库（绕过 init_db 链式迁移），用于播种 0.0.60 迁移输入。
+    fn seed_role_assignment(
+        conn: &Connection,
+        role: &str,
+        connection_id: &str,
+        model_id: &str,
+        context_window: Option<i64>,
+        enabled: bool,
+    ) {
+        conn.execute(
+            "INSERT INTO role_assignments
+             (role, connection_id, model_id, context_window, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(role) DO UPDATE SET
+                 connection_id = excluded.connection_id,
+                 model_id = excluded.model_id,
+                 context_window = excluded.context_window,
+                 enabled = excluded.enabled,
+                 updated_at = excluded.updated_at",
+            params![role, connection_id, model_id, context_window, enabled as i64, now_ts()],
+        )
+        .expect("seed role_assignment");
+    }
+
+    #[test]
+    fn migration_0060_dedupes_models_and_preserves_every_role() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db");
+
+        // 播种 0.0.59 态：连接 A（deepseek）下两个角色（main/action）共用 SAME (conn, model_id)；
+        // plan 同连接 A 但 DIFFERENT model_id；critique 用独立连接 B。
+        let conn_a = upsert_connection(&conn, "", Some("A"), Some("deepseek"), None, "sk-a", "openai")
+            .expect("conn A");
+        let conn_b = upsert_connection(
+            &conn, "", Some("B"), Some("custom"), Some("https://b/v1"), "sk-b", "anthropic",
+        )
+        .expect("conn B");
+        // 注意：role_assignments 里 main/action 同 (connA, deepseek-chat, ctx=128000)。
+        seed_role_assignment(&conn, "main", &conn_a.id, "deepseek-chat", Some(128_000), true);
+        seed_role_assignment(&conn, "action", &conn_a.id, "deepseek-chat", Some(128_000), true);
+        seed_role_assignment(&conn, "plan", &conn_a.id, "deepseek-reasoner", None, true);
+        seed_role_assignment(&conn, "critique", &conn_b.id, "claude-3-5-sonnet", Some(200_000), true);
+
+        // 迁移前：对每个角色快照「应得 provider」——直接用 role_assignment + connection 合成，
+        // 作为逐字节比对基准（这正是 0.0.59 resolve 的语义）。
+        let assignments = get_role_assignments(&conn).expect("assignments");
+        let pre: std::collections::HashMap<String, ModelProvider> = assignments
+            .iter()
+            .map(|a| {
+                let c = get_connection(&conn, &a.connection_id).unwrap().unwrap();
+                (
+                    a.role.clone(),
+                    ModelProvider {
+                        id: a.connection_id.clone(),
+                        role: a.role.clone(),
+                        preset: c.preset.clone(),
+                        label: c.label.clone(),
+                        base_url: c.base_url.clone().filter(|s| !s.trim().is_empty()),
+                        api_key: c.api_key.clone(),
+                        model_id: a.model_id.clone(),
+                        api_format: c.api_format.clone(),
+                        context_window: a.context_window,
+                        enabled: a.enabled,
+                        updated_at: a.updated_at,
+                    },
+                )
+            })
+            .collect();
+
+        // 跑 0.0.60 迁移。
+        migrate_to_models_layer_0060(&conn).expect("migrate 0060");
+
+        // dedup：main/action 同 (connA, deepseek-chat) ⇒ 1 model；plan 同连接异 model_id ⇒ 第 2 model；
+        // critique 独立连接 ⇒ 第 3 model。共 3 个 model 行。
+        assert_eq!(list_models(&conn).expect("models").len(), 3);
+        let main_rm = get_role_model(&conn, "main").expect("q").expect("main");
+        let action_rm = get_role_model(&conn, "action").expect("q").expect("action");
+        let plan_rm = get_role_model(&conn, "plan").expect("q").expect("plan");
+        assert_eq!(main_rm.model_ref, action_rm.model_ref, "main/action 共 model（同 conn+model_id）");
+        assert_ne!(main_rm.model_ref, plan_rm.model_ref, "plan 异 model（同 conn 异 model_id）");
+        // 连接 A 下应有 2 个 model（deepseek-chat / deepseek-reasoner），连接 B 下 1 个。
+        assert_eq!(list_models_for_connection(&conn, &conn_a.id).expect("A").len(), 2);
+        assert_eq!(list_models_for_connection(&conn, &conn_b.id).expect("B").len(), 1);
+
+        // resolve_role_provider 对 EVERY role 逐字节等价（base_url/api_key/model_id/api_format/context_window）。
+        for role in ["main", "action", "plan", "critique"] {
+            let before = &pre[role];
+            let after = resolve_role_provider(&conn, role).expect("resolve").expect("present");
+            assert_eq!(after.base_url, before.base_url, "{role} base_url");
+            assert_eq!(after.api_key, before.api_key, "{role} api_key");
+            assert_eq!(after.model_id, before.model_id, "{role} model_id");
+            assert_eq!(after.api_format, before.api_format, "{role} api_format");
+            assert_eq!(after.context_window, before.context_window, "{role} context_window");
+        }
+
+        // 未分配角色（subagent/embed/vision）回退 main；子代理链 subagent→action→main 成立。
+        assert_eq!(
+            resolve_role_provider(&conn, ROLE_SUBAGENT).expect("q").expect("sub").model_id,
+            "deepseek-chat"
+        );
+        assert_eq!(
+            resolve_role_provider(&conn, ROLE_EMBED).expect("q").expect("embed").api_key,
+            "sk-a"
+        );
+        assert_eq!(
+            resolve_subagent_provider(&conn).expect("q").expect("subchain").model_id,
+            "deepseek-chat"
+        );
+
+        // 幂等：再跑一次 = no-op（门：role_models 已非空）。models/role_models 数量不变。
+        migrate_to_models_layer_0060(&conn).expect("migrate twice");
+        assert_eq!(list_models(&conn).expect("models2").len(), 3);
+        assert_eq!(get_role_models(&conn).expect("rm2").len(), 4);
+
+        // 旧表惰性保留：role_assignments 与 model_providers 均原封未动。
+        assert_eq!(get_role_assignments(&conn).expect("ra").len(), 4, "role_assignments 未动");
+        assert_eq!(list_model_providers(&conn).expect("mp").len(), 0, "model_providers 未被本迁移写入");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn migration_0060_skips_on_fresh_db_and_when_already_migrated() {
+        // 全新库（role_assignments 为空）：迁移 no-op，models/role_models 保持空。
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db");
+        // init_db 已跑过两道迁移（均因空而跳过）。
+        assert!(list_models(&conn).expect("models").is_empty());
+        assert!(get_role_models(&conn).expect("rm").is_empty());
+        // 再显式跑一次仍 no-op。
+        migrate_to_models_layer_0060(&conn).expect("noop");
+        assert!(list_models(&conn).expect("models2").is_empty());
+
+        // 已迁库（role_models 非空）：即便 role_assignments 也有行，迁移因门跳过，不覆盖。
+        let c = upsert_connection(&conn, "", Some("Z"), Some("zhipu"), None, "sk-new", "openai")
+            .expect("conn");
+        let m = upsert_model(&conn, "", &c.id, "glm-4", None, None).expect("model");
+        upsert_role_model(&conn, ROLE_MAIN, &m.id, true).expect("assign");
+        seed_role_assignment(&conn, "main", &c.id, "should-be-ignored", None, true);
+        migrate_to_models_layer_0060(&conn).expect("skip when migrated");
+        // main 仍解析到手配的 glm-4（未被 role_assignments 的 should-be-ignored 覆盖）。
+        assert_eq!(
+            resolve_role_provider(&conn, ROLE_MAIN).expect("q").expect("main").model_id,
+            "glm-4"
+        );
+        assert_eq!(list_models(&conn).expect("models3").len(), 1);
 
         let _ = std::fs::remove_file(db_path);
     }

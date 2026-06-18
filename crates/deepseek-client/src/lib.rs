@@ -746,6 +746,88 @@ pub async fn get_user_balance(api_key: &str) -> Result<UserBalance, DeepSeekErro
     parse_user_balance(&value)
 }
 
+/// 解析 OpenAI 兼容的 `/models` 端点（base 不含 /models 后缀时自动追加，含则原样用）。
+///
+/// 与 [`chat_completions_url`] 同款容错：用户可能填基址（`https://api.deepseek.com`）或
+/// 已带 `/v1` 的串；已以 `/models` 结尾就原样用，否则追加 `/models`。
+pub(crate) fn models_url(base: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    if base.ends_with("/models") {
+        base.to_string()
+    } else {
+        format!("{base}/models")
+    }
+}
+
+/// GET {base}/models 列出该端点可用模型 id（0.0.60「拉取可用模型」）。
+///
+/// 输入已解析的 base_url 与 api_key；走 OpenAI 兼容约定：Bearer 鉴权，解析
+/// `{"data":[{"id":...}]}`（也接受裸数组 `[{"id":...}]`）为模型 id 列表。10–12s 超时。
+/// 失败（端点无 /models、网络、鉴权、解析）返回 Err，由上层回退到手动输入。
+/// **绝不记录 api_key**：仅作为 Bearer 头使用。
+pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, DeepSeekError> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err(DeepSeekError::BadRequest(
+            "Base URL 未配置：请填写供应商端点".to_string(),
+        ));
+    }
+    if api_key.trim().is_empty() {
+        return Err(DeepSeekError::MissingApiKey);
+    }
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(DeepSeekError::Http)?;
+    let response = client
+        .get(models_url(base))
+        .bearer_auth(api_key)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(classify_api_error(status, &body));
+    }
+    let value = response.json::<serde_json::Value>().await?;
+    let ids = parse_model_ids(&value);
+    if ids.is_empty() {
+        return Err(DeepSeekError::BadRequest(
+            "该端点 /models 未返回任何模型，请手动输入模型 ID".to_string(),
+        ));
+    }
+    Ok(ids)
+}
+
+/// 从 /models 响应里抽出模型 id 列表：优先 `data` 数组，否则把顶层裸数组当作条目数组；
+/// 每个条目取其 `id` 字段（字符串），去重保序。
+fn parse_model_ids(value: &serde_json::Value) -> Vec<String> {
+    let items = value
+        .get("data")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.as_array());
+    let Some(items) = items else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        // 条目可能是对象 {"id":...}，少数端点直接给字符串。
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .or_else(|| item.as_str());
+        if let Some(id) = id {
+            let id = id.trim();
+            if !id.is_empty() && seen.insert(id.to_string()) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// 把 /user/balance 的原始 JSON（snake_case）解析为 UserBalance，缺失字段安全降级。
 fn parse_user_balance(value: &serde_json::Value) -> Result<UserBalance, DeepSeekError> {
     let is_available = value
@@ -1301,6 +1383,36 @@ mod tests {
         let balance = parse_user_balance(&serde_json::json!({})).expect("should parse empty");
         assert!(!balance.is_available);
         assert!(balance.balance_infos.is_empty());
+    }
+
+    #[test]
+    fn parses_model_ids_from_data_array_and_bare_array() {
+        // OpenAI 形态：{"data":[{"id":...}]}，保序去重。
+        let v = serde_json::json!({
+            "object": "list",
+            "data": [
+                { "id": "deepseek-chat", "object": "model" },
+                { "id": "deepseek-reasoner" },
+                { "id": "deepseek-chat" }
+            ]
+        });
+        assert_eq!(parse_model_ids(&v), vec!["deepseek-chat", "deepseek-reasoner"]);
+        // 裸数组形态。
+        let v2 = serde_json::json!([{ "id": "glm-4.6" }, { "id": "glm-4-flash" }]);
+        assert_eq!(parse_model_ids(&v2), vec!["glm-4.6", "glm-4-flash"]);
+        // 无 data 且非数组 ⇒ 空。
+        assert!(parse_model_ids(&serde_json::json!({ "error": "x" })).is_empty());
+    }
+
+    #[test]
+    fn models_url_tolerates_base_and_full_endpoint() {
+        assert_eq!(models_url("https://api.deepseek.com"), "https://api.deepseek.com/models");
+        assert_eq!(models_url("https://api.deepseek.com/"), "https://api.deepseek.com/models");
+        assert_eq!(
+            models_url("https://x/v1/models"),
+            "https://x/v1/models",
+            "已含 /models 后缀则原样用"
+        );
     }
 
     #[test]
