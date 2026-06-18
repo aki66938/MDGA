@@ -1,4 +1,4 @@
-// 设置弹窗：模型连接库（Connections）+ 我用到的模型（Models）+ 角色分配（Assignments）+ 其它分类（0.0.60）。
+// 设置弹窗：模型连接库（Connections）+ 加载模型（Models）+ 角色分配（Assignments）+ 其它分类（0.0.60）。
 
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
@@ -173,7 +173,7 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
       <h3 className="settings-content__h">模型连接</h3>
       <p className="settings-desc" style={{ marginTop: 0, marginBottom: 8 }}>
         在这里集中配置可复用的<b>模型连接</b>（端点 + 密钥，配一次即可）。每个连接 = 名称 + 供应商预设 +
-        Base URL + API Key + API 格式。这是<b>唯一</b>录入 API Key 的地方。配好后在每个连接卡下的「<b>我用到的模型</b>」里
+        Base URL + API Key + API 格式。这是<b>唯一</b>录入 API Key 的地方。配好后在每个连接卡下的「<b>加载模型</b>」里
         登记你会用到的模型（一个连接可登记多个），再到「模型分配」把各角色指到其中一个模型。
       </p>
 
@@ -221,7 +221,7 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
                 </button>
               </div>
 
-              {/* 0.0.60：在每个连接卡下登记「我用到的模型」（一个连接可登记多个模型，一对多）。 */}
+              {/* 0.0.60：在每个连接卡下登记「加载模型」（一个连接可登记多个模型，一对多）。 */}
               <ConnectionModels connection={c} />
             </div>
           );
@@ -240,7 +240,7 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
 }
 
 /**
- * 「我用到的模型」子区（0.0.60）：嵌在每个连接卡内，登记**该连接下**用户实际会用到的模型。
+ * 「加载模型」子区（0.0.60）：嵌在每个连接卡内，登记**该连接下**用户实际会用到的模型。
  * 这是连接 ↔ 模型「一对多」显式化的地方，也是角色分配可选模型的来源。
  *
  * 列表来自 list_models_for_connection（现返回 curated 模型，**非**旧的预设字符串清单）。
@@ -253,12 +253,15 @@ function ConnectionModels({ connection }: { connection: ConnectionView }) {
   const [models, setModels] = useState<CuratedModelView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // 添加表单：模型 ID + 可选别名 + 可选上下文窗口（高级，仅在展开时录入）。
+  // 添加表单：模型 ID + 可选别名（行内即可，不再用「高级」折叠）。上下文窗口改为登记后在列表行内就地编辑。
   const [modelId, setModelId] = useState("");
   const [label, setLabel] = useState("");
-  const [ctxWindow, setCtxWindow] = useState("");
-  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [adding, setAdding] = useState(false);
+  // 行内编辑「参数 → 上下文窗口」（0.0.61）：editingCtxId=正在编辑的模型 id（null=无）；
+  // ctxDraft=输入框草稿（空串＝清空＝由端点默认）；savingCtxId=正在保存的模型 id。
+  const [editingCtxId, setEditingCtxId] = useState<string | null>(null);
+  const [ctxDraft, setCtxDraft] = useState("");
+  const [savingCtxId, setSavingCtxId] = useState<string | null>(null);
   // 「拉取可用模型」状态：fetching=进行中；fetched=端点返回的 id 列表（作快速添加 chip）；notice=失败提示。
   const [fetching, setFetching] = useState(false);
   const [fetched, setFetched] = useState<string[] | null>(null);
@@ -297,15 +300,50 @@ function ConnectionModels({ connection }: { connection: ConnectionView }) {
     }
   }
 
-  /** 手动添加表单提交：读 modelId + 可选 label + 可选 contextWindow（高级），添加后清空表单。 */
+  /** 手动添加表单提交：读 modelId + 可选 label（行内），添加后清空表单。上下文窗口在列表行内就地登记。 */
   async function handleAddManual() {
-    const ctx = ctxWindow.trim() ? parseInt(ctxWindow.trim(), 10) : undefined;
-    if (ctx != null && (Number.isNaN(ctx) || ctx <= 0)) { setError("上下文窗口需为正整数"); return; }
     const id = modelId;
-    await addModel(id, { label, contextWindow: ctx });
+    await addModel(id, { label });
     setModelId("");
     setLabel("");
-    setCtxWindow("");
+  }
+
+  /** 进入某行的上下文窗口行内编辑：用当前值填充草稿（未设＝空串）。 */
+  function beginEditCtx(m: CuratedModelView) {
+    setError(null);
+    setEditingCtxId(m.id);
+    setCtxDraft(m.contextWindow != null ? String(m.contextWindow) : "");
+  }
+
+  /** 退出行内编辑且不保存。 */
+  function cancelEditCtx() {
+    setEditingCtxId(null);
+    setCtxDraft("");
+  }
+
+  /** 保存某行的上下文窗口：空串＝清空（contextWindow=null＝由端点默认）；否则须为正整数。经 update_model。 */
+  async function saveCtx(m: CuratedModelView) {
+    const raw = ctxDraft.trim();
+    let next: number | null;
+    if (!raw) {
+      next = null; // 清空 ⇒ 由端点默认
+    } else {
+      const n = parseInt(raw, 10);
+      if (Number.isNaN(n) || n <= 0) { setError("上下文窗口需为正整数，或留空＝由端点默认"); return; }
+      next = n;
+    }
+    setError(null);
+    setSavingCtxId(m.id);
+    try {
+      await invoke<CuratedModelView>("update_model", { id: m.id, contextWindow: next });
+      setEditingCtxId(null);
+      setCtxDraft("");
+      refresh();
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setSavingCtxId(null);
+    }
   }
 
   /** 删除一个已登记模型；若被某角色引用，后端拒绝并返回中文错误，此处原样提示（含建议先去「模型分配」改引用）。 */
@@ -342,7 +380,7 @@ function ConnectionModels({ connection }: { connection: ConnectionView }) {
   return (
     <div className="provider-models">
       <div className="provider-models__head">
-        <span className="provider-models__title">我用到的模型</span>
+        <span className="provider-models__title">加载模型</span>
         <span className="provider-models__count">{models.length} 个</span>
       </div>
 
@@ -354,30 +392,88 @@ function ConnectionModels({ connection }: { connection: ConnectionView }) {
         </p>
       ) : (
         <ul className="provider-models__list">
-          {models.map((m) => (
-            <li key={m.id} className="provider-models__item">
-              <span className="provider-models__id" title={m.modelId}>
-                <code>{m.modelId}</code>
-                {m.label && m.label.trim() && <span className="provider-models__label">{m.label}</span>}
-                {m.contextWindow ? (
-                  <span className="provider-models__ctx">{(m.contextWindow / 1000).toLocaleString()}K ctx</span>
-                ) : null}
-              </span>
-              <button
-                type="button"
-                className="provider-models__del"
-                title="删除该模型"
-                aria-label={`删除模型 ${m.modelId}`}
-                onClick={() => handleDelete(m)}
-              >
-                <Trash2 size={13} />
-              </button>
-            </li>
-          ))}
+          {models.map((m) => {
+            // 仅当 label 是**有意义的别名**时才展示（迁移/旧数据曾把 label 置成 modelId，会重复显示）。
+            const hasAlias = !!(m.label && m.label.trim() && m.label.trim() !== m.modelId);
+            const editing = editingCtxId === m.id;
+            const saving = savingCtxId === m.id;
+            return (
+              <li key={m.id} className="provider-models__item">
+                <div className="provider-models__row">
+                  <span className="provider-models__id" title={m.modelId}>
+                    <code>{m.modelId}</code>
+                    {hasAlias && <span className="provider-models__label">{m.label!.trim()}</span>}
+                  </span>
+                  <button
+                    type="button"
+                    className="provider-models__del"
+                    title="删除该模型"
+                    aria-label={`删除模型 ${m.modelId}`}
+                    onClick={() => handleDelete(m)}
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+
+                {/* 每个模型的「参数」区（0.0.61）：行内就地编辑、可扩展（目前仅上下文窗口，未来如温度等再加一行）。 */}
+                <div className="provider-params">
+                  <div className="provider-param">
+                    <span className="provider-param__name">上下文窗口</span>
+                    {editing ? (
+                      <span className="provider-param__edit">
+                        <input
+                          className="conv-search provider-input provider-param__input"
+                          type="number"
+                          min={1}
+                          autoFocus
+                          value={ctxDraft}
+                          placeholder="留空＝由端点默认"
+                          disabled={saving}
+                          onChange={(e) => setCtxDraft(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") { e.preventDefault(); void saveCtx(m); }
+                            else if (e.key === "Escape") { e.preventDefault(); cancelEditCtx(); }
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="approval-card__btn approval-card__btn--allow provider-param__btn"
+                          disabled={saving}
+                          onClick={() => void saveCtx(m)}
+                        >
+                          {saving ? "保存中…" : "保存"}
+                        </button>
+                        <button
+                          type="button"
+                          className="approval-card__btn provider-param__btn"
+                          disabled={saving}
+                          onClick={cancelEditCtx}
+                        >
+                          取消
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="provider-param__value"
+                        title="点击编辑上下文窗口"
+                        onClick={() => beginEditCtx(m)}
+                      >
+                        {m.contextWindow != null
+                          ? `${m.contextWindow.toLocaleString()} tokens`
+                          : "由端点默认"}
+                        <Pencil size={11} className="provider-param__editicon" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </li>
+            );
+          })}
         </ul>
       )}
 
-      {/* 拉取可用模型 + 手动添加 */}
+      {/* 拉取可用模型 + 手动添加（模型 ID + 可选别名，行内；上下文窗口登记后在列表行内就地设置）。 */}
       <div className="provider-models__add">
         <div className="provider-models__addrow">
           <input
@@ -386,6 +482,14 @@ function ConnectionModels({ connection }: { connection: ConnectionView }) {
             value={modelId}
             placeholder="模型 ID，如 deepseek-chat"
             onChange={(e) => setModelId(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void handleAddManual(); } }}
+          />
+          <input
+            className="conv-search provider-input provider-models__alias"
+            type="text"
+            value={label}
+            placeholder="别名（可选）"
+            onChange={(e) => setLabel(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void handleAddManual(); } }}
           />
           <button
@@ -399,34 +503,6 @@ function ConnectionModels({ connection }: { connection: ConnectionView }) {
           <button type="button" className="approval-card__btn" onClick={handleFetch} disabled={fetching}>
             <Download size={14} /> {fetching ? "拉取中…" : "拉取可用模型"}
           </button>
-        </div>
-
-        <button
-          type="button"
-          className="provider-advanced-toggle"
-          onClick={() => setAdvancedOpen((v) => !v)}
-        >
-          {advancedOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-          高级（别名 / 上下文窗口，可选）
-        </button>
-        <div className={`provider-advanced${advancedOpen ? " provider-advanced--open" : ""}`}>
-          <div className="provider-advanced__inner provider-models__advanced">
-            <input
-              className="conv-search provider-input"
-              type="text"
-              value={label}
-              placeholder="别名（可选，列表中展示）"
-              onChange={(e) => setLabel(e.target.value)}
-            />
-            <input
-              className="conv-search provider-input"
-              type="number"
-              min={1}
-              value={ctxWindow}
-              placeholder="上下文窗口 tokens（可选，如 128000）"
-              onChange={(e) => setCtxWindow(e.target.value)}
-            />
-          </div>
         </div>
 
         {/* 拉取结果：快速添加 chip（已登记的标灰禁用）；失败提示在下方。 */}
@@ -821,7 +897,7 @@ function AssignmentsSettings() {
     <>
       <h3 className="settings-content__h">模型分配</h3>
       <p className="settings-desc" style={{ marginTop: 0, marginBottom: 8 }}>
-        把每个<b>角色</b>指到一个<b>已登记的模型</b>（在「模型连接」的「我用到的模型」里登记）。未单独分配的角色自动<b>跟随主模型</b>。
+        把每个<b>角色</b>指到一个<b>已登记的模型</b>（在「模型连接」的「加载模型」里登记）。未单独分配的角色自动<b>跟随主模型</b>。
         此处只选模型，<b>不输入任何 API Key</b>（密钥在「模型连接」配）。
       </p>
 

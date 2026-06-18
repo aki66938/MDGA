@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 
-// 注（Plan28 P3-9）：CONTEXT_SOFT_LIMIT_TOKENS 与软上限推导 context_soft_limit_for 已迁入
-// mdga-agent-core（compaction 子模块）；本文件不再定义该常量，桌面端改 `mdga_agent_core::...` 引用。
+// 注（0.0.61）：软上限推导 context_soft_limit_for 在 mdga-agent-core（compaction 子模块）。
+// context_window 改为纯用户自定义后，不再有 app 默认常量（旧 CONTEXT_SOFT_LIMIT_TOKENS 已删除）；
+// 主模型未填窗口 ⇒ 软上限为 None ⇒ 不做窗口驱动压缩。桌面端经 `mdga_agent_core::...` 引用。
 /// 摘要压缩时保留最近 N 条 wire 消息原文，更早的历史压缩成任务进度摘要。
 pub(crate) const KEEP_RECENT_WIRE_MESSAGES: usize = 8;
 /// 工具结果被压缩后替换成的短桩内容。

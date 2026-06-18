@@ -1655,7 +1655,7 @@ pub fn delete_role_model(conn: &Connection, role: &str) -> SqlResult<()> {
 /// 也跳过——此时 models / role_models 由 `CREATE TABLE IF NOT EXISTS` 建出但保持为空，用户从新表配。
 ///
 /// dedup：对每条 role_assignments 行，按 (connection_id, model_id) 找/建一条 models 行——
-/// 同一 (连接, 模型) 跨多个角色只产生**一条** model（carry context_window 到 model；label 缺省为 model_id）。
+/// 同一 (连接, 模型) 跨多个角色只产生**一条** model（carry context_window 到 model；label = None 不设别名）。
 /// 然后为该角色 upsert 一条 role_models 指向该 model。
 ///
 /// 回滚：整个搬运在**单事务**内（出错即 ROLLBACK），且**绝不** drop/alter role_assignments /
@@ -1678,10 +1678,11 @@ fn migrate_to_models_layer_0060(conn: &Connection) -> SqlResult<()> {
     let result = (|| -> SqlResult<()> {
         for a in &assignments {
             // dedup：同 (connection_id, model_id) 复用一条 model；首次创建时 carry context_window，
-            // label 缺省为 model_id。新模型「上下文窗口」是 per-model 属性,而旧库可能给同一 (连接,模型)
+            // label = None 不设别名（0.0.61：避免 UI 把 model_id 渲染两次）。新模型「上下文窗口」是
+            // per-model 属性,而旧库可能给同一 (连接,模型)
             // 的不同角色配了不一致的 context_window;迭代是 role ASC,"action"<"main" 会让 action 先建、
-            // main 后复用 → 若不处理就丢掉 main 的窗口。而 main 的窗口**驱动压缩软上限**(agent_loop 取
-            // main 的 context_window 推导 ×0.8 压缩点),丢失会导致迁移后压缩点漂移(过早/过晚压缩)。
+            // main 后复用 → 若不处理就丢掉 main 的窗口。而 main 的窗口**驱动压缩软上限**(0.0.61：agent_loop
+            // 直接以 main 的 context_window 为压缩点,不再 ×0.8),丢失会导致迁移后压缩点漂移(过早/过晚压缩)。
             // 故:**main 角色复用已建 model 时,以 main 的窗口为准覆盖**(main 权威),保证 main 窗口不丢。
             let model_ref = match find_model_id(conn, &a.connection_id, &a.model_id)? {
                 Some(existing) => {
@@ -1694,12 +1695,14 @@ fn migrate_to_models_layer_0060(conn: &Connection) -> SqlResult<()> {
                     existing
                 }
                 None => {
+                    // 0.0.61：迁移出的 model 不设别名（label = None）。此前默认 label = model_id 会让 UI
+                    // 把模型 id 渲染两次（别名行与 id 行重复）；None ⇒ UI 仅显示 model_id 一次。
                     let created = upsert_model(
                         conn,
                         "",
                         &a.connection_id,
                         &a.model_id,
-                        Some(&a.model_id),
+                        None,
                         a.context_window,
                     )?;
                     created.id
