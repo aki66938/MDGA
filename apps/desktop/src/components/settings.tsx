@@ -2,7 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock, Trash2, Pencil } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock, Trash2, Pencil, Wrench } from "lucide-react";
 import { getPermissionModeLabel, type PermissionMode } from "@mdga/ui";
 import {
   PERMISSION_MODES,
@@ -108,6 +108,48 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
     }
   }
 
+  /** 测试工具调用：弹模型 ID 后探测该模型在该连接端点能否返回 tool_call（key 由后端按连接取，前端不接触）。 */
+  async function handleToolTest(c: ConnectionView) {
+    setError(null);
+    let known: string[] = [];
+    try {
+      known = await invoke<string[]>("list_models_for_connection", { connectionId: c.id });
+    } catch {
+      known = [];
+    }
+    const fallback = PROVIDER_PRESETS.find((p) => p.id === c.preset)?.defaultModelId ?? "";
+    const suggested = known[0] ?? fallback;
+    const model = window.prompt(
+      `测试「${connectionDisplayName(c)}」的工具调用，请输入一个用于测试的模型 ID：` +
+        (known.length ? `\n（已知：${known.join("、")}）` : ""),
+      suggested,
+    );
+    if (model == null) return; // 取消
+    const trimmed = model.trim();
+    if (!trimmed) {
+      setTestState((s) => ({ ...s, [c.id]: { ok: false, message: "请提供一个待测模型 ID" } }));
+      return;
+    }
+    setTestState((s) => ({ ...s, [c.id]: { testing: true } }));
+    try {
+      const ok = await invoke<boolean>("smoke_test_tool_call_for_connection", {
+        connectionId: c.id,
+        model: trimmed,
+      });
+      setTestState((s) => ({
+        ...s,
+        [c.id]: {
+          ok,
+          message: ok
+            ? `模型 ${trimmed} 支持工具调用`
+            : `模型 ${trimmed} 未返回工具调用（该模型/端点可能不支持，agent 工具能力会受限）`,
+        },
+      }));
+    } catch (e) {
+      setTestState((s) => ({ ...s, [c.id]: { ok: false, message: humanizeError(String(e)) } }));
+    }
+  }
+
   if (editing) {
     return (
       <ConnectionEditor
@@ -162,6 +204,9 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
               <div className="provider-card__actions">
                 <button type="button" className="approval-card__btn" onClick={() => handleTest(c)} disabled={!!t?.testing}>
                   <Plug size={14} /> 测试连接
+                </button>
+                <button type="button" className="approval-card__btn" onClick={() => handleToolTest(c)} disabled={!!t?.testing}>
+                  <Wrench size={14} /> 测试工具调用
                 </button>
                 <button type="button" className="approval-card__btn" onClick={() => setEditing({ conn: c })}>
                   <Pencil size={14} /> 编辑

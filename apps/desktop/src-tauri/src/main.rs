@@ -36,7 +36,8 @@ use commands::{
 };
 use commands::{
     delete_connection, get_app_setting, list_connections, list_models_for_connection,
-    save_connection, set_app_setting, smoke_test_tool_call, test_connection,
+    save_connection, set_app_setting, smoke_test_tool_call,
+    smoke_test_tool_call_for_connection, test_connection,
 };
 use commands::{
     clear_role_assignment, get_lsp_known_servers, get_lsp_server_config, get_role_assignments,
@@ -237,6 +238,7 @@ fn main() {
             test_connection,
             list_models_for_connection,
             smoke_test_tool_call,
+            smoke_test_tool_call_for_connection,
             get_role_assignments,
             set_role_assignment,
             clear_role_assignment,

@@ -264,6 +264,33 @@ pub(crate) async fn smoke_test_tool_call(
         .map_err(|e| e.to_string())
 }
 
+/// 0.0.59：对「连接 + 模型」做工具调用冒烟探测（连接库版，供「模型连接」设置页用）。
+///
+/// 服务端按 connectionId 取出端点/密钥/格式（前端从不接触明文 key），用给定 model 探测该模型在
+/// 该连接端点上能否返回 tool_call。这把重构前「测试工具调用」按钮的能力以「不暴露 key」的方式补回。
+#[tauri::command]
+pub(crate) async fn smoke_test_tool_call_for_connection(
+    state: State<'_, AppState>,
+    connection_id: String,
+    model: String,
+) -> Result<bool, String> {
+    let connection = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        mdga_storage::get_connection(&db, &connection_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "连接不存在".to_string())?
+    };
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("请提供要测试的模型 id".to_string());
+    }
+    let base = resolve_base_url(connection.base_url.as_deref(), connection.preset.as_deref())
+        .ok_or_else(|| "无法解析端点（自定义 preset 需填 base_url）".to_string())?;
+    probe_tool_call(&base, &connection.api_key, model, &connection.api_format)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 读取一个应用设置（如 modality_extended 开关）。
 #[tauri::command]
 pub(crate) fn get_app_setting(
