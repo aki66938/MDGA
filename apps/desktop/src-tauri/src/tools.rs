@@ -18,6 +18,33 @@ use mdga_tool_runtime::{
 };
 use tauri::{AppHandle, Emitter};
 
+// ── LSP 服务器运行时配置缓存（R-uicfg / 0.0.57）────────────────────────────────
+//
+// LSP 只读工具在 `execute_builtin_tool_call` 里执行，那里没有 DB 句柄；而 lsp 解析需要知道
+// 「哪些已知服务器被启用、有无路径覆盖」。这里用一个进程级 RwLock 缓存当前生效配置：
+//   - 启动时由 main.rs 从 DB 播种（seed_lsp_server_config）；
+//   - 设置页保存时由命令层刷新（refresh_lsp_server_config）。
+// 工具执行时只读该快照（lsp_config_snapshot），零 DB 往返。空/未配置＝默认（全部启用、走 PATH），
+// 与从前行为一致。安全语义（命令身份恒为常量、路径仅作覆盖且校验存在）由 mdga-lsp 强制。
+static LSP_SERVER_CONFIG: std::sync::RwLock<Option<mdga_lsp::LspServerConfig>> =
+    std::sync::RwLock::new(None);
+
+/// 设置当前生效的 LSP 服务器配置快照（启动播种 / 保存后刷新调用）。
+pub(crate) fn set_lsp_server_config(config: mdga_lsp::LspServerConfig) {
+    if let Ok(mut guard) = LSP_SERVER_CONFIG.write() {
+        *guard = Some(config);
+    }
+}
+
+/// 取当前生效的 LSP 服务器配置（无则返回默认＝全部启用、走 PATH）。
+fn lsp_config_snapshot() -> mdga_lsp::LspServerConfig {
+    LSP_SERVER_CONFIG
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default()
+}
+
 /// 扫描工作区 .mdga/skills/*/SKILL.md，返回技能名与描述（首行 frontmatter 或首段）。
 pub(crate) fn load_workspace_skills(workspace: &str) -> Vec<(String, String)> {
     let skills_dir = std::path::Path::new(workspace).join(".mdga").join("skills");
@@ -1151,36 +1178,44 @@ pub(crate) fn execute_builtin_tool_call(
             serde_json::to_value(git_pr(workspace_path, request).map_err(|err| err.to_string())?)
                 .map_err(|err| err.to_string())
         }
-        // R1：LSP 只读工具（编译器级代码智能）。
+        // R1：LSP 只读工具（编译器级代码智能）。R-uicfg：按用户设置门禁/路径覆盖解析服务器。
         "lsp_definition" => {
             let request = serde_json::from_str::<mdga_lsp::LspPositionRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            let cfg = lsp_config_snapshot();
             serde_json::to_value(
-                mdga_lsp::lsp_definition(workspace_path, request).map_err(|err| err.to_string())?,
+                mdga_lsp::lsp_definition_with_config(workspace_path, request, &cfg)
+                    .map_err(|err| err.to_string())?,
             )
             .map_err(|err| err.to_string())
         }
         "lsp_references" => {
             let request = serde_json::from_str::<mdga_lsp::LspPositionRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            let cfg = lsp_config_snapshot();
             serde_json::to_value(
-                mdga_lsp::lsp_references(workspace_path, request).map_err(|err| err.to_string())?,
+                mdga_lsp::lsp_references_with_config(workspace_path, request, &cfg)
+                    .map_err(|err| err.to_string())?,
             )
             .map_err(|err| err.to_string())
         }
         "lsp_hover" => {
             let request = serde_json::from_str::<mdga_lsp::LspPositionRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            let cfg = lsp_config_snapshot();
             serde_json::to_value(
-                mdga_lsp::lsp_hover(workspace_path, request).map_err(|err| err.to_string())?,
+                mdga_lsp::lsp_hover_with_config(workspace_path, request, &cfg)
+                    .map_err(|err| err.to_string())?,
             )
             .map_err(|err| err.to_string())
         }
         "lsp_diagnostics" => {
             let request = serde_json::from_str::<mdga_lsp::LspDiagnosticsRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            let cfg = lsp_config_snapshot();
             serde_json::to_value(
-                mdga_lsp::lsp_diagnostics(workspace_path, request).map_err(|err| err.to_string())?,
+                mdga_lsp::lsp_diagnostics_with_config(workspace_path, request, &cfg)
+                    .map_err(|err| err.to_string())?,
             )
             .map_err(|err| err.to_string())
         }

@@ -29,9 +29,12 @@ mod which;
 use client::{file_uri_for, LspSession};
 use serde::{Deserialize, Serialize};
 use server::resolve_server;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
+
+pub use server::{known_servers, is_known_kind, KnownServer};
 
 const MAX_DOC_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -57,12 +60,60 @@ pub enum LspError {
     Unsupported(String),
     #[error("语言服务器不可用: {0}")]
     ServerUnavailable(String),
+    #[error("语言服务器 `{0}` 已在设置中被禁用")]
+    ServerDisabled(String),
     #[error("LSP 协议错误: {0}")]
     Protocol(String),
     #[error("LSP 操作超时")]
     Timeout,
     #[error("文件系统错误: {0}")]
     Io(#[from] std::io::Error),
+}
+
+// ── 用户配置（启用开关 + 可选路径覆盖）────────────────────────────────────────
+//
+// 安全边界（强约束）：配置只能调节**已知**服务器的两件事——是否启用、二进制在哪。它**不能**新增
+// 一条服务器命令：命令身份（command/args/扩展名）恒由 `server::REGISTRY` 编译期常量决定。`path_override`
+// 是人类用户在设置里显式录入的本地路径（绝非模型/工作区派生），解析时仅作为「已知二进制在哪」的提示，
+// 并在使用前校验其为一个**已存在的文件**；为空则回退到默认的 PATH 解析行为（与从前完全一致）。
+
+/// 单个已知服务器的用户设置。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspServerSetting {
+    /// 是否启用该已知服务器（false=禁用，相关 lsp_* 工具对其语言报「已禁用」错误而非挂死）。
+    pub enabled: bool,
+    /// 可选的二进制**绝对路径**覆盖（人类用户显式录入）。`Some` 且指向已存在文件时直接用它启动，
+    /// 跳过 PATH 解析；`None`/空 时回退默认 PATH 解析。绝不接受相对路径或不存在的路径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_override: Option<String>,
+}
+
+/// 全部已知服务器的用户配置：键为服务器 `kind`（见 `server::known_servers`）。
+///
+/// 缺省语义（向后兼容）：某 kind 在表中**缺席**＝启用且无路径覆盖（即与从前的纯 PATH 解析一致）。
+/// 因此空配置 = 全部启用、全走 PATH，行为不变。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct LspServerConfig {
+    pub servers: HashMap<String, LspServerSetting>,
+}
+
+impl LspServerConfig {
+    /// 该 kind 是否启用（缺省＝启用）。
+    fn is_enabled(&self, kind: &str) -> bool {
+        self.servers.get(kind).map(|s| s.enabled).unwrap_or(true)
+    }
+
+    /// 该 kind 的路径覆盖（trim 后非空才视为有效；缺省＝无覆盖）。
+    fn path_override(&self, kind: &str) -> Option<String> {
+        self.servers
+            .get(kind)
+            .and_then(|s| s.path_override.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
 }
 
 // ── 请求类型（0 基行/列，工作区相对路径） ──────────────────────────────────
@@ -194,6 +245,26 @@ fn validate_relative_path(path: &str) -> Result<PathBuf, LspError> {
     Ok(safe)
 }
 
+/// 校验用户录入的二进制路径覆盖：必须是一个**已存在的文件**（绝对/相对皆可，由用户负责）。
+///
+/// 安全说明：该路径是人类用户在应用设置里**显式录入**的本地二进制位置（绝非模型/工作区派生），
+/// 它只回答「这个**已知**服务器的二进制在哪」。我们在使用前确认它确为现存文件，避免把一个不存在
+/// 或目录路径喂给 spawn。它**不**改变要启动的命令身份——命令身份恒由注册表常量决定。
+fn validate_override_path(path: &str) -> Result<PathBuf, LspError> {
+    let p = Path::new(path.trim());
+    if !p.exists() {
+        return Err(LspError::ServerUnavailable(format!(
+            "设置中为该语言服务器指定的路径不存在: {path}"
+        )));
+    }
+    if !p.is_file() {
+        return Err(LspError::ServerUnavailable(format!(
+            "设置中为该语言服务器指定的路径不是文件: {path}"
+        )));
+    }
+    Ok(p.to_path_buf())
+}
+
 /// 规范化工作区根（与 tool-runtime::canonical_workspace 等价）。
 fn canonical_workspace(workspace_root: impl AsRef<Path>) -> Result<PathBuf, LspError> {
     workspace_root
@@ -265,18 +336,45 @@ struct Prepared {
 /// 池化要点：同 (工作区, 服务器命令+参数) 的会话被复用，省掉冷启动索引。复用时通过
 /// `sync_document`（首次 didOpen、之后 didChange 全量替换）把**磁盘最新内容**喂给服务器，
 /// 保证文件在外部被改写后结果依然正确（不基于陈旧快照）。
-fn open_session(workspace_root: impl AsRef<Path>, path: &str) -> Result<Prepared, LspError> {
+fn open_session(
+    workspace_root: impl AsRef<Path>,
+    path: &str,
+    config: &LspServerConfig,
+) -> Result<Prepared, LspError> {
     let (workspace, relative, target) = resolve_existing_file(workspace_root, path)?;
     let spec = resolve_server(&normalize_relative(&relative))?;
+
+    // 用户设置门禁：被显式禁用的已知服务器直接报错（不挂死）。缺省＝启用。
+    if !config.is_enabled(spec.kind) {
+        return Err(LspError::ServerDisabled(spec.kind.to_string()));
+    }
+    // 路径覆盖（人类显式录入）：非空则校验为已存在文件，作为该已知二进制的绝对路径直接启动。
+    // 为空回退默认 PATH 解析。注意：覆盖只决定「在哪」，命令身份仍是注册表常量。
+    let exe_override = match config.path_override(spec.kind) {
+        Some(p) => Some(validate_override_path(&p)?),
+        None => None,
+    };
     let text = read_doc_text(&target)?;
     let uri = file_uri_for(&workspace, &relative);
 
-    let key = pool::PoolKey::new(&workspace.to_string_lossy(), spec.command, spec.args);
+    // 池键并入路径覆盖指纹：覆盖路径不同应视作不同会话，避免复用到指向另一个二进制的旧会话。
+    let key = pool::PoolKey::new(
+        &workspace.to_string_lossy(),
+        &format!(
+            "{}\u{0}{}",
+            spec.command,
+            exe_override.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
+        ),
+        spec.args,
+    );
 
     // 先尝试从池借出长寿命会话；借不到（未命中/已死）再新建。
     let mut session = match pool::checkout(&key) {
         Some(s) => s,
-        None => LspSession::start(&spec, &workspace)?,
+        None => match &exe_override {
+            Some(exe) => LspSession::start_with_exe(&spec, exe, &workspace)?,
+            None => LspSession::start(&spec, &workspace)?,
+        },
     };
     // 复用会话的 deadline 早已过期，必须重置；新建会话重置也无害。
     session.begin_op();
@@ -299,10 +397,19 @@ fn finish(session: LspSession, key: pool::PoolKey) {
     pool::checkin(key, session);
 }
 
-/// lsp_definition：某位置符号的定义跳转。
+/// lsp_definition：某位置符号的定义跳转。沿用默认配置（全部启用、走 PATH）。
 pub fn lsp_definition(
     workspace_root: impl AsRef<Path>,
     request: LspPositionRequest,
+) -> Result<LspLocationsResult, LspError> {
+    lsp_definition_with_config(workspace_root, request, &LspServerConfig::default())
+}
+
+/// lsp_definition（配置感知版）：按用户设置门禁/路径覆盖解析服务器。
+pub fn lsp_definition_with_config(
+    workspace_root: impl AsRef<Path>,
+    request: LspPositionRequest,
+    config: &LspServerConfig,
 ) -> Result<LspLocationsResult, LspError> {
     let Prepared {
         mut session,
@@ -310,7 +417,7 @@ pub fn lsp_definition(
         uri,
         workspace,
         ..
-    } = open_session(&workspace_root, &request.path)?;
+    } = open_session(&workspace_root, &request.path, config)?;
     let result = session.request_until_ready(
         "textDocument/definition",
         position_params(&uri, request.line, request.character),
@@ -333,10 +440,19 @@ fn is_empty_locations(v: &serde_json::Value) -> bool {
     }
 }
 
-/// lsp_references：某位置符号的全部引用（含声明）。
+/// lsp_references：某位置符号的全部引用（含声明）。沿用默认配置。
 pub fn lsp_references(
     workspace_root: impl AsRef<Path>,
     request: LspPositionRequest,
+) -> Result<LspLocationsResult, LspError> {
+    lsp_references_with_config(workspace_root, request, &LspServerConfig::default())
+}
+
+/// lsp_references（配置感知版）。
+pub fn lsp_references_with_config(
+    workspace_root: impl AsRef<Path>,
+    request: LspPositionRequest,
+    config: &LspServerConfig,
 ) -> Result<LspLocationsResult, LspError> {
     let Prepared {
         mut session,
@@ -344,7 +460,7 @@ pub fn lsp_references(
         uri,
         workspace,
         ..
-    } = open_session(&workspace_root, &request.path)?;
+    } = open_session(&workspace_root, &request.path, config)?;
     let mut params = position_params(&uri, request.line, request.character);
     params["context"] = serde_json::json!({ "includeDeclaration": true });
     let result =
@@ -357,17 +473,26 @@ pub fn lsp_references(
     })
 }
 
-/// lsp_hover：某位置的类型/签名/文档。
+/// lsp_hover：某位置的类型/签名/文档。沿用默认配置。
 pub fn lsp_hover(
     workspace_root: impl AsRef<Path>,
     request: LspPositionRequest,
+) -> Result<LspHoverResult, LspError> {
+    lsp_hover_with_config(workspace_root, request, &LspServerConfig::default())
+}
+
+/// lsp_hover（配置感知版）。
+pub fn lsp_hover_with_config(
+    workspace_root: impl AsRef<Path>,
+    request: LspPositionRequest,
+    config: &LspServerConfig,
 ) -> Result<LspHoverResult, LspError> {
     let Prepared {
         mut session,
         key,
         uri,
         ..
-    } = open_session(&workspace_root, &request.path)?;
+    } = open_session(&workspace_root, &request.path, config)?;
     let result = session.request_until_ready(
         "textDocument/hover",
         position_params(&uri, request.line, request.character),
@@ -381,10 +506,19 @@ pub fn lsp_hover(
     })
 }
 
-/// lsp_diagnostics：某文件的错误/警告（收集 publishDiagnostics 推送）。
+/// lsp_diagnostics：某文件的错误/警告（收集 publishDiagnostics 推送）。沿用默认配置。
 pub fn lsp_diagnostics(
     workspace_root: impl AsRef<Path>,
     request: LspDiagnosticsRequest,
+) -> Result<LspDiagnosticsResult, LspError> {
+    lsp_diagnostics_with_config(workspace_root, request, &LspServerConfig::default())
+}
+
+/// lsp_diagnostics（配置感知版）。
+pub fn lsp_diagnostics_with_config(
+    workspace_root: impl AsRef<Path>,
+    request: LspDiagnosticsRequest,
+    config: &LspServerConfig,
 ) -> Result<LspDiagnosticsResult, LspError> {
     let Prepared {
         mut session,
@@ -392,7 +526,7 @@ pub fn lsp_diagnostics(
         uri,
         relative,
         ..
-    } = open_session(&workspace_root, &request.path)?;
+    } = open_session(&workspace_root, &request.path, config)?;
     let raw = session.collect_diagnostics(&uri)?;
     finish(session, key);
     let diagnostics = parse_diagnostics(&raw);
@@ -634,6 +768,64 @@ fn parse_diagnostics(params: &serde_json::Value) -> Vec<LspDiagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_defaults_enable_all_and_no_override() {
+        // 空配置：任何 kind 都启用、无路径覆盖（与从前 PATH 解析行为一致）。
+        let cfg = LspServerConfig::default();
+        assert!(cfg.is_enabled("rust-analyzer"));
+        assert!(cfg.is_enabled("anything-missing"));
+        assert!(cfg.path_override("rust-analyzer").is_none());
+    }
+
+    #[test]
+    fn config_disable_and_override_honored() {
+        let mut cfg = LspServerConfig::default();
+        cfg.servers.insert(
+            "gopls".to_string(),
+            LspServerSetting { enabled: false, path_override: None },
+        );
+        cfg.servers.insert(
+            "rust-analyzer".to_string(),
+            LspServerSetting {
+                enabled: true,
+                path_override: Some("  /opt/ra/rust-analyzer  ".to_string()),
+            },
+        );
+        // 显式禁用生效。
+        assert!(!cfg.is_enabled("gopls"));
+        // 路径覆盖 trim 后取用。
+        assert_eq!(
+            cfg.path_override("rust-analyzer").as_deref(),
+            Some("/opt/ra/rust-analyzer")
+        );
+        // 空白路径视为无覆盖。
+        cfg.servers.insert(
+            "clangd".to_string(),
+            LspServerSetting { enabled: true, path_override: Some("   ".to_string()) },
+        );
+        assert!(cfg.path_override("clangd").is_none());
+    }
+
+    #[test]
+    fn config_roundtrips_as_transparent_map() {
+        // 透明序列化：直接是 { kind: {enabled, pathOverride} } 形状，便于前端/存储交换。
+        let mut cfg = LspServerConfig::default();
+        cfg.servers.insert(
+            "pyright".to_string(),
+            LspServerSetting { enabled: false, path_override: Some("/x/py".to_string()) },
+        );
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: LspServerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+        assert!(json.contains("pyright"));
+        assert!(json.contains("pathOverride"));
+    }
+
+    #[test]
+    fn validate_override_rejects_missing_file() {
+        assert!(validate_override_path("/definitely/not/here/ra").is_err());
+    }
 
     #[test]
     fn validate_rejects_escape_and_absolute() {

@@ -25,7 +25,9 @@ use mdga_storage::{
     ActivityEventRecord, Conversation, FileCheckpoint, StoredMessage, Workspace,
 };
 use mdga_storage::{
-    delete_model_provider, get_setting, set_setting, upsert_model_provider, ModelProvider,
+    delete_model_provider, get_lsp_server_config_json, get_setting, set_lsp_server_config_json,
+    set_setting, upsert_model_provider, ModelProvider, ROLE_ACTION, ROLE_CRITIQUE, ROLE_MAIN,
+    ROLE_PLAN,
 };
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -262,6 +264,189 @@ pub(crate) fn set_app_setting(
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     set_setting(&db, &key, &value).map_err(|e| e.to_string())
+}
+
+// ── LSP 服务器注册表设置（R-uicfg / 0.0.57）──────────────────────────────────
+
+/// 列出**全部已知**语言服务器（硬编码精选注册表的只读快照），供设置页渲染开关与路径覆盖框。
+///
+/// 安全：该列表完全来自 mdga-lsp 的编译期常量；前端只能据此勾选启用/填写路径，无法新增任意命令。
+#[tauri::command]
+pub(crate) fn get_lsp_known_servers() -> Vec<mdga_lsp::KnownServer> {
+    mdga_lsp::known_servers()
+}
+
+/// 读取当前 LSP 服务器配置（按 kind 的启用/路径覆盖稀疏映射）。未配置返回空配置（＝全部启用、走 PATH）。
+#[tauri::command]
+pub(crate) fn get_lsp_server_config(
+    state: State<AppState>,
+) -> Result<mdga_lsp::LspServerConfig, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let raw = get_lsp_server_config_json(&db).map_err(|e| e.to_string())?;
+    match raw {
+        Some(json) => serde_json::from_str(&json).map_err(|e| e.to_string()),
+        None => Ok(mdga_lsp::LspServerConfig::default()),
+    }
+}
+
+/// 保存 LSP 服务器配置：校验后持久化，并刷新运行时缓存，使后续 lsp_* 工具立即生效。
+///
+/// 安全校验（强约束）：
+///   1. 配置里的每个键必须是**已知种类**（mdga_lsp::is_known_kind）——拒绝注入未知服务器条目；
+///   2. path_override 是人类显式录入的本地路径，这里不强制其立即存在（用户可能先填后装），
+///      但在真正用它启动时由 mdga-lsp 校验其为现存文件。命令身份恒为注册表常量，UI 无法改写。
+#[tauri::command]
+pub(crate) fn save_lsp_server_config(
+    state: State<AppState>,
+    config: mdga_lsp::LspServerConfig,
+) -> Result<(), String> {
+    // 拒绝未知种类键：UI 只应回传 get_lsp_known_servers 列出的 kind。
+    for kind in config.servers.keys() {
+        if !mdga_lsp::is_known_kind(kind) {
+            return Err(format!("未知的语言服务器种类: {kind}"));
+        }
+    }
+    let json = serde_json::to_string(&config).map_err(|e| e.to_string())?;
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        set_lsp_server_config_json(&db, &json).map_err(|e| e.to_string())?;
+    }
+    // 刷新进程级运行时缓存，使工具调用立刻按新配置解析（无需重启）。
+    crate::tools::set_lsp_server_config(config);
+    Ok(())
+}
+
+// ── R8 角色→模型路由设置（R-uicfg / 0.0.57）──────────────────────────────────
+
+/// 一个功能角色当前的路由状态：是否有**自身**配置、以及实际生效的模型/供应商展示信息。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RoleRouting {
+    /// 角色标识：action / plan / critique。
+    pub role: String,
+    /// 该角色是否有一条**自身**已配置且启用的 provider（false＝回退主模型）。
+    pub configured: bool,
+    /// 实际生效的供应商预设（如 deepseek / custom）；回退到 main 时即 main 的预设。None＝连 main 都没配。
+    pub effective_preset: Option<String>,
+    /// 实际生效的模型 ID（自身配置或回退 main 的模型）。None＝连 main 都没配。
+    pub effective_model: Option<String>,
+    /// 实际生效来源：'self'＝用了角色自身配置；'main'＝回退到主模型；'none'＝主模型也没配。
+    pub source: String,
+}
+
+/// 读取三个功能角色（action / plan / critique）的路由概览，供设置页一屏展示「各角色当前用哪个模型」。
+///
+/// 语义复用 resolve_role_provider（未配置/禁用即回退 main）。不回显任何 api_key。
+#[tauri::command]
+pub(crate) fn get_role_routing(state: State<AppState>) -> Result<Vec<RoleRouting>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for role in [ROLE_ACTION, ROLE_PLAN, ROLE_CRITIQUE] {
+        // 自身是否配置且启用。
+        let own = mdga_storage::get_model_provider(&db, role).map_err(|e| e.to_string())?;
+        let configured = own.as_ref().map(|p| p.enabled).unwrap_or(false);
+        // 实际生效（回退 main）。
+        let effective =
+            mdga_storage::resolve_role_provider(&db, role).map_err(|e| e.to_string())?;
+        let source = if configured {
+            "self"
+        } else if effective.is_some() {
+            "main"
+        } else {
+            "none"
+        };
+        out.push(RoleRouting {
+            role: role.to_string(),
+            configured,
+            effective_preset: effective.as_ref().and_then(|p| p.preset.clone()),
+            effective_model: effective.as_ref().map(|p| p.model_id.clone()),
+            source: source.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// 读取某功能角色**自身**已配置的 provider（不回退 main；用于路由设置页表单回填）。api_key 脱敏为空。
+///
+/// 与 get_model_provider_config 等价但语义更明确（路由页用）；role 仅允许 action/plan/critique。
+#[tauri::command]
+pub(crate) fn get_role_provider_config(
+    state: State<AppState>,
+    role: String,
+) -> Result<Option<ModelProvider>, String> {
+    if !matches!(role.as_str(), ROLE_ACTION | ROLE_PLAN | ROLE_CRITIQUE) {
+        return Err(format!("不支持的路由角色: {role}（仅 action/plan/critique）"));
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut provider = mdga_storage::get_model_provider(&db, &role).map_err(|e| e.to_string())?;
+    if let Some(p) = provider.as_mut() {
+        p.api_key = String::new();
+    }
+    Ok(provider)
+}
+
+/// 设置某功能角色（action/plan/critique）绑定的模型+供应商；持久化经 upsert_model_provider。
+///
+/// 语义：role 仅允许三种功能角色（main/vision 走各自既有命令，不在此）。api_key 留空＝保留该角色已存 key
+/// （与 save_model_provider 一致）。保存后该角色即用自身模型；要回退主模型请调用 clear_role_provider。
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub(crate) fn save_role_provider(
+    state: State<AppState>,
+    role: String,
+    preset: Option<String>,
+    label: Option<String>,
+    base_url: Option<String>,
+    api_key: String,
+    model_id: String,
+    context_window: Option<i64>,
+) -> Result<(), String> {
+    if !matches!(role.as_str(), ROLE_ACTION | ROLE_PLAN | ROLE_CRITIQUE) {
+        return Err(format!("不支持的路由角色: {role}（仅 action/plan/critique）"));
+    }
+    if model_id.trim().is_empty() {
+        return Err("请填写模型 ID".to_string());
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let context_window = context_window.filter(|&cw| cw > 0);
+    // 留空 key＝保留已存（避免清掉凭据）；首配空 key 由前端拦截。
+    let api_key = if api_key.trim().is_empty() {
+        mdga_storage::get_model_provider(&db, &role)
+            .ok()
+            .flatten()
+            .map(|p| p.api_key)
+            .unwrap_or_default()
+    } else {
+        api_key.trim().to_string()
+    };
+    // 功能角色恒为 openai 兼容（api_format 固定 openai）。
+    upsert_model_provider(
+        &db,
+        &role,
+        preset.as_deref(),
+        label.as_deref(),
+        base_url.as_deref().filter(|s| !s.trim().is_empty()),
+        &api_key,
+        model_id.trim(),
+        "openai",
+        context_window,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 清除某功能角色的 provider，使其回退到主模型（R8 默认行为）。role 仅允许 action/plan/critique。
+#[tauri::command]
+pub(crate) fn clear_role_provider(state: State<AppState>, role: String) -> Result<(), String> {
+    if !matches!(role.as_str(), ROLE_ACTION | ROLE_PLAN | ROLE_CRITIQUE) {
+        return Err(format!("不支持的路由角色: {role}（仅 action/plan/critique）"));
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    // 防御：绝不允许经此删主模型。
+    if role == ROLE_MAIN {
+        return Err("不能清除主模型".to_string());
+    }
+    delete_model_provider(&db, &role).map_err(|e| e.to_string())
 }
 
 // ── 会话管理 ──────────────────────────────────────────────────────────────

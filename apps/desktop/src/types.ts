@@ -263,8 +263,58 @@ export const PRESET_CONTEXT_WINDOW: Record<string, number | null> = {
 
 export const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"];
 
-/** 设置弹窗的分类标识；提到顶层以便首屏 CTA 指定初始分类（Plan19 P0a）。 */
-export type SettingsSection = "account" | "provider" | "permission" | "rules" | "mcp" | "data" | "about";
+/** 设置弹窗的分类标识；提到顶层以便首屏 CTA 指定初始分类（Plan19 P0a）。
+ *  R-uicfg：新增 "lsp"（语言服务器注册表）与 "routing"（角色→模型路由）。 */
+export type SettingsSection =
+  | "account"
+  | "provider"
+  | "routing"
+  | "lsp"
+  | "permission"
+  | "rules"
+  | "mcp"
+  | "data"
+  | "about";
+
+// ── LSP 服务器注册表（R-uicfg / 0.0.57）──────────────────────────────────────
+
+/** 一个已知语言服务器的只读描述（get_lsp_known_servers 返回，源自后端硬编码注册表）。 */
+export type LspKnownServer = {
+  kind: string;
+  displayName: string;
+  command: string;
+  args: string[];
+  extensions: string[];
+};
+
+/** 单个已知服务器的用户设置（启用 + 可选路径覆盖）。 */
+export type LspServerSetting = {
+  enabled: boolean;
+  pathOverride?: string | null;
+};
+
+/** 全部已知服务器的稀疏配置：键为服务器 kind。缺席＝启用且无覆盖（走 PATH）。
+ *  对应后端 LspServerConfig 的透明 map 形状（{ servers: ... } 被 serde transparent 摊平为裸 map）。 */
+export type LspServerConfig = Record<string, LspServerSetting>;
+
+// ── R8 角色→模型路由（R-uicfg / 0.0.57）─────────────────────────────────────
+
+/** 一个功能角色当前的路由概览（get_role_routing 返回）。 */
+export type RoleRouting = {
+  role: "action" | "plan" | "critique";
+  configured: boolean;
+  effectivePreset?: string | null;
+  effectiveModel?: string | null;
+  /** 'self' 用角色自身配置 | 'main' 回退主模型 | 'none' 主模型也没配。 */
+  source: "self" | "main" | "none";
+};
+
+/** 三个可路由的功能角色及其中文展示名（路由设置页用）。 */
+export const ROUTING_ROLES: Array<{ id: "action" | "plan" | "critique"; label: string; desc: string }> = [
+  { id: "action", label: "行动（Action）", desc: "执行工具的常规循环用此模型" },
+  { id: "plan", label: "规划（Plan）", desc: "计划模式 / 规划步骤用此模型" },
+  { id: "critique", label: "评审（Critique）", desc: "审查 / 批评步骤用此模型（暂为预留角色）" },
+];
 
 /** 斜杠命令清单：输入框以 / 开头时弹出 */
 export const SLASH_COMMANDS: Array<{ cmd: string; desc: string }> = [
