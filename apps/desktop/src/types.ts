@@ -226,49 +226,67 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   { id: "custom", label: "自定义", baseUrl: null, defaultModelId: "" },
 ];
 
-/** 视觉块预设默认 modelId 占位（识图模型）。 */
-export const VISION_PRESET_MODEL: Record<string, string> = {
-  deepseek: "deepseek-vl",
-  zhipu: "glm-4v",
-  moonshot: "moonshot-v1-8k-vision-preview",
-  qwen: "qwen-vl-plus",
-  custom: "",
-};
+// ── 模型连接库 + 角色分配（0.0.59）──────────────────────────────────────────
+// 旧的 role-keyed provider 表（每角色含 api_key，强制逐角色重填）被拆为两层：
+// 可复用的「连接」(端点+密钥，配一次) 与纯「角色分配」引用 (role → 连接 + 模型，无密钥)。
 
-/** 主 provider 配置回填形状（get_model_provider_config 返回，apiKey 已脱敏为空）。 */
-export type ProviderConfig = {
+/** 一个连接的前端视图（list_connections / save_connection 返回）。绝不含 apiKey 明文；
+ *  以 hasKey 表明是否已配密钥。base_url 空＝走 preset 官方端点。 */
+export type ConnectionView = {
   id: string;
-  role: string;
-  preset?: string | null;
-  label?: string | null;
-  baseUrl?: string | null;
-  apiKey: string;
-  modelId: string;
-  /** 视觉 provider 的 API 格式（openai|anthropic）；主模型恒 openai。 */
-  apiFormat?: string | null;
-  /** 上下文窗口（tokens，可选，Plan27 #2）：后端据此推导压缩软上限；缺省回退默认值。 */
-  contextWindow?: number | null;
-  enabled: boolean;
-  updatedAt?: number | null;
+  label?: string;
+  preset?: string;
+  baseUrl?: string;
+  apiFormat: string;
+  hasKey: boolean;
+  createdAt?: number;
+  updatedAt?: number;
 };
 
-/** 各预设的常见上下文窗口（tokens，Plan27 #2）：保存时可预填，留空亦可。 */
-export const PRESET_CONTEXT_WINDOW: Record<string, number | null> = {
-  deepseek: 1000000,
-  zhipu: 128000,
-  moonshot: 128000,
-  qwen: 131072,
-  custom: null,
+/** 一个角色当前的「分配」概览（get_role_assignments 返回）。无密钥。
+ *  connectionId/modelId/... 为该角色**自身**引用（缺＝跟随主模型）；effective 为回退后的实际生效。 */
+export type RoleAssignmentView = {
+  /** main|action|plan|critique|vision|subagent|embed。 */
+  role: string;
+  /** 该角色自身引用的连接 id（None/缺＝跟随主模型）。 */
+  connectionId?: string;
+  /** 自身引用连接的展示名（便于直接渲染）。 */
+  connectionLabel?: string;
+  /** 自身引用的模型 ID。 */
+  modelId?: string;
+  /** 自身引用的上下文窗口（tokens，可选）。 */
+  contextWindow?: number;
+  /** 自身引用是否启用（无自身引用则 false）。 */
+  enabled: boolean;
+  /** 实际生效（经回退主模型后）：连接名 + 模型 + 来源。 */
+  effective: {
+    connectionLabel?: string;
+    modelId?: string;
+    /** 'self'＝用了角色自身引用｜'main'＝回退主模型｜'none'＝主模型也没配。 */
+    source: "self" | "main" | "none";
+  };
 };
+
+/** 全部可分配角色及其中文展示名（分配设置页用）。顺序与后端 ALL_ROLES 一致。 */
+export const ASSIGNABLE_ROLES: Array<{ id: string; label: string; desc: string }> = [
+  { id: "main", label: "主模型（Main）", desc: "默认模型；其它未单独分配的角色都跟随它" },
+  { id: "action", label: "行动（Action）", desc: "执行工具的常规循环用此模型" },
+  { id: "plan", label: "计划（Plan）", desc: "计划模式 / 规划步骤用此模型" },
+  { id: "critique", label: "评审（Critique）", desc: "审查 / 批评步骤用此模型" },
+  { id: "vision", label: "视觉（Vision）", desc: "识图模型；未分配＝不开放图像导入" },
+  { id: "subagent", label: "子代理（Subagent）", desc: "并行子代理用此模型（未配回退行动→主模型）" },
+  { id: "embed", label: "嵌入（Embed）", desc: "code_search 语义检索的 embedding 模型" },
+];
 
 export const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"];
 
 /** 设置弹窗的分类标识；提到顶层以便首屏 CTA 指定初始分类（Plan19 P0a）。
- *  R-uicfg：新增 "lsp"（语言服务器注册表）与 "routing"（角色→模型路由）。 */
+ *  0.0.59：用 "connections"（模型连接库）+ "assignments"（角色→连接/模型分配）替换
+ *  旧的 "provider"（按角色重填 key 的供应商表单）与 "routing"（角色路由卡片）。 */
 export type SettingsSection =
   | "account"
-  | "provider"
-  | "routing"
+  | "connections"
+  | "assignments"
   | "lsp"
   | "permission"
   | "rules"
@@ -297,32 +315,13 @@ export type LspServerSetting = {
  *  对应后端 LspServerConfig 的透明 map 形状（{ servers: ... } 被 serde transparent 摊平为裸 map）。 */
 export type LspServerConfig = Record<string, LspServerSetting>;
 
-// ── R8 角色→模型路由（R-uicfg / 0.0.57）─────────────────────────────────────
-
-/** 一个功能角色当前的路由概览（get_role_routing 返回）。 */
-export type RoleRouting = {
-  role: "action" | "plan" | "critique";
-  configured: boolean;
-  effectivePreset?: string | null;
-  effectiveModel?: string | null;
-  /** 'self' 用角色自身配置 | 'main' 回退主模型 | 'none' 主模型也没配。 */
-  source: "self" | "main" | "none";
-};
-
-/** 三个可路由的功能角色及其中文展示名（路由设置页用）。 */
-export const ROUTING_ROLES: Array<{ id: "action" | "plan" | "critique"; label: string; desc: string }> = [
-  { id: "action", label: "行动（Action）", desc: "执行工具的常规循环用此模型" },
-  { id: "plan", label: "规划（Plan）", desc: "计划模式 / 规划步骤用此模型" },
-  { id: "critique", label: "评审（Critique）", desc: "审查 / 批评步骤用此模型（暂为预留角色）" },
-];
-
 /** 斜杠命令清单：输入框以 / 开头时弹出 */
 export const SLASH_COMMANDS: Array<{ cmd: string; desc: string }> = [
   { cmd: "/compact", desc: "把当前会话历史压缩为摘要，释放上下文" },
   { cmd: "/clear", desc: "开启一个全新会话" },
   { cmd: "/init", desc: "让 Agent 分析项目并生成 MDGA.md 长期记忆" },
   { cmd: "/rewind", desc: "打开文件变更记录，可回退改动" },
-  { cmd: "/model", desc: "打开 设置 → 模型供应商，修改主模型" },
+  { cmd: "/model", desc: "打开 设置 → 模型分配，修改主模型" },
   { cmd: "/help", desc: "查看 MDGA 能做什么（工作区、@引用、命令、快捷键等）" },
 ];
 

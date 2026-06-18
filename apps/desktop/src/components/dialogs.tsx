@@ -358,7 +358,8 @@ export function CommandPalette({
   // 静态动作项（始终可用，按查询词模糊过滤标签）。
   const staticActions: PaletteItem[] = [
     { id: "new", label: "新建对话", hint: "Ctrl/Cmd+N", icon: <SquarePen size={15} />, run: () => act(onNewConversation) },
-    { id: "set-provider", label: "设置 · 模型供应商", icon: <Cpu size={15} />, run: () => act(() => onOpenSettings("provider")) },
+    { id: "set-connections", label: "设置 · 模型连接", icon: <Cpu size={15} />, run: () => act(() => onOpenSettings("connections")) },
+    { id: "set-assignments", label: "设置 · 模型分配", icon: <Cpu size={15} />, run: () => act(() => onOpenSettings("assignments")) },
     { id: "set-permission", label: "设置 · 权限", icon: <Lock size={15} />, run: () => act(() => onOpenSettings("permission")) },
     { id: "set-rules", label: "设置 · 权限规则", icon: <Lock size={15} />, run: () => act(() => onOpenSettings("rules")) },
     { id: "set-mcp", label: "设置 · MCP 服务器", icon: <Plug size={15} />, run: () => act(() => onOpenSettings("mcp")) },
