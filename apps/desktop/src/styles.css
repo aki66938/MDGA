@@ -2230,7 +2230,7 @@ h1 {
   pointer-events: none;
 }
 
-/* ── 「我用到的模型」子区（0.0.60，嵌在连接卡内）── */
+/* ── 「加载模型」子区（0.0.60，嵌在连接卡内）── */
 .provider-models {
   margin-top: 12px;
   padding-top: 12px;
@@ -2266,11 +2266,18 @@ h1 {
 
 .provider-models__item {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 8px;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
   border-radius: 6px;
   background: var(--surface-2);
+}
+
+/* 行首：模型 ID（+ 可选别名）与删除按钮同行。 */
+.provider-models__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .provider-models__id {
@@ -2298,13 +2305,67 @@ h1 {
   white-space: nowrap;
 }
 
-.provider-models__ctx {
-  font-size: 11px;
+/* ── 每个模型的「参数」区（0.0.61）：行内就地编辑、可扩展（目前仅上下文窗口）。 ── */
+.provider-params {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.provider-param {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  min-height: 22px;
+}
+
+.provider-param__name {
   color: var(--text-3);
+  flex-shrink: 0;
+  min-width: 64px;
+}
+
+/* 未编辑态：当前值（或「由端点默认」），点击进入编辑。 */
+.provider-param__value {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 11.5px;
+  cursor: pointer;
   padding: 1px 6px;
-  border-radius: var(--radius-tag);
+  border-radius: 5px;
+}
+
+.provider-param__value:hover {
   background: var(--surface-3);
-  white-space: nowrap;
+  color: var(--text);
+}
+
+.provider-param__editicon {
+  color: var(--text-3);
+}
+
+/* 编辑态：输入框 + 保存/取消。 */
+.provider-param__edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.provider-param__input {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0 !important;
+}
+
+.provider-param__btn {
+  flex-shrink: 0;
 }
 
 .provider-models__del {
@@ -2344,14 +2405,9 @@ h1 {
   flex-shrink: 0;
 }
 
-.provider-models__advanced {
-  display: flex;
-  gap: 8px;
-}
-
-.provider-models__advanced .provider-input {
-  flex: 1;
-  margin-bottom: 0;
+/* 添加表单里的可选别名输入，比模型 ID 窄。 */
+.provider-models__addrow .provider-models__alias {
+  flex: 0 1 160px;
 }
 
 .provider-models__chips {

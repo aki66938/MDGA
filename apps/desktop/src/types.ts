@@ -245,7 +245,7 @@ export type ConnectionView = {
 };
 
 /** 用户在某连接下登记的一个模型（list_models / list_models_for_connection / add_model / update_model 返回）。
- *  这是「我用到的模型」库的一行：一个连接可登记多个模型（一对多）。角色分配从这些 id 里选。 */
+ *  这是「加载模型」库的一行：一个连接可登记多个模型（一对多）。角色分配从这些 id 里选。 */
 export type CuratedModelView = {
   /** 模型记录 id（models.id）；角色分配的 modelRef 引用它。 */
   id: string;

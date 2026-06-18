@@ -149,8 +149,9 @@ export function App() {
   const [pendingImages, setPendingImages] = useState<ImagePart[]>([]);
   // 拖拽图片悬停高亮（Plan19 P0b）：dragenter/over 置 true，drop/leave 置 false。
   const [dragOver, setDragOver] = useState(false);
-  // 上下文用量（上次请求 prompt_tokens / 压缩阈值）。移入底栏指示器（Plan26）。
-  const [ctxUsage, setCtxUsage] = useState<{ promptTokens: number; softLimit: number } | null>(null);
+  // 上下文用量（上次请求 prompt_tokens / 压缩软上限）。移入底栏指示器（Plan26）。
+  // 0.0.61：softLimit 取主模型用户登记的 context_window，直接当 100%；主模型未填＝null＝隐藏指示器。
+  const [ctxUsage, setCtxUsage] = useState<{ promptTokens: number; softLimit: number | null } | null>(null);
   // 上下文指示器弹层开关（Plan26）。
   const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false);
   const { update, setUpdate, handleInstallUpdate } = useUpdate();
@@ -894,8 +895,9 @@ export function App() {
       }
     );
 
-    // context-usage：每轮请求后的真实上下文体积，驱动状态栏百分比
-    const unlistenCtx = await listen<{ promptTokens: number; softLimit: number }>(
+    // context-usage：每轮请求后的真实上下文体积，驱动状态栏百分比。
+    // softLimit=主模型 context_window（直接当 100%）；主模型未填＝null＝隐藏指示器。
+    const unlistenCtx = await listen<{ promptTokens: number; softLimit: number | null }>(
       "context-usage",
       (e) => setCtxUsage(e.payload)
     );
@@ -1580,8 +1582,9 @@ export function App() {
         .filter((f) => f.toLowerCase().includes((fileMention ?? "").toLowerCase()))
         .slice(0, 8)
     : [];
-  // 上下文占用百分比（Plan26 底栏指示器）：无数据时为 null。
-  const ctxPct = ctxUsage && ctxUsage.softLimit > 0
+  // 上下文占用百分比（Plan26 底栏指示器）：无数据 / 主模型未填 context_window（softLimit 为 null）时为 null。
+  // 0.0.61：softLimit 即主模型 context_window，直接当 100%；null ⇒ 隐藏指示器。
+  const ctxPct = ctxUsage && ctxUsage.softLimit != null && ctxUsage.softLimit > 0
     ? Math.round((ctxUsage.promptTokens / ctxUsage.softLimit) * 100)
     : null;
 
@@ -1881,6 +1884,8 @@ export function App() {
                 </button>
 
                 {/* 上下文指示器 + 弹层（Plan26）：从顶栏移入，点击展开「上下文窗口 用量/上限」+ 简化余额。 */}
+                {/* 0.0.61：仅当主模型登记了 context_window（softLimit 非空 ⇒ ctxPct 非空）才显示整块指示器。 */}
+                {ctxPct !== null && (
                 <div className="ctx-pill-wrap">
                   <button
                     type="button"
@@ -1912,7 +1917,7 @@ export function App() {
                         <div className="ctx-popover__row">
                           <span className="ctx-popover__label">上下文窗口</span>
                           <span className="ctx-popover__nums">
-                            {ctxUsage && ctxUsage.softLimit > 0
+                            {ctxUsage && ctxUsage.softLimit != null && ctxUsage.softLimit > 0
                               ? `${fmtTokens(ctxUsage.promptTokens)} / ${fmtTokens(ctxUsage.softLimit)} (${ctxPct}%)`
                               : "暂无数据"}
                           </span>
@@ -1938,6 +1943,7 @@ export function App() {
                     </>
                   )}
                 </div>
+                )}
 
                 {/* 工作区胶囊（B2）：点击弹出小菜单——选择/更换工作区、纯聊天。 */}
                 <div className="workspace-pill-wrap">
