@@ -1,0 +1,14 @@
+[package]
+name = "mdga-browser"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+base64 = "0.22"
+# headless_chrome：成熟、同步（阻塞）API 的 Chrome DevTools Protocol 驱动，自动发现系统 Chrome，
+# Windows 上构建干净（无 vendored C / 无需 async runtime）。R7 浏览器/computer-use 工具的底座。
+headless_chrome = "1"

@@ -51,6 +51,10 @@ pub(crate) fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability
         "web_fetch" | "web_search" | "list_mcp_resources" | "read_mcp_resource" => {
             Ok(ToolCapability::NetworkAccess)
         }
+        // R7：浏览器 / computer-use 工具——无头 Chrome 驱动会触达网络（即便多为 localhost），
+        // 按 NetworkAccess 裁决：Workspace Auto 逐次审批、Full Access 放行。
+        "browser_navigate" | "browser_screenshot" | "browser_click" | "browser_fill"
+        | "browser_read_text" | "browser_console" => Ok(ToolCapability::NetworkAccess),
         other => Err(format!("未知工具: {other}")),
     }
 }

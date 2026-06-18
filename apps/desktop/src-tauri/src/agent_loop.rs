@@ -26,8 +26,9 @@ use crate::permissions::{
 use crate::state::AppState;
 use crate::subagent::{execute_bg_task_tool, execute_run_subtask};
 use crate::tools::{
-    all_builtin_tool_schemas, execute_builtin_tool_call, execute_load_skill, execute_readonly_call,
-    execute_remember, execute_todo_write, load_workspace_skills, PARALLEL_READONLY_TOOLS,
+    all_builtin_tool_schemas, execute_browser_call, execute_builtin_tool_call, execute_load_skill,
+    execute_readonly_call, execute_remember, execute_todo_write, load_workspace_skills,
+    PARALLEL_READONLY_TOOLS,
 };
 use crate::web::{execute_web_fetch, execute_web_search};
 use crate::{commands::permission_mode_from_str, record_tool_event};
@@ -1127,6 +1128,11 @@ async fn chat_with_builtin_tools(
                 }
                 "web_fetch" => execute_web_fetch(&arguments).await,
                 "web_search" => execute_web_search(&arguments).await,
+                // R7：浏览器 / computer-use 工具（无头 Chrome，阻塞 API 在 spawn_blocking 内执行）。
+                "browser_navigate" | "browser_screenshot" | "browser_click" | "browser_fill"
+                | "browser_read_text" | "browser_console" => {
+                    execute_browser_call(&tool_name, &arguments).await
+                }
                 "list_shells" | "get_shell_output" | "kill_shell" => {
                     execute_bg_shell_tool(app, &tool_name, &arguments)
                 }
