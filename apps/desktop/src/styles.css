@@ -2364,8 +2364,37 @@ h1 {
   margin-bottom: 0 !important;
 }
 
-.provider-param__btn {
+/* 行内编辑保存/取消：紧凑图标按钮（✓/✕），贴合页面风格、不占地方（0.0.63）。 */
+.provider-param__iconbtn {
   flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+}
+.provider-param__iconbtn--save {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: var(--on-brand);
+}
+.provider-param__iconbtn--save:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+.provider-param__iconbtn--cancel:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--border-strong);
+  color: var(--danger);
+}
+.provider-param__iconbtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .provider-models__del {

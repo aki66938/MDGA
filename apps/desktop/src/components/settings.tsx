@@ -2,7 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock, Trash2, Pencil, Wrench, Plus, Download } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock, Trash2, Pencil, Wrench, Plus, Download, Check, X } from "lucide-react";
 import { getPermissionModeLabel, type PermissionMode } from "@mdga/ui";
 import {
   PERMISSION_MODES,
@@ -540,19 +540,23 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
                         />
                         <button
                           type="button"
-                          className="approval-card__btn approval-card__btn--allow provider-param__btn"
+                          className="provider-param__iconbtn provider-param__iconbtn--save"
                           disabled={saving}
+                          title={saving ? "保存中…" : "保存"}
+                          aria-label={saving ? "保存中" : "保存"}
                           onClick={() => void saveCtx(m)}
                         >
-                          {saving ? "保存中…" : "保存"}
+                          <Check size={15} />
                         </button>
                         <button
                           type="button"
-                          className="approval-card__btn provider-param__btn"
+                          className="provider-param__iconbtn provider-param__iconbtn--cancel"
                           disabled={saving}
+                          title="取消"
+                          aria-label="取消"
                           onClick={cancelEditCtx}
                         >
-                          取消
+                          <X size={15} />
                         </button>
                       </span>
                     ) : (
