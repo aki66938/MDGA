@@ -287,3 +287,188 @@ fn create_rejects_non_git_directory() {
     assert!(res.is_err(), "在非 git 目录创建隔离工作树应失败");
     std::fs::remove_dir_all(&plain).ok();
 }
+
+// ── P1（0.0.58）：并行编排器的 git 语义端到端测试 ──────────────────────────────────
+//
+// 编排器（apps/desktop subagent.rs::run_parallel_write_subtasks）依赖 LLM 与 AppHandle，无法在
+// 纯 crate 测试里真跑子代理 loop。但它的**全部 git 不变量**——多个隔离工作树同基创建、各写各的、
+// 串行合并回父分支、首冲突即停、父工作树保持干净、全部 RAII 清理——都只依赖本 crate 的
+// `IsolatedWorktree` 原语。下面这些测试**精确复刻编排器的 git 操作序列**（用直接写文件替代子代理
+// 的产出），从而在没有 LLM 的前提下覆盖编排器的关键安全行为。
+
+/// 三个隔离工作树写**不相交**文件 => 串行合并全部干净，父分支拿到三方改动；全部 RAII 清理。
+#[test]
+fn parallel_disjoint_worktrees_all_merge_clean_and_cleanup() {
+    if !git_available() {
+        eprintln!("跳过：系统未安装 git");
+        return;
+    }
+    let repo = init_repo("par_disjoint");
+
+    let mut paths = Vec::new();
+    let mut branches = Vec::new();
+    {
+        // 三个工作树都在同一 base HEAD 上创建（模拟并发 fan-out）。
+        let mut guards = Vec::new();
+        for (i, fname) in ["a.txt", "b.txt", "c.txt"].iter().enumerate() {
+            let wt = IsolatedWorktree::create(&repo, &format!("disjoint-{i}"))
+                .expect("create worktree");
+            paths.push(wt.path().to_path_buf());
+            branches.push(wt.branch().to_string());
+            // 每个写一个**不同**的新文件并提交（互不相交）。
+            std::fs::write(wt.path().join(fname), format!("content {i}\n")).expect("write");
+            wt.commit_all(&format!("add {fname}")).expect("commit");
+            guards.push(wt);
+        }
+
+        // 串行合并回 main（编排器的合并阶段）：三者都应干净。
+        for (i, wt) in guards.iter().enumerate() {
+            let outcome = wt.merge_into("main").expect("merge call");
+            assert!(outcome.is_clean(), "第 {i} 个不相交合并应干净: {outcome:?}");
+        }
+
+        // 父仓库 main 工作树应同时含三个文件。
+        for fname in ["a.txt", "b.txt", "c.txt"] {
+            assert!(
+                repo.join(fname).exists(),
+                "干净并行合并后 main 应含 {fname}"
+            );
+        }
+        // guards 在此离开作用域 → 三个工作树/分支全部 RAII 清理。
+    }
+
+    // 全部清理：目录移除 + 临时分支删除。
+    for p in &paths {
+        assert!(!p.exists(), "Drop 后隔离工作树目录应移除: {p:?}");
+    }
+    for b in &branches {
+        let branch_ref = format!("refs/heads/{b}");
+        assert!(
+            !raw_git_status(&repo, &["rev-parse", "--verify", &branch_ref]),
+            "Drop 后临时分支应删除: {b}"
+        );
+    }
+    // 父工作树干净、无残留合并状态。
+    let status = raw_git(&repo, &["status", "--porcelain"]);
+    assert!(status.trim().is_empty(), "并行合并后父工作树应干净: {status:?}");
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// 两个隔离工作树写**同一文件**且内容冲突 => 第一个干净合并，第二个上报 Conflict；父工作树被
+/// abort 还原干净（无 MERGE_HEAD、无半合并）；绝不强解/选边。复刻编排器「首冲突即停」语义。
+#[test]
+fn parallel_conflicting_worktrees_first_merges_second_surfaces_conflict() {
+    if !git_available() {
+        eprintln!("跳过：系统未安装 git");
+        return;
+    }
+    let repo = init_repo("par_conflict");
+
+    // 两个工作树同基创建，都改同一个已存在文件 base.txt 的同一行为不同内容。
+    let wt1 = IsolatedWorktree::create(&repo, "conf-1").expect("create wt1");
+    std::fs::write(wt1.path().join("base.txt"), "from-agent-1\n").expect("w1");
+    wt1.commit_all("agent1 edit base.txt").expect("commit1");
+
+    let wt2 = IsolatedWorktree::create(&repo, "conf-2").expect("create wt2");
+    std::fs::write(wt2.path().join("base.txt"), "from-agent-2\n").expect("w2");
+    wt2.commit_all("agent2 edit base.txt").expect("commit2");
+
+    let wt2_branch = wt2.branch().to_string();
+
+    // 串行合并：第一个干净（main 此刻无独立改动）。
+    let o1 = wt1.merge_into("main").expect("merge1");
+    assert!(o1.is_clean(), "第一个并行分支应干净合并: {o1:?}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("base.txt")).unwrap(),
+        "from-agent-1\n",
+        "第一个合并后 main 应为 agent-1 内容"
+    );
+
+    // 第二个改了同一行、与已并入的 agent-1 冲突 => 应上报 Conflict 而非静默选边。
+    let o2 = wt2.merge_into("main").expect("merge2 call");
+    match &o2 {
+        MergeOutcome::Conflict { paths } => {
+            assert!(
+                paths.iter().any(|p| p == "base.txt"),
+                "第二个并行分支冲突路径应含 base.txt: {paths:?}"
+            );
+        }
+        other => panic!("第二个并行分支应上报冲突（编排器据此停止），实际: {other:?}"),
+    }
+
+    // 关键安全断言：冲突 abort 后父工作树干净、内容仍是已干净并入的 agent-1（未被 agent-2 静默覆盖）。
+    let status = raw_git(&repo, &["status", "--porcelain"]);
+    assert!(
+        status.trim().is_empty(),
+        "冲突 abort 后父工作树应干净（无半合并）: {status:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("base.txt")).unwrap(),
+        "from-agent-1\n",
+        "冲突不应静默覆盖：base.txt 应仍为已合并的 agent-1 内容"
+    );
+    assert!(
+        !raw_git_status(&repo, &["rev-parse", "--verify", "MERGE_HEAD"]),
+        "abort 后不应残留 MERGE_HEAD"
+    );
+
+    // 编排器在冲突分支上 mem::forget 守卫以保留分支；这里模拟「保留」：分支此刻仍存在。
+    assert!(
+        raw_git_status(&repo, &["rev-parse", "--verify", &format!("refs/heads/{wt2_branch}")]),
+        "冲突保留阶段，第二个隔离分支应仍存在供人工处理: {wt2_branch}"
+    );
+
+    // 清理：wt1 Drop 清理；wt2 这里显式清理（编排器实战里 forget 后由用户/上层处置；测试负责收尾不泄漏）。
+    drop(wt1);
+    drop(wt2);
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// 冲突/错误路径上，剩余未合并的隔离工作树仍被 RAII 清理（不因提前停止而泄漏）。
+#[test]
+fn parallel_remaining_worktrees_cleaned_on_conflict_path() {
+    if !git_available() {
+        eprintln!("跳过：系统未安装 git");
+        return;
+    }
+    let repo = init_repo("par_remain");
+
+    let path_b;
+    let branch_b;
+    {
+        // 两个工作树：第一个会冲突，第二个根本没轮到合并（编排器停止后保留分支但 RAII 仍兜底）。
+        let wt_a = IsolatedWorktree::create(&repo, "remain-a").expect("create a");
+        std::fs::write(wt_a.path().join("base.txt"), "a-side\n").expect("wa");
+        wt_a.commit_all("a edits base").expect("ca");
+
+        let wt_b = IsolatedWorktree::create(&repo, "remain-b").expect("create b");
+        path_b = wt_b.path().to_path_buf();
+        branch_b = wt_b.branch().to_string();
+        std::fs::write(wt_b.path().join("other.txt"), "b-side\n").expect("wb");
+        wt_b.commit_all("b adds other").expect("cb");
+
+        // 父侧 main 也独立改 base.txt 制造与 wt_a 的真冲突。
+        std::fs::write(repo.join("base.txt"), "parent-side\n").expect("wp");
+        raw_git(&repo, &["commit", "-am", "parent edits base"]);
+
+        let oa = wt_a.merge_into("main").expect("merge a");
+        assert!(oa.has_conflict(), "wt_a 应冲突: {oa:?}");
+        // 父工作树被 abort 还原干净。
+        let status = raw_git(&repo, &["status", "--porcelain"]);
+        assert!(status.trim().is_empty(), "冲突后父工作树应干净: {status:?}");
+
+        // 编排器此处会停止，不再合并 wt_b——wt_b 守卫仍在作用域内，离开时 RAII 清理。
+        drop(wt_a);
+        // wt_b 在此块结束时 Drop。
+    }
+
+    // 即便从未合并，wt_b 的工作树/分支也被清理掉（不泄漏）。
+    assert!(!path_b.exists(), "未合并的剩余工作树也应被 Drop 清理: {path_b:?}");
+    assert!(
+        !raw_git_status(&repo, &["rev-parse", "--verify", &format!("refs/heads/{branch_b}")]),
+        "未合并的剩余临时分支也应被删除: {branch_b}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}

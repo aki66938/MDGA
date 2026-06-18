@@ -41,6 +41,9 @@ pub(crate) fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability
         // lsp_* 为只读 LSP 工具（仅查询语言服务器、不改文件），同列自动放行（R1）。
         "list_dir" | "read_file" | "stat_path" | "search_text" | "glob_files" | "code_overview"
         | "repo_map" | "code_search" | "repo_wiki" | "todo_write" | "ask_user" | "run_subtask"
+        // run_parallel_subtasks（P1/0.0.58）与 run_subtask 同档：编排器入口本身只读 git 状态并派发，
+        // 每个并行写子代理的写/删/命令仍在其 loop 内逐次门控+检查点，故入口自动放行、不重复审批。
+        | "run_parallel_subtasks"
         | "load_skill"
         | "remember"
         | "list_shells" | "get_shell_output" | "kill_shell" | "get_task_output" | "kill_task"

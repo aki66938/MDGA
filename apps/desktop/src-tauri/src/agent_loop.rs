@@ -24,7 +24,7 @@ use crate::permissions::{
     execute_ask_user, feed_tool_denial, gate_tool_decision, request_tool_approval, ToolGate,
 };
 use crate::state::AppState;
-use crate::subagent::{execute_bg_task_tool, execute_run_subtask};
+use crate::subagent::{execute_bg_task_tool, execute_run_parallel_subtasks, execute_run_subtask};
 use crate::tools::{
     all_builtin_tool_schemas, execute_browser_call, execute_builtin_tool_call, execute_load_skill,
     execute_readonly_call, execute_remember, execute_todo_write, load_workspace_skills,
@@ -1240,6 +1240,29 @@ async fn chat_with_builtin_tools(
                     );
                     // Plan25 C-3：补传本轮权限模式与权限规则,供可写子代理(mode="write")复用主链路门控/检查点。
                     let (sub_result, sub_usage) = execute_run_subtask(
+                        base_url,
+                        api_key,
+                        model,
+                        workspace_path,
+                        &arguments,
+                        app,
+                        conversation_id,
+                        permission_mode.clone(),
+                        permission_rules.clone(),
+                        &cancel,
+                    )
+                    .await;
+                    usage = merge_usage(usage, sub_usage);
+                    sub_result
+                }
+                // P1（0.0.58）：并行可写子代理编排器（显式 opt-in）。与 run_subtask 同样补传本轮权限
+                // 模式与规则，供每个并行写子代理在其隔离工作树里复用主链路门控/检查点。
+                "run_parallel_subtasks" => {
+                    let _ = app.emit(
+                        "agent-status",
+                        serde_json::json!({ "state": "thinking", "round": round }),
+                    );
+                    let (sub_result, sub_usage) = execute_run_parallel_subtasks(
                         base_url,
                         api_key,
                         model,

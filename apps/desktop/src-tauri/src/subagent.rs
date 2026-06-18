@@ -604,6 +604,422 @@ fn current_repo_branch(repo: &str) -> Result<String, mdga_tool_runtime::ToolRunt
     })
 }
 
+// ── P1（0.0.58）：并行可写子代理编排器（EXPLICIT / opt-in，默认 run_subtask 路径绝不改道） ──
+//
+// 这是建立在 R10 `IsolatedWorktree` 原语之上的**显式编排器**：把 N 个可写子代理各跑在自己的隔离
+// git 工作树里（并发 fan-out，互不踩文件），全部结束后把它们的分支**串行**合并回父分支；任一分支
+// 合并出现冲突，立刻**停止**后续合并并把「哪个子代理、冲突在哪些文件」结构化抛回给用户/模型——
+// **绝不**自动选边、**绝不** force、**绝不** `-X ours|theirs`。冲突由原语的 `merge --abort` 还原父
+// 工作树，编排器不再触碰它。
+//
+// 为什么独立入口、显式触发：默认 `run_subtask` 单子代理路径与主链路共用工作区、行为已稳定，静默
+// 改道到并行隔离写是高风险的（合并时序、清理、与主链路检查点/门控的交互）。本编排器是一个**新的、
+// 必须被显式调用**的内部函数（由上层 `run_parallel_subtasks` 工具触发），不被任何既有路径自动调用。
+//
+// 安全前置（pre-flight）：父仓库必须是 git 工作树、当前在某个**具名分支**（非 detached）、工作树
+// **干净**。任一不满足，编排器**拒绝运行**并回清晰错误——绝不在脏树/分离头上强行合并污染用户工作区。
+
+/// 单个并行子代理的运行 + 合并结局。
+#[allow(dead_code)] // 经由 run_parallel_subtasks 工具消费；字段为结构化结果，部分仅在特定分支填充。
+#[derive(Debug)]
+pub(crate) struct ParallelSubtaskItem {
+    /// 该子代理的人读标签（也是其隔离分支/目录名 slug 的来源）。
+    pub label: String,
+    /// 子代理产出的简明报告。
+    pub report: String,
+    /// 该子代理是否在隔离分支上产生了提交（无改动 => false，跳过合并）。
+    pub committed: bool,
+    /// 合并结局：`None`=未尝试合并（无提交，或前序已冲突而停止）；`Some(Clean)`=已干净并入父分支；
+    /// `Some(Conflict{paths})`=合并冲突（已 abort 还原父工作树，列出冲突文件，待人工处理）。
+    pub merge: Option<mdga_tool_runtime::MergeOutcome>,
+    /// 冲突时保留的隔离分支名（供用户人工 `git merge`）；其余情况为 None（工作树/分支已 RAII 清理）。
+    pub retained_branch: Option<String>,
+}
+
+/// 并行编排的整体结果：逐子代理明细 + 合并到的目标分支 + 合计 usage + 是否因冲突中止。
+#[allow(dead_code)] // 由 run_parallel_subtasks 工具序列化回模型；为结构化编排报告。
+#[derive(Debug)]
+pub(crate) struct ParallelOrchestrationResult {
+    pub target_branch: String,
+    pub items: Vec<ParallelSubtaskItem>,
+    pub usage: Option<mdga_shared::RawUsage>,
+    /// 是否存在冲突导致提前停止合并（true 时其后子代理的 merge 为 None，分支被保留待人工处理）。
+    pub stopped_on_conflict: bool,
+}
+
+/// 一个待编排的并行子代理：标签 + 委托描述。
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct ParallelSubtaskSpec {
+    pub label: String,
+    pub description: String,
+}
+
+/// 并发阶段每个子代理跑完后的中间产物（持有隔离工作树守卫，供后续串行合并/清理）。
+struct PreparedSubtask {
+    guard: mdga_tool_runtime::IsolatedWorktree,
+    label: String,
+    report: String,
+    committed: bool,
+}
+
+/// 子代理 system prompt：可写隔离工作子代理（与 run_subtask write 模式同口径，但点明在隔离工作树里）。
+fn isolated_write_system_prompt(workspace_path: &str) -> String {
+    format!(
+        "你是一个可写工作子代理，运行在一个**隔离的 git 工作树**目录里（路径 {workspace_path}），\
+你的所有改动只发生在这个隔离目录、稍后会被合并回主分支。除只读工具（list_dir、read_file、\
+search_text、glob_files、stat_path）外，你还可以使用 create_file、write_file、edit_file、\
+apply_patch、make_dir、move_path、delete_file、delete_dir、run_command 真正改动文件或执行命令。\
+每次写 / 删 / 命令操作都会经过用户权限门控与检查点保护。请严格聚焦被委托的范围、改前先读、\
+优先用 edit_file/apply_patch 精确修改，**只动与你的任务直接相关的文件**（与其他并行子代理改\
+同一文件会造成合并冲突）。完成后输出一份简明、信息密度高的中文报告，说明你做了哪些改动。"
+    )
+}
+
+/// EXPLICIT / opt-in：并行可写子代理编排器。把 `specs` 里的每个子代理各跑在独立隔离工作树里
+/// （并发），全部结束后**串行**把它们的分支合并回父分支；**任一冲突立即停止并向上抛出**。
+///
+/// 流程：
+/// 1. **pre-flight**：校验 `workspace_path` 是 git 工作树、当前在具名分支（非 detached）、工作树干净。
+///    任一不满足，直接回 `Err`（绝不在脏树/分离头上强行合并）。`specs` 为空也回 `Err`。
+/// 2. **并发阶段**：为每个 spec 在当前 HEAD 上创建一个 `IsolatedWorktree`（各自独立分支+目录）。
+///    任一创建失败，已建的守卫随作用域 RAII 清理后回 `Err`。随后用 `join_all` **并发**地把每个
+///    可写子代理 loop 跑在它自己的隔离目录里（write_mode=true，门控/检查点在 loop 内逐次执行），
+///    跑完在隔离工作树里 `add -A && commit` 把改动固化到隔离分支（无改动则 committed=false、不合并）。
+/// 3. **串行合并阶段**：按 `specs` 顺序逐个 `merge_into(target)`：
+///    - 干净：记 `Clean`，该守卫随后 RAII 清理（工作树/临时分支移除）。
+///    - 冲突：记 `Conflict{paths}`，`mem::forget` 该守卫以**保留**其分支供人工处理，置
+///      `stopped_on_conflict=true`，**停止**合并其余子代理（其余记 merge=None，并保留它们的分支
+///      也供人工查看），整体仍 `Ok` 返回（冲突是结构化结果而非错误）。
+///    - 其它 merge 错误：同样视为停止信号，保留剩余分支，记录错误进对应 item 报告。
+///
+/// 安全不变量：合并/清理全程复用 `IsolatedWorktree`（绝对路径、`-c core.autocrlf=false`、绝不
+/// force、绝不 `-X ours|theirs`、冲突 `merge --abort` 还原父工作树）。本函数不改动权限门控语义。
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // 由 run_parallel_subtasks 工具显式调用；不被任何既有默认路径自动触发。
+pub(crate) async fn run_parallel_write_subtasks(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    workspace_path: &str,
+    specs: &[ParallelSubtaskSpec],
+    app: &AppHandle,
+    conversation_id: &str,
+    cancel: Option<Arc<AtomicBool>>,
+    permission: PermissionMode,
+    permission_rules: &[String],
+    commit_message_prefix: &str,
+) -> Result<ParallelOrchestrationResult, String> {
+    if specs.is_empty() {
+        return Err("并行编排至少需要一个子任务".to_string());
+    }
+    // 标签去重（用于稳定地把合并结果归位到 spec；slug 冲突由原语的唯一 nonce 兜底，这里只防空）。
+    if specs.iter().any(|s| s.description.trim().is_empty()) {
+        return Err("每个并行子任务都需要非空 description".to_string());
+    }
+
+    // 1. pre-flight：必须是 git 工作树、具名分支（非 detached）、工作树干净。
+    let status = mdga_tool_runtime::git_status(
+        workspace_path,
+        mdga_tool_runtime::GitStatusRequest::default(),
+    )
+    .map_err(|e| format!("并行编排前置检查失败（无法读取 git 状态，需在 git 仓库内）: {e}"))?;
+    let target_branch = match &status.branch {
+        Some(b) => b.clone(),
+        None => {
+            return Err(
+                "父仓库处于 detached HEAD，无法安全合并并行子代理结果；请先切到一个具名分支再试"
+                    .to_string(),
+            )
+        }
+    };
+    if !status.clean {
+        return Err(format!(
+            "父仓库工作树不干净（有未提交改动），并行编排为避免污染你的改动而拒绝运行；\
+请先提交或暂存当前改动后再发起并行子代理（目标分支 {target_branch}）"
+        ));
+    }
+
+    // 2. 并发阶段：先创建全部隔离工作树（任一失败则已建的随 Vec 作用域 RAII 清理后回错）。
+    let system_prompt = isolated_write_system_prompt(workspace_path);
+    let mut guards: Vec<mdga_tool_runtime::IsolatedWorktree> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match mdga_tool_runtime::IsolatedWorktree::create(workspace_path, &spec.label) {
+            Ok(g) => guards.push(g),
+            Err(e) => {
+                // guards 在此函数返回时 Drop，自动清理已建的隔离工作树/分支——不泄漏。
+                return Err(format!(
+                    "为并行子代理 '{}' 创建隔离工作树失败: {e}",
+                    spec.label
+                ));
+            }
+        }
+    }
+
+    // 并发跑每个可写子代理 loop（各自隔离目录）。join_all 等全部完成后再进入串行合并阶段。
+    // 注意：cancel 在各子代理间共享（kill 主链路会一并停下所有并行子代理）。
+    let isolated_paths: Vec<String> = guards
+        .iter()
+        .map(|g| g.path().to_string_lossy().to_string())
+        .collect();
+    let run_futs = specs.iter().zip(isolated_paths.iter()).map(|(spec, iso_path)| {
+        let sp = system_prompt.clone();
+        let desc = spec.description.clone();
+        let perm = permission.clone();
+        let rules = permission_rules.to_vec();
+        let cancel = cancel.clone();
+        async move {
+            run_subtask_loop(
+                base_url,
+                api_key,
+                model,
+                iso_path,
+                &sp,
+                &desc,
+                app,
+                conversation_id,
+                cancel,
+                true, // write_mode：隔离工作树内可写，门控/检查点照常逐次执行
+                perm,
+                &rules,
+            )
+            .await
+        }
+    });
+    let run_results = futures_util::future::join_all(run_futs).await;
+
+    // 把每个子代理结果固化到其隔离分支（无改动则不提交、不参与合并）。
+    let mut total_usage: Option<mdga_shared::RawUsage> = None;
+    let mut prepared: Vec<PreparedSubtask> = Vec::with_capacity(specs.len());
+    for ((spec, guard), (report, usage)) in specs.iter().zip(guards).zip(run_results) {
+        total_usage = merge_usage(total_usage, usage);
+        let commit_msg = format!("{commit_message_prefix}{}", spec.label);
+        let committed = guard.commit_all(&commit_msg).is_ok();
+        prepared.push(PreparedSubtask {
+            guard,
+            label: spec.label.clone(),
+            report,
+            committed,
+        });
+    }
+
+    // 3. 串行合并阶段：逐个把已提交的隔离分支合并回 target_branch；任一冲突/错误即停止其余合并。
+    let mut items: Vec<ParallelSubtaskItem> = Vec::with_capacity(prepared.len());
+    let mut stopped = false;
+    for p in prepared {
+        if !p.committed {
+            // 无改动：不合并。守卫在 item push 后随 p 被 Drop 清理（隔离工作树/分支移除）。
+            items.push(ParallelSubtaskItem {
+                label: p.label,
+                report: p.report,
+                committed: false,
+                merge: None,
+                retained_branch: None,
+            });
+            continue;
+        }
+        if stopped {
+            // 已因前序冲突停止：保留本分支供人工查看，不再尝试合并（forget 守卫以阻止 Drop 清理）。
+            let branch = p.guard.branch().to_string();
+            std::mem::forget(p.guard);
+            items.push(ParallelSubtaskItem {
+                label: p.label,
+                report: p.report,
+                committed: true,
+                merge: None,
+                retained_branch: Some(branch),
+            });
+            continue;
+        }
+        match p.guard.merge_into(&target_branch) {
+            Ok(mdga_tool_runtime::MergeOutcome::Conflict { paths }) => {
+                // 冲突：原语已 merge --abort 还原父工作树。保留本隔离分支供人工处理，置停止信号。
+                stopped = true;
+                let branch = p.guard.branch().to_string();
+                std::mem::forget(p.guard);
+                items.push(ParallelSubtaskItem {
+                    label: p.label,
+                    report: p.report,
+                    committed: true,
+                    merge: Some(mdga_tool_runtime::MergeOutcome::Conflict { paths }),
+                    retained_branch: Some(branch),
+                });
+            }
+            Ok(clean) => {
+                // 干净合并：守卫随 p 离开作用域 Drop 清理隔离工作树/分支。
+                items.push(ParallelSubtaskItem {
+                    label: p.label,
+                    report: p.report,
+                    committed: true,
+                    merge: Some(clean),
+                    retained_branch: None,
+                });
+            }
+            Err(e) => {
+                // 非冲突类合并错误（如锁/IO）：保守起见也视为停止信号，保留分支并记入报告。
+                stopped = true;
+                let branch = p.guard.branch().to_string();
+                std::mem::forget(p.guard);
+                items.push(ParallelSubtaskItem {
+                    label: p.label,
+                    report: format!("{}\n[合并失败]: {e}", p.report),
+                    committed: true,
+                    merge: None,
+                    retained_branch: Some(branch),
+                });
+            }
+        }
+    }
+
+    Ok(ParallelOrchestrationResult {
+        target_branch,
+        items,
+        usage: total_usage,
+        stopped_on_conflict: stopped,
+    })
+}
+
+/// 并行编排器一次最多并发的子代理数（保守上限，防一次拉太多 worktree 拖垮磁盘/并发）。
+const MAX_PARALLEL_SUBTASKS: usize = 4;
+
+/// 纯函数：从 `run_parallel_subtasks` 的 JSON 参数解析出子任务规格（含上限/空值校验）。
+///
+/// 抽成纯函数便于单测「上限、空数组、缺/空 description、label 缺省」等校验分支（无需 AppHandle/LLM）。
+/// 校验失败回 `Err(清晰中文原因)`；成功回归一化后的 spec 列表。
+fn parse_parallel_subtask_specs(
+    parsed: &serde_json::Value,
+) -> Result<Vec<ParallelSubtaskSpec>, String> {
+    let Some(arr) = parsed.get("subtasks").and_then(|v| v.as_array()) else {
+        return Err("run_parallel_subtasks 缺少 subtasks 数组".to_string());
+    };
+    if arr.is_empty() {
+        return Err("subtasks 不能为空".to_string());
+    }
+    if arr.len() > MAX_PARALLEL_SUBTASKS {
+        return Err(format!(
+            "并行子任务数 {} 超过上限 {MAX_PARALLEL_SUBTASKS}；请减少数量或分批",
+            arr.len()
+        ));
+    }
+    let mut specs: Vec<ParallelSubtaskSpec> = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let Some(description) = item.get("description").and_then(|v| v.as_str()) else {
+            return Err(format!("subtasks[{i}] 缺少 description"));
+        };
+        if description.trim().is_empty() {
+            return Err(format!("subtasks[{i}] 的 description 为空"));
+        }
+        // label 可选：缺省用序号；仅用于分支/目录命名（原语会再做 sanitize + 唯一 nonce）。
+        let label = item
+            .get("label")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("task-{}", i + 1));
+        specs.push(ParallelSubtaskSpec {
+            label,
+            description: description.to_string(),
+        });
+    }
+    Ok(specs)
+}
+
+/// `run_parallel_subtasks` 工具入口：解析参数 → 调用 `run_parallel_write_subtasks` 并行编排 →
+/// 把结构化编排结果序列化回模型（含每个子代理的报告、是否合并、冲突文件、保留分支）。
+///
+/// 与 `execute_run_subtask` 同形：返回 `(Result<Value>, Option<usage>)`，usage 由调用点并入会话账本。
+/// 这是一个**显式 opt-in** 入口——模型只有主动调用 `run_parallel_subtasks` 才会走并行隔离写，
+/// 既有 `run_subtask`（单子代理，默认路径）行为完全不受影响。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_run_parallel_subtasks(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    workspace_path: &str,
+    arguments: &str,
+    app: &AppHandle,
+    conversation_id: &str,
+    permission: mdga_shared::PermissionMode,
+    permission_rules: Vec<String>,
+    cancel: &Arc<AtomicBool>,
+) -> (Result<serde_json::Value, String>, Option<mdga_shared::RawUsage>) {
+    let parsed: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(value) => value,
+        Err(e) => return (Err(format!("工具参数解析失败: {e}")), None),
+    };
+    let specs = match parse_parallel_subtask_specs(&parsed) {
+        Ok(s) => s,
+        Err(e) => return (Err(e), None),
+    };
+
+    let result = run_parallel_write_subtasks(
+        base_url,
+        api_key,
+        model,
+        workspace_path,
+        &specs,
+        app,
+        conversation_id,
+        Some(cancel.clone()),
+        permission,
+        &permission_rules,
+        "subagent: ",
+    )
+    .await;
+
+    match result {
+        Ok(orch) => {
+            let usage = orch.usage.clone();
+            let items: Vec<serde_json::Value> = orch
+                .items
+                .iter()
+                .map(|it| {
+                    let (merge_state, conflict_paths) = match &it.merge {
+                        Some(mdga_tool_runtime::MergeOutcome::Clean { .. }) => {
+                            ("merged_clean", Vec::new())
+                        }
+                        Some(mdga_tool_runtime::MergeOutcome::Conflict { paths }) => {
+                            ("conflict", paths.clone())
+                        }
+                        None => {
+                            if it.committed {
+                                // 有提交但 merge=None：因前序冲突而被跳过（分支已保留）。
+                                ("skipped_after_conflict", Vec::new())
+                            } else {
+                                ("no_changes", Vec::new())
+                            }
+                        }
+                    };
+                    serde_json::json!({
+                        "label": it.label,
+                        "report": it.report,
+                        "mergeState": merge_state,
+                        "conflictPaths": conflict_paths,
+                        "retainedBranch": it.retained_branch,
+                    })
+                })
+                .collect();
+            let note = if orch.stopped_on_conflict {
+                "存在合并冲突：已在第一个冲突处停止后续合并，父工作树被还原干净（绝未强解/选边）。\
+请查看 conflictPaths 与 retainedBranch——可手动 `git merge <retainedBranch>` 解决冲突，\
+或让对应子代理重做以避开冲突文件。冲突子代理及其后未合并的子代理分支均已保留待你处理。"
+            } else {
+                "全部子代理已干净合并回目标分支（或无改动）。隔离工作树/临时分支已清理。"
+            };
+            (
+                Ok(serde_json::json!({
+                    "targetBranch": orch.target_branch,
+                    "stoppedOnConflict": orch.stopped_on_conflict,
+                    "subtasks": items,
+                    "note": note,
+                })),
+                usage,
+            )
+        }
+        Err(e) => (Err(e), None),
+    }
+}
+
 /// 后台子代理任务工具：get_task_output / kill_task / list_tasks。
 /// get_task_output 在任务完成且未结算时返回其 usage，供主循环并入会话账本（只结算一次）。
 pub(crate) async fn execute_bg_task_tool(
@@ -693,5 +1109,82 @@ pub(crate) async fn execute_bg_task_tool(
             )
         }
         other => (Err(format!("未知后台任务工具: {other}")), None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // P1（0.0.58）：并行编排器参数解析/校验的纯逻辑测试（无需 AppHandle/LLM/git）。
+
+    #[test]
+    fn parse_specs_requires_subtasks_array() {
+        let v = serde_json::json!({});
+        assert!(parse_parallel_subtask_specs(&v).is_err());
+        let v = serde_json::json!({ "subtasks": "nope" });
+        assert!(parse_parallel_subtask_specs(&v).is_err());
+    }
+
+    #[test]
+    fn parse_specs_rejects_empty_array() {
+        let v = serde_json::json!({ "subtasks": [] });
+        let err = parse_parallel_subtask_specs(&v).unwrap_err();
+        assert!(err.contains("不能为空"), "应报空数组: {err}");
+    }
+
+    #[test]
+    fn parse_specs_enforces_max_cap() {
+        // 超过 MAX_PARALLEL_SUBTASKS 应被拒（保守上限，防一次拉太多 worktree）。
+        let items: Vec<serde_json::Value> = (0..(MAX_PARALLEL_SUBTASKS + 1))
+            .map(|i| serde_json::json!({ "description": format!("do {i}") }))
+            .collect();
+        let v = serde_json::json!({ "subtasks": items });
+        let err = parse_parallel_subtask_specs(&v).unwrap_err();
+        assert!(err.contains("超过上限"), "应报超过上限: {err}");
+
+        // 恰好等于上限：允许。
+        let items: Vec<serde_json::Value> = (0..MAX_PARALLEL_SUBTASKS)
+            .map(|i| serde_json::json!({ "description": format!("do {i}") }))
+            .collect();
+        let v = serde_json::json!({ "subtasks": items });
+        let specs = parse_parallel_subtask_specs(&v).expect("恰好上限应通过");
+        assert_eq!(specs.len(), MAX_PARALLEL_SUBTASKS);
+    }
+
+    #[test]
+    fn parse_specs_rejects_missing_or_empty_description() {
+        let v = serde_json::json!({ "subtasks": [{ "label": "x" }] });
+        assert!(parse_parallel_subtask_specs(&v).is_err(), "缺 description 应拒");
+        let v = serde_json::json!({ "subtasks": [{ "description": "   " }] });
+        let err = parse_parallel_subtask_specs(&v).unwrap_err();
+        assert!(err.contains("为空"), "空白 description 应拒: {err}");
+    }
+
+    #[test]
+    fn parse_specs_defaults_label_and_keeps_description() {
+        let v = serde_json::json!({
+            "subtasks": [
+                { "description": "task A" },
+                { "label": "custom", "description": "task B" }
+            ]
+        });
+        let specs = parse_parallel_subtask_specs(&v).expect("应解析");
+        assert_eq!(specs.len(), 2);
+        // 第一个无 label：缺省 task-1。
+        assert_eq!(specs[0].label, "task-1");
+        assert_eq!(specs[0].description, "task A");
+        // 第二个用自定义 label。
+        assert_eq!(specs[1].label, "custom");
+        assert_eq!(specs[1].description, "task B");
+    }
+
+    #[test]
+    fn parse_specs_blank_label_falls_back_to_index() {
+        let v = serde_json::json!({
+            "subtasks": [{ "label": "   ", "description": "x" }]
+        });
+        let specs = parse_parallel_subtask_specs(&v).expect("应解析");
+        assert_eq!(specs[0].label, "task-1", "空白 label 应回退为序号");
     }
 }
