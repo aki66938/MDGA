@@ -113,6 +113,25 @@ pub(crate) fn remove_model_provider(state: State<AppState>, role: String) -> Res
     delete_model_provider(&db, &role).map_err(|e| e.to_string())
 }
 
+/// R8 角色多模型路由：解析某功能角色（action / plan / critique）实际生效的 provider。
+///
+/// 与 get_model_provider_config 的差别：该命令带「回退主模型」语义——角色未单独配置（或被禁用）时
+/// 返回主模型 provider，使前端能展示「该角色当前实际用哪个模型」（自身配置 vs 回退 main）。
+/// api_key 同样脱敏为空（不回显明文）。角色未配置且连 main 都没配时返回 None。
+#[tauri::command]
+pub(crate) fn resolve_role_model_provider(
+    state: State<AppState>,
+    role: String,
+) -> Result<Option<ModelProvider>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut provider =
+        mdga_storage::resolve_role_provider(&db, &role).map_err(|e| e.to_string())?;
+    if let Some(p) = provider.as_mut() {
+        p.api_key = String::new(); // 不回显明文 key
+    }
+    Ok(provider)
+}
+
 /// 对某 role 的供应商做一次「测试连接」（Plan19 C-A）：用极小请求探测端点连通与鉴权是否可用。
 ///
 /// 入参为前端表单的当前值;任一项为空则回退到 DB 已存 provider（支持「已配状态下不重输 Key 直接测试」，
