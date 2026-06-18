@@ -142,6 +142,8 @@ pub(crate) async fn send_message(
         let vision_provider = if images.is_empty() {
             None
         } else {
+            // 要求 enabled：新 UI 关闭视觉走 clear_role_assignment(删行)、从不写 enabled=0 的 vision 行,
+            // 故「enabled 检查」实际等价于「存在性检查」;此处显式要求 enabled 是更直观/安全的契约。
             match get_role_assignment(&db, ROLE_VISION) {
                 Ok(Some(a)) if a.enabled => resolve_role_provider(&db, ROLE_VISION).ok().flatten(),
                 _ => None,

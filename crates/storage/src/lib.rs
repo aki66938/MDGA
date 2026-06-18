@@ -258,7 +258,7 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     add_column_if_missing(&conn, "model_providers", "context_window", "INTEGER")?;
     // 0.0.59：把旧的 role-keyed model_providers 迁到「连接库 + 角色引用」。
     // 一次性、幂等、改前备份 sqlite 文件；旧表保留一版作回滚路径。失败软处理，不阻断建库。
-    migrate_to_connections_0059(&conn, path)?;
+    migrate_to_connections_0059(&conn)?;
     Ok(conn)
 }
 
@@ -1215,7 +1215,14 @@ pub fn upsert_connection(
     let api_format = normalize_api_format(api_format);
     let base_url = base_url.map(str::trim).filter(|s| !s.is_empty());
     if id.trim().is_empty() {
-        // 创建。
+        // 创建：服务端兜底校验——新建连接必须带非空 key（前端表单已挡一道，这里防御性再挡，
+        // 避免任何调用方建出无密钥的死连接）。更新路径的空 key=保留旧 key 语义不受影响。
+        if api_key.trim().is_empty() {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                Some("新建连接必须填写 API Key".to_string()),
+            ));
+        }
         let new_id = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO connections
@@ -1343,47 +1350,43 @@ pub fn delete_role_assignment(conn: &Connection, role: &str) -> SqlResult<()> {
 
 /// 把旧的 role-keyed `model_providers` 迁到「连接库 + 角色引用」。
 ///
-/// **一次性、幂等、改前备份**——本函数可在每次 `init_db` 调用，但只在「`role_assignments` 为空
+/// **一次性、幂等**——本函数可在每次 `init_db` 调用，但只在「`role_assignments` 为空
 /// 且 `model_providers` 有行」时才真正搬数据；搬完后 `role_assignments` 非空，下次调用即 no-op。
 /// 这个「门」既保证不重复迁移、不重复 dedup，也使全新库（无旧行）与已迁库都安全跳过。
 ///
-/// 安全：真正搬数据前，best-effort 把 sqlite 文件复制一份到 `<dbpath>.pre-0059.bak`（失败软处理，
-/// 仍继续迁移）。**绝不** drop / alter `model_providers`——保留一版作回滚路径。
+/// 回滚路径：整个搬运在**单事务**内完成（出错即 ROLLBACK，无半迁状态），且**绝不** drop / alter
+/// `model_providers`——旧表原封不动地保留为「事务化、一致的」回滚快照。故**不再额外落一份明文
+/// 密钥文件备份**（旧的 `.pre-0059.bak` 方案在 WAL 下可能陈旧/不一致，且会把全部 API Key 再留一份
+/// 明文在磁盘上——既不可靠又是泄漏面；保留旧表已是更稳的回滚源）。
 ///
 /// dedup：对每个旧行，按 (preset, COALESCE(base_url,''), api_key, api_format) 去重找/建 connection——
 /// 三元组相同的多个角色共用同一条 connection（同一把 DeepSeek key 被 3 个角色用 ⇒ 1 个连接）。
 /// 然后为该角色插入一条 role_assignment 指向该 connection。
-fn migrate_to_connections_0059(conn: &Connection, path: &Path) -> SqlResult<()> {
+fn migrate_to_connections_0059(conn: &Connection) -> SqlResult<()> {
     // 门：已有任意角色引用 ⇒ 已迁过（或用户已用新表配置），不再迁。
     let assignment_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM role_assignments", [], |r| r.get(0))?;
     if assignment_count > 0 {
         return Ok(());
     }
-    // 旧表无行 ⇒ 全新库，无需迁移（也无备份必要）。
-    let old_rows = list_model_providers(conn)?;
+    // 旧表无行 ⇒ 全新库，无需迁移。
+    let mut old_rows = list_model_providers(conn)?;
     if old_rows.is_empty() {
         return Ok(());
     }
-
-    // 改前备份（best-effort，失败仅记日志不阻断）。WAL 模式下主 .db 可能尚未 checkpoint，
-    // 但备份仍是「尽力而为的回滚点」——配合保留的 model_providers 旧表，回滚路径充足。
-    let backup = {
-        let mut p = path.as_os_str().to_os_string();
-        p.push(".pre-0059.bak");
-        std::path::PathBuf::from(p)
-    };
-    if let Err(e) = std::fs::copy(path, &backup) {
-        eprintln!("[migrate 0.0.59] 备份 DB 失败（继续迁移）: {e}");
-    }
+    // 确定性：按 updated_at 升序处理，使「同 role 的多行」中**最新一行最后写入** → ON CONFLICT(role)
+    // 覆盖后最新者胜出,与旧解析器 `WHERE role=? ORDER BY updated_at DESC LIMIT 1`(最新者胜)一致。
+    // 正常路径不会出现同 role 多行(upsert 先删后插),这是对历史脏数据的防御性确定化。
+    old_rows.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
 
     // 在单事务里做完 dedup + 写入，避免半迁状态。
     conn.execute_batch("BEGIN")?;
     let result = (|| -> SqlResult<()> {
         for row in &old_rows {
             let preset = row.preset.as_deref();
-            // base_url 归一：旧表存的 NULL 与空串都视为「走 preset 官方端点」。
-            let base_url = row.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            // base_url 归一：NULL / 空 / 纯空白都视为「走 preset 官方端点」(=None)；非空值**原样保留
+            // 不 trim**,与旧写入/读取路径逐字节一致(旧 save 仅 filter 空白、不改非空内容)。
+            let base_url = row.base_url.as_deref().filter(|s| !s.trim().is_empty());
             let api_format = normalize_api_format(&row.api_format);
             // dedup 找已有 connection（按三元组 + preset + format）。
             let existing = find_connection_for_triple(
@@ -2050,6 +2053,16 @@ mod tests {
         assert_eq!(c.api_format, "openai");
         assert_eq!(c.base_url, None);
 
+        // 服务端兜底：新建连接(id 空)带空/纯空白 key 必须被拒(不再只靠前端表单)。
+        assert!(
+            upsert_connection(&conn, "", Some("X"), Some("deepseek"), None, "", "openai").is_err(),
+            "新建连接空 key 应被拒"
+        );
+        assert!(
+            upsert_connection(&conn, "", Some("X"), Some("deepseek"), None, "   ", "openai").is_err(),
+            "新建连接纯空白 key 应被拒"
+        );
+
         // 更新：api_key 留空 ⇒ 保留旧 key；base_url 空串归一为 None。
         let updated = upsert_connection(
             &conn, &c.id, Some("DS 改名"), Some("deepseek"), Some("   "), "", "anthropic",
@@ -2184,7 +2197,7 @@ mod tests {
             .collect();
 
         // 跑迁移。
-        migrate_to_connections_0059(&conn, &db_path).expect("migrate");
+        migrate_to_connections_0059(&conn).expect("migrate");
 
         // dedup：main/action/plan 三角色 → 1 个连接；critique → 另 1 个 ⇒ 共 2 个连接。
         let conns = list_connections(&conn).expect("list conns");
@@ -2229,7 +2242,7 @@ mod tests {
         );
 
         // 幂等：再跑一次迁移什么都不应改变（连接数 / 引用不变）。
-        migrate_to_connections_0059(&conn, &db_path).expect("migrate twice");
+        migrate_to_connections_0059(&conn).expect("migrate twice");
         assert_eq!(list_connections(&conn).expect("conns2").len(), 2, "二次迁移不应新增连接");
         assert_eq!(get_role_assignments(&conn).expect("assigns2").len(), 4, "二次迁移不应改引用");
 
@@ -2298,7 +2311,7 @@ mod tests {
 
         // 旧表里也塞一行——迁移因「已有引用」这道门而完全跳过，不污染已有配置。
         seed_old_provider(&conn, "main", Some("deepseek"), Some("DS"), None, "sk-old", "deepseek-chat", "openai", None);
-        migrate_to_connections_0059(&conn, &db_path).expect("migrate no-op");
+        migrate_to_connections_0059(&conn).expect("migrate no-op");
 
         // 仍只有 1 个连接、1 条引用，且都是新表里那条（未被旧行覆盖）。
         assert_eq!(list_connections(&conn).expect("conns").len(), 1);
