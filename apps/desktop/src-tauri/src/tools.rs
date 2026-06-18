@@ -405,7 +405,8 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Natural-language description or keywords of the code you want to find. Required, non-empty." },
-                        "topK": { "type": "integer", "description": "Number of most-relevant chunks to return (default 8, clamped to 1–50)." }
+                        "topK": { "type": "integer", "description": "Number of most-relevant chunks to return (default 8, clamped to 1–50)." },
+                        "useEmbedding": { "type": "boolean", "description": "Optional. Only meaningful when the user has enabled embedding re-rank in settings (default OFF; default search is fully offline/local). When the feature is enabled, the LOCAL top-N candidates are additionally re-ordered by your configured provider's embedding cosine similarity (the local retrieval set never changes). Pass false to force this one call to stay purely local even if the feature is enabled. If the embeddings endpoint is unavailable/errors, it silently falls back to local ranking (the result's embeddingReranked flag and note say which path ran)." }
                     },
                     "required": ["query"],
                     "additionalProperties": false
@@ -1356,8 +1357,12 @@ fn execute_repo_map(workspace_path: &str, arguments: &str) -> Result<serde_json:
         .map_err(|err| err.to_string())
 }
 
-/// code_search 工具（R2 L 阶段）：本地语义代码检索，给 query 回最相关代码块。
-/// 离线、无 embedding、无网络;只读、无副作用。
+/// code_search 工具（R2 L 阶段 + P2/0.0.58 可选 embedding 重排）：本地语义代码检索，给 query 回
+/// 最相关代码块。**默认离线、无 embedding、无网络**;只读、无副作用。
+///
+/// P2:当且仅当用户全局开启 embedding 重排(设置项 `code_search_embedding=on`)且本次未显式
+/// `useEmbedding=false` 时,在本地候选之上叠加一层 provider embedding 余弦重排;任一不可用都静默
+/// 回退纯本地排名。embedding 只**重排已召回的本地候选**,不改变召回集、不让 code_search 依赖网络。
 fn execute_code_search(workspace_path: &str, arguments: &str) -> Result<serde_json::Value, String> {
     #[derive(serde::Deserialize, Default)]
     struct CodeSearchArgs {
@@ -1365,6 +1370,9 @@ fn execute_code_search(workspace_path: &str, arguments: &str) -> Result<serde_js
         query: String,
         #[serde(rename = "topK", default)]
         top_k: usize,
+        /// 单次覆盖:显式 false 时本次强制走纯本地(即便全局开启);缺省/true 时遵循全局开关。
+        #[serde(rename = "useEmbedding", default)]
+        use_embedding: Option<bool>,
     }
     let trimmed = arguments.trim();
     let args = if trimmed.is_empty() {
@@ -1377,8 +1385,14 @@ fn execute_code_search(workspace_path: &str, arguments: &str) -> Result<serde_js
         query: args.query,
         top_k: args.top_k,
     };
-    serde_json::to_value(mdga_codemap::code_search(workspace_path, &request))
-        .map_err(|err| err.to_string())
+    // 默认 None ＝ 纯本地(与 0.0.57 逐字节一致);仅启用且未被本次否决时才得到 Some(embedder)。
+    let embedder = crate::embedding::active_embedder(args.use_embedding);
+    let result = mdga_codemap::code_search_with_embedder(
+        workspace_path,
+        &request,
+        embedder.as_ref().map(|e| e as &dyn mdga_codemap::Embedder),
+    );
+    serde_json::to_value(result).map_err(|err| err.to_string())
 }
 
 /// repo_wiki 工具（R11）：基于 repo_map 的结构化分析生成 / 查询持久仓库 wiki。

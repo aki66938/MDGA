@@ -39,6 +39,12 @@ const MAX_TOTAL_CHUNKS: usize = 40_000;
 /// 返回结果块数默认值与上限。
 const DEFAULT_TOP_K: usize = 8;
 const MAX_TOP_K: usize = 50;
+/// 可选向量重排时,送入 embedder 的本地候选块数上界(只重排「本地已召回」的 TOP-N,
+/// 不改变召回集、也不无限放大网络调用次数)。取 top_k 的若干倍并夹到此上界。
+const EMBED_CANDIDATE_CAP: usize = 30;
+/// 重排时本地分与余弦相似度的融合权重:final = (1-α)·norm(local) + α·cosine。
+/// α 适中:embedding 只**重排**本地候选,不喧宾夺主——本地强信号(精确符号命中)仍占一半权重。
+const EMBED_BLEND_ALPHA: f64 = 0.5;
 /// BM25 参数(标准取值)。
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
@@ -86,15 +92,21 @@ pub struct CodeSearchResult {
     pub total_chunks: usize,
     /// 是否因文件/块上限有内容被省略。
     pub truncated: bool,
+    /// 是否对本地候选施加了 provider embedding 余弦重排(默认 false=纯本地;
+    /// 即便调用方传入 embedder,任一失败也会静默回退本地并保持 false)。
+    #[serde(default)]
+    pub embedding_reranked: bool,
     /// 给模型的口径说明。
     pub note: String,
 }
 
-/// 未来可插拔的「向量召回」后端钩子。默认路径**不使用**它(纯本地词法+图排名)。
+/// 可插拔的「向量重排」后端钩子。**默认路径不使用它**(纯本地词法+图排名);只有调用方
+/// 显式传入 `Some(&dyn Embedder)` 时,`code_search_with_embedder` 才用它对本地 TOP-N 候选
+/// 做余弦相似度重排。
 ///
-/// 约定:`embed` 把一段文本映射到稠密向量,`code_search` 的可选向量重排会用余弦相似度。
-/// 留此 trait 是为了将来接 provider embedding 而**不破坏现有签名**;实现者需自带网络/模型,
-/// 本 crate 默认不提供任何实现,也绝不引入重型 ML 依赖。
+/// 约定:`embed` 把一段文本映射到稠密向量。实现者自带网络/模型(如 provider 的 OpenAI 兼容
+/// `/embeddings` 端点),本 crate 默认不提供任何实现,也绝不引入重型 ML 依赖——只消费 `&dyn Embedder`。
+/// 任一 `embed` 返回 None / panic-free 失败都会让重排对该块降级(不抬升其相似度),整体回退本地排名。
 pub trait Embedder: Send + Sync {
     /// 把文本编码为定长向量。返回 None 表示该后端对此文本不可用(调用方降级到词法分)。
     fn embed(&self, text: &str) -> Option<Vec<f32>>;
@@ -114,8 +126,28 @@ struct Chunk {
     tokens: Vec<String>,
 }
 
-/// 本地语义代码检索。永不硬失败:工作区不存在 / 无源码 / 空 query 都返回空块 + 说明。
+/// 本地语义代码检索(默认路径,纯离线、无网络、无 embedding)。
+///
+/// 行为与 0.0.57 逐字节一致:等价于 `code_search_with_embedder(.., None)`。
 pub fn code_search(workspace_root: &str, request: &CodeSearchRequest) -> CodeSearchResult {
+    code_search_with_embedder(workspace_root, request, None)
+}
+
+/// 本地语义代码检索 + **可选** provider embedding 重排。
+///
+/// `embedder` 为 `None`(默认)时,行为与 [`code_search`] / 0.0.57 逐字节一致:纯本地
+/// BM25 + PageRank + 精确符号命中,无任何网络/embedding。
+///
+/// `embedder` 为 `Some` 时:**先**照常做完整本地召回与排名(从不被 embedding 替代),**再**取本地
+/// 排名的 TOP-N 候选,用 query 与每个候选块的 embedding 余弦相似度,与归一化后的本地分融合
+/// (`EMBED_BLEND_ALPHA`)重排这 N 个候选——embedding 只能**重排已召回的候选**,不改变召回集、
+/// 不引入新块。若 query 向量化失败 / 候选可用向量过少 / 维度不一致,则**静默回退**纯本地排名
+/// (`embedding_reranked=false`),绝不硬失败、绝不挂起(超时由 embedder 实现自行保证)。
+pub fn code_search_with_embedder(
+    workspace_root: &str,
+    request: &CodeSearchRequest,
+    embedder: Option<&dyn Embedder>,
+) -> CodeSearchResult {
     let top_k = normalize_top_k(request.top_k);
     let query = request.query.trim();
     if query.is_empty() {
@@ -178,9 +210,15 @@ pub fn code_search(workspace_root: &str, request: &CodeSearchRequest) -> CodeSea
         return empty_result("未能从源文件切出任何代码块");
     }
 
-    // 5) 本地混合排名。
+    // 5) 本地混合排名(永远先做,embedding 从不替代它)。
     let query_terms = query_terms(query);
-    let scored = rank_chunks(&chunks, &query_terms, &ranks, &discovered.rel_paths);
+    let mut scored = rank_chunks(&chunks, &query_terms, &ranks, &discovered.rel_paths);
+
+    // 5b) 可选 provider embedding 重排:仅重排本地已召回的 TOP-N 候选,失败静默回退。
+    let mut embedding_reranked = false;
+    if let Some(emb) = embedder {
+        embedding_reranked = rerank_with_embedder(&mut scored, &chunks, query, emb, top_k);
+    }
 
     // 6) 取 top_k,组装结果。
     let mut out: Vec<CodeSearchChunk> = Vec::with_capacity(top_k.min(scored.len()));
@@ -198,8 +236,15 @@ pub fn code_search(workspace_root: &str, request: &CodeSearchRequest) -> CodeSea
     }
 
     let truncated = discovered.truncated || chunks_truncated;
+    let pipeline = if embedding_reranked {
+        "本地语义检索 + provider embedding 余弦重排(对本地 TOP-N 候选)"
+    } else if embedder.is_some() {
+        "本地语义检索(已请求 embedding 重排,但 embedder 不可用/失败,已静默回退本地)"
+    } else {
+        "本地语义检索(离线,无 embedding)"
+    };
     let note = format!(
-        "本地语义检索(离线,无 embedding):tree-sitter 切块 + BM25 词法 + PageRank 文件重要度 + 精确标识符命中。\
+        "{pipeline}:tree-sitter 切块 + BM25 词法 + PageRank 文件重要度 + 精确标识符命中。\
          共扫描 {total_files} 个源文件、{total_chunks} 个代码块,返回最相关 {} 个。行号 1 基、闭区间。{}",
         out.len(),
         if truncated {
@@ -214,6 +259,7 @@ pub fn code_search(workspace_root: &str, request: &CodeSearchRequest) -> CodeSea
         total_files,
         total_chunks,
         truncated,
+        embedding_reranked,
         note,
     }
 }
@@ -520,8 +566,122 @@ fn empty_result(note: &str) -> CodeSearchResult {
         total_files: 0,
         total_chunks: 0,
         truncated: false,
+        embedding_reranked: false,
         note: note.to_string(),
     }
+}
+
+// ── 可选向量重排 ─────────────────────────────────────────────────────────────
+
+/// 用 `embedder` 对**本地已排序**的候选 `scored`(降序)做余弦重排。
+///
+/// 只触碰本地排名的前 N 个候选(N = top_k 的几倍,夹到 `EMBED_CANDIDATE_CAP`),把它们按
+/// `(1-α)·norm(local) + α·cosine` 重排;其余候选(N 之后)的相对顺序保持不变,仍排在被重排块之后。
+/// 这样 embedding **只重排已召回候选**,不改变召回集。
+///
+/// 返回 `true` 表示确实施加了重排;`false` 表示因 query 向量化失败 / 可用候选向量不足 / 维度不一致
+/// 而**未改动** `scored`(调用方据此回退本地排名并标注)。本函数不 panic、不阻塞(阻塞/超时由
+/// `embedder` 实现负责);任一块 embed 失败只是该块拿不到相似度、不参与抬升。
+fn rerank_with_embedder(
+    scored: &mut [(usize, f64, String)],
+    chunks: &[Chunk],
+    query: &str,
+    embedder: &dyn Embedder,
+    top_k: usize,
+) -> bool {
+    if scored.is_empty() {
+        return false;
+    }
+    // query 向量:拿不到就整体回退本地(不发起逐块调用,省网络)。
+    let qv = match embedder.embed(query) {
+        Some(v) if !v.is_empty() => v,
+        _ => return false,
+    };
+
+    // 候选窗口:本地前 N 个(N = top_k 的 4 倍,夹到 [top_k, EMBED_CANDIDATE_CAP] 与候选总数)。
+    let cand = (top_k.saturating_mul(4))
+        .clamp(top_k, EMBED_CANDIDATE_CAP)
+        .min(scored.len());
+    if cand < 2 {
+        // 候选不足两个时重排无意义(顺序不会变),直接回退。
+        return false;
+    }
+
+    // 为窗口内每个候选取 embedding 并算余弦;失败的块相似度记为 None(不抬升)。
+    let mut cosines: Vec<Option<f64>> = Vec::with_capacity(cand);
+    let mut usable = 0usize;
+    for &(idx, _, _) in scored.iter().take(cand) {
+        let cos = embedder
+            .embed(&chunks[idx].text)
+            .filter(|v| v.len() == qv.len() && !v.is_empty())
+            .map(|cv| cosine_similarity(&qv, &cv));
+        if cos.is_some() {
+            usable += 1;
+        }
+        cosines.push(cos);
+    }
+    // 可用向量太少(<2)无法形成有意义的重排信号 → 回退本地。
+    if usable < 2 {
+        return false;
+    }
+
+    // 本地分 min-max 归一化(仅窗口内),与余弦同量纲后融合。
+    let local_scores: Vec<f64> = scored.iter().take(cand).map(|&(_, s, _)| s).collect();
+    let lo = local_scores.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = local_scores
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let span = (hi - lo).max(f64::EPSILON);
+
+    // 计算每个候选的融合分;缺余弦的块按 0 相似度参与(等价只用归一化本地分,被有命中的块压后)。
+    let alpha = EMBED_BLEND_ALPHA;
+    // (块索引, 融合分, 余弦[排序次键], 理由)
+    let mut window: Vec<(usize, f64, f64, String)> = Vec::with_capacity(cand);
+    for (i, &(idx, local, ref why)) in scored.iter().take(cand).enumerate() {
+        let norm_local = (local - lo) / span;
+        let cos = cosines[i].unwrap_or(0.0);
+        // 余弦 ∈ [-1,1] → 映射到 [0,1] 再融合,避免负相似度反向放大。
+        let cos01 = (cos + 1.0) / 2.0;
+        let blended = (1.0 - alpha) * norm_local + alpha * cos01;
+        let new_why = match cosines[i] {
+            Some(c) => format!("{why};embedding 余弦 {c:.3}"),
+            None => format!("{why};embedding 不可用(保留本地分)"),
+        };
+        window.push((idx, blended, cos, new_why));
+    }
+
+    // 窗口内按融合分降序;融合分相等时由 embedding 余弦降序决断(重排的本意:近似平局让向量信号说话);
+    // 仍相等再按原本地排名(块索引升序)兜底,保证确定性。
+    window.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.0.cmp(&b.0))
+    });
+
+    // 写回:前 cand 个被重排版本替换(丢弃排序次键),窗口之后的候选保持原序。
+    for (slot, (idx, blended, _cos, why)) in scored.iter_mut().take(cand).zip(window) {
+        *slot = (idx, blended, why);
+    }
+    true
+}
+
+/// 余弦相似度。两个等长非零向量;任一为零向量返回 0(避免 NaN)。
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (*x as f64, *y as f64);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na <= 0.0 || nb <= 0.0 {
+        return 0.0;
+    }
+    (dot / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0)
 }
 
 #[cfg(test)]
@@ -735,5 +895,149 @@ mod tests {
             assert_eq!(c.path, "app.rs");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 可选 embedding 重排 ──────────────────────────────────────────────
+
+    /// 测试用确定性 embedder:把含某标记子串的文本映射到方向 A(与 query 相同),
+    /// 其余映射到正交方向 B。于是 query 与「含标记块」余弦=1、与其它块余弦=0,
+    /// 从而**确定性地**把含标记块抬到本地候选窗口最前——用于验证重排真的改变了顺序。
+    struct MarkerEmbedder {
+        /// 命中此子串的文本被视为「与 query 相关」(方向 A)。
+        marker: &'static str,
+    }
+    impl Embedder for MarkerEmbedder {
+        fn embed(&self, text: &str) -> Option<Vec<f32>> {
+            // 含 marker 的文本(含 query 自身,只要它含 marker)→ 方向 A;否则 → 反向(余弦 -1),
+            // 最大化「含 marker 块」与其它块的相似度落差,使重排效果确定可观测。
+            if text.contains(self.marker) {
+                Some(vec![1.0, 0.0])
+            } else {
+                Some(vec![-1.0, 0.0])
+            }
+        }
+        fn dim(&self) -> usize {
+            2
+        }
+    }
+
+    /// 永远失败的 embedder:query 向量化即返回 None → 应整体回退本地排名。
+    struct FailingEmbedder;
+    impl Embedder for FailingEmbedder {
+        fn embed(&self, _text: &str) -> Option<Vec<f32>> {
+            None
+        }
+        fn dim(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn none_embedder_matches_local_top_k_byte_for_byte() {
+        let dir = make_fixture();
+        let q = req("add numbers multiply login render", 8);
+        let local = code_search(dir.to_str().unwrap(), &q);
+        let explicit_none = code_search_with_embedder(dir.to_str().unwrap(), &q, None);
+        // None 路径必须与 0.0.57 的 code_search 逐字段一致(分数、顺序、note、标志位)。
+        assert!(!local.embedding_reranked);
+        assert!(!explicit_none.embedding_reranked);
+        assert_eq!(local.note, explicit_none.note);
+        assert_eq!(local.chunks.len(), explicit_none.chunks.len());
+        for (a, b) in local.chunks.iter().zip(explicit_none.chunks.iter()) {
+            assert_eq!(a.path, b.path);
+            assert_eq!(a.start_line, b.start_line);
+            assert_eq!(a.end_line, b.end_line);
+            assert_eq!(a.symbol, b.symbol);
+            assert!((a.score - b.score).abs() < 1e-12);
+            assert_eq!(a.why, b.why);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedder_reorders_candidates_deterministically() {
+        let dir = make_fixture();
+        // 一个 query,使本地词法把 math.rs 两个块排到 render.ts 之前;再用一个把含 "render"
+        // 的块判为与 query 同向、其余判为反向的 embedder。embedding 重排应把 render.ts 在候选
+        // 窗口内**严格上移**(re-order),且重排块的理由带 embedding 注释。
+        let q = req("multiply render", 8);
+        let local = code_search(dir.to_str().unwrap(), &q);
+        assert!(local.chunks.len() >= 2, "前置:应有多个候选可供重排");
+        let local_render_rank = local
+            .chunks
+            .iter()
+            .position(|c| c.path == "render.ts")
+            .expect("纯本地结果里应含 render.ts");
+        // 前置:纯本地时 render.ts 不在第一(否则无法证明重排改变了顺序)。
+        assert_ne!(
+            local_render_rank, 0,
+            "前置:纯本地时 render.ts 不应已居首,实得:\n{:#?}",
+            local.chunks
+        );
+
+        let emb = MarkerEmbedder { marker: "render" };
+        let r1 = code_search_with_embedder(dir.to_str().unwrap(), &q, Some(&emb));
+        assert!(r1.embedding_reranked, "应标注已施加 embedding 重排");
+        let reranked_render_rank = r1
+            .chunks
+            .iter()
+            .position(|c| c.path == "render.ts")
+            .expect("重排结果里应仍含 render.ts");
+        assert!(
+            reranked_render_rank < local_render_rank,
+            "embedding 重排应把 render.ts 上移(本地 #{local_render_rank} → 重排 #{reranked_render_rank}),实得:\n{:#?}",
+            r1.chunks
+        );
+        // 命中 embedding 的块,其理由应解释 embedding 余弦。
+        let render_chunk = &r1.chunks[reranked_render_rank];
+        assert!(
+            render_chunk.why.contains("embedding 余弦"),
+            "重排块的理由应解释 embedding 命中,实得 {}",
+            render_chunk.why
+        );
+
+        // 确定性:同输入同输出(顺序与分数一致)。
+        let r2 = code_search_with_embedder(dir.to_str().unwrap(), &q, Some(&emb));
+        assert_eq!(r1.chunks.len(), r2.chunks.len());
+        for (a, b) in r1.chunks.iter().zip(r2.chunks.iter()) {
+            assert_eq!(a.path, b.path);
+            assert_eq!(a.start_line, b.start_line);
+            assert!((a.score - b.score).abs() < 1e-12);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failing_embedder_falls_back_to_local_silently() {
+        let dir = make_fixture();
+        let q = req("add numbers multiply render", 8);
+        let local = code_search(dir.to_str().unwrap(), &q);
+        let fallback =
+            code_search_with_embedder(dir.to_str().unwrap(), &q, Some(&FailingEmbedder));
+        // 失败必须静默回退:不硬失败、不改顺序、标志位为 false。
+        assert!(!fallback.embedding_reranked, "embedder 失败时不应标注已重排");
+        assert_eq!(local.chunks.len(), fallback.chunks.len());
+        for (a, b) in local.chunks.iter().zip(fallback.chunks.iter()) {
+            assert_eq!(a.path, b.path);
+            assert_eq!(a.start_line, b.start_line);
+            assert!((a.score - b.score).abs() < 1e-12, "回退后分数应等于纯本地分");
+            assert_eq!(a.why, b.why, "回退后理由不应被 embedding 注释污染");
+        }
+        // note 应说明已请求但回退本地。
+        assert!(
+            fallback.note.contains("回退本地"),
+            "note 应说明回退,实得 {}",
+            fallback.note
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cosine_similarity_basics() {
+        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-9);
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-9);
+        assert!((cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < 1e-9);
+        // 零向量保护:不产生 NaN。
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
     }
 }

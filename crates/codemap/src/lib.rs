@@ -15,7 +15,8 @@ mod search;
 mod tags;
 
 pub use search::{
-    code_search, CodeSearchChunk, CodeSearchRequest, CodeSearchResult, Embedder,
+    code_search, code_search_with_embedder, CodeSearchChunk, CodeSearchRequest, CodeSearchResult,
+    Embedder,
 };
 
 use ignore::WalkBuilder;
