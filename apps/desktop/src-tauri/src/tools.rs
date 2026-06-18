@@ -418,14 +418,15 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "repo_wiki",
-                "description": "Build and query a DURABLE, queryable wiki of the codebase structure, so you don't re-derive 'what is this repo / where does the core code live / what is each directory for' every turn. Fully deterministic and OFFLINE (no model/network call): it reuses repo_map's tree-sitter + PageRank analysis, groups it per directory into sections (key files, top symbols with line numbers, a structurally-inferred role), and persists them as markdown + JSONL under .mdga/wiki/ (derived data, regenerable). action='build' walks the repo and writes/updates the wiki (incremental & idempotent — unchanged content is skipped); pass force=true to rebuild regardless. action='query' takes a free-text question and returns the most relevant directory sections with their key source files (read_file them for detail) and matched symbols; it degrades gracefully to a live analysis if the wiki hasn't been built yet. Read-only with respect to your source code — build only writes the .mdga/wiki cache. Use build once when orienting in a new/large repo, then query to navigate.",
+                "description": "Build and query a DURABLE, queryable wiki of the codebase structure, so you don't re-derive 'what is this repo / where does the core code live / what is each directory for' every turn. Fully deterministic and OFFLINE by default (no model/network call): it reuses repo_map's tree-sitter + PageRank analysis, groups it per directory into sections (key files, top symbols with line numbers, a structurally-inferred role), and persists them as markdown + JSONL under .mdga/wiki/ (derived data, regenerable). action='build' walks the repo and writes/updates the wiki (incremental & idempotent — unchanged content is skipped); pass force=true to rebuild regardless. action='query' takes a free-text question and returns the most relevant directory sections with their key source files (read_file them for detail) and matched symbols; it degrades gracefully to a live analysis if the wiki hasn't been built yet. Read-only with respect to your source code — build only writes the .mdga/wiki cache. Use build once when orienting in a new/large repo, then query to navigate. OPTIONAL enrich (action='build' with enrich=true, default false): after the deterministic section is built, makes one bounded LLM call per section (using the configured provider) to add a short prose summary, cached by section fingerprint so unchanged sections are not re-summarized; on any LLM failure it falls back to the deterministic section. Leave enrich unset for the offline, deterministic, no-cost default.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": { "type": "string", "enum": ["build", "query"], "description": "'build' generates/updates the wiki cache; 'query' searches it. Defaults to 'query'." },
                         "question": { "type": "string", "description": "For action='query': the free-text question or keywords to find relevant directory sections (e.g. 'where is the agent loop' or a symbol name)." },
                         "limit": { "type": "integer", "description": "For action='query': max sections to return (default 5)." },
-                        "force": { "type": "boolean", "description": "For action='build': rebuild even if content is unchanged. Defaults to false (incremental)." }
+                        "force": { "type": "boolean", "description": "For action='build': rebuild even if content is unchanged. Defaults to false (incremental)." },
+                        "enrich": { "type": "boolean", "description": "For action='build' only: ALSO add a short LLM prose summary per section (one bounded provider call each, cached by section fingerprint; falls back to the deterministic section on failure). Costs paid API calls. Defaults to false (offline, deterministic, no LLM)." }
                     },
                     "required": [],
                     "additionalProperties": false
@@ -1429,31 +1430,16 @@ fn execute_code_search(workspace_path: &str, arguments: &str) -> Result<serde_js
 /// repo_wiki 工具（R11）：基于 repo_map 的结构化分析生成 / 查询持久仓库 wiki。
 /// build 只写 .mdga/wiki 缓存(派生数据、不碰源码)；query 词法检索区段。只读能力档位。
 fn execute_repo_wiki(workspace_path: &str, arguments: &str) -> Result<serde_json::Value, String> {
-    #[derive(serde::Deserialize, Default)]
-    struct RepoWikiArgs {
-        #[serde(default)]
-        action: Option<String>,
-        #[serde(default)]
-        question: Option<String>,
-        #[serde(default)]
-        limit: usize,
-        #[serde(default)]
-        force: bool,
-    }
-    let trimmed = arguments.trim();
-    let args = if trimmed.is_empty() {
-        RepoWikiArgs::default()
-    } else {
-        serde_json::from_str::<RepoWikiArgs>(trimmed)
-            .map_err(|err| format!("工具参数解析失败: {err}"))?
-    };
+    let args = RepoWikiArgs::parse(arguments)?;
     // 默认动作为 query（更轻、最常用）；未知 action 报错以免静默误解意图。
+    // 注：enrich build 不应抵达此同步路径（已在 agent_loop 截走）；若 enrich=true 仍走到这里
+    //（如子代理 / 无运行时上下文），则按确定性 build 处理——纯附加特性静默降级，绝不破坏。
     let action = args.action.as_deref().unwrap_or("query");
     match action {
         "build" => serde_json::to_value(mdga_wiki::build_wiki(workspace_path, args.force))
             .map_err(|err| err.to_string()),
         "query" => {
-            let question = args.question.unwrap_or_default();
+            let question = args.question.clone().unwrap_or_default();
             serde_json::to_value(mdga_wiki::query_wiki(workspace_path, &question, args.limit))
                 .map_err(|err| err.to_string())
         }
@@ -1461,6 +1447,222 @@ fn execute_repo_wiki(workspace_path: &str, arguments: &str) -> Result<serde_json
             "未知 action: {other}（应为 \"build\" 或 \"query\"）"
         )),
     }
+}
+
+/// repo_wiki 的参数解析（供 enrich 路径在 agent_loop 复用，判断是否需要走 LLM enrich build）。
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct RepoWikiArgs {
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub question: Option<String>,
+    #[serde(default)]
+    pub limit: usize,
+    #[serde(default)]
+    pub force: bool,
+    /// P3（opt-in）：action='build' 时是否对每个区段额外做一次有界 LLM 散文摘要。默认 false。
+    #[serde(default)]
+    pub enrich: bool,
+}
+
+impl RepoWikiArgs {
+    pub(crate) fn parse(arguments: &str) -> Result<Self, String> {
+        let trimmed = arguments.trim();
+        if trimmed.is_empty() {
+            return Ok(Self::default());
+        }
+        serde_json::from_str::<Self>(trimmed).map_err(|err| format!("工具参数解析失败: {err}"))
+    }
+
+    /// 是否为「需要 LLM 的 enrich build」——即 action=build 且 enrich=true。
+    /// 其余一切（query、enrich=false 的 build、未知 action）走原确定性同步路径，零行为变化。
+    pub(crate) fn wants_enriched_build(&self) -> bool {
+        self.enrich && self.action.as_deref() == Some("build")
+    }
+}
+
+/// 把 repo_wiki 结构事实变成一句话散文摘要的桌面层摘要器：用**用户自己的** provider key
+/// 走一次有界 chat_completion。crates/wiki 对它零依赖（只见 `dyn SectionSummarizer`）。
+///
+/// 安全/求真边界（逐条对照 P3 约束）：
+///   - **绝不送密钥**：prompt 只含 `analyze_repo` 已公开的结构事实（目录、角色、文件名、符号名+签名行），
+///     不含任何文件正文；API Key 仅用于 Bearer 认证，不进 prompt、不记录。
+///   - **有界**：每段 prompt 截断（符号/文件数封顶、签名行截短），单次调用 60s 超时，
+///     全库最多 `budget` 次付费调用（超预算的段直接退回确定性形态）。
+///   - **永不破坏 build**：任何失败（网络/解析/超时/预算耗尽/运行时不可阻塞）→ 返回 `None`，
+///     该段退回纯确定性区段。
+pub(crate) struct DesktopSectionSummarizer {
+    base_url: String,
+    api_key: String,
+    model: String,
+    /// 剩余允许的付费调用次数（全库总预算，原子递减，0 即停止再调）。
+    budget: std::sync::atomic::AtomicUsize,
+    /// 当前 tokio 运行时句柄，用于从同步 trait 方法里跑异步补全。
+    handle: tokio::runtime::Handle,
+}
+
+impl DesktopSectionSummarizer {
+    /// `budget`：本次 enrich 全库允许的最多付费调用数（防极端宽仓刷爆账单）。
+    pub(crate) fn new(
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        budget: usize,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+            budget: std::sync::atomic::AtomicUsize::new(budget),
+            handle,
+        }
+    }
+
+    /// 把结构事实拼成**有界**的纯结构 prompt（不含文件正文、不含任何密钥）。
+    fn build_prompt(facts: &mdga_wiki::SummaryFacts) -> String {
+        // 单段封顶，防 prompt 体积失控。
+        const MAX_FILES: usize = 8;
+        const MAX_SYMBOLS: usize = 16;
+        const MAX_SIG_CHARS: usize = 120;
+
+        let mut p = String::new();
+        p.push_str(&format!("Directory: {}\n", facts.directory));
+        p.push_str(&format!("Inferred role: {}\n", facts.role));
+        p.push_str(&format!("Source files in this directory: {}\n", facts.file_count));
+        if !facts.key_files.is_empty() {
+            p.push_str("Key files:\n");
+            for f in facts.key_files.iter().take(MAX_FILES) {
+                p.push_str(&format!("- {f}\n"));
+            }
+        }
+        if !facts.symbols.is_empty() {
+            p.push_str("Top symbols (name — signature line):\n");
+            for (name, sig) in facts.symbols.iter().take(MAX_SYMBOLS) {
+                let sig: String = sig.chars().take(MAX_SIG_CHARS).collect();
+                let sig = sig.replace('\n', " ");
+                p.push_str(&format!("- {name} — {sig}\n"));
+            }
+        }
+        p
+    }
+}
+
+impl mdga_wiki::SectionSummarizer for DesktopSectionSummarizer {
+    fn summarize(&self, facts: &mdga_wiki::SummaryFacts) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        // 预算门：原子地领一个名额；领不到（已耗尽）→ 不再付费调用，退回确定性形态。
+        loop {
+            let cur = self.budget.load(Ordering::SeqCst);
+            if cur == 0 {
+                return None;
+            }
+            if self
+                .budget
+                .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        let system = "You are a code documentation assistant. Given the structural facts about ONE \
+            directory of a codebase (its inferred role, key files, and top public symbols), write a \
+            concise 1-2 sentence plain-English summary of what this directory is for and what it \
+            contains. Base it ONLY on the facts provided. Do not invent file contents. Output only \
+            the summary prose, no preamble, no markdown headers.";
+        let user = Self::build_prompt(facts);
+
+        let messages = vec![
+            serde_json::json!({ "role": "system", "content": system }),
+            serde_json::json!({ "role": "user", "content": user }),
+        ];
+
+        let base_url = self.base_url.clone();
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
+
+        // 同步 trait 方法里跑异步补全：在阻塞专用线程上 block_on，避免阻塞异步执行器线程。
+        // 任何失败（含 block_in_place 在 current-thread 运行时 panic 时由调用方兜底）都退回确定性。
+        let result = tokio::task::block_in_place(move || {
+            self.handle.block_on(async move {
+                // 单次有界调用 + 60s 上限：enrich 是附加增强，绝不为它长时间挂起整个工具。
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    mdga_deepseek_client::chat_completion(
+                        &base_url, &api_key, messages, &model, None,
+                    ),
+                )
+                .await
+            })
+        });
+
+        match result {
+            Ok(Ok(completion)) => {
+                let text = completion.content.unwrap_or_default();
+                let text = text.trim();
+                if text.is_empty() {
+                    None
+                } else {
+                    // 回灌前再裁一刀，防模型超长输出撑爆持久化区段。
+                    const MAX_SUMMARY_CHARS: usize = 600;
+                    Some(text.chars().take(MAX_SUMMARY_CHARS).collect())
+                }
+            }
+            // 网络/解析错误 或 超时 → 退回确定性区段（绝不破坏 build）。
+            _ => None,
+        }
+    }
+}
+
+/// enrich build 入口（agent_loop 专用）：用用户 provider key 对每个区段做有界 LLM 摘要后落库。
+///
+/// 仅当 action=build 且 enrich=true 时由 agent_loop 调用；其余 repo_wiki 调用仍走确定性同步路径。
+/// `api_key` 为空（未配置 provider）时不做网络调用、直接退回确定性 build，并在说明里点明。
+pub(crate) fn execute_repo_wiki_enriched(
+    workspace_path: &str,
+    args: &RepoWikiArgs,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<serde_json::Value, String> {
+    // 全库 enrich 付费调用预算上限：与 wiki 的 MAX_SECTIONS 同量级即可覆盖常规仓库，
+    // 又给极端宽仓一个明确硬上限。超出的区段自动退回确定性形态。
+    const ENRICH_CALL_BUDGET: usize = 200;
+
+    if api_key.trim().is_empty() {
+        // 没有可用 key：不联网，退回确定性 build（纯附加特性在无凭据时静默降级，不报错）。
+        let mut value = serde_json::to_value(mdga_wiki::build_wiki(workspace_path, args.force))
+            .map_err(|err| err.to_string())?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "enrich".to_string(),
+                serde_json::json!({
+                    "requested": true,
+                    "applied": false,
+                    "reason": "未配置可用的 provider API Key，已退回确定性离线 wiki（无 LLM 摘要）。"
+                }),
+            );
+        }
+        return Ok(value);
+    }
+
+    let summarizer = DesktopSectionSummarizer::new(
+        base_url,
+        api_key,
+        model,
+        ENRICH_CALL_BUDGET,
+        tokio::runtime::Handle::current(),
+    );
+    let result = mdga_wiki::build_wiki_enriched(workspace_path, args.force, Some(&summarizer));
+    let mut value = serde_json::to_value(result).map_err(|err| err.to_string())?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "enrich".to_string(),
+            serde_json::json!({ "requested": true, "applied": true }),
+        );
+    }
+    Ok(value)
 }
 
 pub(crate) fn execute_create_file_tool_call(

@@ -29,6 +29,54 @@ pub use sections::{WikiSection, WikiSymbol};
 /// wiki 缓存在工作区内的相对根目录。所有派生产物都落在这里、绝不外溢。
 pub const WIKI_DIR: &str = ".mdga/wiki";
 
+/// 一个区段的**确定性结构事实**，喂给可选的 LLM 摘要器（[`SectionSummarizer`]）。
+///
+/// 求真与安全：这里只包含 `analyze_repo` 已暴露的公开结构信息（目录、角色、关键文件名、
+/// 顶层符号名+签名行）——**不含任何文件正文**。摘要器据此生成散文摘要，绝不会因 enrich
+/// 而泄露超出确定性 wiki 已公开的内容。
+#[derive(Debug, Clone)]
+pub struct SummaryFacts {
+    /// 目录（工作区相对路径）。
+    pub directory: String,
+    /// 结构性推断的角色。
+    pub role: String,
+    /// 该目录源文件数。
+    pub file_count: usize,
+    /// 关键文件（工作区相对路径）。
+    pub key_files: Vec<String>,
+    /// 顶层符号的 (名, 签名行) 列表。
+    pub symbols: Vec<(String, String)>,
+}
+
+impl SummaryFacts {
+    fn from_section(s: &WikiSection) -> Self {
+        SummaryFacts {
+            directory: s.directory.clone(),
+            role: s.role.clone(),
+            file_count: s.file_count,
+            key_files: s.key_files.clone(),
+            symbols: s
+                .symbols
+                .iter()
+                .map(|sym| (sym.name.clone(), sym.signature.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// 可选的「把结构事实变成一句话散文摘要」回调。**从桌面层注入**，crates/wiki 对其零硬依赖：
+/// wiki 核心保持纯离线/确定性，是否真去调模型完全由实现决定。
+///
+/// 契约：
+///   - 返回 `Some(prose)` 即把摘要附加到该区段（额外的 `summary` 字段 / markdown `## Summary` 段）。
+///   - 返回 `None` 表示「本段不加摘要」（含 LLM 失败 / 超时 / 被限流的兜底）——
+///     此时区段退回纯确定性形态，**绝不**因摘要失败而破坏 build。
+///   - 实现方负责一切边界（超时、prompt 体积上限、绝不外泄密钥、只发送 `facts` 里的公开结构）。
+pub trait SectionSummarizer {
+    /// 为一个区段生成简短散文摘要；失败/不适用时返回 `None`（调用方据此优雅退回确定性区段）。
+    fn summarize(&self, facts: &SummaryFacts) -> Option<String>;
+}
+
 /// 一次 build 的结果摘要（计数 + 是否走了增量跳过）。
 #[derive(Debug, Clone, Serialize)]
 pub struct WikiBuildResult {
@@ -82,7 +130,30 @@ const DEFAULT_QUERY_LIMIT: usize = 5;
 /// 构建（或增量更新）仓库 wiki。永不硬失败：工作区无源码时返回空结果 + 说明。
 ///
 /// `force=true` 时无视指纹强制重写；否则内容指纹与上次一致就整库跳过（幂等、可反复调用）。
+///
+/// **完全离线/确定性**：这是 0.0.57 的默认入口，逐字节行为不变（内部等价于
+/// `build_wiki_enriched(.., None)`——不注入任何摘要器，绝无网络/模型调用）。
 pub fn build_wiki(workspace_root: &str, force: bool) -> WikiBuildResult {
+    build_wiki_enriched(workspace_root, force, None)
+}
+
+/// 与 [`build_wiki`] 相同，但可注入一个可选的 [`SectionSummarizer`] 给每个区段附加 LLM 散文摘要。
+///
+/// 行为约定（P3，严格 opt-in）：
+///   - `summarizer == None`：**与 0.0.57 的 [`build_wiki`] 逐字节一致**——纯离线、确定性、
+///     无网络、无摘要字段。
+///   - `summarizer == Some(_)`：在确定性区段构建完成**之后**，对每个区段做一次有界的摘要调用，
+///     把结果存进区段的 `summary`（额外字段 + markdown `## Summary` 段）。
+///     **逐段缓存**：按区段的结构指纹（[`store::section_fingerprint`]，不含摘要）键控——
+///     结构未变且上次已有摘要即直接复用，**跳过重复付费调用**；摘要器返回 `None`（失败/超时）
+///     则该段退回纯确定性形态，绝不破坏 build。
+///   - 摘要**不参与内容指纹**：故 enrich 不会改变全局 `force=false` 的跳过判定口径；
+///     但为了让首次 enrich 能真正写入摘要、且复用缓存，见下方的 enrich 专属写盘判定。
+pub fn build_wiki_enriched(
+    workspace_root: &str,
+    force: bool,
+    summarizer: Option<&dyn SectionSummarizer>,
+) -> WikiBuildResult {
     let root = PathBuf::from(workspace_root);
     let wiki_dir_abs = match wiki_dir_within(&root) {
         Some(p) => p,
@@ -103,35 +174,86 @@ pub fn build_wiki(workspace_root: &str, force: bool) -> WikiBuildResult {
         sections.truncate(MAX_SECTIONS);
     }
 
-    // 内容指纹：所有区段的稳定序列化。指纹一致即跳过重写（幂等）。
+    // 内容指纹：所有区段的稳定结构序列化（不含摘要）。指纹一致即结构未变。
     let fingerprint = store::fingerprint(&sections);
-    if !force && store::fingerprint_matches(&wiki_dir_abs, &fingerprint) {
+    let structure_unchanged = store::fingerprint_matches(&wiki_dir_abs, &fingerprint);
+
+    // 摘要复用缓存：把上次持久化区段按「结构指纹 → 已有摘要」建索引，使未变区段免于重复付费调用。
+    // 仅在要 enrich 时才回读旧 wiki（默认路径零额外 I/O，保持 0.0.57 口径）。
+    let mut enriched = 0usize;
+    let mut reused = 0usize;
+    if let Some(summarizer) = summarizer {
+        let cache = store::load_summary_cache(&wiki_dir_abs);
+        for s in &mut sections {
+            let key = store::section_fingerprint(s);
+            if let Some(cached) = cache.get(&key) {
+                // 结构未变且上次已有摘要 → 直接复用，跳过付费 LLM 调用。
+                s.summary = Some(cached.clone());
+                reused += 1;
+                continue;
+            }
+            // 缓存未命中 → 调一次注入的摘要器。失败/不适用返回 None：该段退回确定性形态。
+            let facts = SummaryFacts::from_section(s);
+            if let Some(prose) = summarizer.summarize(&facts) {
+                let prose = prose.trim();
+                if !prose.is_empty() {
+                    s.summary = Some(prose.to_string());
+                    enriched += 1;
+                }
+            }
+        }
+    }
+
+    // 写盘判定：
+    //   - 未注入摘要器（默认）：沿用 0.0.57 口径——结构未变且非 force 即整库跳过。
+    //   - 注入了摘要器：结构未变时，仅当本次确实新增了摘要（enriched>0）才需重写盘以落库摘要；
+    //     若全部命中缓存（reused 覆盖、enriched==0），磁盘已是最新，跳过重写（不重复付费、不空转写盘）。
+    let any_new_summary = enriched > 0;
+    let should_skip = !force
+        && structure_unchanged
+        && (summarizer.is_none() || !any_new_summary);
+    if should_skip {
+        let note = if summarizer.is_some() {
+            format!(
+                "wiki 结构指纹未变，摘要已全部命中缓存（复用 {reused} 段），跳过重写（增量幂等、零额外 LLM 调用）。可用 action=query 检索。"
+            )
+        } else {
+            "wiki 内容指纹未变，已跳过重写（增量幂等）。可用 action=query 检索。".to_string()
+        };
         return WikiBuildResult {
             sections: sections.len(),
             files: analysis.files.len(),
             definitions: analysis.total_definitions,
             skipped_unchanged: true,
             wiki_dir: WIKI_DIR.to_string(),
-            note: "wiki 内容指纹未变，已跳过重写（增量幂等）。可用 action=query 检索。".to_string(),
+            note,
         };
     }
 
     match store::write_all(&wiki_dir_abs, &sections, &fingerprint) {
-        Ok(()) => WikiBuildResult {
-            sections: sections.len(),
-            files: analysis.files.len(),
-            definitions: analysis.total_definitions,
-            skipped_unchanged: false,
-            wiki_dir: WIKI_DIR.to_string(),
-            note: format!(
-                "已为 {} 个目录生成 wiki（覆盖 {} 个源文件、{} 个定义）。\
-                 派生数据写入 {}/，可随时重建；用 action=query 按问题检索区段。",
-                sections.len(),
-                analysis.files.len(),
-                analysis.total_definitions,
-                WIKI_DIR
-            ),
-        },
+        Ok(()) => {
+            let enrich_note = if summarizer.is_some() {
+                format!("；LLM 摘要：新增 {enriched} 段、复用缓存 {reused} 段")
+            } else {
+                String::new()
+            };
+            WikiBuildResult {
+                sections: sections.len(),
+                files: analysis.files.len(),
+                definitions: analysis.total_definitions,
+                skipped_unchanged: false,
+                wiki_dir: WIKI_DIR.to_string(),
+                note: format!(
+                    "已为 {} 个目录生成 wiki（覆盖 {} 个源文件、{} 个定义）{}。\
+                     派生数据写入 {}/，可随时重建；用 action=query 按问题检索区段。",
+                    sections.len(),
+                    analysis.files.len(),
+                    analysis.total_definitions,
+                    enrich_note,
+                    WIKI_DIR
+                ),
+            }
+        }
         Err(e) => empty_build(&format!("wiki 写入失败（已优雅放弃，不影响源码）：{e}")),
     }
 }
@@ -455,5 +577,186 @@ mod tests {
         assert!(terms.contains(&"core".to_string()));
         // 单字符 "a"/标点被丢弃。
         assert!(!terms.iter().any(|t| t.len() < 2));
+    }
+
+    // ===== P3：opt-in LLM enrich =====
+
+    use std::sync::atomic::AtomicUsize as Counter;
+
+    /// 计数型假摘要器：记录被调次数，返回确定性的占位散文。用于断言「缓存命中即跳过付费调用」。
+    struct CountingSummarizer {
+        calls: Counter,
+    }
+    impl CountingSummarizer {
+        fn new() -> Self {
+            Self { calls: Counter::new(0) }
+        }
+        fn count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+    impl SectionSummarizer for CountingSummarizer {
+        fn summarize(&self, facts: &SummaryFacts) -> Option<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // 散文里嵌目录与角色，便于断言摘要确实进了产物。
+            Some(format!(
+                "This directory ({}) acts as {} with {} key file(s).",
+                facts.directory,
+                facts.role,
+                facts.key_files.len()
+            ))
+        }
+    }
+
+    /// 永远失败的假摘要器：模拟 LLM 失败/超时，断言区段优雅退回确定性形态、build 不破。
+    struct FailingSummarizer;
+    impl SectionSummarizer for FailingSummarizer {
+        fn summarize(&self, _facts: &SummaryFacts) -> Option<String> {
+            None
+        }
+    }
+
+    /// 读取某目录区段持久化的 markdown 全文。
+    fn read_doc(dir: &Path, directory: &str) -> String {
+        let stem = crate::sanitize::dir_to_doc_stem(directory);
+        std::fs::read_to_string(dir.join(".mdga").join("wiki").join(format!("{stem}.md")))
+            .unwrap_or_default()
+    }
+
+    /// enrich=false（默认）：摘要器**绝不**被调用，产物与确定性 build 逐字节一致（无 summary）。
+    #[test]
+    fn enrich_false_is_byte_identical_to_deterministic() {
+        let dir_plain = make_fixture();
+        build_wiki(dir_plain.to_str().unwrap(), false);
+        let plain_index = std::fs::read(
+            dir_plain.join(".mdga").join("wiki").join("index.jsonl"),
+        )
+        .unwrap();
+
+        // 用「显式传 None 摘要器」的 enrich 入口构建另一棵相同固件树。
+        let dir_none = make_fixture();
+        build_wiki_enriched(dir_none.to_str().unwrap(), false, None);
+        let none_index = std::fs::read(
+            dir_none.join(".mdga").join("wiki").join("index.jsonl"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plain_index, none_index,
+            "build_wiki 与 build_wiki_enriched(None) 的 index.jsonl 应逐字节一致"
+        );
+        // index 里不应出现 summary 字段（skip_serializing_if 生效）。
+        let s = String::from_utf8(none_index).unwrap();
+        assert!(!s.contains("summary"), "默认路径不应序列化 summary 字段");
+        // 区段回读后 summary 必为 None。
+        let secs = store::load_sections(
+            &dir_none.join(".mdga").join("wiki"),
+        )
+        .unwrap();
+        assert!(secs.iter().all(|s| s.summary.is_none()));
+
+        let _ = std::fs::remove_dir_all(&dir_plain);
+        let _ = std::fs::remove_dir_all(&dir_none);
+    }
+
+    /// enrich=true：摘要被附加进区段 + markdown；第二次（结构未变）build 命中缓存、**不再**调用摘要器。
+    #[test]
+    fn enrich_adds_summary_and_caches() {
+        let dir = make_fixture();
+        let summarizer = CountingSummarizer::new();
+
+        let first = build_wiki_enriched(dir.to_str().unwrap(), false, Some(&summarizer));
+        assert!(!first.skipped_unchanged, "首次 enrich 应写盘");
+        let first_calls = summarizer.count();
+        assert!(first_calls >= 2, "应对每个区段各调一次摘要器，实得 {first_calls}");
+
+        // 区段回读：每段都带非空 summary。
+        let secs = store::load_sections(&dir.join(".mdga").join("wiki")).unwrap();
+        assert!(
+            secs.iter().all(|s| s.summary.as_deref().map(|t| !t.is_empty()).unwrap_or(false)),
+            "enrich 后每段都应带非空 summary"
+        );
+        // markdown 应含 `## Summary` 段与摘要文本。
+        let core_doc = read_doc(&dir, "src/core");
+        assert!(core_doc.contains("## Summary"), "markdown 应含 Summary 段");
+        assert!(core_doc.contains("acts as"), "markdown 应含摘要散文");
+
+        // 第二次 enrich：结构未变 → 全部命中缓存 → 摘要器调用次数不增、且整库跳过重写。
+        let second = build_wiki_enriched(dir.to_str().unwrap(), false, Some(&summarizer));
+        assert_eq!(
+            summarizer.count(),
+            first_calls,
+            "未变结构的二次 enrich 不应再调用摘要器（缓存命中）"
+        );
+        assert!(
+            second.skipped_unchanged,
+            "全部命中缓存的二次 enrich 应跳过重写（零额外付费调用）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// enrich 缓存在「先确定性 build、再 enrich」的升级路径下也成立：摘要进盘，再 enrich 命中缓存。
+    #[test]
+    fn enrich_after_plain_build_then_caches() {
+        let dir = make_fixture();
+        // 先做一次纯确定性 build（无摘要）。
+        let plain = build_wiki(dir.to_str().unwrap(), false);
+        assert!(!plain.skipped_unchanged);
+
+        let summarizer = CountingSummarizer::new();
+        // 首次 enrich：结构未变但磁盘还没摘要 → 应调用摘要器并写盘（不能因「结构未变」而跳过）。
+        let enr = build_wiki_enriched(dir.to_str().unwrap(), false, Some(&summarizer));
+        assert!(!enr.skipped_unchanged, "首次 enrich 即便结构未变也应写入摘要");
+        let calls = summarizer.count();
+        assert!(calls >= 2, "首次 enrich 应真正调用摘要器，实得 {calls}");
+
+        // 二次 enrich：命中缓存、跳过、不再调用。
+        let again = build_wiki_enriched(dir.to_str().unwrap(), false, Some(&summarizer));
+        assert_eq!(summarizer.count(), calls, "二次 enrich 应全命中缓存");
+        assert!(again.skipped_unchanged, "二次 enrich 应跳过重写");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LLM 失败（摘要器恒返回 None）：区段优雅退回确定性形态，build 成功、无 summary。
+    #[test]
+    fn enrich_llm_failure_falls_back_to_deterministic() {
+        let dir = make_fixture();
+        let result = build_wiki_enriched(dir.to_str().unwrap(), false, Some(&FailingSummarizer));
+        assert!(!result.skipped_unchanged, "build 应成功完成");
+        assert!(result.sections >= 2, "区段照常生成");
+
+        let secs = store::load_sections(&dir.join(".mdga").join("wiki")).unwrap();
+        assert!(
+            secs.iter().all(|s| s.summary.is_none()),
+            "摘要器全失败时不应有任何 summary，退回确定性形态"
+        );
+        // 失败的 enrich 产物应与纯确定性产物的 index 一致（无 summary 键）。
+        let none_index = std::fs::read(dir.join(".mdga").join("wiki").join("index.jsonl")).unwrap();
+        assert!(
+            !String::from_utf8(none_index).unwrap().contains("summary"),
+            "失败回退后 index 不应含 summary 字段"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 全局指纹**不受摘要影响**：enrich 与否，同一结构的指纹一致（确保 enrich 不污染增量口径）。
+    #[test]
+    fn fingerprint_ignores_summary() {
+        let dir = make_fixture();
+        let analysis = analyze_repo(dir.to_str().unwrap(), &CodemapRequest::default());
+        let plain = sections::group_into_sections(&analysis.files);
+        let fp_plain = store::fingerprint(&plain);
+
+        let mut enriched = plain.clone();
+        for s in &mut enriched {
+            s.summary = Some("some prose summary".to_string());
+        }
+        let fp_enriched = store::fingerprint(&enriched);
+        assert_eq!(fp_plain, fp_enriched, "摘要不应改变全局内容指纹");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

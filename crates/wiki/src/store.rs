@@ -20,6 +20,10 @@ const INDEX_FILE: &str = "index.jsonl";
 const FINGERPRINT_FILE: &str = ".fingerprint";
 
 /// 计算一批区段的内容指纹（稳定：依赖区段的稳定序列化，与磁盘无关）。
+///
+/// **只表征确定性结构事实**：对每个区段计算其结构指纹（见 [`section_fingerprint`]），
+/// 后者刻意**剥除可选的 LLM `summary`**。因此 enrich 与否、摘要内容如何，全局指纹都不变——
+/// 保证 0.0.57 的增量幂等口径逐字节不动，且摘要只是纯附加产物。
 pub fn fingerprint(sections: &[WikiSection]) -> String {
     let mut hasher = DefaultHasher::new();
     // 版本前缀：未来若改变序列化口径，指纹自动失配触发重建。
@@ -27,11 +31,31 @@ pub fn fingerprint(sections: &[WikiSection]) -> String {
     sections.len().hash(&mut hasher);
     for s in sections {
         // 用确定性 JSON 串参与哈希（serde 对我们的结构是字段定义序，确定）。
-        if let Ok(j) = serde_json::to_string(s) {
+        // 关键：序列化前剥除可选 `summary`——无摘要时 JSON 与 0.0.57 逐字节一致，
+        // 有摘要时也不污染指纹，故全局指纹仍**只**表征确定性结构事实。
+        if let Ok(j) = serde_json::to_string(&bare_section(s)) {
             j.hash(&mut hasher);
         }
     }
     format!("{:016x}", hasher.finish())
+}
+
+/// 单个区段的**结构**指纹（剥除 `summary`），用作 enrich 的逐段摘要缓存键：
+/// 结构未变 ⇒ 段指纹不变 ⇒ 可复用上次摘要、跳过这次付费 LLM 调用。
+pub fn section_fingerprint(section: &WikiSection) -> String {
+    let mut hasher = DefaultHasher::new();
+    "wiki-sec-v1".hash(&mut hasher);
+    if let Ok(j) = serde_json::to_string(&bare_section(section)) {
+        j.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// 返回区段的「无摘要」克隆：摘要是纯附加产物，绝不进入任何指纹（保证 0.0.57 指纹口径不变）。
+fn bare_section(section: &WikiSection) -> WikiSection {
+    let mut bare = section.clone();
+    bare.summary = None;
+    bare
 }
 
 /// 当前磁盘上的指纹是否与给定指纹一致（缺失/读失败都视为不一致 → 需要重写）。
@@ -89,6 +113,23 @@ pub fn write_all(wiki_dir: &Path, sections: &[WikiSection], fp: &str) -> std::io
     Ok(())
 }
 
+/// 回读上次持久化区段里的「结构指纹 → LLM 摘要」缓存（供 enrich 复用、跳过重复付费调用）。
+///
+/// 只收录**带非空摘要**的区段；wiki 不存在 / 损坏 / 全无摘要时返回空表（视为缓存未命中，
+/// 该走全新摘要调用）。绝不硬失败：缓存只是优化，缺失最多是多花一次 LLM 调用。
+pub fn load_summary_cache(wiki_dir: &Path) -> std::collections::HashMap<String, String> {
+    let mut cache = std::collections::HashMap::new();
+    if let Ok(sections) = load_sections(wiki_dir) {
+        for s in &sections {
+            if let Some(summary) = s.summary.as_ref().filter(|t| !t.trim().is_empty()) {
+                // 键 = 该段的结构指纹（不含摘要本身），确保结构变化即缓存失效。
+                cache.insert(section_fingerprint(s), summary.clone());
+            }
+        }
+    }
+    cache
+}
+
 /// 从 index.jsonl 回读区段（供 query）。文件缺失/任一行解析失败都返回该错误，让上层降级。
 pub fn load_sections(wiki_dir: &Path) -> std::io::Result<Vec<WikiSection>> {
     let content = fs::read_to_string(wiki_dir.join(INDEX_FILE))?;
@@ -139,6 +180,14 @@ fn render_markdown(s: &WikiSection) -> String {
     out.push_str(&format!("# {title}\n\n"));
     out.push_str(&format!("**Role:** {}\n\n", s.role));
     out.push_str(&format!("**Files in this directory:** {}\n\n", s.file_count));
+
+    // P3 enrich（opt-in，纯附加）：仅当区段带 LLM 摘要时插入 Summary 段。
+    // 无摘要（默认）时此块整体不出现 → markdown 与 0.0.57 逐字节一致。
+    if let Some(summary) = s.summary.as_ref().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        out.push_str("## Summary\n\n");
+        out.push_str(summary);
+        out.push_str("\n\n");
+    }
 
     if !s.key_files.is_empty() {
         out.push_str("## Key files\n\n");
@@ -197,6 +246,7 @@ mod tests {
                 line: 3,
                 signature: "pub fn run()".to_string(),
             }],
+            summary: None,
         }
     }
 
