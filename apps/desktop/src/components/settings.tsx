@@ -1207,7 +1207,7 @@ export function SettingsModal({
   const [mcpCommand, setMcpCommand] = useState("");
   const [mcpToken, setMcpToken] = useState("");
   const [ruleInput, setRuleInput] = useState("");
-  // 最近被拦动作（Plan27 #9）：进入「权限规则」分类时拉取，每条可一键加 allow/deny 规则。
+  // 最近被拦动作（Plan27 #9）：进入「权限」页时拉取，每条可一键加 allow/deny 规则。
   const [deniedActions, setDeniedActions] = useState<DeniedAction[]>([]);
   // 检查更新按钮自管理：idle → checking → result(10s) → idle，期间禁用、尺寸不变。
   const [checkLabel, setCheckLabel] = useState("检查更新");
@@ -1269,9 +1269,9 @@ export function SettingsModal({
     refreshMainPreset();
   }, []);
 
-  // 进入「权限规则」分类时拉取最近被拦动作（Plan27 #9）。
+  // 进入「权限」页时拉取最近被拦动作（0.0.66：权限规则已并入「权限」页）。
   useEffect(() => {
-    if (section !== "rules") return;
+    if (section !== "permission") return;
     invoke<DeniedAction[]>("recent_denied_actions")
       .then((list) => setDeniedActions(Array.isArray(list) ? list : []))
       .catch(() => setDeniedActions([]));
@@ -1292,7 +1292,6 @@ export function SettingsModal({
     { id: "assignments", label: "模型分配" },
     { id: "lsp", label: "语言服务器" },
     { id: "permission", label: "权限" },
-    { id: "rules", label: "权限规则" },
     { id: "mcp", label: "MCP 服务器" },
     { id: "data", label: "数据" },
     { id: "about", label: "关于" },
@@ -1498,9 +1497,10 @@ export function SettingsModal({
             </>
           )}
 
-          {section === "rules" && (
+          {/* 权限规则并入「权限」页（0.0.66）：与权限模式 / 命令沙箱 / 单轮上限同页,接在其下。 */}
+          {section === "permission" && (
             <>
-              <h3 className="settings-content__h">权限规则</h3>
+              <h3 className="settings-content__h" style={{ marginTop: 24 }}>权限规则</h3>
               <p className="settings-desc">
                 规则按 <b>deny 优先</b>。格式 <code>[allow:|deny:]工具:路径glob</code> / <code>cmd:命令前缀</code> / <code>tool:工具名</code>；例 <code>deny:read_file:**/.env</code>。审批弹窗「总是允许」会自动加 allow 规则。
               </p>

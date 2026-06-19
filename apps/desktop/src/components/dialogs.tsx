@@ -361,7 +361,6 @@ export function CommandPalette({
     { id: "set-connections", label: "设置 · 模型连接", icon: <Cpu size={15} />, run: () => act(() => onOpenSettings("connections")) },
     { id: "set-assignments", label: "设置 · 模型分配", icon: <Cpu size={15} />, run: () => act(() => onOpenSettings("assignments")) },
     { id: "set-permission", label: "设置 · 权限", icon: <Lock size={15} />, run: () => act(() => onOpenSettings("permission")) },
-    { id: "set-rules", label: "设置 · 权限规则", icon: <Lock size={15} />, run: () => act(() => onOpenSettings("rules")) },
     { id: "set-mcp", label: "设置 · MCP 服务器", icon: <Plug size={15} />, run: () => act(() => onOpenSettings("mcp")) },
     { id: "set-account", label: "设置 · 账户", icon: <Settings2 size={15} />, run: () => act(() => onOpenSettings("account")) },
     { id: "set-data", label: "设置 · 数据", icon: <Settings2 size={15} />, run: () => act(() => onOpenSettings("data")) },
@@ -480,7 +479,7 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
     { title: "技能 / .mdga", body: "工作区 .mdga 目录可放长期记忆（MDGA.md）与自定义斜杠命令，作为项目级约定持续生效。" },
     { title: "MCP", body: "在 设置 → MCP 服务器 接入外部 MCP（stdio 或 HTTP），其工具并入模型工具集，统一经权限审批。" },
     { title: "视觉", body: "在 设置 → 模型供应商 开启「扩展模态」并配置视觉模型后，可粘贴/拖拽/导入图片让 Agent 识图。" },
-    { title: "权限模式", body: "受限 / 每次询问 / 工作区自动 / 完全访问 四档，控制 Agent 改文件、跑命令前是否需要审批。可在 设置 → 权限规则 配细粒度规则。" },
+    { title: "权限模式", body: "受限 / 每次询问 / 工作区自动 / 完全访问 四档，控制 Agent 改文件、跑命令前是否需要审批。可在 设置 → 权限 配细粒度规则。" },
     { title: "快捷键", body: "Ctrl/Cmd+N 新对话、Ctrl/Cmd+K 命令面板、Ctrl/Cmd+, 设置、Enter 发送、Shift+Enter 换行、Esc 关闭弹窗。" },
   ];
   return (

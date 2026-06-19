@@ -309,7 +309,6 @@ export type SettingsSection =
   | "assignments"
   | "lsp"
   | "permission"
-  | "rules"
   | "mcp"
   | "data"
   | "about";
