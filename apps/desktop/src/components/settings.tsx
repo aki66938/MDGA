@@ -233,15 +233,13 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
     <>
       <h3 className="settings-content__h">模型连接</h3>
       <p className="settings-desc" style={{ marginTop: 0, marginBottom: 8 }}>
-        在这里集中配置可复用的<b>模型连接</b>（端点 + 密钥，配一次即可）。每个连接 = 名称 + 供应商预设 +
-        Base URL + API Key + API 格式。这是<b>唯一</b>录入 API Key 的地方。配好后在每个连接卡下的「<b>加载模型</b>」里
-        登记你会用到的模型（一个连接可登记多个），再到「模型分配」把各角色指到其中一个模型。
+        连接 = 端点 + 密钥（<b>唯一</b>录入 API Key 处，配一次可复用）。在连接卡下「加载模型」登记要用的模型，再到「模型分配」指派给各角色。
       </p>
 
       {loading ? (
         <p className="settings-row__value">加载中…</p>
       ) : connections.length === 0 ? (
-        <p className="settings-row__value">暂无连接。点击下方「新增连接」配置你的第一个模型供应商。</p>
+        <p className="settings-row__value">暂无连接，点下方「新增连接」开始。</p>
       ) : (
         connections.map((c) => {
           const t = testState[c.id];
@@ -491,7 +489,7 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
         <p className="settings-row__value" style={{ margin: "2px 0" }}>加载中…</p>
       ) : models.length === 0 ? (
         <p className="settings-desc" style={{ margin: "2px 0 6px" }}>
-          还没有登记模型。点「拉取可用模型」自动获取，或在下方手动添加。
+          还没有模型，点「拉取可用模型」或在下方手动添加。
         </p>
       ) : (
         <ul className="provider-models__list">
@@ -807,8 +805,8 @@ function ConnectionEditor({
                 />
                 <p className="settings-desc" style={{ marginTop: 4 }}>
                   {isCustom
-                    ? "自定义供应商必须填写 Base URL（自托管/代理）。基址或完整端点均可，照 API 文档粘贴即可，不会重复拼接路径。"
-                    : `留空即使用 ${presetMeta.label} 官方端点；自托管/代理可填。`}
+                    ? "自定义供应商须填 Base URL；基址或完整端点均可，不会重复拼接。"
+                    : `留空＝用 ${presetMeta.label} 官方端点；自托管/代理可填。`}
                 </p>
               </div>
             </div>
@@ -907,9 +905,7 @@ function LspServerSettings() {
     <>
       <h3 className="settings-content__h">语言服务器（LSP）</h3>
       <p className="settings-desc" style={{ marginTop: 0 }}>
-        启用/停用下列<b>已知</b>语言服务器，决定 Agent 的代码智能工具（定义跳转 / 引用 / 悬浮 / 诊断）对哪些语言生效。
-        可选为某个服务器指定其<b>二进制路径</b>（当它不在 PATH 中时）。出于安全，服务器种类与命令固定，无法新增任意命令；
-        路径仅指明已知二进制的位置，留空即按 PATH 自动查找。
+        启停下列语言服务器，决定代码智能（跳转/引用/悬浮/诊断）对哪些语言生效。可选填其<b>二进制路径</b>（不在 PATH 时），留空即自动查找；种类与命令固定，不可新增任意命令。
       </p>
       {loading ? (
         <p className="settings-row__value">加载中…</p>
@@ -1005,13 +1001,12 @@ function AssignmentsSettings() {
     <>
       <h3 className="settings-content__h">模型分配</h3>
       <p className="settings-desc" style={{ marginTop: 0, marginBottom: 8 }}>
-        把每个<b>角色</b>指到一个<b>已登记的模型</b>（在「模型连接」的「加载模型」里登记）。未单独分配的角色自动<b>跟随主模型</b>。
-        此处只选模型，<b>不输入任何 API Key</b>（密钥在「模型连接」配）。
+        给每个<b>角色</b>选一个已登记的模型；未分配的<b>跟随主模型</b>。此处只选模型，不录 Key。
       </p>
 
       {models.length === 0 && !loading ? (
         <p className="settings-row__value" style={{ color: "var(--warning)" }}>
-          还没有任何已登记的模型。请先到「<b>模型连接</b>」为某个连接添加模型，再回来分配角色。
+          还没有模型，请先到「<b>模型连接</b>」给某个连接添加模型。
         </p>
       ) : loading ? (
         <p className="settings-row__value">加载中…</p>
@@ -1418,7 +1413,7 @@ export function SettingsModal({
                   checked={modalityExtended}
                   onChange={(e) => handleToggleModality(e.target.checked)}
                 />
-                <span><b>扩展 agent 的模态</b>　开启后可为「视觉」角色分配识图模型（上方矩阵）</span>
+                <span><b>扩展 agent 的模态</b>　开启后可给「视觉」角色分配识图模型</span>
               </label>
 
               {modalityExtended && (
@@ -1432,7 +1427,7 @@ export function SettingsModal({
                       <span className="provider-badge">🔒 敬请期待</span>
                     </div>
                     <p className="settings-desc" style={{ marginTop: 4 }}>
-                      后续接入语音模型，实现语音对话交流（占位禁用）。
+                      后续接入语音模型（占位）。
                     </p>
                   </div>
                 </div>
@@ -1468,8 +1463,7 @@ export function SettingsModal({
                 </label>
               </div>
               <p className="settings-desc">
-                开启后，run_command 在<b>受限令牌沙箱</b>中执行：剥离管理员特权、进程随会话干净销毁、子进程环境擦除 API Key 等密钥。
-                少数需要特权的命令可能受影响，可临时关闭。（网络与文件路径隔离将在后续 AppContainer 版本提供。）
+                开启后 run_command 在<b>受限令牌沙箱</b>跑：剥离管理员特权、随会话销毁、子进程擦除密钥。少数需特权的命令可能受影响，可临时关闭。
               </p>
 
               <div className="settings-row" style={{ marginTop: 16 }}>
@@ -1487,7 +1481,7 @@ export function SettingsModal({
                 </span>
               </div>
               {/* Plan21 #4：正名为「单轮上限」，消除「任务级累计」误解；说明含视觉调用开销。 */}
-              <p className="settings-desc">本轮(单次发送)累计 token 超过此值时自动暂停本轮，防止失控烧 token。该上限按每轮独立计算，<b>含本轮视觉识图等调用的 token 开销</b>（0 = 不限）。当前 {taskBudget === 0 ? "不限" : taskBudget.toLocaleString()}。</p>
+              <p className="settings-desc">单次发送累计 token 超此值即暂停本轮，防失控烧钱；按每轮独立计、<b>含视觉识图开销</b>（0 = 不限）。当前 {taskBudget === 0 ? "不限" : taskBudget.toLocaleString()}。</p>
             </>
           )}
 
@@ -1508,9 +1502,7 @@ export function SettingsModal({
             <>
               <h3 className="settings-content__h">权限规则</h3>
               <p className="settings-desc">
-                细粒度规则按 <b>deny 优先</b> 生效。格式：<code>[allow:|deny:]&lt;工具&gt;:&lt;路径glob&gt;</code>，
-                或 <code>cmd:&lt;命令前缀&gt;</code>、<code>tool:&lt;工具名&gt;</code>。
-                例：<code>deny:read_file:**/.env</code>、<code>allow:cmd:git push</code>。审批弹窗的「总是允许」会自动生成 allow 规则。
+                规则按 <b>deny 优先</b>。格式 <code>[allow:|deny:]工具:路径glob</code> / <code>cmd:命令前缀</code> / <code>tool:工具名</code>；例 <code>deny:read_file:**/.env</code>。审批弹窗「总是允许」会自动加 allow 规则。
               </p>
               {permRules.length === 0 && <p className="settings-row__value">暂无规则。</p>}
               {permRules.map((r) => (
@@ -1530,7 +1522,7 @@ export function SettingsModal({
                 <span>最近被拦动作</span>
               </div>
               {deniedActions.length === 0 ? (
-                <p className="settings-desc">暂无被拦动作。当 Agent 的某个工具被权限拦下后，会出现在此，可一键为其加规则。</p>
+                <p className="settings-desc">暂无被拦动作。工具被权限拦下后会出现在此，可一键加规则。</p>
               ) : (
                 deniedActions.map((d, i) => {
                   const rule = `tool:${d.toolName}`;
@@ -1568,7 +1560,7 @@ export function SettingsModal({
                 <span><Plug size={15} style={{ verticalAlign: "-2px" }} /> MCP 服务器</span>
                 <button className="changes-row__revert" type="button" onClick={onRefreshMcp}>刷新状态</button>
               </div>
-              <p className="settings-desc">接入外部 MCP 服务器，其工具会并入模型工具集，统一经权限审批与审计。<b>stdio</b>：填启动命令（需 Node/npx 等）；<b>HTTP</b>：填 http(s):// 地址，可选填 Token；留空且服务端要求授权时自动走浏览器 OAuth。</p>
+              <p className="settings-desc">接入外部 MCP 服务器，其工具并入模型工具集、统一经权限审批。<b>stdio</b> 填启动命令；<b>HTTP</b> 填 http(s):// 地址 + 可选 Token（留空且需授权时走浏览器 OAuth）。</p>
               {mcpServers.map((s) => (
                 <div key={s.id} className="changes-row">
                   <span className={`mcp-dot${s.connected ? " mcp-dot--on" : ""}`} aria-hidden="true">●</span>
