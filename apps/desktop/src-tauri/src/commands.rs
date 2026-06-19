@@ -1729,6 +1729,22 @@ pub(crate) async fn install_update(app: AppHandle) -> Result<(), String> {
     app.restart();
 }
 
+/// 在用户的真实浏览器打开一个外链（0.0.67：供 widget 沙箱的 openLink 桥用）。
+///
+/// 仅放行 http(s)——拒绝 file: / javascript: / data: 等任何其它 scheme,避免沙箱 widget 借此越权。
+/// 前端只在向用户弹确认后才调用本命令；本命令只负责「http(s) 守卫 + 交系统打开」。
+#[tauri::command]
+pub(crate) fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let u = url.trim();
+    if !(u.starts_with("http://") || u.starts_with("https://")) {
+        return Err("仅允许打开 http(s) 链接".to_string());
+    }
+    app.opener()
+        .open_url(u.to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 // ── 命令层共享小工具 ───────────────────────────────────────────────────────
 
 /// 从工作区路径取末段目录名作为工作区显示名；取不到时回退原路径。
