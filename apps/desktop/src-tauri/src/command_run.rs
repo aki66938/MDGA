@@ -36,6 +36,8 @@ pub(crate) fn execute_run_command_tool(
         security_context.network_mode,
         NetworkMode::AllowListed | NetworkMode::FullAccess
     );
+    // 0.0.68：统一经 CommandSandbox::for_session 推导策略,不再向 run_command_streaming 传裸 bool。
+    let policy = mdga_tool_runtime::CommandSandbox::for_session(sandbox, allow_network);
 
     if request.background {
         let shell_id = format!("sh-{}", BG_SHELL_SEQ.fetch_add(1, Ordering::SeqCst));
@@ -80,8 +82,7 @@ pub(crate) fn execute_run_command_tool(
                 RunCommandRequest { background: false, ..request },
                 Some(cb),
                 Some(cancel_thread.clone()),
-                sandbox,
-                allow_network,
+                policy,
             );
             let final_status = if cancel_thread.load(Ordering::SeqCst) {
                 "killed"
@@ -108,10 +109,8 @@ pub(crate) fn execute_run_command_tool(
     // 前台命令：按设置决定是否在受限令牌沙箱中执行（沙箱设置已在上方读取，前后台一致）。
     let cb = command_line_callback(app);
     serde_json::to_value(
-        mdga_tool_runtime::run_command_streaming(
-            &workspace, request, Some(cb), None, sandbox, allow_network,
-        )
-        .map_err(|e| e.to_string())?,
+        mdga_tool_runtime::run_command_streaming(&workspace, request, Some(cb), None, policy)
+            .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
 }

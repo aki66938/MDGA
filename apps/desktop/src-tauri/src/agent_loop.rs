@@ -656,6 +656,8 @@ async fn chat_with_builtin_tools(
         // Plan25 C-3：clone 后再交给安全上下文，保留 permission_mode 供 run_subtask 调用点回传子代理。
         permission_mode.clone(),
         NetworkMode::Disabled,
+        // 0.0.68：把命令沙箱开关快照进上下文,供无 AppState 访问的 dispatcher 兜底分支推导策略。
+        app.state::<AppState>().command_sandbox.load(Ordering::SeqCst),
     )
     .map_err(|e| e.to_string())?;
     // 0.0.59 子代理模型：解析 ROLE_SUBAGENT（回退 subagent → action → main）。**默认**（subagent/action
@@ -913,6 +915,9 @@ async fn chat_with_builtin_tools(
                         security_context.network_mode,
                         NetworkMode::AllowListed | NetworkMode::FullAccess
                     );
+                    // 0.0.68：统一经 CommandSandbox::for_session 推导策略,不再传裸 bool。
+                    let verify_policy =
+                        mdga_tool_runtime::CommandSandbox::for_session(verify_sandbox, verify_net);
                     let mut fed_back = false;
                     let _ = app.emit("agent-status", serde_json::json!({ "state": "thinking", "round": round }));
                     'steps: for step in &plan.steps {
@@ -926,8 +931,7 @@ async fn chat_with_builtin_tools(
                             RunCommandRequest { command: cmd.clone(), timeout_secs: Some(300), background: false },
                             None,
                             None,
-                            verify_sandbox,
-                            verify_net,
+                            verify_policy.clone(),
                         ) {
                             Ok(r) => r,
                             Err(_) => continue, // 命令起不来：跳过该门，不阻断收尾
@@ -942,8 +946,7 @@ async fn chat_with_builtin_tools(
                                     RunCommandRequest { command: step.command.clone(), timeout_secs: Some(300), background: false },
                                     None,
                                     None,
-                                    verify_sandbox,
-                                    verify_net,
+                                    verify_policy.clone(),
                                 ) {
                                     Ok(full) => {
                                         let full_failed = full.exit_code.unwrap_or(0) != 0 || full.timed_out;
@@ -1819,6 +1822,7 @@ mod tests {
             workspace_path.to_string(),
             PermissionMode::WorkspaceAuto,
             NetworkMode::Disabled,
+            false,
         )
         .expect("security context should build");
         execute_builtin_tool_call(

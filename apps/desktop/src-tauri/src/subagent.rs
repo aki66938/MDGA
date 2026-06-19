@@ -281,6 +281,8 @@ async fn run_subtask_loop(
         workspace_path.to_string(),
         permission_mode,
         NetworkMode::Disabled,
+        // 0.0.68：子代理上下文同样携带命令沙箱开关快照(与主代理一致)。
+        app.state::<AppState>().command_sandbox.load(Ordering::SeqCst),
     ) {
         Ok(ctx) => ctx,
         Err(e) => return (format!("子代理初始化失败: {e}"), None),

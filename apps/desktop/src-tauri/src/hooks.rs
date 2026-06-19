@@ -43,17 +43,24 @@ fn hook_matcher_matches(matcher: &str, tool_name: &str) -> bool {
 }
 
 /// 运行一条钩子命令：JSON 从 stdin 传入，30s 超时，返回 (是否成功, 输出文本)。
+///
+/// 0.0.68 安全加固:钩子命令子进程**擦除敏感环境变量**(API Key / Token / 密码),与 run_command 同一份
+/// 清单,杜绝用户(或被污染工作区的 .mdga/hooks.json)经环境变量读取/外泄凭据。注:钩子需经 stdin 传入
+/// `{tool, arguments}` JSON,而沙箱执行路径(run_command_streaming)用 Stdio::null 不支持 stdin,故钩子
+/// **暂未纳入**文件/网络沙箱(全面沙箱化需让沙箱执行器支持 stdin,留作后续版本);本版先关掉凭据外泄这条。
 fn run_hook_command(workspace: &str, command: &str, stdin_json: &str) -> (bool, String) {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
-    let mut child = match Command::new("powershell")
+    let mut builder = Command::new("powershell");
+    builder
         .args(["-NoProfile", "-NonInteractive", "-Command", command])
         .current_dir(workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    // 与 run_command 同源的密钥擦除(0.0.68):防钩子命令经环境变量读到 DEEPSEEK_API_KEY 等凭据。
+    mdga_tool_runtime::scrub_secret_env(&mut builder);
+    let mut child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => return (false, format!("钩子启动失败: {e}")),
     };

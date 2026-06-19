@@ -1583,16 +1583,47 @@ pub fn delete_dir(
     })
 }
 
+/// 命令执行的沙箱策略（0.0.68 fail-open 审计）。把原 `run_command_streaming` 的两个裸 `bool`
+/// (`sandbox`, `allow_network`) 收敛成一个**无法凭空写出**的枚举,杜绝「随手传 `false` 裸跑」这种
+/// 反复发作的 fail-open（历史上 0.0.39 / 0.0.53 / 0.0.65 三度同因复现）:`Unsandboxed` 必须带一个
+/// 理由串,使每处绕过都在源码层留下可被 grep / review 的**显式声明**。所有命令执行路径(主代理 /
+/// 子代理 / 自动验证 / dispatcher 兜底)都应经 [`CommandSandbox::for_session`] 由会话设置统一推导,
+/// 不要各自手搓裸 bool。
+#[derive(Debug, Clone)]
+pub enum CommandSandbox {
+    /// 走沙箱:Windows 上 AppContainer 优先,不支持则 fail-closed 降级受限令牌沙箱(绝不裸跑);
+    /// 非 Windows 报错。`allow_network` 控制沙箱内网络放行。
+    Sandboxed { allow_network: bool },
+    /// 显式裸跑(不沙箱)。`reason` 必填,说明为何允许绕过(如用户在设置里关了命令沙箱开关)。
+    Unsandboxed { reason: String },
+}
+
+impl CommandSandbox {
+    /// 由会话设置推导命令沙箱策略——这是所有命令路径的**单一推导入口**:
+    /// 开沙箱 ⇒ `Sandboxed`(按会话网络模式放行);关沙箱 ⇒ 带固定理由的 `Unsandboxed`。
+    /// 各调用点统一走此函数,避免再各自硬编码 `false`(那正是历次 fail-open 的来源)。
+    pub fn for_session(command_sandbox: bool, allow_network: bool) -> Self {
+        if command_sandbox {
+            CommandSandbox::Sandboxed { allow_network }
+        } else {
+            CommandSandbox::Unsandboxed {
+                reason: "用户在设置中关闭了命令沙箱".to_string(),
+            }
+        }
+    }
+}
+
 /// 在工作区内执行一条 PowerShell 命令。
 ///
-/// 输入命令字符串和可选超时秒数；cwd 固定为工作区根目录，默认超时 120 秒、上限 600 秒。
-/// stdout/stderr 各自截断到 64 KiB，超时则杀进程并标记 timed_out。本方法不做权限裁决，
+/// 输入命令字符串、可选超时秒数与**显式沙箱策略**；cwd 固定为工作区根目录，默认超时 120 秒、上限
+/// 600 秒。stdout/stderr 各自截断到 64 KiB，超时则杀进程并标记 timed_out。本方法不做权限裁决，
 /// 权限由 Host 在调用前用 SessionSecurityContext 判定（仅 FullAccess 允许）。
 pub fn run_command(
     workspace_root: impl AsRef<Path>,
     request: RunCommandRequest,
+    sandbox: CommandSandbox,
 ) -> Result<RunCommandResult, ToolRuntimeError> {
-    run_command_streaming(workspace_root, request, None, None, false, false)
+    run_command_streaming(workspace_root, request, None, None, sandbox)
 }
 
 /// 行级流式输出回调：命令每产生一行 stdout/stderr 调用一次，供 UI 实时展示。
@@ -1712,13 +1743,18 @@ pub fn run_command_streaming(
     request: RunCommandRequest,
     on_line: Option<CommandLineCallback>,
     cancel: Option<CommandCancel>,
-    sandbox: bool,
-    allow_network: bool,
+    policy: CommandSandbox,
 ) -> Result<RunCommandResult, ToolRuntimeError> {
     let command = request.command.trim();
     if command.is_empty() {
         return Err(ToolRuntimeError::EmptyCommand);
     }
+    // 由策略推导出本函数体后续沿用的两个开关。Unsandboxed 才会走到末尾的裸 powershell;
+    // 调用方无法再传裸 `false`——必须显式构造 `CommandSandbox::Unsandboxed { reason }`(见类型注释)。
+    let (sandbox, allow_network) = match &policy {
+        CommandSandbox::Sandboxed { allow_network } => (true, *allow_network),
+        CommandSandbox::Unsandboxed { .. } => (false, false),
+    };
     let workspace = canonical_workspace(workspace_root)?;
     let timeout = Duration::from_secs(
         request
@@ -1866,7 +1902,9 @@ pub fn run_command_streaming(
 ///
 /// 精确移除已知密钥变量，并按名称模式移除疑似密钥的变量；保留 PATH 等正常变量，
 /// 不做 env_clear（清空会破坏 PATH 导致命令找不到），是性能/可用性与安全的平衡。
-fn scrub_secret_env(builder: &mut Command) {
+/// 从子进程环境中擦除敏感凭据(API Key / Token / 密码等),防止经环境变量读取或外泄。
+/// 公开供 Host 侧自建 Command 的执行路径(如生命周期钩子)复用同一份擦除清单,避免各处漂移。
+pub fn scrub_secret_env(builder: &mut Command) {
     const EXACT: &[&str] = &["DEEPSEEK_API_KEY"];
     for name in EXACT {
         builder.env_remove(name);
@@ -2989,6 +3027,24 @@ mod tests {
     }
 
     #[test]
+    fn command_sandbox_for_session_maps_switch() {
+        // 开沙箱 ⇒ Sandboxed,网络模式透传。
+        match CommandSandbox::for_session(true, true) {
+            CommandSandbox::Sandboxed { allow_network } => assert!(allow_network),
+            _ => panic!("开沙箱应得 Sandboxed"),
+        }
+        match CommandSandbox::for_session(true, false) {
+            CommandSandbox::Sandboxed { allow_network } => assert!(!allow_network),
+            _ => panic!("开沙箱应得 Sandboxed"),
+        }
+        // 关沙箱 ⇒ Unsandboxed,且带非空理由(强制每处裸跑留痕,杜绝无声 fail-open)。
+        match CommandSandbox::for_session(false, true) {
+            CommandSandbox::Unsandboxed { reason } => assert!(!reason.trim().is_empty()),
+            _ => panic!("关沙箱应得 Unsandboxed"),
+        }
+    }
+
+    #[test]
     fn run_command_executes_inside_workspace() {
         let workspace = temp_workspace();
         std::fs::write(workspace.join("marker.txt"), "hi").expect("file should be written");
@@ -3000,6 +3056,7 @@ mod tests {
                 timeout_secs: Some(30),
                 background: false,
             },
+            CommandSandbox::Unsandboxed { reason: "test".to_string() },
         )
         .expect("command should execute");
 
@@ -3020,6 +3077,7 @@ mod tests {
                 timeout_secs: None,
                 background: false,
             },
+            CommandSandbox::Unsandboxed { reason: "test".to_string() },
         )
         .expect_err("empty command should be rejected");
         assert!(matches!(err, ToolRuntimeError::EmptyCommand));

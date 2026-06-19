@@ -5,11 +5,11 @@
 
 use crate::permissions::tool_capability_for_name;
 use crate::web::{execute_web_fetch, execute_web_search};
-use mdga_sandbox_runtime::SessionSecurityContext;
+use mdga_sandbox_runtime::{NetworkMode, SessionSecurityContext};
 use mdga_tool_runtime::{
     apply_multi_patch, code_overview, create_file, delete_dir, delete_file, edit_file, git_add,
     git_branch, git_commit, git_diff, git_log, git_pr, git_push, git_status, glob_files, list_dir,
-    make_dir, move_path, read_file, run_command, search_text, stat_path, write_file,
+    make_dir, move_path, read_file, run_command, search_text, stat_path, write_file, CommandSandbox,
     CodeOverviewRequest, CreateFileRequest, DeleteDirRequest, DeleteFileRequest, EditFileRequest,
     GitAddRequest, GitBranchRequest, GitCommitRequest, GitDiffRequest, GitLogRequest, GitPrRequest,
     GitPushRequest, GitStatusRequest, GlobFilesRequest, ListDirRequest, MakeDirRequest,
@@ -1219,8 +1219,18 @@ pub(crate) fn execute_builtin_tool_call(
         "run_command" => {
             let request = serde_json::from_str::<RunCommandRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
-            serde_json::to_value(run_command(workspace_path, request).map_err(|err| err.to_string())?)
-                .map_err(|err| err.to_string())
+            // 0.0.68 fail-open 审计:此 dispatcher 兜底分支此前调 run_command() 硬编码裸跑(sandbox=false),
+            // 是一条潜在 fail-open——主/子代理虽各自特判 run_command 走沙箱感知路径,但任何忘记特判而
+            // fall-through 到此的入口都会裸跑。现改为按会话的命令沙箱开关 + 网络模式推导策略,使兜底亦安全。
+            let allow_network = matches!(
+                security_context.network_mode,
+                NetworkMode::AllowListed | NetworkMode::FullAccess
+            );
+            let policy = CommandSandbox::for_session(security_context.command_sandbox, allow_network);
+            serde_json::to_value(
+                run_command(workspace_path, request, policy).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())
         }
         // R4：git 原生工具（结构化）。
         "git_status" => {

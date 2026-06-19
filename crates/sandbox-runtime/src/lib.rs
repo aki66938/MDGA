@@ -39,6 +39,10 @@ pub struct SessionSecurityContext {
     pub permission_mode: PermissionMode,
     pub network_mode: NetworkMode,
     pub approval_policy: String,
+    /// 用户「命令沙箱」开关的会话级快照(0.0.68 fail-open 审计)。供**无 AppState 访问**的执行器
+    /// (典型是 `execute_builtin_tool_call` 的 dispatcher 兜底分支)推导命令沙箱策略,使其不再被迫
+    /// 默认裸跑——这正是历次 fail-open 的根因(开关只存在 AppState、够不着的执行路径只能默认 false)。
+    pub command_sandbox: bool,
 }
 
 #[derive(Debug, Error)]
@@ -66,6 +70,7 @@ pub fn session_security_context(
     workspace_root: impl Into<String>,
     permission_mode: PermissionMode,
     network_mode: NetworkMode,
+    command_sandbox: bool,
 ) -> Result<SessionSecurityContext, SandboxRuntimeError> {
     let workspace_root = workspace_root.into();
     if workspace_root.trim().is_empty() {
@@ -77,6 +82,7 @@ pub fn session_security_context(
         permission_mode,
         network_mode,
         approval_policy: "host-enforced".to_string(),
+        command_sandbox,
     })
 }
 
@@ -193,6 +199,7 @@ mod tests {
             "C:\\workspace\\demo",
             PermissionMode::WorkspaceAuto,
             NetworkMode::Disabled,
+            true,
         )
         .expect("context should build");
 
@@ -213,6 +220,7 @@ mod tests {
             "C:\\workspace\\demo",
             PermissionMode::Restricted,
             NetworkMode::Disabled,
+            true,
         )
         .expect("context should build");
 
@@ -232,6 +240,7 @@ mod tests {
             "C:\\workspace\\demo",
             PermissionMode::AskEveryTime,
             NetworkMode::Disabled,
+            true,
         )
         .expect("context should build");
 
@@ -277,7 +286,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_workspace_boundary() {
-        let err = session_security_context("", PermissionMode::WorkspaceAuto, NetworkMode::Disabled)
+        let err = session_security_context("", PermissionMode::WorkspaceAuto, NetworkMode::Disabled, true)
             .expect_err("workspace is required");
 
         assert_eq!(err.to_string(), "会话缺少工作区边界");
