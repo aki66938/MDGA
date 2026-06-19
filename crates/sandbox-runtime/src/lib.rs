@@ -123,6 +123,8 @@ pub fn decide_tool_access(
 ///
 /// 输入完整命令串；输出是否可在 Workspace Auto 下免审批直接执行。
 /// 任何包含管道、串联、重定向或命令替换的命令一律不算低风险，避免白名单前缀被绕过。
+/// 0.0.68 加固:补上此前漏掉的 `$`(PowerShell 子表达式 `$(...)` / 变量)、`%`(cmd 风格展开)与
+/// **控制字符(换行等)**——否则 `echo $(恶意命令)` / 多行命令会借白名单前缀(echo)逃过审批直接执行。
 pub fn is_low_risk_command(command: &str) -> bool {
     let trimmed = command.trim();
     if trimmed.is_empty() {
@@ -136,6 +138,9 @@ pub fn is_low_risk_command(command: &str) -> bool {
         || trimmed.contains('<')
         || trimmed.contains('`')
         || trimmed.contains('&')
+        || trimmed.contains('$')
+        || trimmed.contains('%')
+        || trimmed.chars().any(|c| c.is_control())
     {
         return false;
     }
@@ -282,6 +287,12 @@ mod tests {
         assert!(!is_low_risk_command("git status | cat"));
         assert!(!is_low_risk_command("echo hi > file"));
         assert!(!is_low_risk_command(""));
+        // 0.0.68 加固:子表达式 / 变量展开 / 多行借白名单前缀(echo/dir)逃审，一律拒绝。
+        assert!(!is_low_risk_command("echo $(rm -rf x)"));
+        assert!(!is_low_risk_command("echo $env:DEEPSEEK_API_KEY"));
+        assert!(!is_low_risk_command("echo %PATH%"));
+        assert!(!is_low_risk_command("echo a\nrm -rf x"));
+        assert!(!is_low_risk_command("dir; rm x")); // 已被 ';' 覆盖,锚定不回归
     }
 
     #[test]

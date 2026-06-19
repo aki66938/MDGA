@@ -159,7 +159,11 @@ fn rule_decision(rule: &str, tool_name: &str, arguments: &str) -> Option<bool> {
                         .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(str::to_string))
                 })
                 .unwrap_or_default();
-            if glob_match(glob, &path) {
+            // 0.0.68 加固:路径归一化后再匹配——把反斜杠折成正斜杠、双方统一小写。否则 Windows(文件系统
+            // 大小写不敏感)下 `deny:read_file:**/.env` 会被 `.ENV` 或 `config\.env` 等等价写法绕过。
+            // 归一化对 deny 是收紧(更安全)、对 allow 仅在用户自建规则下极小幅放宽,且本就匹配同一文件。
+            let norm = |s: &str| s.replace('\\', "/").to_lowercase();
+            if glob_match(&norm(glob), &norm(&path)) {
                 return Some(effect);
             }
         }
@@ -484,6 +488,18 @@ mod tests {
             permission_rules_decision(&rules, "read_file", "{\"path\":\"src/.env\"}"),
             Some(false)
         );
+        // 0.0.68 加固:大小写 / 反斜杠等价写法不能绕过 deny:**/.env(Windows FS 大小写不敏感)。
+        for p in [
+            "{\"path\":\"src/.ENV\"}",
+            "{\"path\":\"config\\\\.env\"}",
+            "{\"path\":\"CONFIG\\\\.Env\"}",
+        ] {
+            assert_eq!(
+                permission_rules_decision(&rules, "read_file", p),
+                Some(false),
+                "deny:**/.env 应拦住等价写法: {p}"
+            );
+        }
         // 旧式裸规则向后兼容（视为 allow）
         assert_eq!(
             permission_rules_decision(&["tool:write_file".to_string()], "write_file", "{}"),
