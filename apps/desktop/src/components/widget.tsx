@@ -4,8 +4,13 @@
 //   会让 frame 自行卸下 sandbox 逃逸。单独 allow-scripts ＝ null/opaque 源：无 cookie/存储、
 //   读不到父 DOM、所有请求 Origin:null。
 //   即便 Tauri 2.11.2 已修复 IPC 注入到 null 源 iframe（GHSA-57fm-592m-34r7），仍在 wrapper
-//   里加 fail-closed 自检：一旦探测到 __TAURI__ 立刻 window.stop() + 拒绝渲染（置于 <head>，跑在
-//   agent 代码之前，真正阻断后续解析）。
+//   里加 fail-closed 探针兜底。
+//   0.0.68 修正（基于运行时实测）：WebView2 会把 Tauri 的 __TAURI_INTERNALS__ 注入到**所有** frame
+//   （含本 null 源 iframe），所以旧版「探测到该全局存在即拒渲染」是**必然误报**——每个 widget 都被挡。
+//   实测：从 null 源 iframe 真去 invoke('get_app_info') 被 Tauri **当场拒绝**（"Origin header is not a
+//   valid URL" + 缺 __TAURI_INVOKE_KEY__），即「全局存在但打不通」、隔离有效。故把探针从「看名字」改成
+//   「看是否真能打通」：异步真调一次无害只读命令，**唯有它竟然 resolve 成功**（IPC 真打通=真出事）才
+//   window.stop()+抹掉页面拒渲染；被拒/超时/无 invoke（正常隔离）则不动，widget 正常渲染。
 //
 // 网络出口（0.0.67 安全审查后修正——勿再误述为「零网络」）：
 //   · 子资源出口（img/script/style/font 的 GET）已用「default-src 'none' + 仅 data:/blob:、零外部
@@ -42,19 +47,26 @@ function buildSrcdoc(code: string, theme: Record<string, string>): string {
     .map(([k, v]) => `      ${k}: ${v};`)
     .join("\n");
 
-  // fail-closed 自检：放在 <head>、跑在 agent 代码之前。探测到任一 Tauri 桥接全局即
-  // window.stop() 中止文档解析（body 里的 agent 代码不再被解析/执行）+ 改写为拒绝提示 + throw。
-  const selfCheck =
-    "if (window.__TAURI__ || window.__TAURI_INTERNALS__ || window.__TAURI_INVOKE_KEY__) {" +
-    " try{ window.stop(); }catch(e){}" +
-    " document.documentElement.innerHTML = '<body style=\"margin:0\"><p style=\"color:#c00;font:13px system-ui;padding:12px\">\\u26A0 widget \\u9694\\u79BB\\u5931\\u8D25\\uFF0C\\u5DF2\\u62D2\\u7EDD\\u6E32\\u67D3</p></body>';" +
-    " throw new Error('isolation breach'); }";
+  // fail-closed 功能式探针：放在 <head>、跑在 agent 代码之前。不再判断 Tauri 全局「是否存在」
+  // （__TAURI_INTERNALS__ 必被注入，判存在=必然误报），而是**异步真调一次无害只读命令**：
+  // 唯有它竟然 resolve 成功（IPC 真打通=隔离失败）才 window.stop()+抹掉页面拒渲染；
+  // 被拒/超时/无 invoke（正常隔离，实测即此路）则不动，让 widget 正常渲染。
+  // 代价：正常情况下每次渲染会触发一次被 Tauri 拒绝的 invoke，dev 控制台会打一条 warning（生产无控制台）。
+  const probe =
+    "(function(){try{" +
+    "var I=window.__TAURI_INTERNALS__;" +
+    "if(!I||typeof I.invoke!=='function')return;" +
+    "Promise.resolve(I.invoke('get_app_info',{})).then(function(){" +
+    " try{window.stop();}catch(e){}" +
+    " document.documentElement.innerHTML='<body style=\"margin:0\"><p style=\"color:#c00;font:13px system-ui;padding:12px\">\\u26A0 widget \\u9694\\u79BB\\u5931\\u8D25\\uFF08\\u68C0\\u6D4B\\u5230\\u53EF\\u8C03\\u7528\\u540E\\u7AEF\\uFF09\\uFF0C\\u5DF2\\u62D2\\u7EDD\\u6E32\\u67D3</p></body>';" +
+    "},function(){});" + // rejected = 正常隔离，忽略
+    "}catch(e){}})();";
 
   return (
     "<!doctype html><html><head><meta charset=\"utf-8\">" +
     `<meta http-equiv="Content-Security-Policy" content="${csp}">` +
-    // 自检脚本必须是文档里**第一个**执行的脚本，故置于 head、CSP meta 之后、其余内容之前。
-    "<script>" + selfCheck + "</script>" +
+    // 探针脚本置于 head、CSP meta 之后、其余内容之前（尽早起跑；其判定是异步的，不阻塞渲染）。
+    "<script>" + probe + "</script>" +
     "<style>\n" +
     "    :root {\n" +
     vars +
