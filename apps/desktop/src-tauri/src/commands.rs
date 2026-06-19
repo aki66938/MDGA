@@ -835,13 +835,20 @@ pub(crate) fn remove_conversation(
 ///
 /// 仅当会话最后一条消息 role='assistant' 时才删，返回是否删除。前端「重新生成」先调本命令删旧回复，
 /// 再用截至上一条 user 的历史重跑 send_message（不新增 user 消息）。
+///
+/// 0.0.69 真续接:本命令**同时清 wire 快照**——重新生成是「重跑上一轮」,若留着旧快照,续接读回会把
+/// 已删的旧助手回复(及其 tool 历史)当权威重放、还会重复追加该 user。清掉后 send_message 会回退到
+/// 按前端截断后的历史重建,得到正确的「redo」语义(与 rewind/compact 清快照同理)。
 #[tauri::command]
 pub(crate) fn delete_last_assistant_message(
     state: State<AppState>,
     conversation_id: String,
 ) -> Result<bool, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    mdga_storage::delete_last_assistant_message(&db, &conversation_id).map_err(|e| e.to_string())
+    let deleted = mdga_storage::delete_last_assistant_message(&db, &conversation_id)
+        .map_err(|e| e.to_string())?;
+    let _ = mdga_storage::delete_wire_snapshot(&db, &conversation_id);
+    Ok(deleted)
 }
 
 /// 编辑已发消息 = 回退到此处（0.0.49，CC「rewind in here」+ 连文件回退）：删该会话「末尾 n 条」

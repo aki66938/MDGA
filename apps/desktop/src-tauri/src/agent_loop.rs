@@ -630,6 +630,56 @@ pub(crate) fn finalize_wire(wire: &mut Vec<serde_json::Value>) {
     }
 }
 
+/// 0.0.69 真续接:从 DB 读回本会话的 wire 快照(含完整 tool_use/tool_result 配对)。无 / 解析失败 → None。
+fn read_wire_snapshot(app: &AppHandle, conversation_id: &str) -> Option<Vec<serde_json::Value>> {
+    let state = app.state::<AppState>();
+    let db = state.db.lock().ok()?;
+    let json = mdga_storage::get_wire_snapshot(&db, conversation_id).ok()??;
+    serde_json::from_str::<Vec<serde_json::Value>>(&json).ok()
+}
+
+/// 0.0.69 真续接:用 wire 快照作为历史**权威**,只从前端取「新一轮 user 消息」追加,实现 CC 式逐事件续接
+/// ——崩溃/断额后快照里已执行的工具结果(含 tool_use/tool_result 配对)直接接续,而非把历史拍平成纯文本
+/// 让模型重规划。快照在 rewind/compact 时已被清(commands.rs:900/1087),故**快照存在即代表历史未被截改**、
+/// 可安全续接;regenerate/edit 走 rewind 同样清快照,故落到下方安全回退。
+///
+/// 组装:[fresh 的新鲜 system 前缀] ++ [快照里的非 system 历史] ++ [fresh 末条新 user],再 finalize 补孤儿。
+/// 安全卫(任一不满足即回退到 fres/前端重建,不引入风险):有非空快照、fresh 末条是新 user 轮。
+pub(crate) fn assemble_resume_wire(
+    snapshot: Option<Vec<serde_json::Value>>,
+    fresh: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    fn role(m: &serde_json::Value) -> &str {
+        m.get("role").and_then(|r| r.as_str()).unwrap_or("")
+    }
+    let snap = match snapshot {
+        Some(s) if !s.is_empty() => s,
+        _ => return fresh, // 无快照 / 空:首轮 / rewind / compact 后 → 前端重建
+    };
+    if fresh.last().map(role) != Some("user") {
+        return fresh; // 末条非新 user 轮:结构不符预期,稳妥回退
+    }
+    let fresh_system: Vec<serde_json::Value> =
+        fresh.iter().take_while(|m| role(m) == "system").cloned().collect();
+    let new_user = fresh.last().cloned().expect("checked last is user above");
+    let snap_history: Vec<serde_json::Value> =
+        snap.into_iter().filter(|m| role(&m) != "system").collect();
+    // 防重:快照历史末尾已是同一条新 user(如某操作未清快照而 regenerate)则不重复追加,避免连续重复 user。
+    let dup = snap_history.last().is_some_and(|m| {
+        role(m) == "user" && m.get("content") == new_user.get("content")
+    });
+    let mut wire = Vec::with_capacity(fresh_system.len() + snap_history.len() + 1);
+    wire.extend(fresh_system);
+    wire.extend(snap_history);
+    // **先** finalize 补孤儿 tool_result(置于历史末尾、即孤儿 assistant 之后),**再**追加新 user——
+    // 否则占位 tool 会落到新 user 之后,破坏「tool_use 紧跟 tool_result」配对、撞 Anthropic 400。
+    finalize_wire(&mut wire);
+    if !dup {
+        wire.push(new_user);
+    }
+    wire
+}
+
 /// Agent 工具循环：每轮带工具问模型、执行返回的工具、把结果回灌，直到模型不再调用工具
 /// （自然终止）或用户中断。不设轮数上限——上下文自动压缩兜底体积，取消按钮兜底失控；
 /// 所有工具执行前都经 SessionSecurityContext 裁决。
@@ -686,7 +736,10 @@ async fn chat_with_builtin_tools(
         .into_iter()
         .chain(mcp_bindings.iter().map(|b| b.schema.clone()))
         .collect();
-    let mut wire_messages = chat_messages_to_wire(messages);
+    // 0.0.69 真续接:优先用 DB 里的 wire 快照(含完整 tool_use/tool_result)作历史权威,只追加新一轮 user;
+    // 无快照(首轮 / rewind / compact 后)则回退到前端消息重建。崩溃/断额后由此真正接续而非纯文本重规划。
+    let mut wire_messages =
+        assemble_resume_wire(read_wire_snapshot(app, conversation_id), chat_messages_to_wire(messages));
     // 以传入的前置 usage 为初值（Plan21 #4），后续 merge_usage 在其上累加。
     let mut usage: Option<mdga_shared::RawUsage> = initial_usage;
     // 上一次响应返回的 prompt_tokens，作为当前上下文体积的真实信号，驱动轮内压缩。
@@ -1726,6 +1779,85 @@ mod tests {
 
     // 注（Plan28 P3-9）：messages_with_workspace_context 的 3 个单测已随该函数迁入
     // mdga-agent-core（crates/agent-core/src/messages.rs），此处不再保留。
+
+    // ── 0.0.69 真续接:assemble_resume_wire 不变量 ──
+    #[test]
+    fn resume_wire_no_snapshot_falls_back() {
+        let fresh = vec![
+            serde_json::json!({"role":"system","content":"sys"}),
+            serde_json::json!({"role":"user","content":"hi"}),
+        ];
+        assert_eq!(assemble_resume_wire(None, fresh.clone()), fresh);
+    }
+
+    #[test]
+    fn resume_wire_uses_snapshot_tool_history_and_appends_new_user() {
+        // 快照含完整 tool_use/tool_result 配对 + 陈旧 system;fresh 含新鲜 system + 文本历史 + 新 user。
+        let snapshot = vec![
+            serde_json::json!({"role":"system","content":"STALE-sys"}),
+            serde_json::json!({"role":"user","content":"q1"}),
+            serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"t1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+            serde_json::json!({"role":"tool","tool_call_id":"t1","content":"file contents"}),
+            serde_json::json!({"role":"assistant","content":"done"}),
+        ];
+        let fresh = vec![
+            serde_json::json!({"role":"system","content":"FRESH-sys"}),
+            serde_json::json!({"role":"user","content":"q1"}),
+            serde_json::json!({"role":"assistant","content":"done"}),
+            serde_json::json!({"role":"user","content":"q2"}),
+        ];
+        let out = assemble_resume_wire(Some(snapshot), fresh);
+        // 新鲜 system 换掉陈旧 system;快照的 tool 保真历史保留;末尾追加新 user q2。
+        assert_eq!(out.len(), 6);
+        assert_eq!(out[0]["content"], "FRESH-sys");
+        assert_eq!(out[2]["tool_calls"][0]["id"], "t1"); // tool_use 保留
+        assert_eq!(out[3]["role"], "tool"); // tool_result 保留(非拍平成文本)
+        assert_eq!(out[5]["content"], "q2"); // 新 user 追加
+    }
+
+    #[test]
+    fn resume_wire_finalizes_orphan_tool_before_new_user() {
+        // 崩溃在工具执行中途:快照末尾是声明 tool_call 却无 tool_result 的孤儿 assistant。
+        let snapshot = vec![
+            serde_json::json!({"role":"system","content":"sys"}),
+            serde_json::json!({"role":"user","content":"q1"}),
+            serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"orphan","type":"function","function":{"name":"run_command","arguments":"{}"}}]}),
+        ];
+        let fresh = vec![
+            serde_json::json!({"role":"system","content":"sys"}),
+            serde_json::json!({"role":"user","content":"继续"}),
+        ];
+        let out = assemble_resume_wire(Some(snapshot), fresh);
+        // 占位 tool_result 必须紧跟孤儿 assistant、在新 user 之前(否则撞 Anthropic 400)。
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[3]["role"], "tool");
+        assert_eq!(out[3]["tool_call_id"], "orphan");
+        assert_eq!(out[4]["role"], "user");
+        assert_eq!(out[4]["content"], "继续");
+    }
+
+    #[test]
+    fn resume_wire_falls_back_when_last_not_user() {
+        let snapshot = vec![serde_json::json!({"role":"user","content":"x"})];
+        let fresh = vec![
+            serde_json::json!({"role":"system","content":"sys"}),
+            serde_json::json!({"role":"assistant","content":"a"}),
+        ];
+        assert_eq!(assemble_resume_wire(Some(snapshot), fresh.clone()), fresh);
+    }
+
+    #[test]
+    fn resume_wire_dedups_trailing_same_user() {
+        let snapshot = vec![serde_json::json!({"role":"user","content":"q1"})];
+        let fresh = vec![
+            serde_json::json!({"role":"system","content":"sys"}),
+            serde_json::json!({"role":"user","content":"q1"}),
+        ];
+        let out = assemble_resume_wire(Some(snapshot), fresh);
+        // 不重复追加 → 只一条 user q1。
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["content"], "q1");
+    }
 
     #[test]
     fn verify_stall_guard_trips_on_repeated_signature() {
