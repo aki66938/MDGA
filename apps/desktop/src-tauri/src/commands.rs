@@ -1182,6 +1182,67 @@ pub(crate) fn set_command_sandbox(state: State<AppState>, enabled: bool) {
     state.command_sandbox.store(enabled, Ordering::SeqCst);
 }
 
+/// 把探测到的沙箱层级 + 是否降级翻译成给用户的人话（0.0.68 降级可观测）。
+/// **务必区分**「受限令牌(仍剥管理员特权 + Job 进程树 + 擦密钥)」与「完全裸跑」,不要把降级说成无保护。
+fn sandbox_layer_note(layer: Option<&str>, degraded: bool) -> String {
+    match (layer, degraded) {
+        (Some("appcontainer"), false) => {
+            "完整隔离：AppContainer——文件路径隔离(仅显式授权的工作区可读写)+ 网络默认拒绝。".to_string()
+        }
+        (Some("restricted"), _) | (_, true) => {
+            "受限沙箱(已降级)：仍剥管理员特权 + Job 进程树清理 + 擦密钥,但**无文件路径 / 网络隔离**\
+             (常见于被 dev 监视或文件数过大的工作区)。".to_string()
+        }
+        (Some(other), _) => format!("沙箱层级：{other}。"),
+        (None, false) => "未沙箱：命令直接裸跑,无任何隔离。".to_string(),
+    }
+}
+
+/// 探测当前工作区下命令**实际生效**的沙箱层级（0.0.68 降级可观测）：跑一条无害命令,回报
+/// AppContainer / 受限(降级) / 关闭 / 启动失败,供用户或 UI 确认「我现在到底有没有真隔离」,
+/// 而不是静默降级。只读、无副作用（仅 echo 一行)。
+#[tauri::command]
+pub(crate) fn probe_command_sandbox(
+    state: State<AppState>,
+    workspace: String,
+) -> Result<serde_json::Value, String> {
+    let enabled = state.command_sandbox.load(Ordering::SeqCst);
+    if !enabled {
+        return Ok(serde_json::json!({
+            "enabled": false, "layer": "none", "degraded": false,
+            "note": "命令沙箱已关闭：命令直接裸跑,无文件 / 网络隔离。"
+        }));
+    }
+    let ws = workspace.trim();
+    if ws.is_empty() {
+        return Err("当前会话无工作区,无法探测沙箱层级".to_string());
+    }
+    let policy = mdga_tool_runtime::CommandSandbox::for_session(true, false);
+    match mdga_tool_runtime::run_command_streaming(
+        ws,
+        mdga_tool_runtime::RunCommandRequest {
+            command: "echo mdga-sandbox-probe".to_string(),
+            timeout_secs: Some(30),
+            background: false,
+        },
+        None,
+        None,
+        policy,
+    ) {
+        Ok(r) => Ok(serde_json::json!({
+            "enabled": true,
+            "layer": r.sandbox_layer,
+            "degraded": r.sandbox_degraded,
+            "note": sandbox_layer_note(r.sandbox_layer.as_deref(), r.sandbox_degraded),
+        })),
+        Err(e) => Ok(serde_json::json!({
+            "enabled": true, "layer": serde_json::Value::Null, "degraded": true,
+            "error": e.to_string(),
+            "note": "沙箱启动失败：已 fail-closed(命令会被拒绝执行,不会裸跑)。"
+        })),
+    }
+}
+
 /// 导出单个会话为 Markdown 文件（数据治理：用户可导出/备份）。
 #[tauri::command]
 pub(crate) fn export_conversation(
