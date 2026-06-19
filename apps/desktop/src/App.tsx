@@ -1075,14 +1075,29 @@ export function App() {
         images: outImages.map((img) => ({ mediaType: img.mediaType, base64: img.base64 })),
       });
     } catch (err) {
+      const errText = humanizeError(String(err));
+      // 0.0.69 异常落库：保留**已流式产出的部分助手输出**(streamingPartsRef:叙述+工具卡片)并追加中断
+      // 提示,而非整体丢成一行错误。有实质部分输出时持久化进 messages 表,使其在**重载后仍可见**——与
+      // wire 快照里的接续状态(下一轮真续接会从中断处接着干)对齐,不再「异常全丢」。
+      const hadPartial =
+        streamingPartsRef.current.length > 0 || streamingTextRef.current.trim().length > 0;
+      const finalParts: MessagePart[] = hadPartial
+        ? [...streamingPartsRef.current, { type: "notice", text: `本轮中断：${errText}` }]
+        : [{ type: "text", content: errText }];
       setMessages((prev) => {
         const updated = [...prev];
-        updated[updated.length - 1] = {
-          role: "assistant",
-          parts: [{ type: "text", content: humanizeError(String(err)) }],
-        };
+        updated[updated.length - 1] = { role: "assistant", parts: finalParts };
         return updated;
       });
+      if (hadPartial) {
+        await invoke("persist_message", {
+          conversationId: finalConvId,
+          role: "assistant",
+          content: streamingTextRef.current,
+          usageJson: streamingUsageRef.current ? JSON.stringify(streamingUsageRef.current) : null,
+          partsJson: JSON.stringify(finalParts),
+        }).catch(() => {});
+      }
       // 发送失败恢复附图（Plan20 🟠5）：把本轮已快照清空的附图还原回托盘，避免用户重选。
       if (outImages.length > 0) setPendingImages(outImages);
       setSending(false);
