@@ -13,6 +13,7 @@ import type {
   TodoItem, Message, ToolPart, VisionPart, ReasoningPart, RenderBlock, UsageSummary,
 } from "../types";
 import { formatUsd } from "../utils";
+import { WidgetCard } from "./widget";
 
 export function TodoPanel({ items }: { items: TodoItem[] }) {
   // Agent 自维护任务清单：常驻输入框上方，实时反映多步任务进度。
@@ -33,7 +34,14 @@ export function TodoPanel({ items }: { items: TodoItem[] }) {
 
 // ── MessageContent ──────────────────────────────────────────────────────────
 
-export function MessageContent({ msg }: { msg: Message }) {
+export function MessageContent({
+  msg,
+  onSendPrompt,
+}: {
+  msg: Message;
+  /** widget 内 sendPrompt(text) 回灌到 agent 的发送函数（透传给 WidgetCard）。 */
+  onSendPrompt?: (text: string) => void;
+}) {
   // 连续的工具卡片聚合成一个可折叠组；叙述文字与通知保持原位，时间轴不变。
   const blocks: RenderBlock[] = [];
   msg.parts.forEach((part, i) => {
@@ -98,6 +106,9 @@ export function MessageContent({ msg }: { msg: Message }) {
         }
         if (part.type === "reasoning") {
           return <ReasoningCard key={index} part={part} />;
+        }
+        if (part.type === "widget") {
+          return <WidgetCard key={index} part={part} onSendPrompt={onSendPrompt} />;
         }
         return (
           <div key={index} className="notice-inline" aria-label="系统通知">

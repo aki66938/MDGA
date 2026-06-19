@@ -136,7 +136,21 @@ export type VisionPart = {
  */
 export type ReasoningPart = { type: "reasoning"; content: string };
 
-export type MessagePart = TextPart | ToolPart | NoticePart | ImagePart | VisionPart | ReasoningPart;
+/**
+ * 部件画布块（0.0.67）：模型通过 show_widget 工具产出 agent 编写的 HTML/SVG/JS，
+ * 前端在 sandbox="allow-scripts"（绝不带 allow-same-origin）的 iframe 中内联渲染。
+ * code 为不可信内容（agent 生成、可能被 prompt 注入），必须完全隔离；随消息 parts 持久化。
+ */
+export type WidgetPart = { type: "widget"; code: string; title?: string; kind?: "svg" | "html" };
+
+export type MessagePart =
+  | TextPart
+  | ToolPart
+  | NoticePart
+  | ImagePart
+  | VisionPart
+  | ReasoningPart
+  | WidgetPart;
 
 export type Message = {
   role: "user" | "assistant";
@@ -361,5 +375,5 @@ export type PaletteItem = {
 
 /** 渲染块：单个非工具 part，或一段连续的工具调用（聚合为可折叠组） */
 export type RenderBlock =
-  | { kind: "part"; part: TextPart | NoticePart | ImagePart | VisionPart | ReasoningPart; index: number }
+  | { kind: "part"; part: TextPart | NoticePart | ImagePart | VisionPart | ReasoningPart | WidgetPart; index: number }
   | { kind: "tools"; parts: ToolPart[]; index: number };

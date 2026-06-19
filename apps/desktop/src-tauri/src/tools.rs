@@ -165,6 +165,8 @@ pub(crate) const PARALLEL_READONLY_TOOLS: &[&str] = &[
     "code_overview",
     "repo_map",
     "code_search",
+    // show_widget（0.0.67）：纯渲染、零副作用,可并行。
+    "show_widget",
     // repo_wiki（R11）刻意不在此列:其 build 动作会重写 .mdga/wiki 缓存(清旧 .md + 原子写),
     // 并发 build 可能在同一缓存目录上交错,故保持 repo_wiki 串行执行(query 虽纯读,但工具名
     // 粒度无法区分 action,从严按可写处理)。
@@ -429,6 +431,22 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                         "enrich": { "type": "boolean", "description": "For action='build' only: ALSO add a short LLM prose summary per section (one bounded provider call each, cached by section fingerprint; falls back to the deterministic section on failure). Costs paid API calls. Defaults to false (offline, deterministic, no LLM)." }
                     },
                     "required": [],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "show_widget",
+                "description": "Render a visual WIDGET inline in the conversation — agent-authored HTML/SVG/JS shown to the user in a sandboxed canvas. Use it to SHOW the user something visual or interactive: UI mockups, diagrams, flowcharts, charts/dashboards, calculators, interactive forms, before/after comparisons. `code` is raw SVG (must start with `<svg`) OR an HTML fragment (NO doctype/html/head/body wrapper — just body content; inline <style> and <script> are allowed). It renders in a STRICT SANDBOX: no network, no filesystem, no access to the app or its data — so never try to fetch user data from inside it; put any needed data directly in the code. The widget may call two host bridge functions: `sendPrompt(text)` (send a message to you as if the user typed it — wire buttons/inputs to it to make the widget interactive) and `openLink(url)` (open an http(s) link in the user's browser, with the user's confirmation). Use the CSS variables the host injects (e.g. var(--color-text), var(--color-bg), var(--color-text-secondary), var(--brand), var(--border)) so it matches the app's light/dark theme. Keep it self-contained; external libraries load ONLY from cdnjs.cloudflare.com / cdn.jsdelivr.net.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string", "description": "The widget source: raw SVG (starts with <svg) or an HTML body fragment (no doctype/html/head wrapper). Inline <style>/<script> allowed. Max 512KB." },
+                        "title": { "type": "string", "description": "Optional short caption shown above the widget." }
+                    },
+                    "required": ["code"],
                     "additionalProperties": false
                 }
             }
@@ -1185,6 +1203,7 @@ pub(crate) fn execute_builtin_tool_call(
         "repo_map" => execute_repo_map(workspace_path, arguments),
         "code_search" => execute_code_search(workspace_path, arguments),
         "repo_wiki" => execute_repo_wiki(workspace_path, arguments),
+        "show_widget" => execute_show_widget(arguments),
         "move_path" => {
             let request = serde_json::from_str::<MovePathRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
@@ -1663,6 +1682,40 @@ pub(crate) fn execute_repo_wiki_enriched(
         );
     }
     Ok(value)
+}
+
+/// show_widget 工具（0.0.67）：把 agent 写的 HTML/SVG/JS 作为「画布 widget」内联渲染到对话里。
+///
+/// 后端**完全惰性**：只校验 code(非空、≤512KB)并判类型(svg/html),不执行、不存储——真正的渲染由
+/// 前端在**沙箱 iframe**(sandbox="allow-scripts"、null origin、严格 CSP、断网、fail-closed 自检)里做。
+/// widget 代码本身随工具调用参数(inputJson)走到前端,故此处不回传 code。
+fn execute_show_widget(arguments: &str) -> Result<serde_json::Value, String> {
+    #[derive(serde::Deserialize)]
+    struct ShowWidgetArgs {
+        code: String,
+        #[serde(default)]
+        title: Option<String>,
+    }
+    const MAX_WIDGET_BYTES: usize = 512 * 1024;
+    let args = serde_json::from_str::<ShowWidgetArgs>(arguments.trim())
+        .map_err(|err| format!("工具参数解析失败: {err}"))?;
+    if args.code.trim().is_empty() {
+        return Err("show_widget 的 code 不能为空".to_string());
+    }
+    if args.code.len() > MAX_WIDGET_BYTES {
+        return Err("widget 代码过大（上限 512KB）".to_string());
+    }
+    let kind = if args.code.trim_start().starts_with("<svg") {
+        "svg"
+    } else {
+        "html"
+    };
+    Ok(serde_json::json!({
+        "ok": true,
+        "kind": kind,
+        "title": args.title,
+        "bytes": args.code.len(),
+    }))
 }
 
 pub(crate) fn execute_create_file_tool_call(
