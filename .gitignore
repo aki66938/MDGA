@@ -36,3 +36,6 @@ desktop.ini
 # Agent 运行时大输出落盘（非源码）
 .mdga/tool-results/
 .mdga/tasks/
+# R12 情景记忆归档 / repo_wiki 派生数据（运行时生成、可重建,非源码）
+.mdga/archive/
+.mdga/wiki/
