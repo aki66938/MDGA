@@ -1737,6 +1737,11 @@ pub(crate) async fn install_update(app: AppHandle) -> Result<(), String> {
 pub(crate) fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
     let u = url.trim();
+    // 拒绝含控制字符（\n / \r / \t / NUL 等）的 URL：防止换行拼接的解析歧义 / 日志注入,
+    // 也让前端确认框展示的就是将要打开的整串(无隐藏行)。
+    if u.is_empty() || u.chars().any(|c| c.is_control()) {
+        return Err("链接为空或含非法控制字符".to_string());
+    }
     if !(u.starts_with("http://") || u.starts_with("https://")) {
         return Err("仅允许打开 http(s) 链接".to_string());
     }
