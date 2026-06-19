@@ -842,6 +842,45 @@ export function App() {
           // 输出非 JSON 时忽略
         }
       }
+      // show_widget（0.0.67）特例：成功时把 agent 编写的 HTML/SVG/JS 作为 WidgetPart 插入
+      // （而非通用 ToolPart），让用户直接看到渲染后的部件。code/title 在 inputJson，kind 在 outputJson。
+      // running/failed 不留卡片（保持安静；失败时模型通常会另行说明）。
+      if (toolName === "show_widget") {
+        if (status !== "succeeded") return; // running/failed：不插入任何卡片
+        let code = "";
+        let widgetTitle: string | undefined;
+        let kind: "svg" | "html" | undefined;
+        try {
+          const inp = JSON.parse(inputJson ?? "{}") as Record<string, unknown>;
+          if (typeof inp.code === "string") code = inp.code;
+          if (typeof inp.title === "string") widgetTitle = inp.title;
+        } catch {
+          // inputJson 异常：无 code 可渲染，放弃
+        }
+        if (!code) return;
+        if (outputJson) {
+          try {
+            const out = JSON.parse(outputJson) as Record<string, unknown>;
+            if (out.kind === "svg" || out.kind === "html") kind = out.kind;
+          } catch {
+            // 输出非 JSON 时忽略 kind
+          }
+        }
+        setMessages((prev) => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          const last = updated[lastIdx];
+          if (!last || last.role !== "assistant") return prev;
+          const parts: MessagePart[] = [
+            ...last.parts,
+            { type: "widget", code, title: widgetTitle, kind },
+          ];
+          updated[lastIdx] = { ...last, parts };
+          streamingPartsRef.current = parts;
+          return updated;
+        });
+        return;
+      }
       setMessages((prev) => {
         const updated = [...prev];
         const lastIdx = updated.length - 1;
@@ -1674,7 +1713,10 @@ export function App() {
               return (
                 <div key={i} className="message-row">
                   <div className={`message message--${msg.role}`}>
-                    <MessageContent msg={msg} />
+                    <MessageContent
+                      msg={msg}
+                      onSendPrompt={(text) => { void sendText(text); }}
+                    />
                   </div>
                   <MessageActions
                     msg={msg}

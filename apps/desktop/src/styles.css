@@ -1227,6 +1227,22 @@ h1 {
   overflow: hidden;
 }
 
+/* 部件画布（0.0.67）：沙箱 iframe 的外壳。iframe 自身的边框/圆角在组件内联设定，
+   这里只负责外间距与可选标题。 */
+.widget-card {
+  margin: 8px 0;
+}
+
+.widget-card__title {
+  font-size: 12px;
+  color: var(--text-2);
+  margin-bottom: 4px;
+}
+
+.widget-card__frame {
+  display: block;
+}
+
 .vision-card__summary {
   display: flex;
   align-items: center;
