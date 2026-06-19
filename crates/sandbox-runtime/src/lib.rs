@@ -130,17 +130,15 @@ pub fn is_low_risk_command(command: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    if trimmed.contains("&&")
-        || trimmed.contains("||")
-        || trimmed.contains('|')
-        || trimmed.contains(';')
-        || trimmed.contains('>')
-        || trimmed.contains('<')
-        || trimmed.contains('`')
-        || trimmed.contains('&')
-        || trimmed.contains('$')
-        || trimmed.contains('%')
-        || trimmed.chars().any(|c| c.is_control())
+    // 0.0.68 加固(对抗式审查补强):**黑名单注定漏项**——PowerShell 参数位会对子表达式求值执行命令,
+    // 不止 $(...),还有 (...)、@(...)、.(...)、&{...} 等,黑名单永远补不全(审查实证 echo (Get-Content .env)
+    // 等能借 echo/type/dir 前缀零审批执行任意命令并读密钥)。故改用**正向白名单**:整条命令只允许
+    // [字母数字 + 空格 + 常见路径/参数字符],出现任何其它字符(含 ( ) @ { } $ % ` ; | & 等求值/串联算子、
+    // 控制字符)即不算低风险。白名单命令(cargo/npm/git/echo/dir…)本不需要这些字符;需要则走正常审批。
+    const SAFE_ARG_CHARS: &str = " _-./\\:=,\"'~+";
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || SAFE_ARG_CHARS.contains(c))
     {
         return false;
     }
@@ -287,12 +285,23 @@ mod tests {
         assert!(!is_low_risk_command("git status | cat"));
         assert!(!is_low_risk_command("echo hi > file"));
         assert!(!is_low_risk_command(""));
-        // 0.0.68 加固:子表达式 / 变量展开 / 多行借白名单前缀(echo/dir)逃审，一律拒绝。
+        // 0.0.68 加固:子表达式 / 变量展开 / 多行 / 各类求值算子借白名单前缀(echo/type/dir)逃审,一律拒绝。
         assert!(!is_low_risk_command("echo $(rm -rf x)"));
         assert!(!is_low_risk_command("echo $env:DEEPSEEK_API_KEY"));
         assert!(!is_low_risk_command("echo %PATH%"));
         assert!(!is_low_risk_command("echo a\nrm -rf x"));
-        assert!(!is_low_risk_command("dir; rm x")); // 已被 ';' 覆盖,锚定不回归
+        assert!(!is_low_risk_command("dir; rm x"));
+        // 审查补强:圆括号 / 数组 / 点调用子表达式(黑名单漏项,现由正向白名单兜住)。
+        assert!(!is_low_risk_command("echo (Get-Content .env)"));
+        assert!(!is_low_risk_command("echo @(Get-Content .env)"));
+        assert!(!is_low_risk_command("echo .(whoami)"));
+        assert!(!is_low_risk_command("type (Get-Content secret)"));
+        assert!(!is_low_risk_command("echo &{whoami}"));
+        // 正向白名单不能误杀常见合法用法(否则徒增审批噪音):这些都匹配白名单前缀、且只含安全字符。
+        assert!(is_low_risk_command("cargo test --all-features"));
+        assert!(is_low_risk_command("git diff HEAD~1")); // ~ 在安全集
+        assert!(is_low_risk_command("git log --grep=fix")); // = 在安全集
+        assert!(is_low_risk_command("cargo test mod::name")); // : 在安全集
     }
 
     #[test]

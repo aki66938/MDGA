@@ -90,8 +90,19 @@ fn permission_rule_for(tool_name: &str, arguments: &str) -> String {
     format!("tool:{tool_name}")
 }
 
-/// 极简 glob 匹配：`*` 与 `**` 都视为「任意字符序列（含 /）」，支持 `**/.env`、`src/**`、`*.env`。
+/// 极简 glob 匹配。0.0.68 加固:`**/` 前缀按「**零或多段**」语义处理——`**/.env` 既匹配 `src/.env`
+/// 也匹配工作区根目录的裸 `.env`(否则 `**`→`*` 折叠后末段 `/.env` 要求路径含 `/`,会漏掉最常见的
+/// 根目录 .env,使 `deny:read_file:**/.env` 这条最自然的规则保护不到根 .env)。
 fn glob_match(pattern: &str, text: &str) -> bool {
+    if let Some(rest) = pattern.strip_prefix("**/") {
+        // 既试「至少一段 + /rest」(glob_match_inner 原语义),也试「rest 直接匹配 text」(零段)。
+        return glob_match_inner(pattern, text) || glob_match_inner(rest, text);
+    }
+    glob_match_inner(pattern, text)
+}
+
+/// glob 匹配核心：`*` 与 `**` 都视为「任意字符序列（含 /）」，支持 `src/**`、`*.env`。
+fn glob_match_inner(pattern: &str, text: &str) -> bool {
     // 把 ** 折叠为 *，再按 * 切段，依次顺序匹配（首段需前缀对齐、末段需后缀对齐）。
     let pat = pattern.replace("**", "*");
     let parts: Vec<&str> = pat.split('*').collect();
@@ -159,10 +170,11 @@ fn rule_decision(rule: &str, tool_name: &str, arguments: &str) -> Option<bool> {
                         .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(str::to_string))
                 })
                 .unwrap_or_default();
-            // 0.0.68 加固:路径归一化后再匹配——把反斜杠折成正斜杠、双方统一小写。否则 Windows(文件系统
-            // 大小写不敏感)下 `deny:read_file:**/.env` 会被 `.ENV` 或 `config\.env` 等等价写法绕过。
+            // 0.0.68 加固:路径归一化后再匹配——**先 trim**(与 read 侧 validate_relative_path 的
+            // path.trim() 对齐,否则 `.env ` 尾空格让 deny 落空、读时却被 trim 成 `.env` 真读出密钥)、
+            // 把反斜杠折成正斜杠、双方统一小写(Windows 文件系统大小写不敏感,挡 `.ENV`/`config\.env` 等价写法)。
             // 归一化对 deny 是收紧(更安全)、对 allow 仅在用户自建规则下极小幅放宽,且本就匹配同一文件。
-            let norm = |s: &str| s.replace('\\', "/").to_lowercase();
+            let norm = |s: &str| s.trim().replace('\\', "/").to_lowercase();
             if glob_match(&norm(glob), &norm(&path)) {
                 return Some(effect);
             }
@@ -464,6 +476,7 @@ mod tests {
     #[test]
     fn glob_match_handles_wildcards() {
         assert!(glob_match("**/.env", "src/config/.env"));
+        assert!(glob_match("**/.env", ".env")); // 0.0.68:**/ 零段,命中根目录裸 .env
         assert!(glob_match("src/**", "src/a/b.rs"));
         assert!(glob_match("*.env", ".env"));
         assert!(glob_match("*.env", "prod.env"));
@@ -488,11 +501,14 @@ mod tests {
             permission_rules_decision(&rules, "read_file", "{\"path\":\"src/.env\"}"),
             Some(false)
         );
-        // 0.0.68 加固:大小写 / 反斜杠等价写法不能绕过 deny:**/.env(Windows FS 大小写不敏感)。
+        // 0.0.68 加固(含审查补强):大小写 / 反斜杠 / 根目录裸 .env / 尾空格等价写法都不能绕过
+        // deny:**/.env(Windows FS 大小写不敏感;读侧 validate_relative_path 会 trim 尾空格)。
         for p in [
             "{\"path\":\"src/.ENV\"}",
             "{\"path\":\"config\\\\.env\"}",
             "{\"path\":\"CONFIG\\\\.Env\"}",
+            "{\"path\":\".env\"}",   // 根目录裸 .env(Fix 3:**/ 零段)
+            "{\"path\":\".env \"}",  // 尾空格(Fix 2:trim 对齐读侧)
         ] {
             assert_eq!(
                 permission_rules_decision(&rules, "read_file", p),
