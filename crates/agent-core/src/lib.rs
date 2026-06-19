@@ -22,7 +22,10 @@ mod usage;
 mod verification;
 
 // 内核公开面：桌面端按既有引用路径 `mdga_agent_core::<名>` 直接取用。
-pub use compaction::context_soft_limit_for;
+pub use compaction::{
+    context_compaction_trigger, context_soft_limit_for, CompactionTrigger,
+    CONTEXT_LOSSLESS_FLOOR_TOKENS,
+};
 pub use loop_guard::{is_stale, FileFingerprint, SequenceLoopDetector};
 pub use messages::{messages_with_workspace_context, read_workspace_memory};
 pub use prompt::{CODE_OF_CONDUCT, IDENTITY_ANCHOR, TOOL_DISCIPLINE};

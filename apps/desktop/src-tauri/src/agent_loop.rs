@@ -34,7 +34,8 @@ use crate::web::{execute_web_fetch, execute_web_search};
 use crate::{commands::permission_mode_from_str, record_tool_event};
 // Plan28 P3-9：内核纯逻辑（消息构建 / 记忆读取 / 压缩软上限 / 验证探测 / usage 合并）已迁入 agent-core。
 use mdga_agent_core::{
-    context_soft_limit_for, detect_verification_plan, focused_command, format_verify_feedback,
+    context_compaction_trigger, context_soft_limit_for, detect_verification_plan, focused_command,
+    format_verify_feedback,
     is_stale, merge_usage, messages_with_workspace_context, parse_report, parse_review,
     read_workspace_memory, report_signature, FileFingerprint, ReviewVerdict, VerifyKind,
     REVIEW_RUBRIC,
@@ -714,6 +715,10 @@ async fn chat_with_builtin_tools(
     // 此处 context_window 即上方从 ROLE_MAIN 解析出的 main_context_window（见函数顶部 resolve_role_provider(ROLE_MAIN)）。
     // 整轮恒定，故循环外算一次：既用于压缩触发判断，也作为 context-usage 事件的 softLimit（None ⇒ 前端隐藏指示器）。
     let soft_limit: Option<u64> = context_soft_limit_for(context_window);
+    // 0.0.68 无损下限护栏:压缩触发改用 context_compaction_trigger——主模型未填窗口时不再「完全不压缩」,
+    // 而是在保守下限之上做**只无损**(凝练/短桩,可从归档重读)的压缩、绝不有损摘要、绝不臆断窗口大小。
+    // soft_limit(上面)仍只反映真实窗口,供指示器显示(None ⇒ 隐藏),护栏不当作窗口显示——守 0.0.61 红线。
+    let compaction = context_compaction_trigger(context_window);
 
     let mut round: usize = 0;
     loop {
@@ -745,10 +750,10 @@ async fn chat_with_builtin_tools(
         //   ② 短桩：再不够则把更早的大结果换成短桩（彻底丢语义，但已归档可重读）；
         //   ③ 摘要：连桩都无可压仍超限，触发 auto-compact 把旧历史压成任务进度摘要。
         // 工作记忆（wire_messages）由此被有界约束，情景记忆（.mdga/archive）累积全量、永不回灌但可检索。
-        // 0.0.61：soft_limit 为 Option——仅当主模型有用户自定义窗口（Some(limit)）时才做窗口驱动压缩；
-        // None（主模型未填窗口）⇒ 跳过整段压缩，由端点自身上下文上限兜底。
-        if let Some(limit) = soft_limit {
-        if last_prompt_tokens > limit {
+        // 0.0.68：触发阈值改用 compaction.limit（真实窗口 / env / 下限护栏,始终有值）。
+        // 主模型有真实窗口 ⇒ 完整三级(凝练→短桩→有损摘要);未填窗口 ⇒ 下限护栏只做①②两级无损,
+        // allow_summary=false 时跳过③有损摘要,绝不在无窗口时擅自有损 / 臆断窗口大小（守 0.0.61 红线）。
+        if last_prompt_tokens > compaction.limit {
             let condensed = condense_tool_outputs(
                 workspace_path,
                 conversation_id,
@@ -774,7 +779,9 @@ async fn chat_with_builtin_tools(
                         "context-compacted",
                         serde_json::json!({ "kind": "stub", "count": compacted }),
                     );
-                } else {
+                } else if compaction.allow_summary {
+                    // ③有损摘要：仅在用户填了真实窗口(或 env)时才触发。无损护栏走到这里则**不再压缩**,
+                    // 交端点自身上下文上限兜底——绝不在无窗口时擅自把对话压成有损摘要。
                     let _ = app.emit("agent-status", serde_json::json!({ "state": "compacting" }));
                     let (new_wire, summary_usage) = summarize_wire_history(
                         base_url,
@@ -796,7 +803,6 @@ async fn chat_with_builtin_tools(
                     );
                 }
             }
-        }
         }
 
         // 推送轮次进度与思考状态，让前端展示「第 N 轮 · 思考中」而非黑盒等待。
