@@ -590,9 +590,13 @@ fn persist_wire(app: &AppHandle, conversation_id: &str, wire: &[serde_json::Valu
     };
     let state = app.state::<AppState>();
     let Ok(db) = state.db.lock() else {
+        eprintln!("[wire] persist 跳过:db 锁不可用(快照可能落后于已执行工具,续接或重做)");
         return;
     };
-    let _ = mdga_storage::save_wire_snapshot(&db, conversation_id, &json);
+    // 0.0.69:落库失败不再完全静默——快照落后于已执行的有副作用工具会致续接重放,至少留日志便于诊断。
+    if let Err(e) = mdga_storage::save_wire_snapshot(&db, conversation_id, &json) {
+        eprintln!("[wire] persist 失败({e}):快照可能落后于已执行工具,续接时该工具或被重做");
+    }
 }
 
 /// P1.5:给已声明 tool_calls 却无对应 tool 结果的孤儿(中断在工具执行中途)补占位 tool 消息,
@@ -630,6 +634,16 @@ pub(crate) fn finalize_wire(wire: &mut Vec<serde_json::Value>) {
     }
 }
 
+/// 0.0.69:粗略估算 wire 的 token 体积(序列化字节数 / 3,偏保守高估)。仅用于「续接首轮」是否触发压缩
+/// 护栏的初值——真实 prompt_tokens 在首个响应后即校正。高估顶多多压一次无损;低估才危险(漏压超限快照)。
+pub(crate) fn estimate_wire_tokens(wire: &[serde_json::Value]) -> u64 {
+    let bytes: usize = wire
+        .iter()
+        .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
+        .sum();
+    (bytes / 3) as u64
+}
+
 /// 0.0.69 真续接:从 DB 读回本会话的 wire 快照(含完整 tool_use/tool_result 配对)。无 / 解析失败 → None。
 fn read_wire_snapshot(app: &AppHandle, conversation_id: &str) -> Option<Vec<serde_json::Value>> {
     let state = app.state::<AppState>();
@@ -662,18 +676,32 @@ pub(crate) fn assemble_resume_wire(
     let fresh_system: Vec<serde_json::Value> =
         fresh.iter().take_while(|m| role(m) == "system").cloned().collect();
     let new_user = fresh.last().cloned().expect("checked last is user above");
+    // 0.0.69 修正:保留 fresh 中**末条 user 之前紧邻的连续 system**——视觉分析 / 「批准执行计划」等是插在
+    // 末条 user 之前的**非前导** system 注入,既不在前导 fresh_system、又被快照按 system 过滤掉,不单独
+    // 保留就会在续接轮静默丢掉本轮图片分析 / 严格按计划约束。
+    let last_idx = fresh.len() - 1;
+    let mut tail_start = last_idx;
+    while tail_start > 0 && role(&fresh[tail_start - 1]) == "system" {
+        tail_start -= 1;
+    }
+    // 关键:trailing_system 必须**排除前导 system 块**——否则 fresh=[system, user](无中间历史)时,该
+    // 唯一 system 既是前导(进 fresh_system)又紧邻 user,会被重复计入。clamp 到前导块之后即只取非前导段。
+    let tail_start = tail_start.max(fresh_system.len());
+    let trailing_system: Vec<serde_json::Value> = fresh[tail_start..last_idx].to_vec();
     let snap_history: Vec<serde_json::Value> =
         snap.into_iter().filter(|m| role(&m) != "system").collect();
     // 防重:快照历史末尾已是同一条新 user(如某操作未清快照而 regenerate)则不重复追加,避免连续重复 user。
     let dup = snap_history.last().is_some_and(|m| {
         role(m) == "user" && m.get("content") == new_user.get("content")
     });
-    let mut wire = Vec::with_capacity(fresh_system.len() + snap_history.len() + 1);
+    let mut wire =
+        Vec::with_capacity(fresh_system.len() + snap_history.len() + trailing_system.len() + 1);
     wire.extend(fresh_system);
     wire.extend(snap_history);
-    // **先** finalize 补孤儿 tool_result(置于历史末尾、即孤儿 assistant 之后),**再**追加新 user——
-    // 否则占位 tool 会落到新 user 之后,破坏「tool_use 紧跟 tool_result」配对、撞 Anthropic 400。
+    // **先** finalize 补孤儿 tool_result(置于历史末尾、即孤儿 assistant 之后),再接非前导 system,
+    // **最后**才追加新 user——否则占位 tool 落到新 user 之后会破坏「tool_use 紧跟 tool_result」配对撞 400。
     finalize_wire(&mut wire);
+    wire.extend(trailing_system);
     if !dup {
         wire.push(new_user);
     }
@@ -743,7 +771,10 @@ async fn chat_with_builtin_tools(
     // 以传入的前置 usage 为初值（Plan21 #4），后续 merge_usage 在其上累加。
     let mut usage: Option<mdga_shared::RawUsage> = initial_usage;
     // 上一次响应返回的 prompt_tokens，作为当前上下文体积的真实信号，驱动轮内压缩。
-    let mut last_prompt_tokens: u64 = 0;
+    // 0.0.69 修正:初值改用**组装后 wire 的粗略体积估算**(而非 0)——否则续接首轮 `0 > limit` 恒 false、
+    // 跳过压缩护栏,超限快照会原样回放撞端点上下文上限(且该错不可重试、不清快照 ⇒ 续接永久卡死)。
+    // 估算偏保守(高估),首个真实响应后即由 round_usage 校正;首轮小 wire 估算亦小,不会误压。
+    let mut last_prompt_tokens: u64 = estimate_wire_tokens(&wire_messages);
     // 验证回路（Plan25 #7）：记录是否发生过写类工具改动 + 已进行的验证自纠轮数（上限 VERIFY_MAX_ROUNDS）。
     let mut edits_made = false;
     let mut verify_rounds: usize = 0;
@@ -1857,6 +1888,29 @@ mod tests {
         // 不重复追加 → 只一条 user q1。
         assert_eq!(out.len(), 2);
         assert_eq!(out[1]["content"], "q1");
+    }
+
+    #[test]
+    fn resume_wire_keeps_non_leading_system_before_new_user() {
+        // 审查修复:视觉分析 / 批准执行计划等**非前导** system(插在末条 user 之前)续接时不能丢。
+        let snapshot = vec![
+            serde_json::json!({"role":"system","content":"stale"}),
+            serde_json::json!({"role":"user","content":"q1"}),
+            serde_json::json!({"role":"assistant","content":"a1"}),
+        ];
+        let fresh = vec![
+            serde_json::json!({"role":"system","content":"lead-sys"}),
+            serde_json::json!({"role":"user","content":"q1"}),
+            serde_json::json!({"role":"assistant","content":"a1"}),
+            serde_json::json!({"role":"system","content":"VISION-ANALYSIS"}), // 非前导注入
+            serde_json::json!({"role":"user","content":"q2"}),
+        ];
+        let out = assemble_resume_wire(Some(snapshot), fresh);
+        let n = out.len();
+        assert_eq!(out[0]["content"], "lead-sys"); // 前导用新鲜 system
+        assert_eq!(out[n - 1]["content"], "q2"); // 新 user 在最后
+        assert_eq!(out[n - 2]["role"], "system"); // 非前导 system 紧贴新 user 之前、被保留
+        assert_eq!(out[n - 2]["content"], "VISION-ANALYSIS");
     }
 
     #[test]

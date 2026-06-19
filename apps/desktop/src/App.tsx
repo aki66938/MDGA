@@ -1081,8 +1081,16 @@ export function App() {
       // wire 快照里的接续状态(下一轮真续接会从中断处接着干)对齐,不再「异常全丢」。
       const hadPartial =
         streamingPartsRef.current.length > 0 || streamingTextRef.current.trim().length > 0;
+      // 文案诚实(0.0.69 审查):**已执行的工具结果**在 wire 快照里、下次会真接续;但若中断发生在模型刚开始
+      // 回复(工具尚未执行),这段叙述不会带入下一轮,模型会从你的上一条消息重新开始。不夸大「进度已接续」。
       const finalParts: MessagePart[] = hadPartial
-        ? [...streamingPartsRef.current, { type: "notice", text: `本轮中断：${errText}` }]
+        ? [
+            ...streamingPartsRef.current,
+            {
+              type: "notice",
+              text: `本轮中断：${errText}。已执行的步骤会在下次继续时接续；若本轮尚未动工具,模型将从你的上一条消息重新开始。`,
+            },
+          ]
         : [{ type: "text", content: errText }];
       setMessages((prev) => {
         const updated = [...prev];

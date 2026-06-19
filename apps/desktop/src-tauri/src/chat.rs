@@ -158,10 +158,14 @@ pub(crate) fn assistant_message_for_tool_calls(
     assistant_message: serde_json::Value,
     tool_calls: &[ToolCall],
 ) -> serde_json::Value {
+    // 0.0.69 修正:早返条件须是「存在且**非空**」的 tool_calls。流式客户端恒写 `"tool_calls": []`(即便
+    // 为空),旧版 `.is_some()` 对空数组也命中早返,致 DSML/正文兜底恢复出的 tool_calls **没挂回** assistant
+    // ——wire 出现无配对 tool_call_id 的 tool 消息(撞 Anthropic/OpenAI 400),还被快照持久化、续接每轮重放
+    // 卡死。改判非空:仅当模型真给了原生 tool_calls 才原样返回,否则用恢复出的 tool_calls 重建 assistant 消息。
     if assistant_message
         .get("tool_calls")
         .and_then(|calls| calls.as_array())
-        .is_some()
+        .is_some_and(|calls| !calls.is_empty())
     {
         return assistant_message;
     }
@@ -183,4 +187,45 @@ pub(crate) fn chat_messages_to_wire(messages: Vec<ChatMessage>) -> Vec<serde_jso
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mdga_deepseek_client::ToolFunctionCall;
+
+    fn tc(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: ToolFunctionCall {
+                name: "run_command".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn dsml_recovered_tool_calls_attach_when_native_empty() {
+        // 0.0.69 回归:流式客户端恒写 tool_calls:[](空数组),旧版 is_some() 误命中早返 → DSML/正文恢复出的
+        // calls 丢失,wire 出现无配对 tool_call_id 撞 400。现应把恢复出的 calls 挂回重建的 assistant。
+        let native_empty =
+            serde_json::json!({"role":"assistant","content":"<ToolCall>...","tool_calls":[]});
+        let out = assistant_message_for_tool_calls(native_empty, &[tc("dsml_call_0")]);
+        let calls = out
+            .get("tool_calls")
+            .and_then(|c| c.as_array())
+            .expect("应挂回 tool_calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "dsml_call_0");
+    }
+
+    #[test]
+    fn native_nonempty_tool_calls_preserved() {
+        // 模型真给了原生 tool_calls:原样返回,不被恢复值覆盖。
+        let native = serde_json::json!({"role":"assistant","content":null,
+            "tool_calls":[{"id":"native_0","type":"function","function":{"name":"read_file","arguments":"{}"}}]});
+        let out = assistant_message_for_tool_calls(native, &[tc("should_not_use")]);
+        assert_eq!(out["tool_calls"].as_array().unwrap()[0]["id"], "native_0");
+    }
 }
