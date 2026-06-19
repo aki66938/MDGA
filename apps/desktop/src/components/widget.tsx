@@ -107,8 +107,11 @@ export function WidgetCard({
 }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(120);
-  // sendPrompt 确认门控的并发闸：同一时刻只允许一个待确认，防恶意 widget 用 confirm 轰炸。
-  const promptPendingRef = useRef(false);
+  // sendPrompt 确认门控的冷却闸：记录上一次确认框关闭的时刻，冷却窗口内丢弃后续 sendPrompt，
+  // 防恶意 widget 循环调用 sendPrompt 弹出连串阻塞确认框（confirm 轰炸 / 骚扰）。
+  // 不能用「pending 布尔」节流——window.confirm 同步阻塞，pending 在同一事件任务内即置真又复位，
+  // 跨消息永不短路（形同虚设）；故改用基于时间戳的冷却。
+  const lastPromptAtRef = useRef(0);
 
   // 主题随 code 在挂载时一次性 resolve；code 变化时通过 key 整体重挂（见下方 key）。
   const srcdoc = buildSrcdoc(part.code, readHostTheme());
@@ -127,16 +130,16 @@ export function WidgetCard({
       } else if (data.__mdgaWidget === "sendPrompt") {
         // sendPrompt 不可信：widget 代码可在 load/定时器里无人值守地自动调用，把任意文本当「用户输入」
         // 灌进 agent 循环（confused-deputy / 提示注入洗白）。故**必须经用户显式确认**才发，绝不自动驱动。
-        // 父侧自行截断（发送方的 slice 可被绕过），并以「同时只一个待确认」节流防 confirm 轰炸。
+        // 父侧自行截断（发送方的 slice 可被绕过），并以确认框关闭后的冷却窗口节流防 confirm 轰炸。
         const text = (typeof data.text === "string" ? data.text : "").slice(0, 4000);
         if (!text.trim() || !onSendPrompt) return;
-        if (promptPendingRef.current) return;
-        promptPendingRef.current = true;
+        // 上一次确认处理后 1s 内到达的 sendPrompt 一律丢弃（限制连串阻塞确认框的弹出频率）。
+        if (Date.now() - lastPromptAtRef.current < 1000) return;
         const preview = text.length > 300 ? text.slice(0, 300) + "…" : text;
         const ok = window.confirm(
           "此 widget 想代你向 AI 发送下面这条消息（不是你本人输入的）：\n\n" + preview + "\n\n确定发送吗？"
         );
-        promptPendingRef.current = false;
+        lastPromptAtRef.current = Date.now(); // 以确认框关闭时刻为冷却起点
         if (ok) onSendPrompt(text);
       } else if (data.__mdgaWidget === "openLink") {
         const url = typeof data.url === "string" ? data.url : "";
@@ -154,7 +157,10 @@ export function WidgetCard({
         } catch {
           /* 非法 URL：host 保持「无法解析」，后端仍会再校验 http(s) */
         }
-        if (window.confirm("在浏览器打开此链接？\n\n站点主机：" + host + warn + "\n\n完整地址：\n" + url)) {
+        // 展示用的「完整地址」需归一：把所有空白（含换行）折叠为单空格并限长，
+        // 防恶意 url 塞大量换行把可信的「站点主机」行挤出可视区（含控制字符的 url 后端也会拒）。
+        const shownUrl = url.replace(/\s+/g, " ").slice(0, 200) + (url.length > 200 ? "…" : "");
+        if (window.confirm("在浏览器打开此链接？\n\n站点主机：" + host + warn + "\n\n完整地址：\n" + shownUrl)) {
           invoke("open_external_url", { url }).catch(() => {});
         }
       }
