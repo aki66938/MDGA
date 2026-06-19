@@ -832,12 +832,17 @@ export function App() {
       let diff: string | undefined;
       let added: number | undefined;
       let removed: number | undefined;
+      // 0.0.68 降级可观测：run_command 结果带实际沙箱层级——降级(受限令牌,无文件/网络隔离)时给卡片打标。
+      let sandboxDegraded: boolean | undefined;
+      let sandboxLayer: string | undefined;
       if (outputJson) {
         try {
           const out = JSON.parse(outputJson) as Record<string, unknown>;
           if (typeof out.diff === "string") diff = out.diff;
           if (typeof out.added === "number") added = out.added;
           if (typeof out.removed === "number") removed = out.removed;
+          if (typeof out.sandboxDegraded === "boolean") sandboxDegraded = out.sandboxDegraded;
+          if (typeof out.sandboxLayer === "string") sandboxLayer = out.sandboxLayer;
         } catch {
           // 输出非 JSON 时忽略
         }
@@ -910,6 +915,8 @@ export function App() {
                 diff,
                 added,
                 removed,
+                sandboxDegraded,
+                sandboxLayer,
               };
               break;
             }

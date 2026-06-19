@@ -372,7 +372,7 @@ export function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 // ── ToolInlineRow ───────────────────────────────────────────────────────────
 
 export function ToolInlineRow({ part }: { part: ToolPart }) {
-  const { toolName, target, status, error, diff, added, removed, liveOutput, reverted } = part;
+  const { toolName, target, status, error, diff, added, removed, liveOutput, reverted, sandboxDegraded } = part;
   const [showDiff, setShowDiff] = useState(false);
   const icon =
     status === "running" ? <span className="star-spin tool-inline__star" aria-hidden="true">✦</span> :
@@ -392,6 +392,15 @@ export function ToolInlineRow({ part }: { part: ToolPart }) {
         {target && <span className="tool-inline__target">{target}</span>}
         {/* Plan21 #3：回退后角标,与置灰样式配合标识该变更已撤销。 */}
         {reverted && <span className="tool-inline__reverted-badge">已回退</span>}
+        {/* 0.0.68 降级可观测：命令实际在受限令牌沙箱(无文件/网络隔离)执行时打标,而非静默降级。 */}
+        {sandboxDegraded && (
+          <span
+            className="tool-inline__sandbox-degraded"
+            title="此命令本应走 AppContainer(文件/网络隔离),但因工作区被 dev 监视或过大,已降级到受限令牌沙箱：仍剥管理员特权+擦密钥,但无文件路径/网络隔离。"
+          >
+            ⚠ 受限沙箱
+          </span>
+        )}
         {(added !== undefined || removed !== undefined) && (
           <span className="tool-inline__stats">
             {added ? <span className="diff-added">+{added}</span> : null}

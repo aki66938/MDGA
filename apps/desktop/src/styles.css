@@ -993,6 +993,19 @@ h1 {
   border: 1px solid var(--border-strong);
 }
 
+/* 0.0.68 降级可观测：命令在受限令牌沙箱(无文件/网络隔离)执行的角标,暖色提示但不喧宾夺主。 */
+.tool-inline__sandbox-degraded {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  line-height: 1.4;
+  padding: 0 6px;
+  border-radius: 999px;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
+  cursor: help;
+}
+
 /* ── 会话搜索与管理动作 ── */
 
 .conv-search {

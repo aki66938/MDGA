@@ -30,6 +30,10 @@ export type ToolPart = {
   removed?: number;
   /** run_command 运行中的实时输出（行累积，截断保留尾部） */
   liveOutput?: string;
+  /** 0.0.68 降级可观测：run_command 实际生效的沙箱层（"appcontainer"/"restricted"/缺=未沙箱）。 */
+  sandboxLayer?: string;
+  /** 0.0.68：本应走 AppContainer 但降级到受限令牌沙箱（无文件/网络隔离）——卡片打降级标。 */
+  sandboxDegraded?: boolean;
   /** 已被回退（Plan21 #3）：handleRevert 成功后给现存 diff 卡片打标，渲染置灰并加「已回退」角标。 */
   reverted?: boolean;
 };
