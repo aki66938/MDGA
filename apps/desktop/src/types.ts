@@ -241,6 +241,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   { id: "zhipu", label: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4", defaultModelId: "glm-4" },
   { id: "moonshot", label: "月之暗面 Kimi", baseUrl: "https://api.moonshot.cn/v1", defaultModelId: "moonshot-v1-8k" },
   { id: "qwen", label: "通义", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", defaultModelId: "qwen-plus" },
+  { id: "siliconflow", label: "硅基流动", baseUrl: "https://api.siliconflow.cn/v1", defaultModelId: "deepseek-ai/DeepSeek-V3" },
   { id: "custom", label: "自定义", baseUrl: null, defaultModelId: "" },
 ];
 

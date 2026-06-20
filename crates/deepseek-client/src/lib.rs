@@ -37,6 +37,10 @@ pub fn preset_base_url(preset: &str) -> Option<&'static str> {
         "zhipu" => Some("https://open.bigmodel.cn/api/paas/v4"),
         "moonshot" => Some("https://api.moonshot.cn/v1"),
         "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        // 0.0.71:硅基流动(OpenAI 兼容聚合,可接多家开源模型)。Anthropic 暂不加 preset——主对话循环
+        // chat_stream 仅 OpenAI 格式(api_format=anthropic 只用于 test_connection/probe/vision),加 anthropic
+        // preset 会让用户以为能当主模型却在循环里失败,留待主循环支持 anthropic 格式后再补。
+        "siliconflow" => Some("https://api.siliconflow.cn/v1"),
         _ => None,
     }
 }
@@ -1295,6 +1299,20 @@ fn normalize_dsml_parameter(name: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_base_url_covers_known_presets() {
+        // 0.0.71:硅基流动(OpenAI 兼容)preset 解析到官方端点;未知 preset(含 anthropic,主循环暂不支持)为 None。
+        assert_eq!(preset_base_url("siliconflow"), Some("https://api.siliconflow.cn/v1"));
+        assert_eq!(preset_base_url("deepseek"), Some("https://api.deepseek.com"));
+        assert_eq!(preset_base_url("anthropic"), None);
+        assert_eq!(preset_base_url("custom"), None);
+        // resolve:显式 base_url 覆盖 preset;空 base_url 回退 preset 官方端点。
+        assert_eq!(
+            resolve_base_url(None, Some("siliconflow")).as_deref(),
+            Some("https://api.siliconflow.cn/v1")
+        );
+    }
 
     #[test]
     fn parses_tool_call_completion_response() {

@@ -31,6 +31,7 @@ const PRESET_API_FORMAT: Record<string, "openai" | "anthropic"> = {
   zhipu: "openai",
   moonshot: "openai",
   qwen: "openai",
+  siliconflow: "openai",
 };
 
 /** 取连接的展示名：label 优先，其次 preset 名，再次「未命名连接」。 */
