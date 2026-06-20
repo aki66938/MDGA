@@ -135,7 +135,57 @@ fn glob_match_inner(pattern: &str, text: &str) -> bool {
 ///
 /// 规则格式：`[allow:|deny:]<body>`（无前缀默认 allow，向后兼容旧规则）。body 为：
 /// `cmd:<前缀>`（run_command 命令前缀）| `tool:<工具名>`（按工具名）| `<工具名>:<glob>`（工具+路径 glob）。
-fn rule_decision(rule: &str, tool_name: &str, arguments: &str) -> Option<bool> {
+/// 路径归一化(0.0.68):trim + 反斜杠折正斜杠 + 小写(Windows FS 大小写不敏感)。
+fn norm_path(s: &str) -> String {
+    s.trim().replace('\\', "/").to_lowercase()
+}
+
+/// 0.0.71 symlink / 穿越兜底:把模型给的路径展开成**多个待匹配候选**(均已归一化),deny glob 命中任一即拦:
+/// ① 原始归一化;② 词法解析 `.`/`..` 段(无 I/O,挡 `a/../.env`、`./.env` 穿越);③ 若该路径在工作区内
+/// **真实存在**,canonicalize(跟随符号链接)后的工作区相对路径(挡 `link→.env` 读 link 实指 .env)。
+/// 解析失败 / 新文件 / 解析出工作区外 → 跳过该候选,靠 ①②。仅在确有 `<tool>:<glob>` 规则命中工具时才走到这里。
+fn deny_candidate_paths(workspace_root: &str, raw_path: &str) -> Vec<String> {
+    let base = norm_path(raw_path);
+    let mut out = vec![base.clone()];
+    // ② 词法 . / .. 解析(在归一化后的正斜杠形式上)。
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in base.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            s => stack.push(s),
+        }
+    }
+    let lexical = stack.join("/");
+    if !lexical.is_empty() && lexical != base {
+        out.push(lexical);
+    }
+    // ③ canonicalize(真实存在才有;跟随 symlink)。
+    if !workspace_root.trim().is_empty() {
+        let joined = std::path::Path::new(workspace_root).join(raw_path.trim());
+        if let (Ok(canon), Ok(ws_canon)) = (
+            std::fs::canonicalize(&joined),
+            std::fs::canonicalize(workspace_root.trim()),
+        ) {
+            if let Ok(rel) = canon.strip_prefix(&ws_canon) {
+                let rel_norm = norm_path(&rel.to_string_lossy());
+                if !rel_norm.is_empty() && !out.contains(&rel_norm) {
+                    out.push(rel_norm);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn rule_decision(
+    rule: &str,
+    tool_name: &str,
+    arguments: &str,
+    workspace_root: &str,
+) -> Option<bool> {
     let (effect, body) = if let Some(r) = rule.strip_prefix("deny:") {
         (false, r)
     } else if let Some(r) = rule.strip_prefix("allow:") {
@@ -170,12 +220,13 @@ fn rule_decision(rule: &str, tool_name: &str, arguments: &str) -> Option<bool> {
                         .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(str::to_string))
                 })
                 .unwrap_or_default();
-            // 0.0.68 加固:路径归一化后再匹配——**先 trim**(与 read 侧 validate_relative_path 的
-            // path.trim() 对齐,否则 `.env ` 尾空格让 deny 落空、读时却被 trim 成 `.env` 真读出密钥)、
-            // 把反斜杠折成正斜杠、双方统一小写(Windows 文件系统大小写不敏感,挡 `.ENV`/`config\.env` 等价写法)。
-            // 归一化对 deny 是收紧(更安全)、对 allow 仅在用户自建规则下极小幅放宽,且本就匹配同一文件。
-            let norm = |s: &str| s.trim().replace('\\', "/").to_lowercase();
-            if glob_match(&norm(glob), &norm(&path)) {
+            // 0.0.68/0.0.71 加固:对路径的多个归一化候选(原始 / 词法解析 .. / canonicalize 跟随 symlink)
+            // 逐一与 glob 匹配,命中任一即生效。挡大小写 / 反斜杠 / 尾空格 / `a/../.env` 穿越 / `link→.env` 符号链接绕过。
+            let glob_n = norm_path(glob);
+            if deny_candidate_paths(workspace_root, &path)
+                .iter()
+                .any(|cand| glob_match(&glob_n, cand))
+            {
                 return Some(effect);
             }
         }
@@ -184,10 +235,15 @@ fn rule_decision(rule: &str, tool_name: &str, arguments: &str) -> Option<bool> {
 }
 
 /// 汇总权限规则：deny 优先。返回 Some(false)=显式拒绝，Some(true)=显式放行，None=无规则覆盖。
-fn permission_rules_decision(rules: &[String], tool_name: &str, arguments: &str) -> Option<bool> {
+fn permission_rules_decision(
+    rules: &[String],
+    tool_name: &str,
+    arguments: &str,
+    workspace_root: &str,
+) -> Option<bool> {
     let mut allowed = false;
     for rule in rules {
-        match rule_decision(rule, tool_name, arguments) {
+        match rule_decision(rule, tool_name, arguments, workspace_root) {
             Some(false) => return Some(false), // deny 立即否决
             Some(true) => allowed = true,
             None => {}
@@ -216,7 +272,7 @@ pub(crate) fn gate_tool_decision(
     };
 
     // 用户显式 deny 规则最高优先级：任何模式下都拒绝。
-    if permission_rules_decision(rules, tool_name, arguments) == Some(false) {
+    if permission_rules_decision(rules, tool_name, arguments, &context.workspace_root) == Some(false) {
         return ToolGate::Deny("已被用户的拒绝规则阻止".to_string());
     }
 
@@ -243,7 +299,7 @@ pub(crate) fn gate_tool_decision(
     match decide_tool_access(context, capability) {
         ToolDecision::Allow => ToolGate::Allow,
         ToolDecision::AskUser => {
-            if permission_rules_decision(rules, tool_name, arguments) == Some(true) {
+            if permission_rules_decision(rules, tool_name, arguments, &context.workspace_root) == Some(true) {
                 ToolGate::Allow
             } else {
                 ToolGate::Ask
@@ -493,38 +549,75 @@ mod tests {
         ];
         // 读普通文件：allow 命中
         assert_eq!(
-            permission_rules_decision(&rules, "read_file", "{\"path\":\"src/main.rs\"}"),
+            permission_rules_decision(&rules, "read_file", "{\"path\":\"src/main.rs\"}", ""),
             Some(true)
         );
         // 读 .env：deny 命中，优先否决
         assert_eq!(
-            permission_rules_decision(&rules, "read_file", "{\"path\":\"src/.env\"}"),
+            permission_rules_decision(&rules, "read_file", "{\"path\":\"src/.env\"}", ""),
             Some(false)
         );
-        // 0.0.68 加固(含审查补强):大小写 / 反斜杠 / 根目录裸 .env / 尾空格等价写法都不能绕过
-        // deny:**/.env(Windows FS 大小写不敏感;读侧 validate_relative_path 会 trim 尾空格)。
+        // 0.0.68/0.0.71 加固:大小写 / 反斜杠 / 根目录裸 .env / 尾空格 / `a/../.env` 词法穿越 都不能绕过
+        // deny:**/.env(canonicalize 跟随的 symlink 绕过另有真机测试)。
         for p in [
             "{\"path\":\"src/.ENV\"}",
             "{\"path\":\"config\\\\.env\"}",
             "{\"path\":\"CONFIG\\\\.Env\"}",
             "{\"path\":\".env\"}",   // 根目录裸 .env(Fix 3:**/ 零段)
             "{\"path\":\".env \"}",  // 尾空格(Fix 2:trim 对齐读侧)
+            "{\"path\":\"src/sub/../.env\"}", // 0.0.71:词法 .. 穿越 → src/.env
+            "{\"path\":\"./.env\"}",          // 0.0.71:前导 ./
         ] {
             assert_eq!(
-                permission_rules_decision(&rules, "read_file", p),
+                permission_rules_decision(&rules, "read_file", p, ""),
                 Some(false),
                 "deny:**/.env 应拦住等价写法: {p}"
             );
         }
         // 旧式裸规则向后兼容（视为 allow）
         assert_eq!(
-            permission_rules_decision(&["tool:write_file".to_string()], "write_file", "{}"),
+            permission_rules_decision(&["tool:write_file".to_string()], "write_file", "{}", ""),
             Some(true)
         );
         // 命令前缀规则
         assert_eq!(
-            permission_rules_decision(&["cmd:git push".to_string()], "run_command", "{\"command\":\"git push origin\"}"),
+            permission_rules_decision(&["cmd:git push".to_string()], "run_command", "{\"command\":\"git push origin\"}", ""),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn deny_resolves_symlink_target() {
+        // 0.0.71:link → .env 的符号链接,读 link 应被 deny:**/.env 拦(canonicalize 跟随)。
+        // Windows 建 symlink 需开发者模式/管理员,创建失败则**跳过**(非失败),不阻断 CI/无权限环境。
+        use std::io::Write;
+        let ws = std::env::temp_dir().join(format!("mdga-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        if std::fs::create_dir_all(&ws).is_err() {
+            return;
+        }
+        let env_file = ws.join(".env");
+        if let Ok(mut f) = std::fs::File::create(&env_file) {
+            let _ = f.write_all(b"SECRET=x");
+        }
+        let link = ws.join("innocent.txt");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&env_file, &link).is_ok();
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink(&env_file, &link).is_ok();
+        if !made {
+            let _ = std::fs::remove_dir_all(&ws);
+            return; // 无权限创建 symlink:跳过
+        }
+        let rules = vec!["deny:read_file:**/.env".to_string()];
+        let args = serde_json::json!({ "path": "innocent.txt" }).to_string();
+        let decision =
+            permission_rules_decision(&rules, "read_file", &args, ws.to_str().unwrap_or(""));
+        let _ = std::fs::remove_dir_all(&ws);
+        assert_eq!(
+            decision,
+            Some(false),
+            "读经 symlink 指向 .env 的 innocent.txt 应被 deny:**/.env 拦"
         );
     }
 }
