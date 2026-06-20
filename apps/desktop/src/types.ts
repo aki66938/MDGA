@@ -173,6 +173,12 @@ export type UsageSummary = {
   estimatedCostUsd: number;
   usageSource: string;
   pricingVersion: string;
+  /** 0.0.72 计价：该轮成本（金额随 currency；null＝该模型未填单价/无价表）。后端 chat-usage 事件随新字段下发。 */
+  estimatedCost?: number | null;
+  /** 0.0.72：该轮成本的币种（null＝无金额可言）。 */
+  currency?: PricingCurrency | null;
+  /** 0.0.72：该轮计费方式（'api'＝按量｜'subscription'＝套餐内｜'none'＝免计费；缺＝旧数据，按 estimatedCostUsd 回退）。 */
+  billingMode?: BillingMode;
 };
 
 export type Conversation = {
@@ -261,6 +267,89 @@ export type ConnectionView = {
   hasKey: boolean;
   createdAt?: number;
   updatedAt?: number;
+  /** 0.0.72 计价：连接级计费方式。'api'＝按量付费（模型行可填单价）｜'subscription'＝订阅套餐｜'none'＝本地免计费。缺＝按 'api' 处理。 */
+  billingMode?: BillingMode;
+  /** 0.0.72：billingMode='subscription' 时的套餐元信息 JSON（SubscriptionInfo 序列化）。 */
+  subscriptionJson?: string;
+};
+
+// ── 计价（Pricing，0.0.72）──────────────────────────────────────────────────
+
+/** 连接级计费方式。后端 set_connection_billing 接受同名字符串。 */
+export type BillingMode = "api" | "subscription" | "none";
+
+/** 价格币种。 */
+export type PricingCurrency = "CNY" | "USD";
+
+/** 价格单位：每百万 token 或每千 token。预设均为 per_1m。 */
+export type PricingUnit = "per_1m" | "per_1k";
+
+/** 上下文分档价（长上下文阶梯定价）：maxContext 为该档上限 token 数。 */
+export type PricingTier = {
+  maxContext: number;
+  input: number;
+  output: number;
+  cachedInput?: number | null;
+};
+
+/**
+ * 一个模型的纯价格结构（与后端 serde camelCase 同名）。
+ * input/output/... 的数值与 unit 匹配（unit='per_1k' 即以「每千」计），后端按 unit 归一化。
+ */
+export type ModelPricing = {
+  currency: PricingCurrency;
+  unit: PricingUnit;
+  /** 输入（未命中缓存）单价。 */
+  input: number;
+  /** 输出单价。 */
+  output: number;
+  /** 缓存命中输入单价（可空）。 */
+  cachedInput?: number | null;
+  /** 缓存写入单价（可空）。 */
+  cacheWrite?: number | null;
+  /** 批量折扣系数（可空，如 0.5＝五折）。 */
+  batchDiscount?: number | null;
+  /** 上下文分档（长上下文阶梯定价，可空）。 */
+  tiers?: PricingTier[];
+};
+
+/**
+ * 存进 pricing_json 的对象 = ModelPricing + 下划线前缀元数据。
+ * 后端原样存取、计算时只读价格字段（忽略下划线字段）；前端用元数据渲染徽标。
+ */
+export type StoredPricing = ModelPricing & {
+  /** 'preset'＝来自内置预设（可改）｜'custom'＝用户改过的自定义价。 */
+  _source: "preset" | "custom";
+  /** 预设置信度（如 'high'/'medium'/'low'），仅 _source='preset' 时有意义。 */
+  _confidence?: string;
+  /** 预设需用户核对（价格可能变动），徽标叠「待官网核对」。 */
+  _needsVerify?: boolean;
+  /** 预设来源链接（官网定价页），编辑器内可点开核对。 */
+  _sourceUrl?: string;
+};
+
+/** lookup_model_preset 返回视图：命中的预设价 + 展示元信息（null＝无预设）。 */
+export type PresetView = {
+  pricing: ModelPricing;
+  displayName: string;
+  confidence: string;
+  needsVerify: boolean;
+  sourceUrl: string;
+};
+
+/** subscriptionJson 自由结构：套餐名 + 月费 + 月额度 token（均可空）。 */
+export type SubscriptionInfo = {
+  planLabel?: string;
+  monthlyFee?: number;
+  currency?: PricingCurrency;
+  monthlyQuotaTokens?: number;
+};
+
+/** get_connection_monthly_usage 返回：本月该连接累计用量。 */
+export type ConnectionMonthlyUsage = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
 };
 
 /** 用户在某连接下登记的一个模型（list_models / list_models_for_connection / add_model / update_model 返回）。
@@ -278,6 +367,8 @@ export type CuratedModelView = {
   label?: string;
   /** 可选上下文窗口（tokens）。 */
   contextWindow?: number;
+  /** 0.0.72 计价：该模型单价的 pricing_json（StoredPricing 序列化）；缺＝未填单价。 */
+  pricingJson?: string;
 };
 
 /** 一个角色当前的「分配」概览（get_role_assignments 返回）。无密钥。

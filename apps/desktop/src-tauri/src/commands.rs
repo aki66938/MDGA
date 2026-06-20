@@ -25,11 +25,14 @@ use mdga_storage::{
     ActivityEventRecord, Conversation, FileCheckpoint, StoredMessage, Workspace,
 };
 use mdga_storage::{
-    delete_role_model, get_connection, get_lsp_server_config_json, get_model, get_role_model,
-    get_setting, list_models_for_connection as storage_list_models_for_connection,
-    resolve_role_provider, set_lsp_server_config_json, set_setting, upsert_connection, upsert_model,
-    upsert_role_model, CuratedModel, ProviderConnection, ALL_ROLES, ROLE_MAIN,
+    current_ym, delete_role_model, get_connection, get_lsp_server_config_json, get_model,
+    get_monthly_usage, get_role_model, get_setting,
+    list_models_for_connection as storage_list_models_for_connection, resolve_role_provider,
+    set_connection_billing as storage_set_connection_billing, set_lsp_server_config_json,
+    set_model_pricing as storage_set_model_pricing, set_setting, upsert_connection, upsert_model,
+    upsert_role_model, CuratedModel, MonthlyUsage, ProviderConnection, ALL_ROLES, ROLE_MAIN,
 };
+use mdga_token_accounting::{lookup_preset, ModelPricing};
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
@@ -68,6 +71,10 @@ pub(crate) struct ConnectionView {
     pub api_format: String,
     /// 是否已配置密钥（明文绝不回传，仅以此布尔表明「已配」）。
     pub has_key: bool,
+    /// 0.0.72 计费方式：'api' | 'subscription' | 'none'。
+    pub billing_mode: String,
+    /// 0.0.72 订阅描述（可空，自由 JSON 串）。
+    pub subscription_json: Option<String>,
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
 }
@@ -81,6 +88,8 @@ impl From<ProviderConnection> for ConnectionView {
             base_url: c.base_url,
             api_format: c.api_format,
             has_key: !c.api_key.trim().is_empty(),
+            billing_mode: c.billing_mode,
+            subscription_json: c.subscription_json,
             created_at: c.created_at,
             updated_at: c.updated_at,
         }
@@ -202,6 +211,8 @@ pub(crate) struct CuratedModelView {
     pub model_id: String,
     pub label: Option<String>,
     pub context_window: Option<i64>,
+    /// 0.0.72 单价快照（可空，原始 JSON 串：价格字段 + `_` 前缀元数据，前端解析渲染）。
+    pub pricing_json: Option<String>,
 }
 
 /// 把一个 [`CuratedModel`] 包成前端视图，连接展示名按 `db` 现状解析。
@@ -217,6 +228,7 @@ fn model_to_view(db: &rusqlite::Connection, m: CuratedModel) -> CuratedModelView
         model_id: m.model_id,
         label: m.label,
         context_window: m.context_window,
+        pricing_json: m.pricing_json,
     }
 }
 
@@ -331,6 +343,102 @@ pub(crate) fn delete_model(
     };
     crate::embedding::refresh_embedding_config(&db);
     Ok(affected)
+}
+
+// ── 计价（0.0.72）─────────────────────────────────────────────────────────────
+//
+// 三条命令给前端「计价」UI 用：lookup_model_preset（添加模型/拉取/恢复预设时自动填单价）、
+// set_model_pricing（保存/清空模型单价）、set_connection_billing（保存连接计费方式）。
+// 这些命令都不触碰 api_key。pricing_json 前端存「价格字段 + `_` 前缀元数据」的 JSON 串，
+// 后端原样存取，不解析校验；仅结算时（agent_loop）以 serde 解析价格字段。
+
+/// 一条预设单价的前端友好视图（0.0.72）：pricing 为结构化单价，余为展示/核对元数据。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PresetView {
+    pub pricing: ModelPricing,
+    pub display_name: String,
+    /// 置信度："high" | "medium" | "low"。
+    pub confidence: String,
+    /// true → 前端显「待官网核对」黄标。
+    pub needs_verify: bool,
+    pub source_url: String,
+}
+
+/// 在内置预设库中查一条模型单价（0.0.72）：供前端「添加模型 / 拉取 / 恢复预设」时自动填单价。
+///
+/// 匹配规则见内核 `lookup_preset`（preset 小写相等；model_id 规范化后大小写不敏感匹配；
+/// currency 大小写不敏感）。未命中返回 None，前端据此回退手动填价。不触碰任何凭据。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) fn lookup_model_preset(
+    connectionPreset: String,
+    modelId: String,
+    currency: String,
+) -> Option<PresetView> {
+    lookup_preset(&connectionPreset, &modelId, &currency).map(|e| PresetView {
+        pricing: e.pricing.clone(),
+        display_name: e.display_name.to_string(),
+        confidence: e.confidence.to_string(),
+        needs_verify: e.needs_verify,
+        source_url: e.source_url.to_string(),
+    })
+}
+
+/// 保存或清空某模型的单价快照（0.0.72）。
+///
+/// `modelRef` = models.id；`pricingJson` 为前端构造的 JSON 串（价格字段 + `_` 前缀元数据），
+/// 后端**原样存**，不解析校验；传 None 清空（恢复「无单价」）。返回写入后的模型视图。
+/// 改 main/embed 角色所用模型的单价不影响窗口，但镜像 update_model 保守刷新 embedding 快照。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) fn set_model_pricing(
+    state: State<AppState>,
+    modelRef: String,
+    pricingJson: Option<String>,
+) -> Result<CuratedModelView, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let saved = storage_set_model_pricing(&db, &modelRef, pricingJson.as_deref())
+        .map_err(|e| e.to_string())?;
+    crate::embedding::refresh_embedding_config(&db);
+    Ok(model_to_view(&db, saved))
+}
+
+/// 保存某连接的计费方式（0.0.72）。
+///
+/// `billingMode` 归一化为 'api' | 'subscription' | 'none'（未知落回 'api'）；`subscriptionJson`
+/// 为订阅描述自由串（可空，原样存）。返回脱敏后的连接视图（绝不回传 api_key）。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) fn set_connection_billing(
+    state: State<AppState>,
+    connectionId: String,
+    billingMode: String,
+    subscriptionJson: Option<String>,
+) -> Result<ConnectionView, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let saved = storage_set_connection_billing(
+        &db,
+        &connectionId,
+        &billingMode,
+        subscriptionJson.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(ConnectionView::from(saved))
+}
+
+/// 读某连接「当前 UTC 月」累计的原始 token 用量（0.0.72 订阅进度条）。
+///
+/// 月份键取 [`current_ym`]（"YYYY-MM"，UTC）。该计数与计价/成本完全无关，也独立于会话累计；
+/// 无记录时返回全 0 的 [`MonthlyUsage`]。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) fn get_connection_monthly_usage(
+    state: State<AppState>,
+    connectionId: String,
+) -> Result<MonthlyUsage, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    get_monthly_usage(&db, &connectionId, &current_ym()).map_err(|e| e.to_string())
 }
 
 /// 拉取某连接端点真实可用的模型 id 列表（0.0.60）：GET {base}/models（连接的 key 作 Bearer）。

@@ -1,12 +1,99 @@
 // 纯工具函数（0.0.37 从 App.tsx 抽出，纯搬移，无逻辑改动）。
 
-import type { Message, UsageSummary } from "./types";
+import type {
+  Message,
+  UsageSummary,
+  PricingCurrency,
+  PricingUnit,
+  StoredPricing,
+  PricingTier,
+} from "./types";
 
 /** token 数精简成 k/M（对标 Claude 的「576.5k / 1.0M」）。 */
 export function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return `${n}`;
+}
+
+// ── 计价工具（Pricing，0.0.72）──────────────────────────────────────────────
+
+/** 币种符号：CNY→￥｜USD→＄。 */
+export function currencySymbol(currency: PricingCurrency | undefined): string {
+  return currency === "USD" ? "＄" : "￥";
+}
+
+/** 单位后缀：per_1k→/K｜per_1m（默认）→/M。 */
+export function unitSuffix(unit: PricingUnit | undefined): string {
+  return unit === "per_1k" ? "/K" : "/M";
+}
+
+/**
+ * 解析 pricing_json（StoredPricing）。失败/空串返回 null。
+ * 容错：缺 currency/unit 时补默认（CNY / per_1m），缺 _source 时按 'custom'。
+ */
+export function parseStoredPricing(json: string | null | undefined): StoredPricing | null {
+  if (!json || !json.trim()) return null;
+  try {
+    const o = JSON.parse(json) as Partial<StoredPricing>;
+    if (o == null || typeof o !== "object") return null;
+    return {
+      ...o,
+      currency: o.currency === "USD" ? "USD" : "CNY",
+      unit: o.unit === "per_1k" ? "per_1k" : "per_1m",
+      input: typeof o.input === "number" ? o.input : 0,
+      output: typeof o.output === "number" ? o.output : 0,
+      _source: o._source === "preset" ? "preset" : "custom",
+    } as StoredPricing;
+  } catch {
+    return null;
+  }
+}
+
+/** 把一个价格数字按习惯精简显示：整数不带小数，否则去掉尾随 0。null/undefined→「—」。 */
+export function fmtPriceNum(n: number | null | undefined): string {
+  if (n == null || Number.isNaN(n)) return "—";
+  if (Number.isInteger(n)) return String(n);
+  return String(n).replace(/\.?0+$/, "");
+}
+
+/**
+ * 模型行的单价摘要：`￥3 / 0.025 / 6 /M`（输入 / 命中 / 输出，符号随币种）。
+ * 命中（cachedInput）缺省时该位显「—」。无价格（null）整体返回「—」。
+ */
+export function pricingSummary(p: StoredPricing | null): string {
+  if (!p) return "—";
+  const sym = currencySymbol(p.currency);
+  const cached = p.cachedInput != null ? fmtPriceNum(p.cachedInput) : "—";
+  return `${sym}${fmtPriceNum(p.input)} / ${cached} / ${fmtPriceNum(p.output)} ${unitSuffix(p.unit)}`;
+}
+
+/** 单价徽标判定：预设（可改） / 待官网核对 / 自定义。无价格返回 null（不显徽标）。 */
+export type PricingBadge = "preset" | "needs_verify" | "custom";
+
+/**
+ * 计算应展示的徽标集合（顺序：来源徽标在前，needsVerify 叠加在后）。
+ * _source='preset' → ['preset']，若 _needsVerify 再追加 'needs_verify'；
+ * _source='custom' → ['custom']；无价格 → []。
+ */
+export function pricingBadges(p: StoredPricing | null): PricingBadge[] {
+  if (!p) return [];
+  if (p._source === "preset") {
+    return p._needsVerify ? ["preset", "needs_verify"] : ["preset"];
+  }
+  return ["custom"];
+}
+
+/** 切单位时换算可见数字（per_1m↔per_1k：×/÷1000）。null/undefined 原样返回。 */
+export function convertPriceForUnit(
+  value: number | null | undefined,
+  from: PricingUnit,
+  to: PricingUnit,
+): number | null | undefined {
+  if (value == null || from === to) return value;
+  // per_1m → per_1k：每千的数更小，÷1000；反之 ×1000。
+  const factor = from === "per_1m" && to === "per_1k" ? 1 / 1000 : 1000;
+  return value * factor;
 }
 
 export function aggregateUsage(messages: Message[]): UsageSummary | null {
@@ -39,6 +126,126 @@ export function aggregateUsage(messages: Message[]): UsageSummary | null {
 export function formatUsd(cost: number): string {
   if (cost < 0.0001 && cost > 0) return "<$0.0001";
   return `$${cost.toFixed(6).replace(/\.?0+$/, "")}`;
+}
+
+/**
+ * 金额格式化（0.0.72）：按币种带符号（CNY→￥｜USD→＄），去尾随 0。
+ * 极小额（>0 且 <0.0001）显 `<￥0.0001` / `<＄0.0001`，避免精度损失误显 0。
+ * 与 formatUsd 同风格，但符号随 currency；currency 缺省按 CNY。
+ */
+export function formatMoney(amount: number, currency: PricingCurrency | undefined): string {
+  const sym = currencySymbol(currency);
+  if (amount < 0.0001 && amount > 0) return `<${sym}0.0001`;
+  return `${sym}${amount.toFixed(6).replace(/\.?0+$/, "")}`;
+}
+
+/**
+ * 会话成本聚合（0.0.72）：按币种把「api 且有金额」的各轮 estimatedCost 分别累加，
+ * 并分别计数套餐内 / 免计费 / 已计价但无金额（未计价）的轮数。
+ *
+ * 判定优先级：
+ * - billingMode==='subscription' → subscriptionTurns++（不计金额）。
+ * - billingMode==='none' → noneTurns++（不计金额）。
+ * - billingMode==='api'：有金额（estimatedCost!=null）→ 按 currency 累加；无金额 → uncostedTurns++。
+ * - billingMode 缺失（旧数据回退）：estimatedCostUsd>0 → 按 USD 累加；否则忽略（不计入任何计数，不当 0 元）。
+ *
+ * 设计要点：无金额的 api 轮绝不当 0 元并进合计，而是单独计入 uncostedTurns。
+ */
+export type CostAggregate = {
+  byCurrency: { CNY?: number; USD?: number };
+  subscriptionTurns: number;
+  noneTurns: number;
+  uncostedTurns: number;
+};
+
+export function aggregateCost(usages: UsageSummary[]): CostAggregate {
+  const byCurrency: { CNY?: number; USD?: number } = {};
+  let subscriptionTurns = 0;
+  let noneTurns = 0;
+  let uncostedTurns = 0;
+
+  const add = (cur: PricingCurrency, amount: number) => {
+    byCurrency[cur] = (byCurrency[cur] ?? 0) + amount;
+  };
+
+  for (const u of usages) {
+    if (u.billingMode === "subscription") {
+      subscriptionTurns += 1;
+      continue;
+    }
+    if (u.billingMode === "none") {
+      noneTurns += 1;
+      continue;
+    }
+    if (u.billingMode === "api") {
+      if (u.estimatedCost != null) {
+        add(u.currency === "USD" ? "USD" : "CNY", u.estimatedCost);
+      } else {
+        uncostedTurns += 1;
+      }
+      continue;
+    }
+    // billingMode 缺失：旧持久化用量，按原 USD 估算回退（>0 才计，避免把 0 元轮并入）。
+    if (u.estimatedCostUsd > 0) {
+      add("USD", u.estimatedCostUsd);
+    }
+  }
+
+  return { byCurrency, subscriptionTurns, noneTurns, uncostedTurns };
+}
+
+/** 把 aggregateCost 的分币种合计渲染为 `￥X` / `￥X ＋ ＄Y`；全空返回 ""（调用方据此显套餐/免计费/未计价文案）。 */
+export function formatCostByCurrency(byCurrency: { CNY?: number; USD?: number }): string {
+  const parts: string[] = [];
+  if (byCurrency.CNY != null) parts.push(formatMoney(byCurrency.CNY, "CNY"));
+  if (byCurrency.USD != null) parts.push(formatMoney(byCurrency.USD, "USD"));
+  return parts.join(" ＋ ");
+}
+
+/**
+ * 计价非负校验（0.0.72）：动钱字段不允许负值。返回中文错误文案；全部合法返回 null。
+ *
+ * 规则：
+ * - 顶层 input/output/cachedInput/cacheWrite 若有值须 `>= 0`。
+ * - batchDiscount 若有值须落在 `[0, 1]`（折扣是乘数，超出区间无意义）。
+ * - 每个 tier 的 input/output/cachedInput 若有值须 `>= 0`。
+ *
+ * 纯函数：只读入已解析的数值（null=未填，跳过），不触碰任何状态，便于单测。
+ */
+export function validatePricingNonNeg(
+  top: {
+    input: number | null;
+    output: number | null;
+    cachedInput: number | null;
+    cacheWrite: number | null;
+    batchDiscount: number | null;
+  },
+  tiers: PricingTier[],
+): string | null {
+  const nonNeg = (v: number | null | undefined, label: string): string | null =>
+    v != null && v < 0 ? `${label}不能为负数。` : null;
+
+  const checks = [
+    nonNeg(top.input, "输入（未命中）单价"),
+    nonNeg(top.output, "输出单价"),
+    nonNeg(top.cachedInput, "缓存命中单价"),
+    nonNeg(top.cacheWrite, "缓存写入单价"),
+  ];
+  for (const err of checks) {
+    if (err) return err;
+  }
+  if (top.batchDiscount != null && (top.batchDiscount < 0 || top.batchDiscount > 1)) {
+    return "批量折扣须在 0 到 1 之间（如 0.5 表示五折）。";
+  }
+  for (let i = 0; i < tiers.length; i += 1) {
+    const t = tiers[i];
+    const tierErr =
+      nonNeg(t.input, `第 ${i + 1} 档输入单价`) ??
+      nonNeg(t.output, `第 ${i + 1} 档输出单价`) ??
+      nonNeg(t.cachedInput, `第 ${i + 1} 档缓存命中单价`);
+    if (tierErr) return tierErr;
+  }
+  return null;
 }
 
 /** 查找正文中工具调用标记的最早位置（<ToolCall>、DSML 各变体）；无标记返回 -1。 */

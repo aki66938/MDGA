@@ -19,8 +19,27 @@ import {
   type LspKnownServer,
   type LspServerConfig,
   type LspServerSetting,
+  type BillingMode,
+  type ModelPricing,
+  type StoredPricing,
+  type PricingCurrency,
+  type PricingUnit,
+  type PricingTier,
+  type PresetView,
+  type SubscriptionInfo,
+  type ConnectionMonthlyUsage,
 } from "../types";
-import { humanizeError } from "../utils";
+import {
+  humanizeError,
+  fmtTokens,
+  currencySymbol,
+  unitSuffix,
+  parseStoredPricing,
+  pricingSummary,
+  pricingBadges,
+  convertPriceForUnit,
+  validatePricingNonNeg,
+} from "../utils";
 import { useFocusTrap } from "./dialogs";
 
 // ── 模型连接库（Connections，0.0.59）─────────────────────────────────────────
@@ -61,6 +80,38 @@ function cascadeDeleteNotice(returnedRoles: string[]): string {
   const names = returnedRoles.map(roleLabel).join("、");
   const mainCleared = returnedRoles.includes("main");
   return `已删除；已清除分配：${names}${mainCleared ? "（主模型现未配置，请重新指定）" : ""}`;
+}
+
+// ── 计费方式（Billing，0.0.72）──────────────────────────────────────────────
+
+/** 连接的有效计费方式（缺＝按量付费 'api'）。 */
+function effectiveBillingMode(c: ConnectionView): BillingMode {
+  return c.billingMode === "subscription" || c.billingMode === "none" ? c.billingMode : "api";
+}
+
+/** 三档计费方式的中文标签（分段控件用）。 */
+const BILLING_MODES: Array<{ id: BillingMode; label: string }> = [
+  { id: "api", label: "按量付费（API）" },
+  { id: "subscription", label: "订阅套餐" },
+  { id: "none", label: "本地免计费" },
+];
+
+/** 解析 subscriptionJson（自由结构）。失败/空返回 {}。 */
+function parseSubscription(json: string | null | undefined): SubscriptionInfo {
+  if (!json || !json.trim()) return {};
+  try {
+    const o = JSON.parse(json) as SubscriptionInfo;
+    return o && typeof o === "object" ? o : {};
+  } catch {
+    return {};
+  }
+}
+
+/** 徽标文案（单价）：preset→「预设·可改」｜needs_verify→「待官网核对」｜custom→「自定义」。 */
+function pricingBadgeLabel(b: "preset" | "needs_verify" | "custom"): string {
+  if (b === "preset") return "预设·可改";
+  if (b === "needs_verify") return "待官网核对";
+  return "自定义";
 }
 
 /**
@@ -281,6 +332,10 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
                 </button>
               </div>
 
+              {/* 0.0.72：连接级「计费方式」（按量/订阅/免计费）+ 订阅套餐元信息 + 订阅月度用量条。
+                  改 billingMode 后刷新连接列表，让模型行单价编辑可见性、卡头徽标即时更新。 */}
+              <ConnectionBilling connection={c} onChanged={refresh} />
+
               {/* 0.0.60：在每个连接卡下登记「加载模型」（一个连接可登记多个模型，一对多）。
                   0.0.62：级联删模型可能清掉 main，故把 onChanged 透传给上层刷新（主模型徽标等）。 */}
               <ConnectionModels connection={c} onChanged={onChanged} />
@@ -298,6 +353,220 @@ function ConnectionsSettings({ onChanged }: { onChanged?: () => void }) {
         </button>
       </div>
     </>
+  );
+}
+
+/**
+ * 连接级「计费方式」（0.0.72）：三档分段控件（按量付费 / 订阅套餐 / 本地免计费）。
+ * 改动经 set_connection_billing；选「订阅套餐」额外露出套餐名/月费/月额度 token（写入 subscriptionJson）。
+ * subscription 模式再挂一个「本月用量条」（MonthlyUsageBar）。改完调 onChanged 让上层刷新连接列表。
+ */
+function ConnectionBilling({ connection, onChanged }: { connection: ConnectionView; onChanged: () => void }) {
+  const mode = effectiveBillingMode(connection);
+  const initialSub = parseSubscription(connection.subscriptionJson);
+  const [planLabel, setPlanLabel] = useState(initialSub.planLabel ?? "");
+  const [monthlyFee, setMonthlyFee] = useState(initialSub.monthlyFee != null ? String(initialSub.monthlyFee) : "");
+  const [subCurrency, setSubCurrency] = useState<PricingCurrency>(initialSub.currency === "USD" ? "USD" : "CNY");
+  const [quotaTokens, setQuotaTokens] = useState(
+    initialSub.monthlyQuotaTokens != null ? String(initialSub.monthlyQuotaTokens) : "",
+  );
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  /** 组装当前订阅字段为 SubscriptionInfo（空字段省略）。 */
+  function buildSubscription(): SubscriptionInfo {
+    const out: SubscriptionInfo = { currency: subCurrency };
+    const pl = planLabel.trim();
+    if (pl) out.planLabel = pl;
+    const fee = parseFloat(monthlyFee);
+    if (monthlyFee.trim() && !Number.isNaN(fee)) out.monthlyFee = fee;
+    const q = parseInt(quotaTokens, 10);
+    if (quotaTokens.trim() && !Number.isNaN(q) && q > 0) out.monthlyQuotaTokens = q;
+    return out;
+  }
+
+  /** 切换计费方式：subscription 带当前订阅字段，其它传 null。 */
+  async function changeMode(next: BillingMode) {
+    if (next === mode && next !== "subscription") return;
+    setError(null);
+    setSaving(true);
+    try {
+      const subJson = next === "subscription" ? JSON.stringify(buildSubscription()) : null;
+      await invoke("set_connection_billing", {
+        connectionId: connection.id,
+        billingMode: next,
+        subscriptionJson: subJson,
+      });
+      onChanged();
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /** 保存订阅元信息（套餐名/月费/月额度），保持 billingMode='subscription'。 */
+  async function saveSubscription() {
+    setError(null);
+    setSaving(true);
+    try {
+      await invoke("set_connection_billing", {
+        connectionId: connection.id,
+        billingMode: "subscription",
+        subscriptionJson: JSON.stringify(buildSubscription()),
+      });
+      onChanged();
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="provider-billing">
+      <div className="provider-billing__head">
+        <span className="provider-billing__title">计费方式</span>
+        <span className="provider-billing__seg" role="group" aria-label="计费方式">
+          {BILLING_MODES.map((b) => (
+            <button
+              key={b.id}
+              type="button"
+              className={`provider-billing__segbtn${mode === b.id ? " provider-billing__segbtn--on" : ""}`}
+              disabled={saving}
+              aria-pressed={mode === b.id}
+              onClick={() => void changeMode(b.id)}
+            >
+              {b.label}
+            </button>
+          ))}
+        </span>
+      </div>
+
+      {mode === "subscription" && (
+        <div className="provider-billing__sub">
+          <div className="provider-grid">
+            <label className="provider-field">
+              <span className="provider-field__label">套餐名</span>
+              <input
+                className="conv-search provider-input"
+                type="text"
+                value={planLabel}
+                placeholder="如 Pro / 月付套餐"
+                disabled={saving}
+                onChange={(e) => setPlanLabel(e.target.value)}
+              />
+            </label>
+            <label className="provider-field">
+              <span className="provider-field__label">月费（可空）</span>
+              <span style={{ display: "flex", gap: 6 }}>
+                <select
+                  value={subCurrency}
+                  disabled={saving}
+                  style={{ width: 64 }}
+                  onChange={(e) => setSubCurrency(e.target.value === "USD" ? "USD" : "CNY")}
+                >
+                  <option value="CNY">￥</option>
+                  <option value="USD">＄</option>
+                </select>
+                <input
+                  className="conv-search provider-input"
+                  type="number"
+                  min={0}
+                  value={monthlyFee}
+                  placeholder="如 99"
+                  disabled={saving}
+                  onChange={(e) => setMonthlyFee(e.target.value)}
+                />
+              </span>
+            </label>
+            <label className="provider-field provider-field--full">
+              <span className="provider-field__label">月额度 token（可空，用于本月用量进度条）</span>
+              <input
+                className="conv-search provider-input"
+                type="number"
+                min={0}
+                value={quotaTokens}
+                placeholder="如 5000000；留空＝不显进度只显累计"
+                disabled={saving}
+                onChange={(e) => setQuotaTokens(e.target.value)}
+              />
+            </label>
+          </div>
+          <div className="provider-card__actions">
+            <button
+              type="button"
+              className="approval-card__btn approval-card__btn--allow"
+              disabled={saving}
+              onClick={() => void saveSubscription()}
+            >
+              {saving ? "保存中…" : "保存套餐信息"}
+            </button>
+          </div>
+          <MonthlyUsageBar connection={connection} quotaTokens={parseSubscription(connection.subscriptionJson).monthlyQuotaTokens} />
+        </div>
+      )}
+
+      {error && <p className="settings-row__value" style={{ color: "var(--danger)", marginTop: 4 }}>{error}</p>}
+    </div>
+  );
+}
+
+/**
+ * 订阅月度用量条（0.0.72 ⑥）：调 get_connection_monthly_usage 取本月该连接累计 token。
+ * 有 monthlyQuotaTokens → 进度条「本月 X / Y tokens」；无额度 → 只显「本月 X tokens」。
+ * 用 fmtTokens 做 k/M 简写。connection.subscriptionJson 变化时重取（额度来自上层已保存的值）。
+ */
+function MonthlyUsageBar({
+  connection,
+  quotaTokens,
+}: {
+  connection: ConnectionView;
+  quotaTokens?: number;
+}) {
+  const [usage, setUsage] = useState<ConnectionMonthlyUsage | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setError(null);
+    invoke<ConnectionMonthlyUsage>("get_connection_monthly_usage", { connectionId: connection.id })
+      .then((u) => { if (alive) setUsage(u ?? null); })
+      .catch((e) => { if (alive) setError(humanizeError(String(e))); });
+    return () => { alive = false; };
+    // 订阅 JSON（含额度）变化时重取，使刚保存的额度即时反映在进度条。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connection.id, connection.subscriptionJson]);
+
+  if (error) {
+    return <p className="settings-desc" style={{ marginTop: 6, color: "var(--warning)" }}>本月用量获取失败：{error}</p>;
+  }
+  if (!usage) {
+    return <p className="settings-desc" style={{ marginTop: 6 }}>本月用量加载中…</p>;
+  }
+
+  const used = usage.totalTokens ?? 0;
+  const hasQuota = quotaTokens != null && quotaTokens > 0;
+  const pct = hasQuota ? Math.min(100, Math.round((used / quotaTokens!) * 100)) : 0;
+  const over = hasQuota && used > quotaTokens!;
+
+  return (
+    <div className="provider-usage">
+      <div className="provider-usage__label">
+        {hasQuota
+          ? `本月 ${fmtTokens(used)} / ${fmtTokens(quotaTokens!)} tokens`
+          : `本月 ${fmtTokens(used)} tokens`}
+        {over && <span style={{ color: "var(--danger)", marginLeft: 6 }}>已超额度</span>}
+      </div>
+      {hasQuota && (
+        <div className="provider-usage__track" aria-hidden="true">
+          <div
+            className="provider-usage__fill"
+            style={{ width: `${pct}%`, background: over ? "var(--danger)" : "var(--brand)" }}
+          />
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -330,6 +599,11 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
   const [fetching, setFetching] = useState(false);
   const [fetched, setFetched] = useState<string[] | null>(null);
   const [fetchNotice, setFetchNotice] = useState<string | null>(null);
+  // 单价就地编辑（0.0.72）：editingPriceId=正在改单价的模型 id（null=无）。仅 billingMode='api' 的连接可用。
+  const [editingPriceId, setEditingPriceId] = useState<string | null>(null);
+
+  // 该连接的有效计费方式：决定模型行是显单价编辑（api）/「套餐内」（subscription）/「免计费」（none）。
+  const billing = effectiveBillingMode(connection);
 
   const refresh = () => {
     setLoading(true);
@@ -343,6 +617,38 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
   /** 已登记的 modelId 集合（小写归一），用于「拉取」结果里标注哪些已添加。 */
   const existingIds = new Set(models.map((m) => m.modelId.trim().toLowerCase()));
 
+  /**
+   * 预设自动填（0.0.72）：新增模型后，按 (连接 preset, modelId, 默认 'CNY') 查 lookup_model_preset；
+   * 命中且该模型尚无单价时，把 pricing + _source:'preset' + 元数据存进去（set_model_pricing）。
+   * 静默尽力（查不到/无 preset/出错都不打断添加流程）。仅 billingMode='api' 才填。
+   */
+  async function autofillPreset(modelRef: string, modelId: string, alreadyHasPricing: boolean) {
+    if (billing !== "api" || alreadyHasPricing) return;
+    const preset = connection.preset?.trim();
+    if (!preset || preset === "custom") return;
+    try {
+      const view = await invoke<PresetView | null>("lookup_model_preset", {
+        connectionPreset: preset,
+        modelId,
+        currency: "CNY",
+      });
+      if (!view || !view.pricing) return;
+      const stored: StoredPricing = {
+        ...view.pricing,
+        _source: "preset",
+        _confidence: view.confidence,
+        _needsVerify: view.needsVerify,
+        _sourceUrl: view.sourceUrl,
+      };
+      await invoke<CuratedModelView>("set_model_pricing", {
+        modelRef,
+        pricingJson: JSON.stringify(stored),
+      });
+    } catch {
+      // 静默：无预设/网络/解析失败都不阻断添加。
+    }
+  }
+
   /** 添加一个模型（手填或来自拉取 chip）。可带 label/contextWindow；add_model 按 连接+modelId 去重。 */
   async function addModel(id: string, opts?: { label?: string; contextWindow?: number }) {
     const trimmed = id.trim();
@@ -350,12 +656,14 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
     setError(null);
     setAdding(true);
     try {
-      await invoke<CuratedModelView>("add_model", {
+      const added = await invoke<CuratedModelView>("add_model", {
         connectionId: connection.id,
         modelId: trimmed,
         label: opts?.label?.trim() || null,
         contextWindow: opts?.contextWindow ?? null,
       });
+      // 预设自动填单价（仅按量付费连接；已有单价的不覆盖）。再 refresh 刷新显示。
+      await autofillPreset(added.id, added.modelId, !!added.pricingJson);
       refresh();
     } catch (e) {
       setError(humanizeError(String(e)));
@@ -572,6 +880,26 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
                       </button>
                     )}
                   </div>
+
+                  {/* 单价（0.0.72）：仅按量付费连接显示编辑；订阅＝「套餐内」；免计费＝「免计费」。 */}
+                  <div className="provider-param">
+                    <span className="provider-param__name">单价</span>
+                    {billing === "subscription" ? (
+                      <span className="provider-param__value" style={{ cursor: "default" }}>套餐内</span>
+                    ) : billing === "none" ? (
+                      <span className="provider-param__value" style={{ cursor: "default" }}>免计费</span>
+                    ) : (
+                      <ModelPriceCell
+                        model={m}
+                        connection={connection}
+                        editing={editingPriceId === m.id}
+                        onBeginEdit={() => { setError(null); setEditingPriceId(m.id); }}
+                        onClose={() => setEditingPriceId(null)}
+                        onSaved={() => { setEditingPriceId(null); refresh(); }}
+                        onError={setError}
+                      />
+                    )}
+                  </div>
                 </div>
               </li>
             );
@@ -640,6 +968,480 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
       {notice && <p className="settings-row__value" style={{ color: "var(--success)", marginTop: 4 }}>{notice}</p>}
       {error && <p className="settings-row__value" style={{ color: "var(--danger)", marginTop: 4 }}>{error}</p>}
     </div>
+  );
+}
+
+/**
+ * 模型行单价单元（0.0.72）：未编辑态显「单价摘要 + 徽标 + 改单价」；编辑态展开 ModelPricingEditor。
+ * 仅 billingMode='api' 的连接会渲染本组件（见调用处）。
+ */
+function ModelPriceCell({
+  model,
+  connection,
+  editing,
+  onBeginEdit,
+  onClose,
+  onSaved,
+  onError,
+}: {
+  model: CuratedModelView;
+  connection: ConnectionView;
+  editing: boolean;
+  onBeginEdit: () => void;
+  onClose: () => void;
+  onSaved: () => void;
+  onError: (msg: string | null) => void;
+}) {
+  const stored = parseStoredPricing(model.pricingJson);
+  // 显示侧预设回退（0.0.72）：升级前登记、pricing_json 为空的老模型，按 (连接 preset, modelId, CNY)
+  // 查预设展示「预设·可改」，与后端 resolve_billing 运行期回退一致。不写库——点「改单价」保存才落库。
+  const billingMode = effectiveBillingMode(connection);
+  const presetId = connection.preset?.trim();
+  const [presetFallback, setPresetFallback] = useState<StoredPricing | null>(null);
+  useEffect(() => {
+    let alive = true;
+    setPresetFallback(null);
+    if (model.pricingJson || billingMode !== "api" || !presetId || presetId === "custom") return;
+    invoke<PresetView | null>("lookup_model_preset", {
+      connectionPreset: presetId,
+      modelId: model.modelId,
+      currency: "CNY",
+    })
+      .then((view) => {
+        if (alive && view && view.pricing) {
+          setPresetFallback({
+            ...view.pricing,
+            _source: "preset",
+            _confidence: view.confidence,
+            _needsVerify: view.needsVerify,
+            _sourceUrl: view.sourceUrl,
+          });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [model.pricingJson, model.modelId, billingMode, presetId]);
+
+  const pricing = stored ?? presetFallback;
+
+  if (editing) {
+    return (
+      <ModelPricingEditor
+        model={model}
+        connection={connection}
+        initial={pricing}
+        onCancel={onClose}
+        onSaved={onSaved}
+        onError={onError}
+      />
+    );
+  }
+
+  const badges = pricingBadges(pricing);
+  return (
+    <span className="provider-price__summary">
+      <span className="provider-price__nums">{pricingSummary(pricing)}</span>
+      {badges.map((b) => (
+        <span
+          key={b}
+          className={
+            "provider-price__badge" +
+            (b === "preset" ? " provider-price__badge--preset" : "") +
+            (b === "needs_verify" ? " provider-price__badge--verify" : "") +
+            (b === "custom" ? " provider-price__badge--custom" : "")
+          }
+          title={b === "needs_verify" ? "以官网为准：预设价可能已变动，请核对官网定价" : undefined}
+        >
+          {pricingBadgeLabel(b)}
+        </span>
+      ))}
+      <button
+        type="button"
+        className="provider-param__value"
+        title="改单价"
+        onClick={onBeginEdit}
+      >
+        改单价
+        <Pencil size={11} className="provider-param__editicon" />
+      </button>
+    </span>
+  );
+}
+
+/** tiers 的草稿行（字符串草稿，保存时解析）。 */
+type TierDraft = { maxContext: string; input: string; output: string; cachedInput: string };
+
+/**
+ * 模型单价就地编辑器（0.0.72）：货币/单位 select + 输入(未命中)/缓存命中(可空)/输出三个 input；
+ * 进阶折叠区含 tiers（可加/删档）+ 缓存写入 + 批量折扣。
+ * 保存：价格字段 + _source:'custom' 组装 → JSON.stringify → set_model_pricing。
+ * 恢复预设：重新 lookup_model_preset 覆盖回 _source:'preset'。切货币若有该币种预设则重 lookup 填充。
+ * 切单位：换算可见数字（×/÷1000）并更新 unit。
+ * 表单控件用裸 <select>/<input>，仅内联 style 覆盖 width，不手写 height/font-size。
+ */
+function ModelPricingEditor({
+  model,
+  connection,
+  initial,
+  onCancel,
+  onSaved,
+  onError,
+}: {
+  model: CuratedModelView;
+  connection: ConnectionView;
+  initial: StoredPricing | null;
+  onCancel: () => void;
+  onSaved: () => void;
+  onError: (msg: string | null) => void;
+}) {
+  // 草稿：用字符串持有数字输入（允许空 = 未填）。来源/元数据单独持有。
+  const [currency, setCurrency] = useState<PricingCurrency>(initial?.currency ?? "CNY");
+  const [unit, setUnit] = useState<PricingUnit>(initial?.unit ?? "per_1m");
+  const [input, setInput] = useState(initial?.input != null ? String(initial.input) : "");
+  const [cachedInput, setCachedInput] = useState(initial?.cachedInput != null ? String(initial.cachedInput) : "");
+  const [output, setOutput] = useState(initial?.output != null ? String(initial.output) : "");
+  const [cacheWrite, setCacheWrite] = useState(initial?.cacheWrite != null ? String(initial.cacheWrite) : "");
+  const [batchDiscount, setBatchDiscount] = useState(initial?.batchDiscount != null ? String(initial.batchDiscount) : "");
+  const [tiers, setTiers] = useState<TierDraft[]>(
+    (initial?.tiers ?? []).map((t) => ({
+      maxContext: String(t.maxContext),
+      input: String(t.input),
+      output: String(t.output),
+      cachedInput: t.cachedInput != null ? String(t.cachedInput) : "",
+    })),
+  );
+  // 来源元数据：保存时若任一价格字段被改过 → 转 custom；恢复预设 → preset（+ 元数据）。
+  const [source, setSource] = useState<"preset" | "custom">(initial?._source ?? "custom");
+  const [confidence, setConfidence] = useState<string | undefined>(initial?._confidence);
+  const [needsVerify, setNeedsVerify] = useState<boolean>(!!initial?._needsVerify);
+  const [sourceUrl, setSourceUrl] = useState<string | undefined>(initial?._sourceUrl);
+  const [advancedOpen, setAdvancedOpen] = useState(
+    !!(initial?.tiers?.length || initial?.cacheWrite != null || initial?.batchDiscount != null),
+  );
+  const [saving, setSaving] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+
+  const preset = connection.preset?.trim();
+  const canLookupPreset = !!preset && preset !== "custom";
+
+  /** 把字符串草稿解析为数字（空＝null）。非法（非数字）抛出。 */
+  function num(s: string): number | null {
+    const t = s.trim();
+    if (!t) return null;
+    const n = Number(t);
+    if (Number.isNaN(n)) throw new Error(`「${t}」不是有效数字`);
+    return n;
+  }
+
+  /** 用一个 ModelPricing（预设或恢复）填充全部草稿字段。 */
+  function fillFromPricing(p: ModelPricing) {
+    setCurrency(p.currency === "USD" ? "USD" : "CNY");
+    setUnit(p.unit === "per_1k" ? "per_1k" : "per_1m");
+    setInput(p.input != null ? String(p.input) : "");
+    setOutput(p.output != null ? String(p.output) : "");
+    setCachedInput(p.cachedInput != null ? String(p.cachedInput) : "");
+    setCacheWrite(p.cacheWrite != null ? String(p.cacheWrite) : "");
+    setBatchDiscount(p.batchDiscount != null ? String(p.batchDiscount) : "");
+    setTiers(
+      (p.tiers ?? []).map((t) => ({
+        maxContext: String(t.maxContext),
+        input: String(t.input),
+        output: String(t.output),
+        cachedInput: t.cachedInput != null ? String(t.cachedInput) : "",
+      })),
+    );
+  }
+
+  /** 切货币：若 (preset, modelId, 新币种) 有预设则重 lookup 填充，否则仅改 currency 字段（保留用户值）。 */
+  async function handleCurrencyChange(next: PricingCurrency) {
+    setCurrency(next);
+    if (!canLookupPreset) return;
+    try {
+      const view = await invoke<PresetView | null>("lookup_model_preset", {
+        connectionPreset: preset,
+        modelId: model.modelId,
+        currency: next,
+      });
+      if (view && view.pricing) {
+        fillFromPricing(view.pricing);
+        setSource("preset");
+        setConfidence(view.confidence);
+        setNeedsVerify(view.needsVerify);
+        setSourceUrl(view.sourceUrl);
+      } else {
+        // 目标币种无预设：保留用户已填数字，但徽标须如实显「自定义」——
+        // 否则会显「预设」却配着非该币种的数字（与 handleUnitChange 同样的处理）。
+        setSource("custom");
+        setConfidence(undefined);
+        setNeedsVerify(false);
+        setSourceUrl(undefined);
+      }
+    } catch {
+      // 静默：lookup 失败时只切 currency。
+    }
+  }
+
+  /** 切单位：换算可见数字（per_1m↔per_1k ×/÷1000）并改 unit。用户手改了值→视为 custom。 */
+  function handleUnitChange(next: PricingUnit) {
+    if (next === unit) return;
+    const conv = (s: string): string => {
+      const t = s.trim();
+      if (!t) return "";
+      const n = Number(t);
+      if (Number.isNaN(n)) return s;
+      const v = convertPriceForUnit(n, unit, next);
+      return v != null ? String(v) : "";
+    };
+    setInput(conv(input));
+    setCachedInput(conv(cachedInput));
+    setOutput(conv(output));
+    setCacheWrite(conv(cacheWrite));
+    setTiers((ts) => ts.map((t) => ({ ...t, input: conv(t.input), output: conv(t.output), cachedInput: conv(t.cachedInput) })));
+    setUnit(next);
+    // 单位换算改了数字基准，标记为 custom（避免误显「预设·可改」却与官网 per_1m 数不一致）。
+    setSource("custom");
+  }
+
+  /** 恢复预设：重 lookup 覆盖回 preset（+ 元数据）。 */
+  async function handleRestorePreset() {
+    if (!canLookupPreset) return;
+    onError(null);
+    setRestoring(true);
+    try {
+      const view = await invoke<PresetView | null>("lookup_model_preset", {
+        connectionPreset: preset,
+        modelId: model.modelId,
+        currency,
+      });
+      if (!view || !view.pricing) {
+        onError("未找到该模型的预设单价（可能预设库未收录），请手动填写。");
+        return;
+      }
+      fillFromPricing(view.pricing);
+      setSource("preset");
+      setConfidence(view.confidence);
+      setNeedsVerify(view.needsVerify);
+      setSourceUrl(view.sourceUrl);
+    } catch (e) {
+      onError(humanizeError(String(e)));
+    } finally {
+      setRestoring(false);
+    }
+  }
+
+  /** 标记用户改了价格字段 → custom（绑在各 input 的 onChange 上）。 */
+  function markCustom() {
+    if (source !== "custom") setSource("custom");
+  }
+
+  function updateTier(i: number, patch: Partial<TierDraft>) {
+    markCustom();
+    setTiers((ts) => ts.map((t, idx) => (idx === i ? { ...t, ...patch } : t)));
+  }
+  function addTier() {
+    markCustom();
+    setTiers((ts) => [...ts, { maxContext: "", input: "", output: "", cachedInput: "" }]);
+  }
+  function removeTier(i: number) {
+    markCustom();
+    setTiers((ts) => ts.filter((_, idx) => idx !== i));
+  }
+
+  /** 保存：组装 StoredPricing（含 _source 与预设元数据）→ set_model_pricing。 */
+  async function handleSave() {
+    onError(null);
+    let parsed: { input: number | null; output: number | null; cachedInput: number | null; cacheWrite: number | null; batchDiscount: number | null };
+    try {
+      parsed = {
+        input: num(input),
+        output: num(output),
+        cachedInput: num(cachedInput),
+        cacheWrite: num(cacheWrite),
+        batchDiscount: num(batchDiscount),
+      };
+    } catch (e) {
+      onError(`单价格式有误：${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    if (parsed.input == null || parsed.output == null) {
+      onError("请至少填写「输入（未命中）」与「输出」单价。");
+      return;
+    }
+    // 解析 tiers（每档须 maxContext+input+output；忽略整行全空）。
+    const tierOut: PricingTier[] = [];
+    try {
+      for (const t of tiers) {
+        if (!t.maxContext.trim() && !t.input.trim() && !t.output.trim() && !t.cachedInput.trim()) continue;
+        const mc = num(t.maxContext);
+        const ti = num(t.input);
+        const to = num(t.output);
+        if (mc == null || ti == null || to == null) {
+          onError("分档需填写「上下文上限 / 输入 / 输出」；如不需要请删除该档。");
+          return;
+        }
+        const tc = num(t.cachedInput);
+        tierOut.push({ maxContext: mc, input: ti, output: to, ...(tc != null ? { cachedInput: tc } : {}) });
+      }
+    } catch (e) {
+      onError(`分档格式有误：${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+
+    // 非负校验（动钱字段不允许负值；折扣须落在 [0,1]）。任一非法即拒绝保存。
+    const nonNegError = validatePricingNonNeg(parsed, tierOut);
+    if (nonNegError) {
+      onError(nonNegError);
+      return;
+    }
+
+    const stored: StoredPricing = {
+      currency,
+      unit,
+      input: parsed.input,
+      output: parsed.output,
+      ...(parsed.cachedInput != null ? { cachedInput: parsed.cachedInput } : {}),
+      ...(parsed.cacheWrite != null ? { cacheWrite: parsed.cacheWrite } : {}),
+      ...(parsed.batchDiscount != null ? { batchDiscount: parsed.batchDiscount } : {}),
+      ...(tierOut.length ? { tiers: tierOut } : {}),
+      _source: source,
+      ...(source === "preset" && confidence ? { _confidence: confidence } : {}),
+      ...(source === "preset" && needsVerify ? { _needsVerify: true } : {}),
+      ...(source === "preset" && sourceUrl ? { _sourceUrl: sourceUrl } : {}),
+    };
+
+    setSaving(true);
+    try {
+      await invoke<CuratedModelView>("set_model_pricing", {
+        modelRef: model.id,
+        pricingJson: JSON.stringify(stored),
+      });
+      onSaved();
+    } catch (e) {
+      onError(humanizeError(String(e)));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /** 清空单价（传 null）。 */
+  async function handleClear() {
+    onError(null);
+    setSaving(true);
+    try {
+      await invoke<CuratedModelView>("set_model_pricing", { modelRef: model.id, pricingJson: null });
+      onSaved();
+    } catch (e) {
+      onError(humanizeError(String(e)));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const sym = currencySymbol(currency);
+  const unitLabel = unitSuffix(unit);
+
+  return (
+    <span className="provider-price__edit">
+      <div className="provider-price__grid">
+        <label className="provider-price__field">
+          <span className="provider-price__flabel">货币</span>
+          <select value={currency} disabled={saving} onChange={(e) => void handleCurrencyChange(e.target.value === "USD" ? "USD" : "CNY")}>
+            <option value="CNY">￥人民币</option>
+            <option value="USD">＄美元</option>
+          </select>
+        </label>
+        <label className="provider-price__field">
+          <span className="provider-price__flabel">单位</span>
+          <select value={unit} disabled={saving} onChange={(e) => handleUnitChange(e.target.value === "per_1k" ? "per_1k" : "per_1m")}>
+            <option value="per_1m">每百万 / 1M</option>
+            <option value="per_1k">每千 / 1K</option>
+          </select>
+        </label>
+        <label className="provider-price__field">
+          <span className="provider-price__flabel">输入（未命中）{sym}{unitLabel}</span>
+          <input type="number" min={0} step="any" style={{ width: 90 }} value={input} disabled={saving}
+            onChange={(e) => { setInput(e.target.value); markCustom(); }} />
+        </label>
+        <label className="provider-price__field">
+          <span className="provider-price__flabel">缓存命中（可空）{sym}{unitLabel}</span>
+          <input type="number" min={0} step="any" style={{ width: 90 }} value={cachedInput} disabled={saving}
+            onChange={(e) => { setCachedInput(e.target.value); markCustom(); }} />
+        </label>
+        <label className="provider-price__field">
+          <span className="provider-price__flabel">输出 {sym}{unitLabel}</span>
+          <input type="number" min={0} step="any" style={{ width: 90 }} value={output} disabled={saving}
+            onChange={(e) => { setOutput(e.target.value); markCustom(); }} />
+        </label>
+      </div>
+
+      <button type="button" className="provider-advanced-toggle" onClick={() => setAdvancedOpen((v) => !v)}>
+        {advancedOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        进阶（分档定价 / 缓存写入 / 批量折扣）
+      </button>
+      {advancedOpen && (
+        <div className="provider-price__advanced">
+          <div className="provider-price__row">
+            <label className="provider-price__field">
+              <span className="provider-price__flabel">缓存写入（可空）{sym}{unitLabel}</span>
+              <input type="number" min={0} step="any" style={{ width: 90 }} value={cacheWrite} disabled={saving}
+                onChange={(e) => { setCacheWrite(e.target.value); markCustom(); }} />
+            </label>
+            <label className="provider-price__field">
+              <span className="provider-price__flabel">批量折扣（可空，如 0.5）</span>
+              <input type="number" min={0} step="any" style={{ width: 90 }} value={batchDiscount} disabled={saving}
+                onChange={(e) => { setBatchDiscount(e.target.value); markCustom(); }} />
+            </label>
+          </div>
+
+          <div className="provider-price__tiers">
+            <span className="provider-price__flabel">上下文分档（长上下文阶梯定价）</span>
+            {tiers.map((t, i) => (
+              <div key={i} className="provider-price__tier">
+                <input type="number" min={0} step="any" style={{ width: 110 }} placeholder="上限 token" value={t.maxContext} disabled={saving}
+                  onChange={(e) => updateTier(i, { maxContext: e.target.value })} />
+                <input type="number" min={0} step="any" style={{ width: 72 }} placeholder="输入" value={t.input} disabled={saving}
+                  onChange={(e) => updateTier(i, { input: e.target.value })} />
+                <input type="number" min={0} step="any" style={{ width: 72 }} placeholder="命中" value={t.cachedInput} disabled={saving}
+                  onChange={(e) => updateTier(i, { cachedInput: e.target.value })} />
+                <input type="number" min={0} step="any" style={{ width: 72 }} placeholder="输出" value={t.output} disabled={saving}
+                  onChange={(e) => updateTier(i, { output: e.target.value })} />
+                <button type="button" className="provider-models__del" title="删除该档" aria-label="删除该档" onClick={() => removeTier(i)}>
+                  <Trash2 size={13} />
+                </button>
+              </div>
+            ))}
+            <button type="button" className="approval-card__btn" style={{ marginTop: 4 }} onClick={addTier} disabled={saving}>
+              <Plus size={13} /> 加一档
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 预设来源信息：恢复预设按钮 + 来源链接 + 置信度。 */}
+      {canLookupPreset && (
+        <div className="provider-price__preset">
+          <button type="button" className="approval-card__btn" onClick={() => void handleRestorePreset()} disabled={saving || restoring}>
+            <Download size={13} /> {restoring ? "查询中…" : "恢复预设"}
+          </button>
+          {source === "preset" && sourceUrl && (
+            <a className="provider-price__src" href={sourceUrl} target="_blank" rel="noreferrer" title={sourceUrl}>来源</a>
+          )}
+          {source === "preset" && confidence && (
+            <span className="provider-price__conf">置信度 {confidence}</span>
+          )}
+        </div>
+      )}
+
+      <div className="provider-card__actions" style={{ marginTop: 6 }}>
+        <button type="button" className="approval-card__btn" onClick={onCancel} disabled={saving}>取消</button>
+        <button type="button" className="approval-card__btn" onClick={() => void handleClear()} disabled={saving} style={{ color: "var(--danger)" }}>清空单价</button>
+        <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={() => void handleSave()} disabled={saving}>
+          {saving ? "保存中…" : "保存单价"}
+        </button>
+      </div>
+    </span>
   );
 }
 

@@ -44,10 +44,13 @@ use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMes
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
 use mdga_shared::PermissionMode;
 use mdga_storage::{
-    get_conversation, get_messages, get_role_model, list_permission_rules, resolve_role_provider,
-    save_token_ledger_entry, ROLE_ACTION, ROLE_MAIN, ROLE_PLAN, ROLE_VISION,
+    bump_usage_counter, current_ym, get_conversation, get_messages, get_role_model,
+    list_permission_rules, resolve_pricing_context, resolve_role_provider, save_token_ledger_entry,
+    PricingContext, ROLE_ACTION, ROLE_MAIN, ROLE_PLAN, ROLE_VISION,
 };
-use mdga_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
+use mdga_token_accounting::{
+    compute_cost_summary_priced, lookup_preset, BillingMode, ModelPricing,
+};
 use mdga_tool_runtime::RunCommandRequest;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -111,7 +114,7 @@ pub(crate) async fn send_message(
     // R8 角色多模型路由：本轮生效的角色——计划模式用 'plan'，常规工具循环用 'action'。
     // 二者均经 resolve_role_provider 解析：角色未单独配置时回退主模型，行为与从前一致（向后兼容）。
     let active_role = if plan_mode { ROLE_PLAN } else { ROLE_ACTION };
-    let (conversation, permission_rules, base_url, api_key, model_id, context_window, vision_provider) = {
+    let (conversation, permission_rules, base_url, api_key, model_id, context_window, vision_provider, pricing_ctx) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let conversation = get_conversation(&db, &conversation_id)
             .map_err(|e| e.to_string())?
@@ -151,7 +154,11 @@ pub(crate) async fn send_message(
                 _ => None,
             }
         };
-        (conversation, rules, base_url, api_key, model_id, main_context_window, vision_provider)
+        // 0.0.72 计价：沿 active_role 的同一条解析+回退链（与上面 resolve_role_provider 同口径）取出
+        // 本轮命中连接的 billing_mode + subscription_json 与命中模型的 pricing_json，供本轮结束结算用。
+        // 软处理：解析失败/未配置 → None，结算时落到「无金额」（前端显「—」），不中断本轮。
+        let pricing_ctx = resolve_pricing_context(&db, active_role).ok().flatten();
+        (conversation, rules, base_url, api_key, model_id, main_context_window, vision_provider, pricing_ctx)
     };
     // 入参 model 保留以不破坏前端命令签名，但本轮已不再用它决定模型（权威源为 model_id）。
     let _ = &model;
@@ -395,12 +402,72 @@ pub(crate) async fn send_message(
     let raw_usage = result?;
 
     if let Some(raw) = raw_usage {
-        let summary = compute_cost_summary(&raw, &deepseek_pricing_for_model(&model_id));
+        // 0.0.72 计价：据本轮命中的连接 billing_mode + 模型 pricing_json 结算（pricing_ctx 已沿
+        // active_role 的解析+回退链取出）。未解析到上下文时按「无计费信息」处理（api 模式无单价）。
+        let (mode, pricing) = resolve_billing(pricing_ctx.as_ref());
+        let summary = compute_cost_summary_priced(&raw, mode, pricing.as_ref());
         let _ = app.emit("chat-usage", summary);
+
+        // 0.0.72 月度用量：按本轮命中连接累计原始 token（订阅进度条数据支撑）。与上面的计价/成本
+        // 路径完全隔离——只累加 raw 的三项 token，不读单价、不进 token_ledger。对**所有连接**都记
+        // （不止订阅，cheap，且日后切订阅有历史）。失败软处理：绝不中断本轮、不 panic。
+        // 注：这与「会话累计」（前端从 message.usageJson 聚合）是两套独立的数，互不重复计。
+        if let Some(ctx) = pricing_ctx.as_ref() {
+            if let Ok(db) = state.db.lock() {
+                let _ = bump_usage_counter(
+                    &db,
+                    &ctx.connection_id,
+                    &current_ym(),
+                    raw.prompt_tokens,
+                    raw.completion_tokens,
+                    raw.total_tokens,
+                );
+            }
+        }
     }
 
     let _ = app.emit("chat-done", ());
     Ok(())
+}
+
+/// 把本轮命中的计价上下文映射为结算所需的 `(BillingMode, Option<ModelPricing>)`（0.0.72）。
+///
+/// - `mode`：连接 billing_mode 串映射到 [`BillingMode`]，未知值（理论上不会出现，写入侧已归一）落回 Api。
+/// - `pricing`：
+///   - 优先把模型 `pricing_json` 解析为 [`ModelPricing`]（serde 默认忽略 `_` 前缀元数据等多余字段）；
+///     解析失败**软处理**为 None（不 panic、不中断本轮）。
+///   - 若 `pricing_json` 为空（或解析失败为 None）**且 mode == Api**，回退用预设库 `lookup_preset`
+///     按（连接 preset, model_id, 币种）取价；币种无从得知时默认 "CNY"。
+///   - 其余情况（非 Api，或 Api 但既无 json 又无预设命中）→ None。
+///
+/// `ctx == None`（未解析到任何计价上下文）：mode = Api、pricing = None（金额走「—」），与「未填单价」一致。
+fn resolve_billing(ctx: Option<&PricingContext>) -> (BillingMode, Option<ModelPricing>) {
+    let Some(ctx) = ctx else {
+        return (BillingMode::Api, None);
+    };
+    let mode = match ctx.billing_mode.as_str() {
+        "subscription" => BillingMode::Subscription,
+        "none" => BillingMode::None,
+        _ => BillingMode::Api,
+    };
+    // 优先解析模型 pricing_json（软处理：失败当 None）。
+    let from_json = ctx
+        .pricing_json
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| serde_json::from_str::<ModelPricing>(s).ok());
+    let pricing = match from_json {
+        Some(p) => Some(p),
+        // 仅 Api 模式才按预设库回退取价；币种无从得知 → 默认 "CNY"。
+        None if mode == BillingMode::Api => {
+            // 此回退按 CNY 估算（连接/模型数据层无币种字段，且三家预设均为人民币计价的国产供应商）；
+            // 用户若显式切 USD，pricing_json 已落库 → 走上面 from_json 分支，不经此回退。
+            let preset = ctx.preset.as_deref().unwrap_or_default();
+            lookup_preset(preset, &ctx.model_id, "CNY").map(|e| e.pricing.clone())
+        }
+        None => None,
+    };
+    (mode, pricing)
 }
 
 /// 把 todo 清单（todo_write 的 items 数组）压成轻量文本，供每轮回灌提醒（Plan25 #5①）。

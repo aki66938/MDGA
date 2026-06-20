@@ -37,7 +37,8 @@ use commands::{
 };
 use commands::{
     add_model, delete_connection, delete_model, fetch_available_models, get_app_setting,
-    list_connections, list_models, list_models_for_connection, save_connection, set_app_setting,
+    get_connection_monthly_usage, list_connections, list_models, list_models_for_connection,
+    lookup_model_preset, save_connection, set_app_setting, set_connection_billing, set_model_pricing,
     smoke_test_tool_call, smoke_test_tool_call_for_connection, test_connection, update_model,
 };
 use commands::{
@@ -244,6 +245,10 @@ fn main() {
             add_model,
             update_model,
             delete_model,
+            lookup_model_preset,
+            set_model_pricing,
+            set_connection_billing,
+            get_connection_monthly_usage,
             fetch_available_models,
             smoke_test_tool_call,
             smoke_test_tool_call_for_connection,

@@ -50,6 +50,8 @@ import {
 import {
   fmtTokens,
   aggregateUsage,
+  aggregateCost,
+  formatCostByCurrency,
   findToolMarkupIndex,
   humanizeError,
   basenameFromPath,
@@ -1626,6 +1628,12 @@ export function App() {
   }
   const activeConversation = conversations.find((conv) => conv.id === activeConvId);
   const conversationUsage = aggregateUsage(messages);
+  // 0.0.72：参与本会话的各轮原始用量（成本聚合按币种分小计；token 求和仍用 aggregateUsage）。
+  const turnUsages = messages
+    .map((m) => m.usage)
+    .filter((u): u is NonNullable<typeof u> => Boolean(u));
+  const conversationCost = aggregateCost(turnUsages);
+  const conversationCostStr = formatCostByCurrency(conversationCost.byCurrency);
 
   // 斜杠菜单可见项（Plan27 #7：提到 render 顶层供键盘导航与 JSX 共用）。
   const slashMenuOpen = input.startsWith("/") && !input.includes(" ") && !sending;
@@ -1757,7 +1765,6 @@ export function App() {
                     onEditRetry={() => editRetryMessage(msg, i)}
                     onRegenerate={handleRegenerate}
                     usage={msg.usage}
-                    showCost={isDeepseekMain}
                   />
                 </div>
               );
@@ -1815,7 +1822,7 @@ export function App() {
         )}
 
         {conversationUsage && (
-          <ConversationUsageSummary usage={conversationUsage} showCost={isDeepseekMain} />
+          <ConversationUsageSummary aggregated={conversationUsage} usages={turnUsages} />
         )}
 
         {todos.length > 0 && <TodoPanel items={todos} />}
@@ -2010,6 +2017,32 @@ export function App() {
                                 : "账户余额"} →
                             </button>
                           )}
+                        </div>
+                        {/* 本对话累计 + 成本合计（0.0.72）：对所有主模型都显（不再 DeepSeek 专属）。
+                            余额链接仍仅 DeepSeek（上方 isDeepseekMain 门控）。 */}
+                        <div className="ctx-popover__divider" />
+                        <div className="ctx-popover__row">
+                          <span className="ctx-popover__label">本对话累计</span>
+                          <span className="ctx-popover__nums">
+                            {conversationUsage
+                              ? `↑${fmtTokens(conversationUsage.promptTokens)} · ↓${fmtTokens(conversationUsage.completionTokens)} · 缓存${fmtTokens(conversationUsage.cacheHitTokens)}`
+                              : "暂无数据"}
+                          </span>
+                        </div>
+                        <div className="ctx-popover__row">
+                          <span className="ctx-popover__label">成本合计</span>
+                          <span className="ctx-popover__nums">
+                            {conversationCostStr
+                              ? conversationCostStr
+                              : conversationCost.subscriptionTurns > 0
+                                ? "套餐内"
+                                : conversationCost.noneTurns > 0
+                                  ? "免计费"
+                                  : "未计价"}
+                          </span>
+                        </div>
+                        <div className="ctx-popover__note">
+                          上方百分比是上下文占用，压缩后会回落；成本是本对话累计，只增不减——两个不同的数。
                         </div>
                       </div>
                     </>

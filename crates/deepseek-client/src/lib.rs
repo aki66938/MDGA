@@ -861,21 +861,33 @@ fn parse_user_balance(value: &serde_json::Value) -> Result<UserBalance, DeepSeek
 /// 输入 usage 字段的 serde_json::Value 和原始 JSON 字符串，输出标准化结构；
 /// 缺失字段保留为 0，raw_json 保存完整原始字符串供审计。
 pub(crate) fn parse_raw_usage(usage: &serde_json::Value, raw_data: &str) -> RawUsage {
+    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    // DeepSeek 私有字段在场则原样;否则按 OpenAI 标准推导命中/未命中,保证 hit+miss==prompt_tokens。
+    // 非 DeepSeek(zhipu/siliconflow/qwen 等 OpenAI 兼容端点)只回标准 prompt_tokens(至多
+    // prompt_tokens_details.cached_tokens),若不兜底则 hit=miss=0 → 输入费=0 且分级选档恒落最低档。
+    let ds_hit = usage.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64());
+    let ds_miss = usage.get("prompt_cache_miss_tokens").and_then(|v| v.as_u64());
+    let (prompt_cache_hit_tokens, prompt_cache_miss_tokens) = match (ds_hit, ds_miss) {
+        (Some(h), Some(m)) => (h, m), // DeepSeek 原样
+        _ => {
+            // OpenAI 兼容端点:cached_tokens 作命中,其余按 prompt_tokens 推导未命中。
+            let cached = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let hit = cached.min(prompt_tokens);
+            (hit, prompt_tokens.saturating_sub(hit))
+        }
+    };
     RawUsage {
-        prompt_tokens: usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+        prompt_tokens,
         completion_tokens: usage
             .get("completion_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
         total_tokens: usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        prompt_cache_hit_tokens: usage
-            .get("prompt_cache_hit_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        prompt_cache_miss_tokens: usage
-            .get("prompt_cache_miss_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
+        prompt_cache_hit_tokens,
+        prompt_cache_miss_tokens,
         reasoning_tokens: usage
             .pointer("/completion_tokens_details/reasoning_tokens")
             .and_then(|v| v.as_u64())
@@ -1347,6 +1359,43 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].id, "call_1");
         assert_eq!(parsed.tool_calls[0].function.name, "create_file");
         assert_eq!(parsed.usage.expect("usage should parse").total_tokens, 15);
+    }
+
+    #[test]
+    fn parse_raw_usage_openai_with_cached_tokens() {
+        // OpenAI 兼容端点:有 prompt_tokens_details.cached_tokens → 命中=cached,未命中=余下。
+        let usage = serde_json::json!({
+            "prompt_tokens": 5000,
+            "prompt_tokens_details": { "cached_tokens": 1000 }
+        });
+        let r = parse_raw_usage(&usage, "{}");
+        assert_eq!(r.prompt_tokens, 5000);
+        assert_eq!(r.prompt_cache_hit_tokens, 1000);
+        assert_eq!(r.prompt_cache_miss_tokens, 4000);
+    }
+
+    #[test]
+    fn parse_raw_usage_openai_plain_prompt_tokens() {
+        // 仅 prompt_tokens(无 details):命中=0,未命中=全部 prompt_tokens(不再漏算输入费)。
+        let usage = serde_json::json!({ "prompt_tokens": 5000 });
+        let r = parse_raw_usage(&usage, "{}");
+        assert_eq!(r.prompt_tokens, 5000);
+        assert_eq!(r.prompt_cache_hit_tokens, 0);
+        assert_eq!(r.prompt_cache_miss_tokens, 5000);
+    }
+
+    #[test]
+    fn parse_raw_usage_deepseek_private_fields_unchanged() {
+        // DeepSeek 私有字段在场 → 原样使用,不被 OpenAI 兜底覆盖。
+        let usage = serde_json::json!({
+            "prompt_tokens": 5000,
+            "prompt_cache_hit_tokens": 1000,
+            "prompt_cache_miss_tokens": 4000
+        });
+        let r = parse_raw_usage(&usage, "{}");
+        assert_eq!(r.prompt_tokens, 5000);
+        assert_eq!(r.prompt_cache_hit_tokens, 1000);
+        assert_eq!(r.prompt_cache_miss_tokens, 4000);
     }
 
     #[test]

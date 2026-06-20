@@ -269,6 +269,19 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             wire_json       TEXT NOT NULL,
             updated_at      INTEGER NOT NULL
         );
+
+        -- 0.0.72「订阅套餐·月度用量」：按 (连接, 年月) 累计原始 token 用量,给订阅进度条做数据支撑。
+        -- 与计价/成本路径完全隔离(不读单价、不进 token_ledger);也与「会话累计」(前端从
+        -- message.usageJson 聚合)是两套独立的数,互不重复计。对所有连接都记(订阅日后切换有历史)。
+        CREATE TABLE IF NOT EXISTS usage_counters (
+            connection_id     TEXT NOT NULL,
+            ym                TEXT NOT NULL,         -- \"YYYY-MM\"(UTC)
+            prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens      INTEGER NOT NULL DEFAULT 0,
+            updated_at        INTEGER,
+            PRIMARY KEY (connection_id, ym)
+        );
         ",
     )?;
     add_column_if_missing(&conn, "conversations", "workspace_path", "TEXT")?;
@@ -283,6 +296,12 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     add_column_if_missing(&conn, "model_providers", "api_format", "TEXT NOT NULL DEFAULT 'openai'")?;
     // Plan27 C2 #2：供应商上下文窗口（tokens，可空）。主 provider 有值时据其推导压缩软上限。
     add_column_if_missing(&conn, "model_providers", "context_window", "INTEGER")?;
+    // 0.0.72 计价：模型粒度单价快照（pricing_json，前端存「价格字段 + _ 前缀元数据」的 JSON 串，
+    // 后端原样存取；结算时仅以 serde 解析价格字段，多余元数据被忽略）；连接粒度计费方式
+    // billing_mode（'api' | 'subscription' | 'none'，默认 api）与订阅描述 subscription_json（可空）。
+    add_column_if_missing(&conn, "models", "pricing_json", "TEXT")?;
+    add_column_if_missing(&conn, "connections", "billing_mode", "TEXT NOT NULL DEFAULT 'api'")?;
+    add_column_if_missing(&conn, "connections", "subscription_json", "TEXT")?;
     // 0.0.59：把旧的 role-keyed model_providers 迁到「连接库 + 角色引用」。
     // 一次性、幂等、改前备份 sqlite 文件；旧表保留一版作回滚路径。失败软处理，不阻断建库。
     migrate_to_connections_0059(&conn)?;
@@ -301,6 +320,42 @@ pub fn now_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// 返回当前 UTC 年月，格式 "YYYY-MM"（0.0.72 月度用量计数键）。
+///
+/// 工作区无 `chrono` 依赖且本任务不引新依赖，故从 [`now_ts`]（Unix 秒）手写 civil 换算，
+/// 仅取年/月，逻辑见 [`ym_from_unix_secs`]（Howard Hinnant `civil_from_days` 的截断特化）。
+pub fn current_ym() -> String {
+    ym_from_unix_secs(now_ts())
+}
+
+/// 把 Unix 时间戳（秒，UTC）换算为 "YYYY-MM"。
+///
+/// 取自 Howard Hinnant 的 `civil_from_days` 算法（chrono 实现同源），但只需要年和月，
+/// 故省去「日」的回算。要点：把纪元偏移到 0000-03-01（3 月起算，使闰日落在年末便于整除），
+/// 以 146097 天（400 年周期）和 153 天 5 月块做整数运算，正确处理闰年与月份边界。
+/// 负时间戳（1970 前）也用 floor 除法正确处理（虽运行时不会出现）。
+fn ym_from_unix_secs(secs: i64) -> String {
+    // 向下取整到「天」：对负秒数（理论值）也用 floor div，确保 0..86399 区间映射到同一天。
+    let days = secs.div_euclid(86_400);
+    // 自 1970-01-01 偏移到自 0000-03-01：719468 = 从 0000-03-01 到 1970-01-01 的天数。
+    let z = days + 719_468;
+    // era = 400 年纪元编号；doe = 纪元内天序号 [0, 146096]。
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    // yoe = 纪元内年份 [0, 399]。
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    // year（以 3 月为岁首的内部年）。
+    let y = yoe + era * 400;
+    // doy = 该（3 月起算）年内的天序号 [0, 365]。
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    // mp = 以 3 月为 0 的「移位月」[0, 11]。
+    let mp = (5 * doy + 2) / 153;
+    // 还原为常规月份：mp<10 → +3（3..12）；否则 -9（1..2，且年份要 +1）。
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}")
 }
 
 fn add_column_if_missing(
@@ -756,6 +811,71 @@ pub fn get_token_ledger_entries(
     rows.collect()
 }
 
+// ── 月度用量计数（usage_counters，0.0.72 订阅进度条）────────────────────────────
+
+/// 某连接在某 UTC 自然月内累计的原始 token 用量（serde camelCase）。
+///
+/// 与计价/成本完全无关：这里只累加 RawUsage 的 prompt/completion/total，给订阅套餐进度条用。
+/// 无行（该连接该月尚无记录）时各字段为 0。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonthlyUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// 按 (connection_id, ym) 累加一笔月度 token 用量（0.0.72）。
+///
+/// UPSERT 累加（**不是覆盖**）：首笔 INSERT；后续同 (connection_id, ym) ON CONFLICT 把三项
+/// token 各自 += excluded.*，并刷新 updated_at。SQLite INTEGER 为有符号 i64，token 数远不会溢出。
+/// 失败由调用方软处理（不阻断 agent 本轮）。
+pub fn bump_usage_counter(
+    conn: &Connection,
+    connection_id: &str,
+    ym: &str,
+    prompt: u64,
+    completion: u64,
+    total: u64,
+) -> SqlResult<()> {
+    let now = now_ts();
+    conn.execute(
+        "INSERT INTO usage_counters
+             (connection_id, ym, prompt_tokens, completion_tokens, total_tokens, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(connection_id, ym) DO UPDATE SET
+             prompt_tokens     = prompt_tokens + excluded.prompt_tokens,
+             completion_tokens = completion_tokens + excluded.completion_tokens,
+             total_tokens      = total_tokens + excluded.total_tokens,
+             updated_at        = excluded.updated_at",
+        params![connection_id, ym, prompt as i64, completion as i64, total as i64, now],
+    )?;
+    Ok(())
+}
+
+/// 读某连接某 UTC 月的累计用量（0.0.72）。无行返回全 0（[`MonthlyUsage::default`]）。
+pub fn get_monthly_usage(
+    conn: &Connection,
+    connection_id: &str,
+    ym: &str,
+) -> SqlResult<MonthlyUsage> {
+    let mut stmt = conn.prepare(
+        "SELECT prompt_tokens, completion_tokens, total_tokens
+         FROM usage_counters
+         WHERE connection_id = ?1 AND ym = ?2
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![connection_id, ym])?;
+    match rows.next()? {
+        Some(row) => Ok(MonthlyUsage {
+            prompt_tokens: row.get::<_, i64>(0)? as u64,
+            completion_tokens: row.get::<_, i64>(1)? as u64,
+            total_tokens: row.get::<_, i64>(2)? as u64,
+        }),
+        None => Ok(MonthlyUsage::default()),
+    }
+}
+
 // ── File Checkpoint CRUD ─────────────────────────────────────────────────
 
 /// 记录一次文件变更检查点（写类工具执行成功后调用，保存变更前快照）。
@@ -1153,6 +1273,78 @@ fn synthesize_role_provider(conn: &Connection, role: &str) -> SqlResult<Option<M
     }))
 }
 
+/// 某角色本轮实际命中的「连接 + 模型」计价上下文（0.0.72）。
+///
+/// 与 [`resolve_role_provider`] 走**同一条解析 + 回退链**（role → role_models → models →
+/// connections，未配置/禁用回退 main），但只携结算需要的字段，不含 api_key：
+/// - `billing_mode` / `subscription_json` 来自命中的 **connection**；
+/// - `pricing_json` 来自命中的 **model**（前端存的原始 JSON 串，结算侧解析）；
+/// - `preset` 来自命中的 connection，供 `pricing_json` 为空且 mode=api 时按预设库回退取价。
+///
+/// **不含 api_key**：本结构永不返回密钥，可安全用于结算/展示链路。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingContext {
+    /// 命中连接的计费方式：'api' | 'subscription' | 'none'。
+    pub billing_mode: String,
+    /// 命中连接的订阅描述（可空）。
+    pub subscription_json: Option<String>,
+    /// 命中模型的单价 JSON 串（可空，原始串，结算侧解析）。
+    pub pricing_json: Option<String>,
+    /// 命中连接的 preset（供按预设库回退取价；可空）。
+    pub preset: Option<String>,
+    /// 命中模型的实际 API 模型串（供按预设库回退匹配）。
+    pub model_id: String,
+    /// 0.0.72 月度用量：本轮命中连接的 id（供 agent_loop 按连接累计月度 token 用量）。
+    /// 纯增量字段，不参与结算（resolve_billing 不读它）。
+    pub connection_id: String,
+}
+
+/// 按角色解析本轮实际命中的计价上下文，回退语义与 [`resolve_role_provider`] **逐字对齐**（0.0.72）。
+///
+/// - role == "main"：直接取 main 的分配，不回退（未配置 → None）。
+/// - 其它角色：自身有一条 *启用* 的分配则用之，否则回退 main。
+///
+/// 返回 None 仅当角色未配置且 main 也未配置（与 resolve_role_provider 同口径）。
+pub fn resolve_pricing_context(conn: &Connection, role: &str) -> SqlResult<Option<PricingContext>> {
+    if role == ROLE_MAIN {
+        return synthesize_pricing_context(conn, ROLE_MAIN);
+    }
+    if let Some(rm) = get_role_model(conn, role)? {
+        if rm.enabled {
+            if let Some(ctx) = synthesize_pricing_context(conn, role)? {
+                return Ok(Some(ctx));
+            }
+        }
+    }
+    synthesize_pricing_context(conn, ROLE_MAIN)
+}
+
+/// 把某角色的 role_models → models → connections 链合成一个 [`PricingContext`]（不回退）。
+/// 任一环缺失 → None（与 [`synthesize_role_provider`] 同口径）。
+fn synthesize_pricing_context(
+    conn: &Connection,
+    role: &str,
+) -> SqlResult<Option<PricingContext>> {
+    let Some(rm) = get_role_model(conn, role)? else {
+        return Ok(None);
+    };
+    let Some(m) = get_model(conn, &rm.model_ref)? else {
+        return Ok(None);
+    };
+    let Some(c) = get_connection(conn, &m.connection_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(PricingContext {
+        billing_mode: c.billing_mode,
+        subscription_json: c.subscription_json,
+        pricing_json: m.pricing_json,
+        preset: c.preset,
+        model_id: m.model_id,
+        connection_id: m.connection_id,
+    }))
+}
+
 // ── 连接库（connections）CRUD（0.0.59）──────────────────────────────────────
 
 /// 一份「端点 + 密钥」接入参数（配置一次，可被多个角色引用）。
@@ -1168,6 +1360,10 @@ pub struct ProviderConnection {
     pub base_url: Option<String>,
     pub api_key: String,
     pub api_format: String,
+    /// 0.0.72 计费方式：'api' | 'subscription' | 'none'，默认 'api'。命令层归一化未知值落回 'api'。
+    pub billing_mode: String,
+    /// 0.0.72 订阅描述（可空）：订阅套餐的自由 JSON 串，仅存储/展示，结算不解析。
+    pub subscription_json: Option<String>,
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
 }
@@ -1197,6 +1393,10 @@ pub struct CuratedModel {
     pub model_id: String,
     pub label: Option<String>,
     pub context_window: Option<i64>,
+    /// 0.0.72 单价快照（可空）：前端存「价格字段 + `_` 前缀元数据(_source/_confidence/_needsVerify/
+    /// _sourceUrl)」的 JSON 串。后端**原样存取**，不解析校验元数据；仅结算时以
+    /// `serde_json::from_str::<ModelPricing>()` 取价格字段（serde 默认忽略多余字段）。
+    pub pricing_json: Option<String>,
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
 }
@@ -1223,7 +1423,7 @@ fn normalize_api_format(api_format: &str) -> &'static str {
 /// 列出全部连接，按创建时间正序。
 pub fn list_connections(conn: &Connection) -> SqlResult<Vec<ProviderConnection>> {
     let mut stmt = conn.prepare(
-        "SELECT id, label, preset, base_url, api_key, api_format, created_at, updated_at
+        "SELECT id, label, preset, base_url, api_key, api_format, billing_mode, subscription_json, created_at, updated_at
          FROM connections
          ORDER BY created_at ASC, id ASC",
     )?;
@@ -1234,7 +1434,7 @@ pub fn list_connections(conn: &Connection) -> SqlResult<Vec<ProviderConnection>>
 /// 按 id 读取单个连接，未找到返回 None。
 pub fn get_connection(conn: &Connection, id: &str) -> SqlResult<Option<ProviderConnection>> {
     let mut stmt = conn.prepare(
-        "SELECT id, label, preset, base_url, api_key, api_format, created_at, updated_at
+        "SELECT id, label, preset, base_url, api_key, api_format, billing_mode, subscription_json, created_at, updated_at
          FROM connections
          WHERE id = ?1
          LIMIT 1",
@@ -1254,9 +1454,20 @@ fn row_to_connection(row: &rusqlite::Row) -> SqlResult<ProviderConnection> {
         base_url: row.get(3)?,
         api_key: row.get(4)?,
         api_format: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        billing_mode: row.get(6)?,
+        subscription_json: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
+}
+
+/// 归一化计费方式：仅 'api' | 'subscription' | 'none'，未知值落回 'api'。
+fn normalize_billing_mode(billing_mode: &str) -> &'static str {
+    match billing_mode.trim() {
+        "subscription" => "subscription",
+        "none" => "none",
+        _ => "api",
+    }
 }
 
 /// 新建或更新一个连接。
@@ -1310,6 +1521,30 @@ pub fn upsert_connection(
          SET label = ?2, preset = ?3, base_url = ?4, api_key = ?5, api_format = ?6, updated_at = ?7
          WHERE id = ?1",
         params![id, label, preset, base_url, api_key, api_format, now],
+    )?;
+    get_connection(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// 设置某连接的计费方式（0.0.72）。
+///
+/// `billing_mode` 归一化为 'api' | 'subscription' | 'none'（未知落回 'api'）；`subscription_json`
+/// 为订阅描述自由串（可空，原样存）。连接不存在则报错。不触碰 api_key 等其它字段。
+/// 返回写入后的完整 [`ProviderConnection`]（含 api_key 明文——命令层负责脱敏）。
+pub fn set_connection_billing(
+    conn: &Connection,
+    id: &str,
+    billing_mode: &str,
+    subscription_json: Option<&str>,
+) -> SqlResult<ProviderConnection> {
+    // 先确认连接存在（不存在则报错，避免静默 no-op）。
+    get_connection(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let mode = normalize_billing_mode(billing_mode);
+    let now = now_ts();
+    conn.execute(
+        "UPDATE connections
+         SET billing_mode = ?2, subscription_json = ?3, updated_at = ?4
+         WHERE id = ?1",
+        params![id, mode, subscription_json, now],
     )?;
     get_connection(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
@@ -1474,15 +1709,16 @@ fn row_to_model(row: &rusqlite::Row) -> SqlResult<CuratedModel> {
         model_id: row.get(2)?,
         label: row.get(3)?,
         context_window: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
+        pricing_json: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
 /// 列出全部登记模型（跨所有连接），按连接 + 创建时间正序。
 pub fn list_models(conn: &Connection) -> SqlResult<Vec<CuratedModel>> {
     let mut stmt = conn.prepare(
-        "SELECT id, connection_id, model_id, label, context_window, created_at, updated_at
+        "SELECT id, connection_id, model_id, label, context_window, pricing_json, created_at, updated_at
          FROM models
          ORDER BY connection_id ASC, created_at ASC, id ASC",
     )?;
@@ -1496,7 +1732,7 @@ pub fn list_models_for_connection(
     connection_id: &str,
 ) -> SqlResult<Vec<CuratedModel>> {
     let mut stmt = conn.prepare(
-        "SELECT id, connection_id, model_id, label, context_window, created_at, updated_at
+        "SELECT id, connection_id, model_id, label, context_window, pricing_json, created_at, updated_at
          FROM models
          WHERE connection_id = ?1
          ORDER BY created_at ASC, id ASC",
@@ -1508,7 +1744,7 @@ pub fn list_models_for_connection(
 /// 按 id 读取一个模型，未找到返回 None。
 pub fn get_model(conn: &Connection, id: &str) -> SqlResult<Option<CuratedModel>> {
     let mut stmt = conn.prepare(
-        "SELECT id, connection_id, model_id, label, context_window, created_at, updated_at
+        "SELECT id, connection_id, model_id, label, context_window, pricing_json, created_at, updated_at
          FROM models
          WHERE id = ?1
          LIMIT 1",
@@ -1587,6 +1823,23 @@ pub fn upsert_model(
             get_model(conn, &new_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
         }
     }
+}
+
+/// 设置某模型的单价快照（0.0.72）。`pricing_json` 为前端构造的 JSON 串（价格字段 + `_` 前缀元数据），
+/// 后端**原样存取**，不解析校验；传 `None` 清空（恢复「无单价」）。模型不存在则报错。
+pub fn set_model_pricing(
+    conn: &Connection,
+    id: &str,
+    pricing_json: Option<&str>,
+) -> SqlResult<CuratedModel> {
+    // 先确认模型存在（不存在则报错，避免静默 no-op）。
+    get_model(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let now = now_ts();
+    conn.execute(
+        "UPDATE models SET pricing_json = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, pricing_json, now],
+    )?;
+    get_model(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
 /// 返回引用了某模型的角色名列表（供「拒删被引用模型」判断与人话化错误）。
@@ -3138,6 +3391,143 @@ mod tests {
             get_role_model(&conn, ROLE_ACTION).expect("rm action").expect("present").model_ref,
             m2.id
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn pricing_and_billing_round_trip() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db");
+
+        // 新建连接：billing_mode 默认 'api'，subscription_json 为 None（建库默认值）。
+        let c = upsert_connection(&conn, "", Some("DS"), Some("deepseek"), None, "sk-1", "openai")
+            .expect("conn");
+        let c0 = get_connection(&conn, &c.id).expect("get").expect("present");
+        assert_eq!(c0.billing_mode, "api", "新连接默认 api");
+        assert!(c0.subscription_json.is_none());
+
+        // 新建模型：pricing_json 默认 None。
+        let m = upsert_model(&conn, "", &c.id, "deepseek-chat", None, Some(128_000)).expect("model");
+        assert!(get_model(&conn, &m.id).expect("get").expect("present").pricing_json.is_none());
+
+        // set_model_pricing：原样存取（含 `_` 前缀元数据，后端不解析）。
+        let pricing = r#"{"currency":"CNY","unit":"per_1m","input":2.0,"output":3.0,"_source":"manual","_needsVerify":false}"#;
+        let m1 = set_model_pricing(&conn, &m.id, Some(pricing)).expect("set pricing");
+        assert_eq!(m1.pricing_json.as_deref(), Some(pricing), "pricing_json 原样往返");
+        // 重读确认持久化。
+        assert_eq!(
+            get_model(&conn, &m.id).expect("get").expect("present").pricing_json.as_deref(),
+            Some(pricing)
+        );
+        // 传 None 清空。
+        let m2 = set_model_pricing(&conn, &m.id, None).expect("clear pricing");
+        assert!(m2.pricing_json.is_none(), "传 None 清空 pricing_json");
+        // 重新设置，供后续 resolve 断言。
+        set_model_pricing(&conn, &m.id, Some(pricing)).expect("reset pricing");
+
+        // set_connection_billing：归一化未知值落回 'api'；合法值原样存。
+        let c1 = set_connection_billing(&conn, &c.id, "subscription", Some(r#"{"plan":"pro"}"#))
+            .expect("set billing");
+        assert_eq!(c1.billing_mode, "subscription");
+        assert_eq!(c1.subscription_json.as_deref(), Some(r#"{"plan":"pro"}"#));
+        let c2 = set_connection_billing(&conn, &c.id, "garbage", None).expect("normalize");
+        assert_eq!(c2.billing_mode, "api", "未知 billing_mode 落回 api");
+        assert!(c2.subscription_json.is_none(), "subscription_json 被清空");
+        // 设回 none 供 resolve 断言。
+        set_connection_billing(&conn, &c.id, "none", None).expect("set none");
+
+        // 不存在的 id 报错（非静默 no-op）。
+        assert!(set_model_pricing(&conn, "no-such-model", Some("{}")).is_err());
+        assert!(set_connection_billing(&conn, "no-such-conn", "api", None).is_err());
+
+        // resolve_pricing_context：main 直接命中；功能角色未配置回退 main（与 resolve_role_provider 同口径）。
+        upsert_role_model(&conn, ROLE_MAIN, &m.id, true).expect("assign main");
+        let ctx = resolve_pricing_context(&conn, ROLE_MAIN).expect("q").expect("main ctx");
+        assert_eq!(ctx.billing_mode, "none");
+        assert_eq!(ctx.pricing_json.as_deref(), Some(pricing));
+        assert_eq!(ctx.preset.as_deref(), Some("deepseek"));
+        assert_eq!(ctx.model_id, "deepseek-chat");
+        // action 未单独配置 ⇒ 回退 main 的连接/模型计价上下文。
+        let action_ctx = resolve_pricing_context(&conn, ROLE_ACTION).expect("q").expect("fallback");
+        assert_eq!(action_ctx.billing_mode, "none");
+        assert_eq!(action_ctx.pricing_json.as_deref(), Some(pricing));
+        assert_eq!(action_ctx.model_id, "deepseek-chat");
+
+        // 未配置任何角色的库：resolve 返回 None。
+        let empty_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let empty = init_db(&empty_path).expect("empty db");
+        assert!(resolve_pricing_context(&empty, ROLE_MAIN).expect("q").is_none());
+        assert!(resolve_pricing_context(&empty, ROLE_ACTION).expect("q").is_none());
+        let _ = std::fs::remove_file(empty_path);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn ym_from_unix_secs_known_timestamps() {
+        // 已知 UTC 时刻 → 年月（含闰年 2 月底、年/月边界、纪元起点）。
+        // 1970-01-01 00:00:00Z
+        assert_eq!(ym_from_unix_secs(0), "1970-01");
+        // 1970-01-31 23:59:59Z（1 月末最后一秒，仍是 01）
+        assert_eq!(ym_from_unix_secs(2_678_399), "1970-01");
+        // 1970-02-01 00:00:00Z（进 2 月）
+        assert_eq!(ym_from_unix_secs(2_678_400), "1970-02");
+        // 2000-02-29 12:00:00Z（闰年 2 月 29 日，世纪闰年）→ 2000-02
+        assert_eq!(ym_from_unix_secs(951_825_600), "2000-02");
+        // 2000-03-01 00:00:00Z（闰年 2 月翻 3 月）→ 2000-03
+        assert_eq!(ym_from_unix_secs(951_868_800), "2000-03");
+        // 2021-02-28 23:59:59Z（平年 2 月末最后一秒）→ 2021-02
+        assert_eq!(ym_from_unix_secs(1_614_556_799), "2021-02");
+        // 2021-03-01 00:00:00Z → 2021-03
+        assert_eq!(ym_from_unix_secs(1_614_556_800), "2021-03");
+        // 2023-12-31 23:59:59Z（年末最后一秒，跨年边界）→ 2023-12
+        assert_eq!(ym_from_unix_secs(1_704_067_199), "2023-12");
+        // 2024-01-01 00:00:00Z（跨年）→ 2024-01
+        assert_eq!(ym_from_unix_secs(1_704_067_200), "2024-01");
+        // 2024-12-01 00:00:00Z（闰年 12 月起点）→ 2024-12
+        assert_eq!(ym_from_unix_secs(1_733_011_200), "2024-12");
+
+        // current_ym 形状自洽：恒为 "YYYY-MM"，月在 01..=12。
+        let ym = current_ym();
+        assert_eq!(ym.len(), 7);
+        assert_eq!(&ym[4..5], "-");
+        let month: u32 = ym[5..7].parse().expect("month digits");
+        assert!((1..=12).contains(&month), "month {month} 越界");
+    }
+
+    #[test]
+    fn usage_counters_bump_accumulate_isolate_and_default() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db");
+
+        // 无行 → 全 0。
+        let zero = get_monthly_usage(&conn, "conn-a", "2026-06").expect("get empty");
+        assert_eq!(zero.prompt_tokens, 0);
+        assert_eq!(zero.completion_tokens, 0);
+        assert_eq!(zero.total_tokens, 0);
+
+        // bump 两次同 (connection_id, ym) → 累加（不是覆盖）。
+        bump_usage_counter(&conn, "conn-a", "2026-06", 100, 40, 140).expect("bump 1");
+        bump_usage_counter(&conn, "conn-a", "2026-06", 5, 3, 8).expect("bump 2");
+        let acc = get_monthly_usage(&conn, "conn-a", "2026-06").expect("get acc");
+        assert_eq!(acc.prompt_tokens, 105);
+        assert_eq!(acc.completion_tokens, 43);
+        assert_eq!(acc.total_tokens, 148);
+
+        // 按 ym 隔离：另一月不受影响。
+        bump_usage_counter(&conn, "conn-a", "2026-07", 1, 1, 2).expect("bump other month");
+        let jul = get_monthly_usage(&conn, "conn-a", "2026-07").expect("get jul");
+        assert_eq!(jul.total_tokens, 2);
+        let jun = get_monthly_usage(&conn, "conn-a", "2026-06").expect("get jun again");
+        assert_eq!(jun.total_tokens, 148, "6 月不被 7 月写入污染");
+
+        // 按 connection_id 隔离：另一连接同月互不干扰。
+        bump_usage_counter(&conn, "conn-b", "2026-06", 9, 9, 18).expect("bump conn-b");
+        let b = get_monthly_usage(&conn, "conn-b", "2026-06").expect("get b");
+        assert_eq!(b.total_tokens, 18);
+        let a_after = get_monthly_usage(&conn, "conn-a", "2026-06").expect("get a after b");
+        assert_eq!(a_after.total_tokens, 148, "conn-a 不被 conn-b 写入污染");
 
         let _ = std::fs::remove_file(db_path);
     }

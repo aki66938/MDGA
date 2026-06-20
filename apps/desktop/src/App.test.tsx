@@ -94,7 +94,8 @@ describe("desktop MVP shell", () => {
       const summary = screen.getByLabelText("Conversation token summary");
       expect(within(summary).getByText("会话累计")).toBeTruthy();
       expect(within(summary).getByText("200 tokens")).toBeTruthy();
-      expect(within(summary).getByText("$0.00012")).toBeTruthy();
+      // 0.0.72：成本改为按币种分小计、显「合计 …」；无 billingMode 的旧用量回退按 USD（formatMoney→＄）累加。
+      expect(within(summary).getByText(/合计\s*＄0\.00012/)).toBeTruthy();
     });
   });
 

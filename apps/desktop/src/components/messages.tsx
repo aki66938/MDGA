@@ -12,7 +12,7 @@ import {
 import type {
   TodoItem, Message, ToolPart, VisionPart, ReasoningPart, RenderBlock, UsageSummary,
 } from "../types";
-import { formatUsd } from "../utils";
+import { formatMoney, aggregateCost, formatCostByCurrency } from "../utils";
 import { WidgetCard } from "./widget";
 
 export function TodoPanel({ items }: { items: TodoItem[] }) {
@@ -142,7 +142,6 @@ export function MessageActions({
   onEditRetry,
   onRegenerate,
   usage,
-  showCost,
 }: {
   msg: Message;
   disabled: boolean;
@@ -154,8 +153,6 @@ export function MessageActions({
   onRegenerate: () => void;
   /** 该轮 token 用量（0.0.45）：随操作条同行展示，仅 assistant 消息有。 */
   usage?: UsageSummary;
-  /** 是否显示成本金额（非 DeepSeek 主供应商时以「—」占位）。 */
-  showCost: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const hasText = msg.parts.some((p) => p.type === "text" && p.content.trim().length > 0);
@@ -176,7 +173,7 @@ export function MessageActions({
 
   return (
     <div className={`message-actions message-actions--${msg.role}`} aria-label="消息操作">
-      {showUsage && usage && <UsageBadge usage={usage} showCost={showCost} />}
+      {/* 复制按钮移位（0.0.72 ⑧）：从成本之后挪到成本之前——动作按钮先排，用量徽标（金额收尾）落在行末最醒目。复制内容/行为不变。 */}
       {hasText && (
         <button
           type="button"
@@ -225,6 +222,7 @@ export function MessageActions({
           </button>
         </>
       )}
+      {showUsage && usage && <UsageBadge usage={usage} />}
     </div>
   );
 }
@@ -453,12 +451,47 @@ export function DiffBlock({ diff }: { diff: string }) {
 
 // ── UsageBadge ────────────────────────────────────────────────────────────
 
-// showCost（Plan21 #5）：非 DeepSeek 主供应商时按 DeepSeek 价表算出的金额会误导，
-// 此时金额位以「—」占位（token 数照常展示）。
-export function UsageBadge({ usage, showCost }: { usage: UsageSummary; showCost: boolean }) {
-  const costStr = formatUsd(usage.estimatedCostUsd);
-  const isEstimate = usage.usageSource !== "deepseek_usage";
+/**
+ * 单轮成本位（0.0.72 四态 + 旧数据回退）：成本是否/如何展示由每轮 usage 字段决定，
+ * 不再由「主模型是不是 DeepSeek」全局门控（showCost 闸已拆）。
+ * - billingMode==='none' → 「免计费」（灰）。
+ * - billingMode==='subscription' → 「套餐内」（信息蓝）。
+ * - billingMode==='api' 且 estimatedCost!=null → formatMoney（符号随 currency；非 deepseek_usage 标「(估算)」）。
+ * - billingMode==='api' 且 estimatedCost==null → 「—」（hover「该模型未填单价/无价表」）。
+ * - billingMode 缺失（旧持久化）→ estimatedCostUsd>0 按 $ 显，否则「—」，不让历史会话崩。
+ */
+function UsageCost({ usage }: { usage: UsageSummary }) {
+  const mode = usage.billingMode;
+  if (mode === "none") {
+    return <span className="usage-cost usage-cost--free" title="该连接标记为本地免计费">免计费</span>;
+  }
+  if (mode === "subscription") {
+    return <span className="usage-cost usage-cost--sub" title="该连接为订阅套餐，按量金额不单独计价">套餐内</span>;
+  }
+  if (mode === "api") {
+    if (usage.estimatedCost != null) {
+      const isEstimate = usage.usageSource !== "deepseek_usage";
+      return (
+        <span className="usage-cost">
+          {formatMoney(usage.estimatedCost, usage.currency ?? undefined)}{isEstimate && " (估算)"}
+        </span>
+      );
+    }
+    return <span className="usage-cost usage-cost--na" title="该模型未填单价/无价表，金额不可估算">—</span>;
+  }
+  // billingMode 缺失：旧持久化用量回退原逻辑（estimatedCostUsd>0 按 USD 显，否则「—」），与会话聚合的回退口径一致。
+  if (usage.estimatedCostUsd > 0) {
+    const isEstimate = usage.usageSource !== "deepseek_usage";
+    return (
+      <span className="usage-cost">
+        {formatMoney(usage.estimatedCostUsd, "USD")}{isEstimate && " (估算)"}
+      </span>
+    );
+  }
+  return <span className="usage-cost usage-cost--na" title="该模型未填单价/无价表，金额不可估算">—</span>;
+}
 
+export function UsageBadge({ usage }: { usage: UsageSummary }) {
   return (
     <div className="usage-badge" aria-label="Token usage">
       <span>{usage.totalTokens.toLocaleString()} tokens</span>
@@ -473,40 +506,64 @@ export function UsageBadge({ usage, showCost }: { usage: UsageSummary; showCost:
         </>
       )}
       <span className="usage-sep">·</span>
-      <span className="usage-cost">
-        {showCost ? <>{costStr}{isEstimate && " (估算)"}</> : <span className="usage-cost--na" title="该供应商暂无成本价表，金额不可估算">—</span>}
-      </span>
+      <UsageCost usage={usage} />
     </div>
   );
 }
 
 // ── ConversationUsageSummary ───────────────────────────────────────────────
 
-export function ConversationUsageSummary({ usage, showCost }: { usage: UsageSummary; showCost: boolean }) {
+/**
+ * 会话累计（0.0.72）：token 部分照旧；成本部分改为按币种分小计（aggregateCost 喂入）。
+ * - 各币种合计：`合计 ￥X` 或 `合计 ￥X ＋ ＄Y`（仅在该币种出现时显）。
+ * - 套餐内 / 免计费 轮数各以小徽标注明（数为 0 不显）。
+ * - api 且无金额（—）的轮以「N 轮未计价」提示，绝不当 0 元并进合计。
+ * usages 为参与本会话的各轮原始用量（用于成本聚合）；aggregated 为 token 求和（aggregateUsage 结果）。
+ */
+export function ConversationUsageSummary({
+  aggregated,
+  usages,
+}: {
+  aggregated: UsageSummary;
+  usages: UsageSummary[];
+}) {
+  const cost = aggregateCost(usages);
+  const costStr = formatCostByCurrency(cost.byCurrency);
   return (
     <div className="conversation-usage" aria-label="Conversation token summary">
       <span className="conversation-usage__label">会话累计</span>
-      <span>{usage.totalTokens.toLocaleString()} tokens</span>
+      <span>{aggregated.totalTokens.toLocaleString()} tokens</span>
       <span className="usage-sep">·</span>
-      <span>{usage.promptTokens.toLocaleString()} in</span>
+      <span>{aggregated.promptTokens.toLocaleString()} in</span>
       <span className="usage-sep">/</span>
-      <span>{usage.completionTokens.toLocaleString()} out</span>
-      {usage.reasoningTokens > 0 && (
+      <span>{aggregated.completionTokens.toLocaleString()} out</span>
+      {aggregated.reasoningTokens > 0 && (
         <>
           <span className="usage-sep">·</span>
-          <span>{usage.reasoningTokens.toLocaleString()} reasoning</span>
+          <span>{aggregated.reasoningTokens.toLocaleString()} reasoning</span>
         </>
       )}
-      {usage.cacheHitTokens > 0 && (
+      {aggregated.cacheHitTokens > 0 && (
         <>
           <span className="usage-sep">·</span>
-          <span className="usage-cache">{usage.cacheHitTokens.toLocaleString()} cached</span>
+          <span className="usage-cache">{aggregated.cacheHitTokens.toLocaleString()} cached</span>
         </>
       )}
       <span className="usage-sep">·</span>
-      <span className="usage-cost">
-        {showCost ? formatUsd(usage.estimatedCostUsd) : <span className="usage-cost--na" title="该供应商暂无成本价表，金额不可估算">—</span>}
-      </span>
+      {costStr ? (
+        <span className="usage-cost">合计 {costStr}</span>
+      ) : (
+        <span className="usage-cost usage-cost--na" title="本会话暂无可计价的按量轮次">合计 —</span>
+      )}
+      {cost.subscriptionTurns > 0 && (
+        <span className="usage-cost usage-cost--sub" title="计入订阅套餐、不单独计价的轮次">另 {cost.subscriptionTurns} 轮套餐内</span>
+      )}
+      {cost.noneTurns > 0 && (
+        <span className="usage-cost usage-cost--free" title="本地免计费的轮次">{cost.noneTurns} 轮免计费</span>
+      )}
+      {cost.uncostedTurns > 0 && (
+        <span className="usage-cost usage-cost--na" title="按量计费但该模型未填单价/无价表的轮次">{cost.uncostedTurns} 轮未计价</span>
+      )}
     </div>
   );
 }
