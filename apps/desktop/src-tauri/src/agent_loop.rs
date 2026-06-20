@@ -44,12 +44,12 @@ use mdga_deepseek_client::{analyze_image, chat_stream, resolve_base_url, ChatMes
 use mdga_sandbox_runtime::{session_security_context, NetworkMode};
 use mdga_shared::PermissionMode;
 use mdga_storage::{
-    bump_usage_counter, current_ym, get_conversation, get_messages, get_role_model,
-    list_permission_rules, resolve_pricing_context, resolve_role_provider, save_token_ledger_entry,
-    PricingContext, ROLE_ACTION, ROLE_MAIN, ROLE_PLAN, ROLE_VISION,
+    bump_usage_counter, current_ym, get_conversation, get_messages, get_pricing_override,
+    get_role_model, list_permission_rules, resolve_pricing_context, resolve_role_provider,
+    save_token_ledger_entry, PricingContext, ROLE_ACTION, ROLE_MAIN, ROLE_PLAN, ROLE_VISION,
 };
 use mdga_token_accounting::{
-    compute_cost_summary_priced, lookup_preset, BillingMode, ModelPricing,
+    canonical_model_id, compute_cost_summary_priced, lookup_preset, BillingMode, ModelPricing,
 };
 use mdga_tool_runtime::RunCommandRequest;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -404,7 +404,25 @@ pub(crate) async fn send_message(
     if let Some(raw) = raw_usage {
         // 0.0.72 计价：据本轮命中的连接 billing_mode + 模型 pricing_json 结算（pricing_ctx 已沿
         // active_role 的解析+回退链取出）。未解析到上下文时按「无计费信息」处理（api 模式无单价）。
-        let (mode, pricing) = resolve_billing(pricing_ctx.as_ref());
+        // 0.0.73 第二层：pricing_json 为空且 mode=api 时的回退价改走「有效价」——先查采集覆盖层
+        // （override，实时官网价）、再编译快照。这里趁结算前用短作用域 db 锁预解析好回退价，
+        // resolve_billing 仍保持纯计算（不持 db），既有 pricing_json 优先/订阅/免计费逻辑不变。
+        let preset_fallback = {
+            let preset = pricing_ctx
+                .as_ref()
+                .and_then(|c| c.preset.as_deref())
+                .unwrap_or_default();
+            let model_id = pricing_ctx.as_ref().map(|c| c.model_id.as_str()).unwrap_or_default();
+            // db 锁作用域短：仅取一次 override，松锁后查编译（纯函数）。锁/查询失败软处理为无 override。
+            // override 用 canonical key 查（与写入侧一致），消除大小写 / Pro/ / 别名口径偏差。
+            let key = canonical_model_id(preset, model_id);
+            let over = match state.db.lock() {
+                Ok(db) => get_pricing_override(&db, preset, &key, "CNY").ok().flatten(),
+                Err(_) => None,
+            };
+            effective_fallback_pricing(over, lookup_preset(preset, model_id, "CNY"))
+        };
+        let (mode, pricing) = resolve_billing(pricing_ctx.as_ref(), preset_fallback);
         let summary = compute_cost_summary_priced(&raw, mode, pricing.as_ref());
         let _ = app.emit("chat-usage", summary);
 
@@ -430,18 +448,41 @@ pub(crate) async fn send_message(
     Ok(())
 }
 
-/// 把本轮命中的计价上下文映射为结算所需的 `(BillingMode, Option<ModelPricing>)`（0.0.72）。
+/// 在「采集覆盖层 + 编译快照」中选有效回退价（0.0.73 第二层，override 优先、编译兜底）。
+///
+/// 纯函数，便于单测：
+/// - `over` 命中且 `pricing_json` 能解析为 [`ModelPricing`] → 用采集价（实时官网价）。
+/// - override 缺失 **或解析失败**（软处理：绝不 panic / 中断本轮）→ 跌落编译条目的 pricing。
+/// - 两者皆无 → None。
+fn effective_fallback_pricing(
+    over: Option<mdga_storage::PricingOverride>,
+    compiled: Option<&mdga_token_accounting::PresetEntry>,
+) -> Option<ModelPricing> {
+    if let Some(o) = over {
+        if let Ok(p) = serde_json::from_str::<ModelPricing>(&o.pricing_json) {
+            return Some(p);
+        }
+    }
+    compiled.map(|e| e.pricing.clone())
+}
+
+/// 把本轮命中的计价上下文映射为结算所需的 `(BillingMode, Option<ModelPricing>)`（0.0.72 / 0.0.73）。
 ///
 /// - `mode`：连接 billing_mode 串映射到 [`BillingMode`]，未知值（理论上不会出现，写入侧已归一）落回 Api。
 /// - `pricing`：
 ///   - 优先把模型 `pricing_json` 解析为 [`ModelPricing`]（serde 默认忽略 `_` 前缀元数据等多余字段）；
 ///     解析失败**软处理**为 None（不 panic、不中断本轮）。
-///   - 若 `pricing_json` 为空（或解析失败为 None）**且 mode == Api**，回退用预设库 `lookup_preset`
-///     按（连接 preset, model_id, 币种）取价；币种无从得知时默认 "CNY"。
-///   - 其余情况（非 Api，或 Api 但既无 json 又无预设命中）→ None。
+///   - 若 `pricing_json` 为空（或解析失败为 None）**且 mode == Api**，用 `fallback`——0.0.73 起它是
+///     调用方预解析的「有效价」（采集覆盖层 override 优先、编译快照兜底），见 [`effective_fallback_pricing`]。
+///   - 其余情况（非 Api，或 Api 但既无 json 又无回退价）→ None。
+///
+/// 本函数保持**纯计算**（不持 db）：override 查询在调用点用短作用域 db 锁预解析后以 `fallback` 传入。
 ///
 /// `ctx == None`（未解析到任何计价上下文）：mode = Api、pricing = None（金额走「—」），与「未填单价」一致。
-fn resolve_billing(ctx: Option<&PricingContext>) -> (BillingMode, Option<ModelPricing>) {
+fn resolve_billing(
+    ctx: Option<&PricingContext>,
+    fallback: Option<ModelPricing>,
+) -> (BillingMode, Option<ModelPricing>) {
     let Some(ctx) = ctx else {
         return (BillingMode::Api, None);
     };
@@ -458,13 +499,10 @@ fn resolve_billing(ctx: Option<&PricingContext>) -> (BillingMode, Option<ModelPr
         .and_then(|s| serde_json::from_str::<ModelPricing>(s).ok());
     let pricing = match from_json {
         Some(p) => Some(p),
-        // 仅 Api 模式才按预设库回退取价；币种无从得知 → 默认 "CNY"。
-        None if mode == BillingMode::Api => {
-            // 此回退按 CNY 估算（连接/模型数据层无币种字段，且三家预设均为人民币计价的国产供应商）；
-            // 用户若显式切 USD，pricing_json 已落库 → 走上面 from_json 分支，不经此回退。
-            let preset = ctx.preset.as_deref().unwrap_or_default();
-            lookup_preset(preset, &ctx.model_id, "CNY").map(|e| e.pricing.clone())
-        }
+        // 仅 Api 模式才用回退价；0.0.73：fallback 已是「有效价」（override 优先、编译兜底，
+        // 按 CNY 取——连接/模型层无币种字段，三家供应商均人民币计价；用户显式切 USD 时 pricing_json
+        // 已落库走上面分支，不经此回退）。
+        None if mode == BillingMode::Api => fallback,
         None => None,
     };
     (mode, pricing)
@@ -1877,6 +1915,104 @@ mod tests {
 
     // 注（Plan28 P3-9）：messages_with_workspace_context 的 3 个单测已随该函数迁入
     // mdga-agent-core（crates/agent-core/src/messages.rs），此处不再保留。
+
+    // ── 0.0.73 第二层：有效回退价（override 优先、编译兜底）+ resolve_billing 接线 ──
+
+    /// 构造一条采集覆盖价（pricing_json 由参数定，便于测「解析失败跌落」）。
+    fn make_override(pricing_json: &str) -> mdga_storage::PricingOverride {
+        mdga_storage::PricingOverride {
+            connection_preset: "deepseek".to_string(),
+            model_id: "deepseek-v4-pro".to_string(),
+            currency: "CNY".to_string(),
+            pricing_json: pricing_json.to_string(),
+            source_url: Some("https://example.com".to_string()),
+            fetched_at: Some(1_700_000_000),
+        }
+    }
+
+    fn override_pricing_json() -> &'static str {
+        r#"{"currency":"CNY","unit":"per_1m","input":1.5,"output":3.0,"cachedInput":null,"cacheWrite":null,"batchDiscount":null,"tiers":null}"#
+    }
+
+    #[test]
+    fn effective_fallback_prefers_override() {
+        let p = effective_fallback_pricing(Some(make_override(override_pricing_json())), None)
+            .expect("override hit");
+        assert_eq!(p.input, 1.5);
+        assert_eq!(p.output, 3.0);
+        assert_eq!(p.currency, "CNY");
+    }
+
+    #[test]
+    fn effective_fallback_bad_override_falls_to_compiled() {
+        // override 存在但 pricing_json 解析失败 → 跌落编译条目（这里用一个真实存在的预设作兜底）。
+        let compiled = lookup_preset("deepseek", "deepseek-chat", "CNY");
+        assert!(compiled.is_some(), "预设库应含 deepseek 编译条目");
+        let p = effective_fallback_pricing(Some(make_override("not json")), compiled)
+            .expect("falls to compiled");
+        assert_eq!(p, compiled.unwrap().pricing);
+    }
+
+    #[test]
+    fn effective_fallback_none_when_both_missing() {
+        assert!(effective_fallback_pricing(None, None).is_none());
+        // override 解析失败且无编译 → 也是 None。
+        assert!(effective_fallback_pricing(Some(make_override("{bad")), None).is_none());
+    }
+
+    #[test]
+    fn resolve_billing_api_uses_effective_fallback_when_no_json() {
+        let ctx = PricingContext {
+            billing_mode: "api".to_string(),
+            subscription_json: None,
+            pricing_json: None,
+            preset: Some("deepseek".to_string()),
+            model_id: "deepseek-v4-pro".to_string(),
+            connection_id: "c1".to_string(),
+        };
+        let fallback =
+            effective_fallback_pricing(Some(make_override(override_pricing_json())), None);
+        let (mode, pricing) = resolve_billing(Some(&ctx), fallback);
+        assert_eq!(mode, BillingMode::Api);
+        let pricing = pricing.expect("api fallback applied");
+        assert_eq!(pricing.input, 1.5); // 来自 override
+    }
+
+    #[test]
+    fn resolve_billing_json_wins_over_fallback() {
+        let ctx = PricingContext {
+            billing_mode: "api".to_string(),
+            subscription_json: None,
+            pricing_json: Some(
+                r#"{"currency":"CNY","unit":"per_1m","input":9.9,"output":9.9}"#.to_string(),
+            ),
+            preset: Some("deepseek".to_string()),
+            model_id: "deepseek-v4-pro".to_string(),
+            connection_id: "c1".to_string(),
+        };
+        // 即便给了回退价，pricing_json 优先。
+        let fallback =
+            effective_fallback_pricing(Some(make_override(override_pricing_json())), None);
+        let (_, pricing) = resolve_billing(Some(&ctx), fallback);
+        assert_eq!(pricing.expect("json").input, 9.9);
+    }
+
+    #[test]
+    fn resolve_billing_non_api_ignores_fallback() {
+        let ctx = PricingContext {
+            billing_mode: "subscription".to_string(),
+            subscription_json: None,
+            pricing_json: None,
+            preset: Some("deepseek".to_string()),
+            model_id: "deepseek-v4-pro".to_string(),
+            connection_id: "c1".to_string(),
+        };
+        let fallback =
+            effective_fallback_pricing(Some(make_override(override_pricing_json())), None);
+        let (mode, pricing) = resolve_billing(Some(&ctx), fallback);
+        assert_eq!(mode, BillingMode::Subscription);
+        assert!(pricing.is_none(), "非 Api 模式不应用回退价");
+    }
 
     // ── 0.0.69 真续接:assemble_resume_wire 不变量 ──
     #[test]

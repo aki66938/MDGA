@@ -50,6 +50,8 @@ body {
   /* 对话栏（栅格第 2 轨）左右内边距。滚动条 = 该列右边界：今天与窗口右缘重合，
      未来停靠式第三栏在 .app-shell 追加第 3 轨后，对话栏收窄、滚动条自动落到第 2/3 栏分界。 */
   --col-gutter: 48px;
+  /* 对话线程宽度(消息行 + composer 共用,居中、min(...,100%) 自适应)。0.0.73:760→860 略加宽。 */
+  --thread-width: 860px;
   /* 滚动条配色（淡中性，融入主题）。 */
   --scrollbar-thumb: rgba(26, 29, 36, 0.18);
   --scrollbar-thumb-hover: rgba(26, 29, 36, 0.32);
@@ -362,11 +364,12 @@ h1 {
 }
 
 /* 每条消息的行容器，user 右对齐，assistant 左对齐。
-   限宽 760 + 由 .message-list 的 align-items:center 居中（滚动容器满列、内容居中）。 */
+   限宽 --thread-width + 由 .message-list 的 align-items:center 居中（滚动容器满列、内容居中）；
+   与 .composer-area 共用同一宽度，故助手输出与输入框等长。 */
 .message-row {
   display: flex;
   flex-direction: column;
-  width: min(760px, 100%);
+  width: min(var(--thread-width), 100%);
 }
 
 .message-row:has(.message--user) {
@@ -393,9 +396,12 @@ h1 {
   min-height: 26px;
 }
 
-/* token 行落到操作条同行:清掉它独立成行时的上边距,避免被推下半行。字号/弱色沿用 .usage-badge。 */
+/* token 行落到操作条同行:清掉它独立成行时的上边距,避免被推下半行。字号/弱色沿用 .usage-badge。
+   0.0.73:计价徽标改为与复制/重新生成按钮同样 hover 才淡入(默认隐藏),不悬停时整行干净、计价不再孤零零常显。 */
 .message-actions .usage-badge {
   margin-top: 0;
+  opacity: 0;
+  transition: opacity .12s;
 }
 
 .message-actions--user {
@@ -419,8 +425,10 @@ h1 {
   transition: color .12s, background .12s, opacity .12s;
 }
 
-/* 仅图标按钮 hover 整行(或键盘聚焦)才淡入;token 行不参与淡入、始终可见。 */
+/* hover 整行(或键盘聚焦)才淡入:0.0.73 起图标按钮与 token/计价徽标一起淡入,不悬停整行隐藏。 */
 .message-row:hover .message-actions__btn,
+.message-row:hover .usage-badge,
+.message-actions:focus-within .usage-badge,
 .message-actions__btn:focus-visible {
   opacity: 1;
 }
@@ -449,9 +457,11 @@ h1 {
   padding: 10px 15px;
 }
 
-/* assistant 消息：无背景，内容直接融入页面 */
+/* assistant 消息：无背景，内容直接融入页面。0.0.73:占满整行(覆盖 .message 的 80% 上限),
+   与输入框等长、右侧不再留白;用户消息仍走 .message 的 80% 气泡。 */
 .message--assistant {
   width: 100%;
+  max-width: 100%;
   color: var(--text);
 }
 
@@ -1555,7 +1565,7 @@ h1 {
 
 .composer-area {
   position: relative;
-  width: min(760px, 100%);
+  width: min(var(--thread-width), 100%);
   align-self: center;
   flex-shrink: 0;
   margin-top: 12px;
@@ -2788,6 +2798,207 @@ h1 {
   flex: 0 0 auto;
 }
 
+/* 显示侧「官网价」徽标（0.0.73）：采集覆盖来源的回退价，用品牌色（与「预设·可改」同色系区分）。 */
+.provider-price__badge--official {
+  color: var(--brand);
+  background: var(--brand-tint-strong);
+}
+
+/* ── 官网单价采集（0.0.73）────────────────────────────────────────────────── */
+
+/* 「官网单价」按钮：无边框幽灵、品牌色、文字在前图标在后。 */
+.provider-models__capture {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding: 1px 4px;
+  border: none;
+  background: none;
+  color: var(--brand);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: var(--radius-tag);
+}
+.provider-models__capture:hover:not(:disabled) {
+  background: var(--brand-tint);
+}
+.provider-models__capture:disabled {
+  color: var(--text-3);
+  cursor: default;
+}
+/* 采集中图标旋转。 */
+.provider-models__capture-spin {
+  animation: provider-capture-spin 0.9s linear infinite;
+}
+@keyframes provider-capture-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* diff 面板：软背景、无边框、圆角。 */
+.pricing-capture {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 2px 0 8px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border-radius: var(--radius-card);
+}
+
+.pricing-capture__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.pricing-capture__name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.pricing-capture__fresh {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.pricing-capture__intro {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+/* 截断警示（#8）：页面过大被截断时显式提醒可能漏采，warning 语义色，区别于普通 intro。 */
+.pricing-capture__truncated {
+  margin: 0 0 2px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+
+.pricing-capture__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+/* 每行：白底（surface），勾选 + 模型名 + 徽标 + 价对比。 */
+.pricing-capture__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--surface);
+  border-radius: var(--radius-btn);
+}
+.pricing-capture__row--disabled {
+  opacity: 0.55;
+}
+
+.pricing-capture__check {
+  display: inline-flex;
+  align-items: center;
+}
+
+.pricing-capture__model {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pricing-capture__model code {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+/* 变化徽标：降价绿 / 涨价琥珀 / 新模型蓝 / 无变化灰 / 中性变化（方向未定）灰蓝。 */
+.pricing-capture__badge {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: var(--radius-tag);
+  white-space: nowrap;
+}
+.pricing-capture__badge--down {
+  color: var(--success);
+  background: var(--surface-3);
+}
+.pricing-capture__badge--up {
+  color: var(--warning);
+  background: var(--surface-3);
+}
+.pricing-capture__badge--new {
+  color: var(--brand);
+  background: var(--brand-tint);
+}
+.pricing-capture__badge--changed {
+  color: var(--text-2);
+  background: var(--surface-3);
+}
+.pricing-capture__badge--unchanged {
+  color: var(--text-3);
+  background: var(--surface-3);
+}
+
+/* 价对比：旧→新；旧价弱化，新价随方向语义色。 */
+.pricing-capture__prices {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+}
+.pricing-capture__old {
+  color: var(--text-3);
+  text-decoration: line-through;
+}
+.pricing-capture__arrow {
+  color: var(--text-3);
+}
+.pricing-capture__new {
+  color: var(--text-2);
+}
+.pricing-capture__new--down {
+  color: var(--success);
+}
+.pricing-capture__new--up {
+  color: var(--warning);
+}
+.pricing-capture__new--new {
+  color: var(--brand);
+}
+.pricing-capture__same {
+  color: var(--text-3);
+}
+
+/* 底部行：左恢复预设（幽灵），右应用所选 + 取消。 */
+.pricing-capture__foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pricing-capture__foot-right {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 8px;
+}
+.pricing-capture__foot .approval-card__btn {
+  flex: 0 0 auto;
+}
+
 .changes-list {
   display: flex;
   flex-direction: column;
@@ -3305,7 +3516,7 @@ h1 {
 :root[data-theme="dark"] .hljs { background: var(--surface-3) !important; color: var(--text) !important; }
 
 /* ── 当前模型只读胶囊（Plan20 🔴1）── */
-/* 控制行右侧的只读「当前模型」按钮，展示主 provider 的 model_id，点击进 设置 → 模型供应商。 */
+/* 控制行右侧的只读「当前模型」按钮，展示主模型的 model_id，点击进 设置 → 模型分配。 */
 .model-pill {
   display: inline-flex;
   align-items: center;

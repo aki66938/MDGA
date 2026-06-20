@@ -45,7 +45,7 @@ fn needs_verify(connection_preset: &str, confidence: &str) -> bool {
 }
 
 /// 规范化 model_id：trim，并去掉前导 `Pro/`（大小写不敏感，仅去一层）。
-fn normalize_model_id(model_id: &str) -> String {
+pub fn normalize_model_id(model_id: &str) -> String {
     let trimmed = model_id.trim();
     // char 安全:用 get(..4) 而非 trimmed[..4],避免多字节字符(CJK model_id)非字符边界处 panic。
     let without_pro = if trimmed.get(..4).map_or(false, |p| p.eq_ignore_ascii_case("pro/")) {
@@ -58,7 +58,7 @@ fn normalize_model_id(model_id: &str) -> String {
 
 /// 应用 DeepSeek 别名：connection_preset=="deepseek" 且 model_id ∈ {deepseek-chat,
 /// deepseek-reasoner}（大小写不敏感）时，等同 "deepseek-v4-flash"。
-fn apply_alias(connection_preset: &str, normalized: &str) -> String {
+pub fn apply_alias(connection_preset: &str, normalized: &str) -> String {
     if connection_preset == "deepseek"
         && (normalized.eq_ignore_ascii_case("deepseek-chat")
             || normalized.eq_ignore_ascii_case("deepseek-reasoner"))
@@ -67,6 +67,24 @@ fn apply_alias(connection_preset: &str, normalized: &str) -> String {
     } else {
         normalized.to_string()
     }
+}
+
+/// 规范化 model_id 为 override 存储/查询用的 canonical key。
+///
+/// 把同一逻辑模型在不同登记 / 采集形态下的串收敛成同一个键，使 override 的**写键 == 读键**、
+/// 且与编译 [`lookup_preset`] 的匹配口径一致（[`lookup_preset`] 自身行为不变，本函数只是把同套
+/// 规范化逻辑额外暴露给 override 存储侧）：
+/// 1. `normalize_model_id`：trim + 去前导 `Pro/`；
+/// 2. `apply_alias`（preset 先小写，对齐 `lookup_preset` 内部口径）：deepseek-chat /
+///    deepseek-reasoner → deepseek-v4-flash；
+/// 3. `.to_ascii_lowercase()`：消除大小写差异。
+///
+/// 注意：canonical key 仅用于 override 的存储/查询 key，**绝不**用作展示串（展示仍用抽取原串，
+/// 见 `PricingDiff.modelId`）。
+pub fn canonical_model_id(connection_preset: &str, model_id: &str) -> String {
+    let preset_lc = connection_preset.trim().to_ascii_lowercase();
+    let normalized = normalize_model_id(model_id);
+    apply_alias(&preset_lc, &normalized).to_ascii_lowercase()
 }
 
 /// 在预设库中查找单价。
@@ -432,5 +450,46 @@ mod tests {
     fn lookup_preset_with_cjk_model_id_returns_none_not_panic() {
         // 结算路径无 catch_unwind;CJK model_id 必须返回 None 而非崩溃。
         assert!(lookup_preset("siliconflow", "智谱清言", "CNY").is_none());
+    }
+
+    #[test]
+    fn canonical_model_id_strips_pro_and_lowercases() {
+        // Pro/ 前缀去掉 + 全小写：两种登记形态收敛到同一 canonical key。
+        assert_eq!(
+            canonical_model_id("siliconflow", "Pro/zai-org/GLM-5.1"),
+            "zai-org/glm-5.1"
+        );
+        assert_eq!(
+            canonical_model_id("siliconflow", "zai-org/GLM-5.1"),
+            "zai-org/glm-5.1"
+        );
+        // 大小写 / 前后空白差异均被吸收。
+        assert_eq!(
+            canonical_model_id("SiliconFlow", "  ZAI-ORG/glm-5.1 "),
+            "zai-org/glm-5.1"
+        );
+    }
+
+    #[test]
+    fn canonical_model_id_applies_deepseek_alias() {
+        // deepseek-chat / deepseek-reasoner → deepseek-v4-flash（大小写不敏感），再小写。
+        assert_eq!(
+            canonical_model_id("deepseek", "deepseek-chat"),
+            "deepseek-v4-flash"
+        );
+        assert_eq!(
+            canonical_model_id("DEEPSEEK", "DEEPSEEK-REASONER"),
+            "deepseek-v4-flash"
+        );
+        // 非别名串只小写。
+        assert_eq!(
+            canonical_model_id("deepseek", "DEEPSEEK-V4-PRO"),
+            "deepseek-v4-pro"
+        );
+        // 别名仅对 deepseek preset 生效：其他 preset 不映射。
+        assert_eq!(
+            canonical_model_id("siliconflow", "deepseek-chat"),
+            "deepseek-chat"
+        );
     }
 }

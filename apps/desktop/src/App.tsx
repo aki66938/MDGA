@@ -84,7 +84,7 @@ export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
-  // 主模型 id（Plan20 🔴1）：单一真相源 = 主 provider 的 model_id（设置→模型供应商配）。
+  // 主模型 id（Plan20 🔴1）：单一真相源 = 主模型角色分配指向的模型（设置→模型连接 登记、模型分配 指派）。
   // 类型放宽为 string 以容纳任意供应商模型名；初始化为默认 DeepSeek 值仅作兜底占位，
   // 挂载/配置后用 main 角色分配生效的 modelId 覆盖（get_role_assignments）。后端忽略此入参选模型。
   const [model, setModel] = useState<string>(DEFAULT_DEEPSEEK_MODEL_ID);
@@ -122,7 +122,7 @@ export function App() {
   const planRoundRef = useRef(false);
   // 设置面板 / 变更记录面板
   const [showSettings, setShowSettings] = useState(false);
-  // 打开设置面板时初始定位的分类（首屏 CTA 可直接跳到「模型供应商」）。
+  // 打开设置面板时初始定位的分类（首屏 CTA 可直接跳到「模型连接」）。
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("account");
   // 主模型是否已配（Plan19 P0a）：未配则首屏给「去配置」引导。
   const [mainConfigured, setMainConfigured] = useState<boolean | null>(null);

@@ -38,13 +38,17 @@ use commands::{
 use commands::{
     add_model, delete_connection, delete_model, fetch_available_models, get_app_setting,
     get_connection_monthly_usage, list_connections, list_models, list_models_for_connection,
-    lookup_model_preset, save_connection, set_app_setting, set_connection_billing, set_model_pricing,
-    smoke_test_tool_call, smoke_test_tool_call_for_connection, test_connection, update_model,
+    lookup_effective_pricing, lookup_model_preset, save_connection, set_app_setting,
+    set_connection_billing, set_model_pricing, smoke_test_tool_call,
+    smoke_test_tool_call_for_connection, test_connection, update_model,
 };
 use commands::{
     clear_role_assignment, get_lsp_known_servers, get_lsp_server_config, get_role_assignments,
     save_lsp_server_config, set_role_assignment,
 };
+
+mod pricing_capture;
+use pricing_capture::{apply_pricing_overrides, capture_official_pricing, reset_pricing_overrides};
 
 // 注（Plan28 P3-9）：原 agent_prompt 模块（仅持有三个灵魂常量）已不再需要——常量权威定义
 // 迁入 mdga-agent-core，消息构建也已迁过去；桌面端不再有 crate::agent_prompt::* 引用，故移除该模块。
@@ -246,8 +250,12 @@ fn main() {
             update_model,
             delete_model,
             lookup_model_preset,
+            lookup_effective_pricing,
             set_model_pricing,
             set_connection_billing,
+            capture_official_pricing,
+            apply_pricing_overrides,
+            reset_pricing_overrides,
             get_connection_monthly_usage,
             fetch_available_models,
             smoke_test_tool_call,

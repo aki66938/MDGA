@@ -10,8 +10,16 @@ import {
   aggregateCost,
   formatCostByCurrency,
   validatePricingNonNeg,
+  changeBadge,
+  pricingChangeDirection,
+  relativeTime,
+  buildApplyItem,
+  buildApplyItems,
+  diffKey,
+  humanizeError,
+  shouldStoreAutofill,
 } from "./utils";
-import type { StoredPricing, UsageSummary, PricingTier } from "./types";
+import type { StoredPricing, UsageSummary, PricingTier, ModelPricing, PricingDiff, EffectivePricingView } from "./types";
 
 /** 造一组顶层价格参数（默认全合法），便于在各用例只改一个字段。 */
 function top(partial: Partial<{
@@ -151,5 +159,138 @@ describe("validatePricingNonNeg（0.0.72 FIX 4）", () => {
     expect(validatePricingNonNeg(top(), [okTier, badInput])).toBe("第 2 档输入单价不能为负数。");
     const badCached: PricingTier = { maxContext: 32000, input: 6, output: 24, cachedInput: -1 };
     expect(validatePricingNonNeg(top(), [badCached])).toBe("第 1 档缓存命中单价不能为负数。");
+  });
+});
+
+// ── 官网单价采集 diff 纯函数（0.0.73）────────────────────────────────────────
+
+/** 造一条 ModelPricing（默认 CNY/per_1m）。 */
+function mp(partial: Partial<ModelPricing> = {}): ModelPricing {
+  return { currency: "CNY", unit: "per_1m", input: 1, output: 2, ...partial };
+}
+
+/** 造一条 PricingDiff（默认 changed，old=1/2、new=1/2）。 */
+function diff(partial: Partial<PricingDiff> = {}): PricingDiff {
+  return {
+    modelId: "m",
+    currency: "CNY",
+    change: "changed",
+    oldPricing: mp(),
+    newPricing: mp(),
+    ...partial,
+  };
+}
+
+describe("changeBadge / pricingChangeDirection（0.0.73）", () => {
+  it("new→新模型蓝；unchanged→无变化灰", () => {
+    expect(changeBadge(diff({ change: "new", oldPricing: undefined }))).toEqual({ kind: "new", label: "新模型" });
+    expect(changeBadge(diff({ change: "unchanged" }))).toEqual({ kind: "unchanged", label: "无变化" });
+  });
+
+  it("changed：output 降→降价绿、涨→涨价琥珀", () => {
+    const down = diff({ oldPricing: mp({ output: 6 }), newPricing: mp({ output: 4 }) });
+    expect(changeBadge(down)).toEqual({ kind: "down", label: "降价" });
+    const up = diff({ oldPricing: mp({ output: 4 }), newPricing: mp({ output: 6 }) });
+    expect(changeBadge(up)).toEqual({ kind: "up", label: "涨价" });
+  });
+
+  it("changed：output 相等但其它字段变→方向未定→中性『有变化』", () => {
+    // output 一致（方向算不出），但 cachedInput 变 → 仍是 changed，徽标中性。
+    const d = diff({ oldPricing: mp({ output: 6, cachedInput: 1 }), newPricing: mp({ output: 6, cachedInput: 2 }) });
+    expect(changeBadge(d)).toEqual({ kind: "changed", label: "有变化" });
+  });
+
+  it("pricingChangeDirection：缺旧价→null；output 缺退用 input", () => {
+    expect(pricingChangeDirection(undefined, mp())).toBeNull();
+    // output 两侧都缺（用 input 判）：input 6→4 = down。
+    const oldNoOut = { currency: "CNY", unit: "per_1m", input: 6, output: 0 } as unknown as ModelPricing;
+    const newNoOut = { currency: "CNY", unit: "per_1m", input: 4, output: 0 } as unknown as ModelPricing;
+    // output 为 0（number）按 output 判：0===0 → null（相等）。验证 output 优先于 input。
+    expect(pricingChangeDirection(oldNoOut, newNoOut)).toBeNull();
+  });
+});
+
+describe("relativeTime（0.0.73）", () => {
+  const now = 1_000_000; // 秒
+  const nowMs = now * 1000;
+  it("缺时间戳/不足 1 分钟→刚刚更新", () => {
+    expect(relativeTime(undefined, nowMs)).toBe("刚刚更新");
+    expect(relativeTime(now - 30, nowMs)).toBe("刚刚更新");
+    // 未来时间戳（时钟漂移）→ 刚刚更新（delta<60）。
+    expect(relativeTime(now + 100, nowMs)).toBe("刚刚更新");
+  });
+  it("分钟/小时/天", () => {
+    expect(relativeTime(now - 5 * 60, nowMs)).toBe("5 分钟前");
+    expect(relativeTime(now - 3 * 3600, nowMs)).toBe("3 小时前");
+    expect(relativeTime(now - 2 * 86400, nowMs)).toBe("2 天前");
+  });
+});
+
+describe("buildApplyItem(s) / diffKey（0.0.73）", () => {
+  it("diffKey：modelId+currency 主键稳定", () => {
+    expect(diffKey(diff({ modelId: "deepseek-v4-pro", currency: "CNY" }))).toBe("deepseek-v4-pro|CNY");
+  });
+
+  it("buildApplyItem：newPricing 序列化进 pricingJson，带/不带 sourceUrl", () => {
+    const d = diff({ modelId: "x", currency: "CNY", newPricing: mp({ input: 3, output: 6 }) });
+    const item = buildApplyItem(d, "https://e.com/pricing");
+    expect(item.modelId).toBe("x");
+    expect(item.currency).toBe("CNY");
+    expect(item.sourceUrl).toBe("https://e.com/pricing");
+    expect(JSON.parse(item.pricingJson)).toMatchObject({ input: 3, output: 6 });
+    // 无 sourceUrl 时省略该键。
+    expect(buildApplyItem(d, undefined).sourceUrl).toBeUndefined();
+  });
+
+  it("buildApplyItems：仅组装选中键的行", () => {
+    const a = diff({ modelId: "a", currency: "CNY" });
+    const b = diff({ modelId: "b", currency: "CNY" });
+    const c = diff({ modelId: "c", currency: "CNY", change: "unchanged" });
+    const selected = new Set([diffKey(a), diffKey(b)]);
+    const items = buildApplyItems([a, b, c], selected, "https://e.com/pricing");
+    expect(items.map((i) => i.modelId)).toEqual(["a", "b"]);
+  });
+});
+
+// shouldStoreAutofill（#3+#4 修复）：加模型自动填只对编译预设落库；采集覆盖一律不落库（保持走实时回退）。
+describe("shouldStoreAutofill 自动填落库决策", () => {
+  const ev = (partial: Partial<EffectivePricingView>): EffectivePricingView => ({
+    pricing: mp(),
+    source: "preset",
+    needsVerify: false,
+    ...partial,
+  });
+
+  it("source==='preset' 且有 pricing → 落库", () => {
+    expect(shouldStoreAutofill(ev({ source: "preset" }))).toBe(true);
+  });
+
+  it("source==='override' → 不落库（不把官网价冻进 pricing_json）", () => {
+    expect(shouldStoreAutofill(ev({ source: "override" }))).toBe(false);
+  });
+
+  it("view 为 null / undefined / 无 pricing → 不落库", () => {
+    expect(shouldStoreAutofill(null)).toBe(false);
+    expect(shouldStoreAutofill(undefined)).toBe(false);
+    expect(shouldStoreAutofill({ source: "preset", needsVerify: false } as unknown as EffectivePricingView)).toBe(false);
+  });
+});
+
+// humanizeError（#10 修复）：0.0.60 后设置页只有「模型连接 / 模型分配」，不应再指向已废的「模型供应商」。
+describe("humanizeError 引导文案不指向已废分类", () => {
+  it("未配置主模型：指向 模型连接 / 模型分配，不含「模型供应商」", () => {
+    const out = humanizeError("未配置主模型");
+    expect(out).toContain("模型连接");
+    expect(out).not.toContain("模型供应商");
+  });
+
+  it("认证失败：指向 模型连接，不含「模型供应商」", () => {
+    const out = humanizeError("认证失败");
+    expect(out).toContain("模型连接");
+    expect(out).not.toContain("模型供应商");
+  });
+
+  it("未识别错误保留原文", () => {
+    expect(humanizeError("某个未知错误")).toContain("某个未知错误");
   });
 });

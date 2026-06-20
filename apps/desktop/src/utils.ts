@@ -7,6 +7,10 @@ import type {
   PricingUnit,
   StoredPricing,
   PricingTier,
+  ModelPricing,
+  PricingDiff,
+  ApplyItem,
+  EffectivePricingView,
 } from "./types";
 
 /** token 数精简成 k/M（对标 Claude 的「576.5k / 1.0M」）。 */
@@ -248,6 +252,106 @@ export function validatePricingNonNeg(
   return null;
 }
 
+// ── 官网单价采集 diff（0.0.73）纯函数 ─────────────────────────────────────────
+
+/**
+ * 一条 diff 的展示徽标判定（0.0.73）：把 change + 涨/降方向归一为一个 kind + 文案。
+ * - change='new' → { kind:'new', label:'新模型' }（蓝）。
+ * - change='unchanged' → { kind:'unchanged', label:'无变化' }（灰，行禁用置灰）。
+ * - change='changed'：比较 new.output 与 old.output（output 为 None 时退而比 input）判涨/降：
+ *     新价更低 → { kind:'down', label:'降价' }（绿）；更高 → { kind:'up', label:'涨价' }（琥珀）；
+ *     方向算不出（缺旧价/两值相等）→ { kind:'changed', label:'有变化' }（中性）。
+ */
+export type ChangeBadge = {
+  kind: "new" | "up" | "down" | "changed" | "unchanged";
+  label: string;
+};
+
+export function changeBadge(diff: PricingDiff): ChangeBadge {
+  if (diff.change === "new") return { kind: "new", label: "新模型" };
+  if (diff.change === "unchanged") return { kind: "unchanged", label: "无变化" };
+  // changed：判方向。
+  const dir = pricingChangeDirection(diff.oldPricing, diff.newPricing);
+  if (dir === "down") return { kind: "down", label: "降价" };
+  if (dir === "up") return { kind: "up", label: "涨价" };
+  return { kind: "changed", label: "有变化" };
+}
+
+/**
+ * 涨/降方向（0.0.73）：以输出单价为主判据（output 缺则退用输入单价）。
+ * 缺旧价、或主判据两侧都取不到、或相等 → null（方向未定）。返回 'up'｜'down'｜null。
+ */
+export function pricingChangeDirection(
+  oldP: ModelPricing | undefined,
+  newP: ModelPricing,
+): "up" | "down" | null {
+  if (!oldP) return null;
+  // 主判据 output；output 任一侧缺（理论不该有，防御）退用 input。
+  const pick = (p: ModelPricing): number | null =>
+    typeof p.output === "number" ? p.output : typeof p.input === "number" ? p.input : null;
+  const a = pick(oldP);
+  const b = pick(newP);
+  if (a == null || b == null) return null;
+  if (b < a) return "down";
+  if (b > a) return "up";
+  return null;
+}
+
+/**
+ * 极简相对新鲜度（0.0.73）：把秒级时间戳转成「刚刚更新 / N 分钟前 / N 小时前 / N 天前」。
+ * fetchedAt 缺/未来时间 → 「刚刚更新」。nowMs 可注入便于单测（默认 Date.now()）。
+ */
+export function relativeTime(fetchedAtSec: number | undefined, nowMs: number = Date.now()): string {
+  if (fetchedAtSec == null) return "刚刚更新";
+  const deltaSec = Math.floor(nowMs / 1000) - fetchedAtSec;
+  if (deltaSec < 60) return "刚刚更新";
+  const min = Math.floor(deltaSec / 60);
+  if (min < 60) return `${min} 分钟前`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr} 小时前`;
+  const day = Math.floor(hr / 24);
+  return `${day} 天前`;
+}
+
+/**
+ * 加模型自动填单价的「是否落库」决策（0.0.73 修正，#3+#4）：纯函数，便于单测。
+ * 只有来源是编译预设快照（source==='preset'，且 view 非空、有 pricing）才落库；
+ * 来源是采集覆盖（source==='override'）一律**不落库**——否则会把实时官网价冻进模型条目，
+ * 使其不再跟随后续官网刷新、且徽标误显「自定义」。让模型保持 pricing_json 空走实时有效价回退。
+ */
+export function shouldStoreAutofill(
+  view: EffectivePricingView | null | undefined,
+): view is EffectivePricingView {
+  if (!view || !view.pricing) return false;
+  return view.source === "preset";
+}
+
+/** 把一条 diff 组装成 apply 入参（0.0.73）：newPricing 序列化进 pricingJson，带 sourceUrl。 */
+export function buildApplyItem(diff: PricingDiff, sourceUrl: string | undefined): ApplyItem {
+  return {
+    modelId: diff.modelId,
+    currency: diff.currency,
+    pricingJson: JSON.stringify(diff.newPricing),
+    ...(sourceUrl ? { sourceUrl } : {}),
+  };
+}
+
+/** 把选中的 diff（按 modelId+currency 主键集合）组装成 apply 入参数组（0.0.73）。 */
+export function buildApplyItems(
+  diffs: PricingDiff[],
+  selectedKeys: Set<string>,
+  sourceUrl: string | undefined,
+): ApplyItem[] {
+  return diffs
+    .filter((d) => selectedKeys.has(diffKey(d)))
+    .map((d) => buildApplyItem(d, sourceUrl));
+}
+
+/** 一条 diff 的稳定主键（modelId + currency）：用作勾选集合的元素与 React key。 */
+export function diffKey(diff: PricingDiff): string {
+  return diff.modelId + "|" + diff.currency;
+}
+
 /** 查找正文中工具调用标记的最早位置（<ToolCall>、DSML 各变体）；无标记返回 -1。 */
 export function findToolMarkupIndex(text: string): number {
   const markers = ["<ToolCall", "<DSML", "<｜DSML", "<｜｜DSML"];
@@ -262,10 +366,10 @@ export function findToolMarkupIndex(text: string): number {
 /** 把后端原始错误串映射为面向用户的友好提示与建议动作；未识别的错误保留原文便于反馈。 */
 export function humanizeError(raw: string): string {
   if (raw.includes("未配置主模型") || raw.includes("DEEPSEEK_API_KEY")) {
-    return "未配置主模型：请在 设置 → 模型供应商 中填写 API Key 与模型后再发送。";
+    return "未配置主模型：请在 设置 → 模型连接 添加连接与模型，再到 模型分配 指定主模型后发送。";
   }
   if (raw.includes("认证失败")) {
-    return "API Key 无效：请在 设置 → 模型供应商 检查 API Key 是否填写正确。";
+    return "API Key 无效：请在 设置 → 模型连接 检查 API Key 是否填写正确。";
   }
   if (raw.includes("余额不足")) {
     return "DeepSeek 账户余额不足：请前往 DeepSeek 开放平台充值后重试。";

@@ -9,7 +9,7 @@ use mdga_shared::RawUsage;
 use serde::{Deserialize, Serialize};
 
 pub mod presets;
-pub use presets::{lookup_preset, PresetEntry};
+pub use presets::{canonical_model_id, lookup_preset, PresetEntry};
 
 /// 单次请求的价格快照，版本化保存以支持历史费用回放。
 ///

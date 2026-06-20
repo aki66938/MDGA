@@ -337,6 +337,78 @@ export type PresetView = {
   sourceUrl: string;
 };
 
+// ── 官网单价采集（0.0.73）────────────────────────────────────────────────────
+
+/**
+ * lookup_effective_pricing 返回视图：当前真正生效的价（采集覆盖优先、编译快照兜底）。
+ * 显示侧预设回退 + 加模型自动填都用它（与后端结算口径一致）。
+ * source='override'＝采集价（实时官网价，needsVerify 恒 false、confidence 缺）；
+ * source='preset'＝编译快照（沿用条目 confidence/needsVerify/sourceUrl）。
+ */
+export type EffectivePricingView = {
+  pricing: ModelPricing;
+  /** 'override'＝采集覆盖层｜'preset'＝编译快照。 */
+  source: "override" | "preset";
+  /** 仅 preset 来源有值（编译条目置信度）；override 来源缺。 */
+  confidence?: string;
+  /** override 来源恒 false；preset 来源沿用条目 needs_verify。 */
+  needsVerify: boolean;
+  /** 来源链接（官网定价页）；可空。 */
+  sourceUrl?: string;
+  /** override 来源为采集时间戳（毫秒前的秒级时间戳，可空）；preset 来源缺。 */
+  fetchedAt?: number;
+};
+
+/**
+ * 单条 diff：一个抽到的模型与「现价」的比对结果（capture_official_pricing 返回的一行）。
+ * change='new'＝现价不存在（新模型）｜'changed'＝价格有变｜'unchanged'＝完全一致。
+ */
+export type PricingDiff = {
+  /** 真实 API 模型串（原样，作为 override 主键的一部分）。 */
+  modelId: string;
+  currency: string;
+  change: "new" | "changed" | "unchanged";
+  /** 现价（override 或编译快照解析得到）；new 时缺。 */
+  oldPricing?: ModelPricing;
+  /** 官网抽到的新价。 */
+  newPricing: ModelPricing;
+};
+
+/**
+ * capture_official_pricing 的统一返回（不写库；前端据此渲染 diff 勾选表）。
+ * supported=false → 该平台不支持自动采集（显 message）；ok=false → 抓取/抽取/校验失败（显 error）；
+ * ok=true → 展开 diff 面板（diffs 逐模型）。
+ */
+export type CaptureResult = {
+  /** 该 preset 是否支持自动采集。 */
+  supported: boolean;
+  /** 抓取+抽取+校验整体是否成功（supported=false 时无意义，恒 false）。 */
+  ok: boolean;
+  /** 失败原因（人话）；成功时缺。 */
+  error?: string;
+  /** supported=false 时的提示文案。 */
+  message?: string;
+  /** 采集源 url（成功时回填，供 apply 写 source_url）。 */
+  sourceUrl?: string;
+  /** 抓取/抽取时间戳（秒级，成功时回填）。 */
+  fetchedAt?: number;
+  /** 页面过大被截断：抽取可能漏采部分模型，前端需显式警示而非以「采集成功」无差别呈现。 */
+  truncated: boolean;
+  /** 逐模型 diff（changed/new/unchanged 都在；unchanged 由前端默认不勾且置灰）。 */
+  diffs: PricingDiff[];
+};
+
+/** apply_pricing_overrides 的单条入参：前端把勾选行的 newPricing 序列化回传。 */
+export type ApplyItem = {
+  /** 真实 API 模型串（原样写入 override 主键）。 */
+  modelId: string;
+  currency: string;
+  /** newPricing 序列化后的 JSON 串（原样存进 override 的 pricing_json）。 */
+  pricingJson: string;
+  /** 采集源 url（可空；前端从 CaptureResult.sourceUrl 带回）。 */
+  sourceUrl?: string;
+};
+
 /** subscriptionJson 自由结构：套餐名 + 月费 + 月额度 token（均可空）。 */
 export type SubscriptionInfo = {
   planLabel?: string;

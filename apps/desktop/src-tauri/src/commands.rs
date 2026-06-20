@@ -26,13 +26,14 @@ use mdga_storage::{
 };
 use mdga_storage::{
     current_ym, delete_role_model, get_connection, get_lsp_server_config_json, get_model,
-    get_monthly_usage, get_role_model, get_setting,
+    get_monthly_usage, get_pricing_override, get_role_model, get_setting,
     list_models_for_connection as storage_list_models_for_connection, resolve_role_provider,
     set_connection_billing as storage_set_connection_billing, set_lsp_server_config_json,
     set_model_pricing as storage_set_model_pricing, set_setting, upsert_connection, upsert_model,
-    upsert_role_model, CuratedModel, MonthlyUsage, ProviderConnection, ALL_ROLES, ROLE_MAIN,
+    upsert_role_model, CuratedModel, MonthlyUsage, PricingOverride, ProviderConnection, ALL_ROLES,
+    ROLE_MAIN,
 };
-use mdga_token_accounting::{lookup_preset, ModelPricing};
+use mdga_token_accounting::{canonical_model_id, lookup_preset, ModelPricing, PresetEntry};
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
@@ -383,6 +384,90 @@ pub(crate) fn lookup_model_preset(
         needs_verify: e.needs_verify,
         source_url: e.source_url.to_string(),
     })
+}
+
+/// 「有效价」前端视图（0.0.73 第二层）：成本计算 / 显示 / 加模型自动填都用它。
+///
+/// `source` 标明价从哪来："override"（采集覆盖层）| "preset"（编译快照）。采集价是实时官网价，
+/// `needsVerify` 恒 false、`confidence` 为 None；编译快照沿用预设条目的 confidence/needsVerify。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EffectivePricingView {
+    pub pricing: ModelPricing,
+    /// "override" | "preset"。
+    pub source: String,
+    /// 仅 preset 来源有值（编译条目置信度）；override 来源为 None。
+    pub confidence: Option<String>,
+    /// override 来源恒 false；preset 来源沿用条目 needs_verify。
+    pub needs_verify: bool,
+    pub source_url: Option<String>,
+    /// override 来源为采集时间戳（可空）；preset 来源恒 None。
+    pub fetched_at: Option<i64>,
+}
+
+/// 在「采集覆盖层 + 编译快照」中选有效价（0.0.73 第二层，override 优先、编译兜底）。
+///
+/// 纯函数，便于单测：
+/// - `over` 命中且 `pricing_json` 能解析为 [`ModelPricing`] → override 视图（采集价=实时官网价，
+///   `needsVerify=false`、`confidence=None`，带 source_url/fetched_at）。
+/// - override 缺失 **或解析失败**（软处理：不报错、不 panic）→ 跌落编译条目，命中即 preset 视图
+///   （沿用条目 confidence/needs_verify/source_url，fetched_at=None）。
+/// - 两者皆无 → None。
+pub(crate) fn pick_effective_pricing(
+    over: Option<PricingOverride>,
+    compiled: Option<&PresetEntry>,
+) -> Option<EffectivePricingView> {
+    // 1) 优先采集覆盖层；解析失败软处理为「没有」，跌落编译。
+    if let Some(o) = over {
+        if let Ok(pricing) = serde_json::from_str::<ModelPricing>(&o.pricing_json) {
+            return Some(EffectivePricingView {
+                pricing,
+                source: "override".to_string(),
+                confidence: None,
+                needs_verify: false,
+                source_url: o.source_url,
+                fetched_at: o.fetched_at,
+            });
+        }
+    }
+    // 2) 编译快照兜底。
+    compiled.map(|e| EffectivePricingView {
+        pricing: e.pricing.clone(),
+        source: "preset".to_string(),
+        confidence: Some(e.confidence.to_string()),
+        needs_verify: e.needs_verify,
+        source_url: Some(e.source_url.to_string()),
+        fetched_at: None,
+    })
+}
+
+/// 查某模型的「有效价」（0.0.73 第二层）：override（采集覆盖层）优先、编译快照兜底。
+///
+/// 供前端「成本计算 / 显示 / 加模型自动填」用——它要的是当前真正生效的价，而「恢复预设」仍走
+/// [`lookup_model_preset`]（只回编译快照）。
+///
+/// **匹配口径**（0.0.73 修复 1）：override 的查询 key 经 [`canonical_model_id`] 规范化（去前导
+/// `Pro/`、deepseek-chat/reasoner→flash 别名、小写），与写入侧（`apply_pricing_overrides`）及编译
+/// `lookup_preset` 口径一致，故登记串与采集串大小写 / `Pro/` / 别名不一致时也能命中 override。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) fn lookup_effective_pricing(
+    state: State<AppState>,
+    connectionPreset: String,
+    modelId: String,
+    currency: String,
+) -> Option<EffectivePricingView> {
+    // db 锁作用域尽量短：只取 override，松锁后再查编译（纯函数，无需持锁）。
+    // 锁失败/查询失败均软处理为「无 override」，仍跌落编译快照，不整条返回 None。
+    let key = canonical_model_id(&connectionPreset, &modelId);
+    let over = match state.db.lock() {
+        Ok(db) => get_pricing_override(&db, &connectionPreset, &key, &currency)
+            .ok()
+            .flatten(),
+        Err(_) => None,
+    };
+    let compiled = lookup_preset(&connectionPreset, &modelId, &currency);
+    pick_effective_pricing(over, compiled)
 }
 
 /// 保存或清空某模型的单价快照（0.0.72）。
@@ -1945,5 +2030,67 @@ pub(crate) fn permission_mode_from_str(value: &str) -> PermissionMode {
         "workspace_auto" => PermissionMode::WorkspaceAuto,
         "full_access" => PermissionMode::FullAccess,
         _ => PermissionMode::Restricted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn override_with(json: &str) -> PricingOverride {
+        PricingOverride {
+            connection_preset: "deepseek".to_string(),
+            model_id: "deepseek-v4-pro".to_string(),
+            currency: "CNY".to_string(),
+            pricing_json: json.to_string(),
+            source_url: Some("https://collected.example".to_string()),
+            fetched_at: Some(1_700_000_000),
+        }
+    }
+
+    fn ok_pricing_json() -> &'static str {
+        r#"{"currency":"CNY","unit":"per_1m","input":2.0,"output":4.0,"cachedInput":0.5,"cacheWrite":null,"batchDiscount":null,"tiers":null}"#
+    }
+
+    /// 用一个真实编译条目做兜底（preset 库内必有 deepseek 条目）。
+    fn a_compiled() -> &'static PresetEntry {
+        lookup_preset("deepseek", "deepseek-chat", "CNY").expect("预设库应含 deepseek 条目")
+    }
+
+    #[test]
+    fn pick_override_hit() {
+        let v = pick_effective_pricing(Some(override_with(ok_pricing_json())), Some(a_compiled()))
+            .expect("override hit");
+        assert_eq!(v.source, "override");
+        assert!(!v.needs_verify); // 采集价不需核对
+        assert!(v.confidence.is_none());
+        assert_eq!(v.source_url.as_deref(), Some("https://collected.example"));
+        assert_eq!(v.fetched_at, Some(1_700_000_000));
+        assert_eq!(v.pricing.input, 2.0);
+    }
+
+    #[test]
+    fn pick_override_parse_fail_falls_to_preset() {
+        let compiled = a_compiled();
+        let v = pick_effective_pricing(Some(override_with("not-json")), Some(compiled))
+            .expect("falls to preset");
+        assert_eq!(v.source, "preset");
+        assert_eq!(v.confidence.as_deref(), Some(compiled.confidence));
+        assert_eq!(v.needs_verify, compiled.needs_verify);
+        assert_eq!(v.fetched_at, None);
+        assert_eq!(v.pricing, compiled.pricing);
+    }
+
+    #[test]
+    fn pick_no_override_uses_preset() {
+        let v = pick_effective_pricing(None, Some(a_compiled())).expect("preset");
+        assert_eq!(v.source, "preset");
+    }
+
+    #[test]
+    fn pick_none_when_both_missing() {
+        assert!(pick_effective_pricing(None, None).is_none());
+        // override 解析失败且无编译 → None。
+        assert!(pick_effective_pricing(Some(override_with("{bad")), None).is_none());
     }
 }

@@ -2,7 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock, Trash2, Pencil, Wrench, Plus, Download, Check, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock, Trash2, Pencil, Wrench, Plus, Download, Check, X, RefreshCw } from "lucide-react";
 import { getPermissionModeLabel, type PermissionMode } from "@mdga/ui";
 import {
   PERMISSION_MODES,
@@ -26,6 +26,9 @@ import {
   type PricingUnit,
   type PricingTier,
   type PresetView,
+  type EffectivePricingView,
+  type CaptureResult,
+  type PricingDiff,
   type SubscriptionInfo,
   type ConnectionMonthlyUsage,
 } from "../types";
@@ -39,6 +42,11 @@ import {
   pricingBadges,
   convertPriceForUnit,
   validatePricingNonNeg,
+  changeBadge,
+  relativeTime,
+  buildApplyItems,
+  diffKey,
+  shouldStoreAutofill,
 } from "../utils";
 import { useFocusTrap } from "./dialogs";
 
@@ -112,6 +120,30 @@ function pricingBadgeLabel(b: "preset" | "needs_verify" | "custom"): string {
   if (b === "preset") return "预设·可改";
   if (b === "needs_verify") return "待官网核对";
   return "自定义";
+}
+
+/**
+ * 把 lookup_effective_pricing 返回的有效价视图转成 StoredPricing（0.0.73）。
+ * source='override'（采集价）→ _source:'custom'（实时官网价、可改；不当预设）；
+ * source='preset'（编译快照）→ _source:'preset' + confidence/needsVerify/sourceUrl 元数据。
+ * 用于「显示侧回退」徽标判定与「加模型自动填」落库。
+ */
+function effectiveToStored(view: EffectivePricingView): StoredPricing {
+  if (view.source === "override") {
+    return {
+      ...view.pricing,
+      _source: "custom",
+      // 采集价携带来源链接（官网定价页），保留以便编辑器内可点开核对。
+      ...(view.sourceUrl ? { _sourceUrl: view.sourceUrl } : {}),
+    };
+  }
+  return {
+    ...view.pricing,
+    _source: "preset",
+    ...(view.confidence ? { _confidence: view.confidence } : {}),
+    ...(view.needsVerify ? { _needsVerify: true } : {}),
+    ...(view.sourceUrl ? { _sourceUrl: view.sourceUrl } : {}),
+  };
 }
 
 /**
@@ -601,9 +633,17 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
   const [fetchNotice, setFetchNotice] = useState<string | null>(null);
   // 单价就地编辑（0.0.72）：editingPriceId=正在改单价的模型 id（null=无）。仅 billingMode='api' 的连接可用。
   const [editingPriceId, setEditingPriceId] = useState<string | null>(null);
+  // 官网单价采集（0.0.73）：capturing=抓取中；captureResult=展开 diff 面板的成功结果（null=未展开）；
+  // captureNotice=不支持/失败的一句提示（不弹面板）。仅 deepseek/siliconflow 显「官网单价」按钮。
+  const [capturing, setCapturing] = useState(false);
+  const [captureResult, setCaptureResult] = useState<CaptureResult | null>(null);
+  const [captureNotice, setCaptureNotice] = useState<string | null>(null);
 
   // 该连接的有效计费方式：决定模型行是显单价编辑（api）/「套餐内」（subscription）/「免计费」（none）。
   const billing = effectiveBillingMode(connection);
+  // 该 preset 是否支持官网采集（仅两家）：决定是否露出「官网单价」按钮。
+  const capturePreset = connection.preset?.trim().toLowerCase();
+  const captureSupported = capturePreset === "deepseek" || capturePreset === "siliconflow";
 
   const refresh = () => {
     setLoading(true);
@@ -614,38 +654,48 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
   };
   useEffect(() => { refresh(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [connection.id]);
 
+  // 计费方式切到非 api（订阅/免计费）时（#12）：「官网单价」按钮随之隐藏，必须同时清掉已展开的
+  // diff 面板与采集提示——否则面板会残留且可应用，与隐藏的按钮状态不一致。
+  useEffect(() => {
+    if (billing !== "api") {
+      setCaptureResult(null);
+      setCaptureNotice(null);
+    }
+  }, [billing]);
+
   /** 已登记的 modelId 集合（小写归一），用于「拉取」结果里标注哪些已添加。 */
   const existingIds = new Set(models.map((m) => m.modelId.trim().toLowerCase()));
 
   /**
-   * 预设自动填（0.0.72）：新增模型后，按 (连接 preset, modelId, 默认 'CNY') 查 lookup_model_preset；
-   * 命中且该模型尚无单价时，把 pricing + _source:'preset' + 元数据存进去（set_model_pricing）。
-   * 静默尽力（查不到/无 preset/出错都不打断添加流程）。仅 billingMode='api' 才填。
+   * 预设价自动填（0.0.73 修正）：新增模型后，按 (连接 preset, modelId, 'CNY') 查 lookup_effective_pricing，
+   * **仅当来源是编译预设快照（source==='preset'）才落库**（_source:'preset'，含 confidence/needsVerify/sourceUrl）。
+   *
+   * 关键：来源是采集覆盖（source==='override'）时**直接 return、不写 pricing_json**——否则会把实时官网价
+   * 冻进模型条目，使其不再跟随后续官网刷新、且徽标误显「自定义」。让该模型保持 pricing_json 空，
+   * 显示侧（ModelPriceCell 回退查 lookup_effective_pricing）与结算（resolve_billing override>编译兜底）
+   * 都会走实时有效价 → 显「官网价」蓝标、后续刷新自动跟随。
+   *
+   * 静默尽力（查不到/无 preset/出错都不打断添加）。仅 api 才填。
    */
   async function autofillPreset(modelRef: string, modelId: string, alreadyHasPricing: boolean) {
     if (billing !== "api" || alreadyHasPricing) return;
     const preset = connection.preset?.trim();
     if (!preset || preset === "custom") return;
     try {
-      const view = await invoke<PresetView | null>("lookup_model_preset", {
+      const view = await invoke<EffectivePricingView | null>("lookup_effective_pricing", {
         connectionPreset: preset,
         modelId,
         currency: "CNY",
       });
-      if (!view || !view.pricing) return;
-      const stored: StoredPricing = {
-        ...view.pricing,
-        _source: "preset",
-        _confidence: view.confidence,
-        _needsVerify: view.needsVerify,
-        _sourceUrl: view.sourceUrl,
-      };
+      // 采集覆盖（source==='override'）不落库，保持 pricing_json 空 → 显示/结算走实时有效价回退
+      // （显「官网价」、跟随刷新）；仅编译预设快照（source==='preset'）才落库（新增即有可结算价）。
+      if (!shouldStoreAutofill(view)) return;
       await invoke<CuratedModelView>("set_model_pricing", {
         modelRef,
-        pricingJson: JSON.stringify(stored),
+        pricingJson: JSON.stringify(effectiveToStored(view)),
       });
     } catch {
-      // 静默：无预设/网络/解析失败都不阻断添加。
+      // 静默：无有效价/网络/解析失败都不阻断添加。
     }
   }
 
@@ -787,12 +837,107 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
     }
   }
 
+  /**
+   * 官网单价采集（0.0.73）：抓官网定价页 → LLM 抽取 → 与现价 diff（不写库）。
+   * supported=false → 一句提示「该平台暂不支持自动采集」（不弹面板）；
+   * ok=false → 显 error（如「抓取失败…」，不弹面板）；ok=true → 就地展开 diff 面板。
+   */
+  async function handleCapturePricing() {
+    setCaptureNotice(null);
+    setCaptureResult(null);
+    setError(null);
+    setCapturing(true);
+    try {
+      const res = await invoke<CaptureResult>("capture_official_pricing", {
+        connectionId: connection.id,
+      });
+      if (!res.supported) {
+        setCaptureNotice(res.message ?? "该平台暂不支持自动采集，可手填或恢复预设。");
+        return;
+      }
+      if (!res.ok) {
+        setCaptureNotice(res.error ?? "采集失败：以官网为准、保留现价。");
+        return;
+      }
+      setCaptureResult(res);
+    } catch (e) {
+      setCaptureNotice(humanizeError(String(e)));
+    } finally {
+      setCapturing(false);
+    }
+  }
+
+  /** 应用所选采集价（0.0.73）：组装 ApplyItem 调 apply_pricing_overrides → 刷新、关面板。 */
+  async function handleApplyCaptured(items: ReturnType<typeof buildApplyItems>) {
+    await invoke<number>("apply_pricing_overrides", {
+      connectionPreset: connection.preset?.trim() ?? "",
+      items,
+    });
+    setCaptureResult(null);
+    refresh();
+  }
+
+  /**
+   * 连接级「恢复预设」（0.0.73，bug 修复）：把本连接所有模型恢复为内置预设价。
+   * 关键：用户「自定义」价在模型 pricing_json（优先级最高那层），只重置采集覆盖层碰不到它，
+   * 故必须先清各模型的 pricing_json（撤销手填）→ 再重置采集覆盖（回编译快照）→ 有效价落到内置预设。
+   * 破坏性操作（清手填 + 已采集官网价），先确认。
+   */
+  async function handleResetCaptured() {
+    const ok = window.confirm(
+      "恢复预设：将本连接所有模型恢复为内置预设价，清除你的手填单价与已采集官网价。继续？",
+    );
+    if (!ok) return;
+    // 撤销各模型手填（pricing_json 置空）——这才是「自定义」价所在。
+    for (const m of models) {
+      if (m.pricingJson) {
+        await invoke("set_model_pricing", { modelRef: m.id, pricingJson: null }).catch(() => {});
+      }
+    }
+    // 重置采集覆盖层 → 有效价跌回编译快照（内置预设）。
+    await invoke<number>("reset_pricing_overrides", {
+      connectionPreset: connection.preset?.trim() ?? "",
+    }).catch(() => {});
+    setCaptureResult(null);
+    refresh();
+  }
+
   return (
     <div className="provider-models">
       <div className="provider-models__head">
         <span className="provider-models__title">加载模型</span>
         <span className="provider-models__count">{models.length} 个</span>
+        {/* 官网单价（0.0.73）：仅 deepseek/siliconflow + 按量付费连接显示。无边框幽灵按钮，品牌色，文字在前图标在后。 */}
+        {captureSupported && billing === "api" && (
+          <button
+            type="button"
+            className="provider-models__capture"
+            disabled={capturing}
+            title="抓取官网现价并对比，勾选后应用"
+            onClick={() => void handleCapturePricing()}
+          >
+            {capturing ? "采集中…" : "官网单价"}
+            <RefreshCw size={12} className={capturing ? "provider-models__capture-spin" : undefined} />
+          </button>
+        )}
       </div>
+
+      {/* 采集一句提示（不支持 / 失败）：不弹面板时显示在标题下。 */}
+      {captureNotice && (
+        <p className="settings-desc" style={{ margin: "2px 0 6px", color: "var(--warning)" }}>{captureNotice}</p>
+      )}
+
+      {/* diff 面板（采集成功后就地展开）。与按钮可见条件对齐：仅 api 计费时渲染（#12）。 */}
+      {billing === "api" && captureResult && (
+        <PricingCapturePanel
+          connectionName={connectionDisplayName(connection)}
+          result={captureResult}
+          onApply={handleApplyCaptured}
+          onReset={handleResetCaptured}
+          onCancel={() => setCaptureResult(null)}
+          onError={setError}
+        />
+      )}
 
       {loading ? (
         <p className="settings-row__value" style={{ margin: "2px 0" }}>加载中…</p>
@@ -971,6 +1116,175 @@ function ConnectionModels({ connection, onChanged }: { connection: ConnectionVie
   );
 }
 
+/** 一条 ModelPricing 的极简单价摘要（输入/命中/输出，符号随币种）：复用 pricingSummary 口径。
+ *  ModelPricing 无 _source 元字段，这里转成 StoredPricing 形（_source 仅占位、不影响 pricingSummary）。 */
+function modelPricingSummary(p: ModelPricing | undefined): string {
+  if (!p) return "—";
+  return pricingSummary({ ...p, _source: "custom" });
+}
+
+/**
+ * 官网单价采集 diff 面板（0.0.73）：软背景、无边框、圆角容器。
+ *
+ * 结构：头（连接名 + 极简新鲜度）→ 一句说明（N 项有变化）→ 每行（勾选 + 模型名 + 变化徽标 +
+ * 旧→新价对比）→ 底部行（左「恢复预设」幽灵；右「应用所选(n)」主按钮 + 「取消」）。
+ * change!='unchanged' 的行默认勾选；unchanged 行禁用置灰、不可勾。
+ * 应用：把勾选行组装 ApplyItem → onApply（apply_pricing_overrides）；恢复预设 → onReset。
+ */
+function PricingCapturePanel({
+  connectionName,
+  result,
+  onApply,
+  onReset,
+  onCancel,
+  onError,
+}: {
+  connectionName: string;
+  result: CaptureResult;
+  onApply: (items: ReturnType<typeof buildApplyItems>) => Promise<void>;
+  onReset: () => Promise<void>;
+  onCancel: () => void;
+  onError: (msg: string | null) => void;
+}) {
+  // 默认勾选：change!='unchanged' 的行。unchanged 行不可勾。
+  const [selected, setSelected] = useState<Set<string>>(
+    () => new Set(result.diffs.filter((d) => d.change !== "unchanged").map(diffKey)),
+  );
+  const [applying, setApplying] = useState(false);
+  const [resetting, setResetting] = useState(false);
+
+  const changedCount = result.diffs.filter((d) => d.change !== "unchanged").length;
+  const selectedCount = selected.size;
+
+  function toggle(d: PricingDiff) {
+    if (d.change === "unchanged") return; // unchanged 禁用，不可勾。
+    const key = diffKey(d);
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  async function handleApply() {
+    onError(null);
+    setApplying(true);
+    try {
+      const items = buildApplyItems(result.diffs, selected, result.sourceUrl);
+      await onApply(items);
+    } catch (e) {
+      onError(humanizeError(String(e)));
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  async function handleReset() {
+    onError(null);
+    setResetting(true);
+    try {
+      await onReset();
+    } catch (e) {
+      onError(humanizeError(String(e)));
+    } finally {
+      setResetting(false);
+    }
+  }
+
+  const busy = applying || resetting;
+
+  return (
+    <div className="pricing-capture">
+      <div className="pricing-capture__head">
+        <span className="pricing-capture__name">{connectionName}</span>
+        <span className="pricing-capture__fresh">{relativeTime(result.fetchedAt)}</span>
+      </div>
+      {/* 截断警示（#8）：页面过大被截断时，抽取可能漏采部分模型——显式警示，不以「采集成功」无差别呈现。 */}
+      {result.truncated && (
+        <p className="pricing-capture__truncated" role="alert">
+          页面过大已截断，可能漏采部分模型，请核对官网或手填。
+        </p>
+      )}
+      <p className="pricing-capture__intro">
+        {changedCount} 项有变化，勾选后「应用」才写入；不动你已手填的单价。
+      </p>
+
+      <ul className="pricing-capture__list">
+        {result.diffs.map((d) => {
+          const key = diffKey(d);
+          const badge = changeBadge(d);
+          const unchanged = d.change === "unchanged";
+          const checked = selected.has(key);
+          return (
+            <li
+              key={key}
+              className={`pricing-capture__row${unchanged ? " pricing-capture__row--disabled" : ""}`}
+            >
+              <label className="pricing-capture__check">
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={unchanged || busy}
+                  onChange={() => toggle(d)}
+                />
+              </label>
+              <span className="pricing-capture__model" title={d.modelId}>
+                <code>{d.modelId}</code>
+              </span>
+              <span className={`pricing-capture__badge pricing-capture__badge--${badge.kind}`}>
+                {badge.label}
+              </span>
+              <span className="pricing-capture__prices">
+                {unchanged ? (
+                  <span className="pricing-capture__same">不变 {modelPricingSummary(d.newPricing)}</span>
+                ) : d.change === "new" ? (
+                  <span className={`pricing-capture__new pricing-capture__new--${badge.kind}`}>
+                    {modelPricingSummary(d.newPricing)}
+                  </span>
+                ) : (
+                  <>
+                    <span className="pricing-capture__old">{modelPricingSummary(d.oldPricing)}</span>
+                    <span className="pricing-capture__arrow" aria-hidden="true">→</span>
+                    <span className={`pricing-capture__new pricing-capture__new--${badge.kind}`}>
+                      {modelPricingSummary(d.newPricing)}
+                    </span>
+                  </>
+                )}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+
+      <div className="pricing-capture__foot">
+        <button
+          type="button"
+          className="approval-card__btn pricing-capture__reset"
+          disabled={busy}
+          title="删除该连接全部采集覆盖，单价回到内置预设快照"
+          onClick={() => void handleReset()}
+        >
+          {resetting ? "恢复中…" : "恢复预设"}
+        </button>
+        <span className="pricing-capture__foot-right">
+          <button type="button" className="approval-card__btn" disabled={busy} onClick={onCancel}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="approval-card__btn approval-card__btn--allow"
+            disabled={busy || selectedCount === 0}
+            onClick={() => void handleApply()}
+          >
+            {applying ? "应用中…" : `应用所选（${selectedCount}）`}
+          </button>
+        </span>
+      </div>
+    </div>
+  );
+}
+
 /**
  * 模型行单价单元（0.0.72）：未编辑态显「单价摘要 + 徽标 + 改单价」；编辑态展开 ModelPricingEditor。
  * 仅 billingMode='api' 的连接会渲染本组件（见调用处）。
@@ -993,29 +1307,27 @@ function ModelPriceCell({
   onError: (msg: string | null) => void;
 }) {
   const stored = parseStoredPricing(model.pricingJson);
-  // 显示侧预设回退（0.0.72）：升级前登记、pricing_json 为空的老模型，按 (连接 preset, modelId, CNY)
-  // 查预设展示「预设·可改」，与后端 resolve_billing 运行期回退一致。不写库——点「改单价」保存才落库。
+  // 显示侧有效价回退（0.0.73，原 0.0.72 预设回退升级）：pricing_json 为空的模型，按 (连接 preset,
+  // modelId, CNY) 查 lookup_effective_pricing（采集覆盖优先、编译快照兜底），与后端结算口径一致。
+  // 不写库——点「改单价」保存才落库。fallbackSource 记来源以决定徽标（采集→「官网价」｜预设→「预设·可改」）。
   const billingMode = effectiveBillingMode(connection);
   const presetId = connection.preset?.trim();
   const [presetFallback, setPresetFallback] = useState<StoredPricing | null>(null);
+  const [fallbackSource, setFallbackSource] = useState<"override" | "preset" | null>(null);
   useEffect(() => {
     let alive = true;
     setPresetFallback(null);
+    setFallbackSource(null);
     if (model.pricingJson || billingMode !== "api" || !presetId || presetId === "custom") return;
-    invoke<PresetView | null>("lookup_model_preset", {
+    invoke<EffectivePricingView | null>("lookup_effective_pricing", {
       connectionPreset: presetId,
       modelId: model.modelId,
       currency: "CNY",
     })
       .then((view) => {
         if (alive && view && view.pricing) {
-          setPresetFallback({
-            ...view.pricing,
-            _source: "preset",
-            _confidence: view.confidence,
-            _needsVerify: view.needsVerify,
-            _sourceUrl: view.sourceUrl,
-          });
+          setPresetFallback(effectiveToStored(view));
+          setFallbackSource(view.source);
         }
       })
       .catch(() => {});
@@ -1039,10 +1351,21 @@ function ModelPriceCell({
     );
   }
 
-  const badges = pricingBadges(pricing);
+  // 徽标：来自采集覆盖的回退价（fallbackSource==='override'）显「官网价」蓝标；其余沿用 pricingBadges
+  // （预设·可改 / 待官网核对 / 自定义）。模型自填的 stored 价不携带 override 来源，故仅在回退态生效。
+  const showOfficialBadge = !stored && fallbackSource === "override" && !!pricing;
+  const badges = showOfficialBadge ? [] : pricingBadges(pricing);
   return (
     <span className="provider-price__summary">
       <span className="provider-price__nums">{pricingSummary(pricing)}</span>
+      {showOfficialBadge && (
+        <span
+          className="provider-price__badge provider-price__badge--official"
+          title="官网采集价：已用最近一次抓取的官网现价"
+        >
+          官网价
+        </span>
+      )}
       {badges.map((b) => (
         <span
           key={b}

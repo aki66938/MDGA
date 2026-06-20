@@ -52,6 +52,23 @@ pub struct Workspace {
     pub active: bool,
 }
 
+/// 单价采集覆盖记录，对应 preset_pricing_overrides 表一行（0.0.73）。
+///
+/// 「一键抓官网现价」抓取+抽取后的实时价存于此「覆盖层」；查找有效价时按
+/// 「模型自填 pricing_json > 采集覆盖(本表) > 编译快照 presets.rs」解析（查找接线为下一步，不在本层）。
+/// 本层只存取：`pricing_json` 为 ModelPricing 的原样 JSON 串，本层不解析；`connection_preset`/
+/// `currency`/`model_id` 均原样存取，不规范化（规范化策略留给查找层）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingOverride {
+    pub connection_preset: String,
+    pub model_id: String,
+    pub currency: String,
+    pub pricing_json: String,
+    pub source_url: Option<String>,
+    pub fetched_at: Option<i64>,
+}
+
 /// Activity Event 记录，对应一次工具调用的请求、裁决和执行结果，用于审计与前端过程展示。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -281,6 +298,26 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             total_tokens      INTEGER NOT NULL DEFAULT 0,
             updated_at        INTEGER,
             PRIMARY KEY (connection_id, ym)
+        );
+
+        -- 0.0.73「单价自动采集·覆盖层」：一键抓官网现价后写入的「采集覆盖」存储。
+        -- 某模型有效价以后按「模型自填 pricing_json > 采集覆盖(本表) > 编译快照 presets.rs」解析
+        -- (查找接线为下一步,不在本层)。本层只存取,不解析、不规范化:
+        --   connection_preset = 连接 preset('deepseek'|'siliconflow' 等),原样存取;
+        --   model_id          = 实际 API 模型串(规范化前原样:如 deepseek-v4-pro / deepseek-ai/DeepSeek-V4-Pro);
+        --   currency          = 'CNY'|'USD',原样存取;
+        --   pricing_json      = 抓取+抽取后的 ModelPricing JSON 串(原样,本层不解析);
+        --   source_url        = 来源页 URL(可空);
+        --   fetched_at        = 抓取时间 Unix 秒(可空)。
+        -- 同 (connection_preset, model_id, currency) 唯一 → 再抓覆盖同行,不新增。
+        CREATE TABLE IF NOT EXISTS preset_pricing_overrides (
+            connection_preset TEXT NOT NULL,
+            model_id          TEXT NOT NULL,
+            currency          TEXT NOT NULL,
+            pricing_json      TEXT NOT NULL,
+            source_url        TEXT,
+            fetched_at        INTEGER,
+            PRIMARY KEY (connection_preset, model_id, currency)
         );
         ",
     )?;
@@ -1623,6 +1660,109 @@ pub fn delete_connection_cascade(conn: &Connection, id: &str) -> SqlResult<Vec<S
     }
 }
 
+// ── 单价采集覆盖层 CRUD（preset_pricing_overrides，0.0.73）─────────────────────
+//
+// 「一键抓官网现价」管线写入的目标存储。本层只做存取，不做查找/合并/规范化：
+// connection_preset / currency / model_id 均原样存取（调用方负责大小写一致）。
+
+fn row_to_pricing_override(row: &rusqlite::Row) -> SqlResult<PricingOverride> {
+    Ok(PricingOverride {
+        connection_preset: row.get(0)?,
+        model_id: row.get(1)?,
+        currency: row.get(2)?,
+        pricing_json: row.get(3)?,
+        source_url: row.get(4)?,
+        fetched_at: row.get(5)?,
+    })
+}
+
+/// 写入（或覆盖）一条采集覆盖价。
+///
+/// 主键 (connection_preset, model_id, currency) 冲突时覆盖既有行的
+/// pricing_json / source_url / fetched_at（再抓不新增）。原样存，本层不解析、不规范化。
+pub fn upsert_pricing_override(
+    conn: &Connection,
+    connection_preset: &str,
+    model_id: &str,
+    currency: &str,
+    pricing_json: &str,
+    source_url: Option<&str>,
+    fetched_at: i64,
+) -> SqlResult<()> {
+    conn.execute(
+        "INSERT INTO preset_pricing_overrides
+         (connection_preset, model_id, currency, pricing_json, source_url, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(connection_preset, model_id, currency) DO UPDATE SET
+             pricing_json = excluded.pricing_json,
+             source_url   = excluded.source_url,
+             fetched_at   = excluded.fetched_at",
+        params![connection_preset, model_id, currency, pricing_json, source_url, fetched_at],
+    )?;
+    Ok(())
+}
+
+/// 按主键读取单条采集覆盖价，未找到返回 None。
+pub fn get_pricing_override(
+    conn: &Connection,
+    connection_preset: &str,
+    model_id: &str,
+    currency: &str,
+) -> SqlResult<Option<PricingOverride>> {
+    let mut stmt = conn.prepare(
+        "SELECT connection_preset, model_id, currency, pricing_json, source_url, fetched_at
+         FROM preset_pricing_overrides
+         WHERE connection_preset = ?1 AND model_id = ?2 AND currency = ?3
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![connection_preset, model_id, currency])?;
+    match rows.next()? {
+        Some(row) => row_to_pricing_override(row).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// 列出某连接 preset 下的全部采集覆盖价，按 model_id 升序（供后续 diff/展示用）。
+pub fn list_pricing_overrides(
+    conn: &Connection,
+    connection_preset: &str,
+) -> SqlResult<Vec<PricingOverride>> {
+    let mut stmt = conn.prepare(
+        "SELECT connection_preset, model_id, currency, pricing_json, source_url, fetched_at
+         FROM preset_pricing_overrides
+         WHERE connection_preset = ?1
+         ORDER BY model_id ASC",
+    )?;
+    let rows = stmt.query_map(params![connection_preset], row_to_pricing_override)?;
+    rows.collect()
+}
+
+/// 删除单条采集覆盖价（供「撤销采集价、回退到编译快照」用）。不存在则静默 no-op。
+pub fn delete_pricing_override(
+    conn: &Connection,
+    connection_preset: &str,
+    model_id: &str,
+    currency: &str,
+) -> SqlResult<()> {
+    conn.execute(
+        "DELETE FROM preset_pricing_overrides
+         WHERE connection_preset = ?1 AND model_id = ?2 AND currency = ?3",
+        params![connection_preset, model_id, currency],
+    )?;
+    Ok(())
+}
+
+/// 清空某连接 preset 下的**全部**采集覆盖价（连接级「恢复预设」用，0.0.73）。
+///
+/// 删完该 preset 的覆盖层后，有效价整体跌回编译快照（presets.rs）。返回删除的行数。
+/// 无任何覆盖时返回 0（静默 no-op）。
+pub fn clear_pricing_overrides(conn: &Connection, connection_preset: &str) -> SqlResult<usize> {
+    conn.execute(
+        "DELETE FROM preset_pricing_overrides WHERE connection_preset = ?1",
+        params![connection_preset],
+    )
+}
+
 // ── 角色引用（role_assignments）CRUD（0.0.59）───────────────────────────────
 
 /// 列出全部角色引用。
@@ -2385,6 +2525,142 @@ pub fn get_activity_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 单价采集覆盖层（preset_pricing_overrides，0.0.73）────────────────────
+
+    #[test]
+    fn pricing_override_upsert_get_roundtrip_and_overwrite() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        // upsert → get 往返一致（含 source_url / fetched_at）。
+        upsert_pricing_override(
+            &conn,
+            "deepseek",
+            "deepseek-v4-pro",
+            "CNY",
+            "{\"in\":1.0}",
+            Some("https://deepseek.com/pricing"),
+            1_700_000_000,
+        )
+        .expect("upsert 1");
+        let got = get_pricing_override(&conn, "deepseek", "deepseek-v4-pro", "CNY")
+            .expect("get")
+            .expect("some");
+        assert_eq!(got.connection_preset, "deepseek");
+        assert_eq!(got.model_id, "deepseek-v4-pro");
+        assert_eq!(got.currency, "CNY");
+        assert_eq!(got.pricing_json, "{\"in\":1.0}");
+        assert_eq!(got.source_url.as_deref(), Some("https://deepseek.com/pricing"));
+        assert_eq!(got.fetched_at, Some(1_700_000_000));
+
+        // 同主键再 upsert → 覆盖（pricing_json/source_url/fetched_at 更新），不新增行。
+        upsert_pricing_override(
+            &conn,
+            "deepseek",
+            "deepseek-v4-pro",
+            "CNY",
+            "{\"in\":2.0}",
+            None,
+            1_700_000_999,
+        )
+        .expect("upsert 2 overwrite");
+        let got2 = get_pricing_override(&conn, "deepseek", "deepseek-v4-pro", "CNY")
+            .expect("get2")
+            .expect("some2");
+        assert_eq!(got2.pricing_json, "{\"in\":2.0}");
+        assert_eq!(got2.source_url, None);
+        assert_eq!(got2.fetched_at, Some(1_700_000_999));
+        // 仍只有一行（覆盖而非新增）。
+        assert_eq!(list_pricing_overrides(&conn, "deepseek").expect("list").len(), 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn pricing_override_get_missing_returns_none() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        assert!(get_pricing_override(&conn, "deepseek", "nope", "CNY")
+            .expect("get")
+            .is_none());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn pricing_override_list_filters_by_preset_sorted_and_isolated() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        // 同一 preset 两条，乱序插入；另一 preset 一条作隔离验证。
+        upsert_pricing_override(&conn, "deepseek", "zeta", "CNY", "{}", None, 1).expect("z");
+        upsert_pricing_override(&conn, "deepseek", "alpha", "CNY", "{}", None, 2).expect("a");
+        upsert_pricing_override(&conn, "siliconflow", "alpha", "USD", "{}", None, 3).expect("sf");
+
+        let ds = list_pricing_overrides(&conn, "deepseek").expect("list ds");
+        assert_eq!(ds.len(), 2);
+        // model_id 升序。
+        assert_eq!(ds[0].model_id, "alpha");
+        assert_eq!(ds[1].model_id, "zeta");
+        // 跨 preset 隔离：deepseek 列表不含 siliconflow 行。
+        assert!(ds.iter().all(|p| p.connection_preset == "deepseek"));
+
+        let sf = list_pricing_overrides(&conn, "siliconflow").expect("list sf");
+        assert_eq!(sf.len(), 1);
+        assert_eq!(sf[0].model_id, "alpha");
+        assert_eq!(sf[0].currency, "USD");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn pricing_override_delete_removes_single_row() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        upsert_pricing_override(&conn, "deepseek", "m1", "CNY", "{}", None, 1).expect("m1");
+        upsert_pricing_override(&conn, "deepseek", "m2", "CNY", "{}", None, 1).expect("m2");
+
+        delete_pricing_override(&conn, "deepseek", "m1", "CNY").expect("delete");
+        assert!(get_pricing_override(&conn, "deepseek", "m1", "CNY")
+            .expect("get m1")
+            .is_none());
+        // 同 preset 的另一条不受影响。
+        assert!(get_pricing_override(&conn, "deepseek", "m2", "CNY")
+            .expect("get m2")
+            .is_some());
+        // 删不存在的条目静默 no-op（不报错）。
+        delete_pricing_override(&conn, "deepseek", "m1", "CNY").expect("delete absent no-op");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn clear_pricing_overrides_removes_all_for_preset_and_isolates_others() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        // deepseek 三条（含两币种）；siliconflow 一条作隔离验证。
+        upsert_pricing_override(&conn, "deepseek", "m1", "CNY", "{}", None, 1).expect("m1");
+        upsert_pricing_override(&conn, "deepseek", "m2", "CNY", "{}", None, 1).expect("m2");
+        upsert_pricing_override(&conn, "deepseek", "m1", "USD", "{}", None, 1).expect("m1usd");
+        upsert_pricing_override(&conn, "siliconflow", "m1", "CNY", "{}", None, 1).expect("sf");
+
+        // 清 deepseek 全部覆盖 → 返回删除行数 3。
+        let removed = clear_pricing_overrides(&conn, "deepseek").expect("clear deepseek");
+        assert_eq!(removed, 3);
+        assert!(list_pricing_overrides(&conn, "deepseek").expect("list ds").is_empty());
+
+        // siliconflow 不受影响。
+        assert_eq!(list_pricing_overrides(&conn, "siliconflow").expect("list sf").len(), 1);
+
+        // 再清（已空）→ 返回 0（静默 no-op）。
+        assert_eq!(clear_pricing_overrides(&conn, "deepseek").expect("clear empty"), 0);
+
+        let _ = std::fs::remove_file(db_path);
+    }
 
     #[test]
     fn records_and_lists_file_checkpoints_with_seq() {
