@@ -1,4 +1,4 @@
-name: Build Check
+name: Build & Test
 
 on:
   push:
@@ -24,7 +24,7 @@ on:
 
 jobs:
   build-check:
-    name: Build Check (Windows)
+    name: Build & Test (Windows)
     runs-on: windows-latest
 
     steps:
@@ -53,5 +53,18 @@ jobs:
       - name: Check frontend build
         run: npm run build --workspace=apps/desktop
 
+      # 0.0.70 测试门:前端 vitest(含 widget 安全 wrapper 冒烟)——失败即挡合并,不再只「编译绿」。
+      - name: Run frontend tests
+        run: npm test
+
       - name: Check Rust compile
         run: cargo check --workspace
+
+      # 0.0.70 测试门:全工作区 Rust 单测/集成测(沙箱/权限/续接不变量等)——失败即挡合并。
+      - name: Run Rust tests
+        run: cargo test --workspace
+
+      # 0.0.70:clippy 暂作**信息性**(现有约 41 条 warning,待全仓清理后再升为 -D warnings 硬门),不阻断合并。
+      - name: Clippy (informational)
+        run: cargo clippy --workspace
+        continue-on-error: true

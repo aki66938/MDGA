@@ -25,8 +25,9 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { WidgetPart } from "../types";
 
-/** 把 agent code 包进固定可信 wrapper，构造 iframe 的 srcdoc。code 为 HTML/SVG/JS，**原样**插入（不转义）。 */
-function buildSrcdoc(code: string, theme: Record<string, string>): string {
+/** 把 agent code 包进固定可信 wrapper，构造 iframe 的 srcdoc。code 为 HTML/SVG/JS，**原样**插入（不转义）。
+ *  导出供 widget.test.tsx 冒烟锁安全 wrapper(CSP 零外联 / 自检 / 无 CDN 等)防回归(0.0.70)。 */
+export function buildSrcdoc(code: string, theme: Record<string, string>): string {
   // 严格 CSP：default-src 'none' 全封；脚本/样式只放行 inline，**不放行任何外部主机**。
   // 安全审查教训：connect-src 'none' 只挡 fetch/XHR/WS/sendBeacon，**挡不住**经 img-src/script-src/
   // style-src/font-src 放行域发出的子资源 GET——白名单里只要有外部主机，其完整 URL 路径/查询串即一条
