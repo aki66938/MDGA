@@ -33,7 +33,9 @@ use mdga_storage::{
     upsert_role_model, CuratedModel, MonthlyUsage, PricingOverride, ProviderConnection, ALL_ROLES,
     ROLE_MAIN,
 };
-use mdga_token_accounting::{canonical_model_id, lookup_preset, ModelPricing, PresetEntry};
+use mdga_token_accounting::{
+    build_thinking_profile, canonical_model_id, lookup_preset, ModelPricing, PresetEntry,
+};
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
@@ -468,6 +470,46 @@ pub(crate) fn lookup_effective_pricing(
     };
     let compiled = lookup_preset(&connectionPreset, &modelId, &currency);
     pick_effective_pricing(over, compiled)
+}
+
+/// 思考深度滑块单档前端视图（F）：仅暴露展示 label，**不**含 emit 等内部语义（脱敏红线）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ThinkingStopView {
+    pub label: String,
+}
+
+/// 思考深度档案前端视图（F）：仅 stops(label) + 默认档 + 是否可调；**绝不**回 emit/dialect/echo。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ThinkingProfileView {
+    pub stops: Vec<ThinkingStopView>,
+    pub default_index: usize,
+    pub adjustable: bool,
+}
+
+/// 思考深度查询命令（F）：据 (connectionPreset, modelId) 返回**脱敏**的思考能力档案，供前端渲染思考滑块。
+///
+/// **脱敏红线**：只回每档的展示 label + 默认档下标 + 是否可调；**绝不回** emit / dialect / echo
+/// （这些是发往服务端的内部参数，前端无需也不应感知）。查不到（未知/未支持 preset 或无思考能力模型）
+/// 返回 None —— 前端据此隐藏思考入口。纯函数，不持锁、不联网。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) fn get_thinking_profile(
+    connectionPreset: String,
+    modelId: String,
+) -> Option<ThinkingProfileView> {
+    build_thinking_profile(&connectionPreset, &modelId).map(|p| ThinkingProfileView {
+        stops: p
+            .stops
+            .iter()
+            .map(|s| ThinkingStopView {
+                label: s.label.to_string(),
+            })
+            .collect(),
+        default_index: p.default_index,
+        adjustable: p.adjustable,
+    })
 }
 
 /// 保存或清空某模型的单价快照（0.0.72）。
@@ -1990,9 +2032,9 @@ pub(crate) async fn install_update(app: AppHandle) -> Result<(), String> {
     app.restart();
 }
 
-/// 在用户的真实浏览器打开一个外链（0.0.67：供 widget 沙箱的 openLink 桥用）。
+/// 在用户的真实浏览器打开一个外链（0.0.67 起：供互动卡片沙箱的 openLink 桥用）。
 ///
-/// 仅放行 http(s)——拒绝 file: / javascript: / data: 等任何其它 scheme,避免沙箱 widget 借此越权。
+/// 仅放行 http(s)——拒绝 file: / javascript: / data: 等任何其它 scheme,避免沙箱互动卡片借此越权。
 /// 前端只在向用户弹确认后才调用本命令；本命令只负责「http(s) 守卫 + 交系统打开」。
 #[tauri::command]
 pub(crate) fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {

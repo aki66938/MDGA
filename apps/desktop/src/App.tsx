@@ -46,6 +46,7 @@ import {
   type CuratedModelView,
   type RoleAssignmentView,
   type SettingsSection,
+  type ThinkingProfileView,
 } from "./types";
 import {
   fmtTokens,
@@ -114,6 +115,16 @@ export function App() {
   const [todos, setTodos] = useState<TodoItem[]>([]);
   // 计划模式：先出计划等确认，本轮不执行工具
   const [planMode, setPlanMode] = useState(false);
+  // 思考深度（Thinking）：当前主模型的可选档案（null＝该模型无思考能力或查询失败 ⇒ 整块控件不渲染）。
+  // get_thinking_profile(connectionPreset, modelId) 拉取；随主模型变化重拉。
+  const [thinkingProfile, setThinkingProfile] = useState<ThinkingProfileView | null>(null);
+  // 选中的思考档位 index（null＝跟随模型默认档 defaultIndex）。
+  // **每轮临时、仅内存态，绝不写 storage/DB**；同一会话内 sticky，换模型即重置为 null。
+  const [thinkingStop, setThinkingStop] = useState<number | null>(null);
+  // 思考深度滑轨拖拽中（pointer 按下到抬起）：拖拽期间 pointermove 才更新档位。
+  const [thinkingDragging, setThinkingDragging] = useState(false);
+  // 思考深度弹窗开合（点 chip 开/关；点外 mousedown / Esc 关）。
+  const [thinkingPopoverOpen, setThinkingPopoverOpen] = useState(false);
   // C-4 计划闭环：上一轮以计划模式产出了助手回复，等待用户「批准并执行」。
   // chat-done 成功收尾时置 true（仅当该轮为计划轮）；新建/切换会话、下一次普通发送时清除。
   const [awaitingPlanApproval, setAwaitingPlanApproval] = useState(false);
@@ -147,6 +158,10 @@ export function App() {
   const [mentionActive, setMentionActive] = useState(0);
   // 工作区胶囊菜单容器（Plan27 #7）：打开时聚焦首项 + 方向键漫游 + Esc 关。
   const workspaceMenuRef = useRef<HTMLDivElement>(null);
+  // 思考深度滑轨：测 clientX → 最近档位。
+  const thinkingTrackRef = useRef<HTMLDivElement>(null);
+  // 思考深度弹窗容器（chip + 弹层，点外 mousedown / Esc 关用）。
+  const thinkingPopoverRef = useRef<HTMLDivElement>(null);
   // 待发送的附图（Plan18 M18.1）：📎 选图后暂存，发送时随 send_message 上送，发送框上方显示缩略图。
   const [pendingImages, setPendingImages] = useState<ImagePart[]>([]);
   // 拖拽图片悬停高亮（Plan19 P0b）：dragenter/over 置 true，drop/leave 置 false。
@@ -236,6 +251,34 @@ export function App() {
       workspaceMenuRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
     }
   }, [workspaceMenuOpen]);
+
+  // 思考深度档案：主模型（preset 或 modelId）变化时重拉，并把 thinkingStop 重置为 null（换模型回默认档）。
+  // 查不到该模型思考能力 / 拉取异常 ⇒ setThinkingProfile(null) 静默隐藏控件，不打断。
+  useEffect(() => {
+    setThinkingStop(null);
+    setThinkingPopoverOpen(false);
+    if (!mainModelId) { setThinkingProfile(null); return; }
+    let alive = true;
+    invoke<ThinkingProfileView | null>("get_thinking_profile", {
+      connectionPreset: mainPreset,
+      modelId: mainModelId,
+    })
+      .then((p) => { if (alive) setThinkingProfile(p ?? null); })
+      .catch(() => { if (alive) setThinkingProfile(null); });
+    return () => { alive = false; };
+  }, [mainPreset, mainModelId]);
+
+  // 思考深度弹窗：点外 mousedown / Esc 关闭（不影响弹层内拖拽）。
+  useEffect(() => {
+    if (!thinkingPopoverOpen) return;
+    function onDown(e: MouseEvent) {
+      if (!thinkingPopoverRef.current?.contains(e.target as Node)) setThinkingPopoverOpen(false);
+    }
+    function onKey(e: KeyboardEvent) { if (e.key === "Escape") setThinkingPopoverOpen(false); }
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => { window.removeEventListener("mousedown", onDown); window.removeEventListener("keydown", onKey); };
+  }, [thinkingPopoverOpen]);
 
   // 正文搜索（Plan27 #6）：query 非空时防抖（~250ms）调 search_conversations（标题或正文命中）；
   // 空则清结果回退本地全量列表。
@@ -510,6 +553,10 @@ export function App() {
     // C-4：跨会话清除待批准态与本轮计划标记，避免上一会话的计划闭环残留到新会话。
     setAwaitingPlanApproval(false);
     planRoundRef.current = false;
+    // 思考深度档位是「每轮临时 / 同一会话内」语义，新建/切换会话须回默认档（否则会全局粘滞、
+    // 把上一会话临时选的深度带入新会话，与 thinkingStop 的注释契约矛盾）。
+    setThinkingStop(null);
+    setThinkingPopoverOpen(false);
   }
 
   async function handleDeleteConversation(e: React.MouseEvent, id: string) {
@@ -849,18 +896,18 @@ export function App() {
           // 输出非 JSON 时忽略
         }
       }
-      // show_widget（0.0.67）特例：成功时把 agent 编写的 HTML/SVG/JS 作为 WidgetPart 插入
-      // （而非通用 ToolPart），让用户直接看到渲染后的部件。code/title 在 inputJson，kind 在 outputJson。
-      // running/failed 不留卡片（保持安静；失败时模型通常会另行说明）。
-      if (toolName === "show_widget") {
+      // render_artifact（0.0.67 起；0.0.74 改名）特例：成功时把 agent 编写的 HTML/SVG/JS 作为
+      // ArtifactPart 插入（而非通用 ToolPart），让用户直接看到渲染后的互动卡片。code/title 在
+      // inputJson，kind 在 outputJson。running/failed 不留卡片（保持安静；失败时模型通常会另行说明）。
+      if (toolName === "render_artifact") {
         if (status !== "succeeded") return; // running/failed：不插入任何卡片
         let code = "";
-        let widgetTitle: string | undefined;
+        let artifactTitle: string | undefined;
         let kind: "svg" | "html" | undefined;
         try {
           const inp = JSON.parse(inputJson ?? "{}") as Record<string, unknown>;
           if (typeof inp.code === "string") code = inp.code;
-          if (typeof inp.title === "string") widgetTitle = inp.title;
+          if (typeof inp.title === "string") artifactTitle = inp.title;
         } catch {
           // inputJson 异常：无 code 可渲染，放弃
         }
@@ -880,7 +927,7 @@ export function App() {
           if (!last || last.role !== "assistant") return prev;
           const parts: MessagePart[] = [
             ...last.parts,
-            { type: "widget", code, title: widgetTitle, kind },
+            { type: "artifact", code, title: artifactTitle, kind },
           ];
           updated[lastIdx] = { ...last, parts };
           streamingPartsRef.current = parts;
@@ -1075,6 +1122,9 @@ export function App() {
         executePlan,
         // 本轮附图（Plan18 M18.1）：后端据此走「自动初看」识图并注入主 agent。
         images: outImages.map((img) => ({ mediaType: img.mediaType, base64: img.base64 })),
+        // 思考深度档位 index（number＝选中档；null＝跟随模型默认档，后端 Option<usize> 收 null=默认）。
+        // 同一会话内 sticky，不在发送后重置（换模型才重置——见思考深度 useEffect）。
+        thinkingStop,
       });
     } catch (err) {
       const errText = humanizeError(String(err));
@@ -1754,6 +1804,7 @@ export function App() {
                     <MessageContent
                       msg={msg}
                       onSendPrompt={(text) => { void sendText(text); }}
+                      pushToast={pushToast}
                     />
                   </div>
                   <MessageActions
@@ -2104,6 +2155,85 @@ export function App() {
               </div>
 
               <div className="composer-footer__right">
+                {/* 思考深度控件（仅当主模型有思考能力 ⇒ thinkingProfile != null 才渲染）。
+                    底栏 chip 显当前档，点开弹窗——弹层内是渐变滑轨（更快↔更聪明，可拖可点 + 键盘）
+                    + 档位标签。强制档(adjustable=false / 单档)显静态 chip、不开弹窗。 */}
+                {thinkingProfile && (() => {
+                  const profile = thinkingProfile;
+                  const stops = profile.stops;
+                  const n = stops.length;
+                  const activeIdx = Math.min(thinkingStop ?? profile.defaultIndex, Math.max(0, n - 1));
+                  const activeLabel = stops[activeIdx]?.label ?? "思考深度";
+                  const adjustable = profile.adjustable && n > 1;
+                  // 强制思考（不可关）或仅一档：静态 chip，不可调、不开弹窗。
+                  if (!adjustable) {
+                    return (
+                      <div className="think-depth">
+                        <span className="think-depth__chip think-depth__chip--static" title="该模型思考不可关闭">
+                          <span className="think-depth__chip-label">思考深度</span>
+                        </span>
+                      </div>
+                    );
+                  }
+                  const pct = (activeIdx / (n - 1)) * 100;
+                  const pickFromClientX = (clientX: number) => {
+                    const el = thinkingTrackRef.current;
+                    if (!el) return;
+                    const rect = el.getBoundingClientRect();
+                    const frac = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
+                    setThinkingStop(Math.max(0, Math.min(n - 1, Math.round(frac * (n - 1)))));
+                  };
+                  return (
+                    <div className="think-depth" ref={thinkingPopoverRef}>
+                      <button
+                        type="button"
+                        className="think-depth__chip"
+                        aria-haspopup="dialog"
+                        aria-expanded={thinkingPopoverOpen}
+                        title="思考深度"
+                        onClick={() => setThinkingPopoverOpen((v) => !v)}
+                      >
+                        <span className="think-depth__chip-label">思考深度</span>
+                      </button>
+                      {thinkingPopoverOpen && (
+                        <div className="think-depth__pop" role="dialog" aria-label="思考深度">
+                          <div className="think-depth__pop-ends"><span>更快</span><span>更聪明</span></div>
+                          <div
+                            ref={thinkingTrackRef}
+                            className="think-depth__track"
+                            role="slider"
+                            tabIndex={0}
+                            aria-label="思考深度"
+                            aria-valuemin={0}
+                            aria-valuemax={n - 1}
+                            aria-valuenow={activeIdx}
+                            aria-valuetext={activeLabel}
+                            onPointerDown={(e) => {
+                              e.preventDefault();
+                              e.currentTarget.setPointerCapture(e.pointerId);
+                              setThinkingDragging(true);
+                              pickFromClientX(e.clientX);
+                            }}
+                            onPointerMove={(e) => { if (thinkingDragging) pickFromClientX(e.clientX); }}
+                            onPointerUp={(e) => {
+                              setThinkingDragging(false);
+                              if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "ArrowLeft" || e.key === "ArrowDown") { e.preventDefault(); setThinkingStop(Math.max(0, activeIdx - 1)); }
+                              else if (e.key === "ArrowRight" || e.key === "ArrowUp") { e.preventDefault(); setThinkingStop(Math.min(n - 1, activeIdx + 1)); }
+                              else if (e.key === "Home") { e.preventDefault(); setThinkingStop(0); }
+                              else if (e.key === "End") { e.preventDefault(); setThinkingStop(n - 1); }
+                            }}
+                          >
+                            <div className="think-depth__thumb" style={{ left: `${pct}%` }} />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
                 {/* 当前模型只读胶囊（Plan26：移入右组、贴近发送；图标 Gauge→Cpu）。点击进 设置 → 模型分配。 */}
                 <button
                   type="button"

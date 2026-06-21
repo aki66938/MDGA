@@ -346,6 +346,13 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
     // 直接从 pre-0.0.59 升级时，0.0.59 先填好 role_assignments，本迁移再据其建 models + role_models。
     // 一次性、幂等；不 drop/alter role_assignments / model_providers（惰性回滚源）。
     migrate_to_models_layer_0060(&conn)?;
+    // 0.0.74：把工具 show_widget 改名为 render_artifact 后，结构化地把已存历史里的旧名同步过来：
+    // messages.parts_json 里 type=="widget" 的 part → "artifact"；wire_snapshots.wire_json 里
+    // 工具调用结构里的工具名 "show_widget" → "render_artifact"。结构化解析、绝不字符串盲替；
+    // 一次性、幂等；失败软处理、不阻断建库（旧名残留只影响展示/续接回放标签，不破坏数据）。
+    if let Err(e) = migrate_widget_to_artifact_0074(&conn) {
+        eprintln!("[migrate-0074] show_widget→render_artifact 历史迁移跳过（不阻断建库）: {e}");
+    }
     Ok(conn)
 }
 
@@ -2188,6 +2195,131 @@ fn migrate_to_models_layer_0060(conn: &Connection) -> SqlResult<()> {
     }
 }
 
+// ── 0.0.74 数据迁移：show_widget/widget → render_artifact/artifact ───────────
+
+/// 把历史会话里残留的旧名同步到 0.0.74 的新名（工具 show_widget → render_artifact）。
+///
+/// **结构化、绝不字符串盲替**：part.code / 任意自由文本里也可能含 "widget"/"show_widget" 字样，
+/// 盲替会损坏用户内容。故只逐行解析 JSON、只改约定字段：
+///
+/// - `messages.parts_json`：JSON 数组，逐 part 把 `type == "widget"` 改成 `type == "artifact"`，
+///   其它字段（尤其 `code`/`title`）原样不动。
+/// - `wire_snapshots.wire_json`：OpenAI 风格消息数组。工具名只出现在 assistant 消息的
+///   `tool_calls[].function.name`（tool_result 仅以 `tool_call_id` 关联、无工具名字段），故只把
+///   该路径上值为 `"show_widget"` 的 name 改为 `"render_artifact"`，**绝不动消息正文/content/任何
+///   自由文本**。这是安全且充分的结构化改名。
+///
+/// **一次性、幂等**：再跑一次无新变化（已是 artifact / render_artifact 的不动）。仅当某行**真的**
+/// 发生改名时才写回该行；逐行用 serde 解析，解析失败的行跳过（不阻断、不破坏）。整个迁移失败由调用方
+/// 软处理（见 `init_db`），不阻断建库——旧名残留只影响展示/续接回放里的标签，不破坏底层数据。
+fn migrate_widget_to_artifact_0074(conn: &Connection) -> SqlResult<()> {
+    // 表可能尚未存在（极早期库），用 IF NOT EXISTS 语义的探测避免 prepare 失败。
+    // init_db 已 CREATE TABLE IF NOT EXISTS messages / wire_snapshots，故此处直接查询是安全的。
+
+    // 1) messages.parts_json：type=="widget" → "artifact"
+    {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT id, parts_json FROM messages WHERE parts_json IS NOT NULL AND parts_json != ''",
+        )?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for r in mapped {
+            rows.push(r?);
+        }
+        drop(stmt);
+        for (id, parts_json) in rows {
+            // 解析失败的行（非法 JSON）跳过，不阻断。
+            let Ok(mut parts) = serde_json::from_str::<serde_json::Value>(&parts_json) else {
+                continue;
+            };
+            let Some(arr) = parts.as_array_mut() else {
+                continue;
+            };
+            let mut changed = false;
+            for part in arr.iter_mut() {
+                let Some(obj) = part.as_object_mut() else {
+                    continue;
+                };
+                if obj.get("type").and_then(|t| t.as_str()) == Some("widget") {
+                    // 只改 type 字段，其它字段（code/title/...）原样保留。
+                    obj.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("artifact".to_string()),
+                    );
+                    changed = true;
+                }
+            }
+            if changed {
+                // 仅在真的改了 type 时写回；序列化失败则跳过该行（不阻断）。
+                if let Ok(new_json) = serde_json::to_string(&parts) {
+                    conn.execute(
+                        "UPDATE messages SET parts_json = ?2 WHERE id = ?1",
+                        params![id, new_json],
+                    )?;
+                }
+            }
+        }
+    }
+
+    // 2) wire_snapshots.wire_json：tool_calls[].function.name == "show_widget" → "render_artifact"
+    {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, wire_json FROM wire_snapshots WHERE wire_json IS NOT NULL AND wire_json != ''",
+        )?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for r in mapped {
+            rows.push(r?);
+        }
+        drop(stmt);
+        for (conv_id, wire_json) in rows {
+            let Ok(mut wire) = serde_json::from_str::<serde_json::Value>(&wire_json) else {
+                continue;
+            };
+            let Some(messages) = wire.as_array_mut() else {
+                continue;
+            };
+            let mut changed = false;
+            for msg in messages.iter_mut() {
+                // 工具名只在 assistant 消息的 tool_calls[].function.name；逐层结构化下钻，
+                // 任一层不符即跳过（绝不触碰 content 等自由文本）。
+                let Some(calls) = msg
+                    .get_mut("tool_calls")
+                    .and_then(|c| c.as_array_mut())
+                else {
+                    continue;
+                };
+                for call in calls.iter_mut() {
+                    let Some(name) = call
+                        .get_mut("function")
+                        .and_then(|f| f.get_mut("name"))
+                    else {
+                        continue;
+                    };
+                    if name.as_str() == Some("show_widget") {
+                        *name = serde_json::Value::String("render_artifact".to_string());
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                if let Ok(new_json) = serde_json::to_string(&wire) {
+                    conn.execute(
+                        "UPDATE wire_snapshots SET wire_json = ?2 WHERE conversation_id = ?1",
+                        params![conv_id, new_json],
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── 0.0.59 数据迁移：model_providers → connections + role_assignments ────────
 
 /// 把旧的 role-keyed `model_providers` 迁到「连接库 + 角色引用」。
@@ -3804,6 +3936,134 @@ mod tests {
         assert_eq!(b.total_tokens, 18);
         let a_after = get_monthly_usage(&conn, "conn-a", "2026-06").expect("get a after b");
         assert_eq!(a_after.total_tokens, 148, "conn-a 不被 conn-b 写入污染");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // ── 0.0.74 迁移：show_widget/widget → render_artifact/artifact ────────────
+
+    #[test]
+    fn migrate_0074_renames_part_type_and_tool_name_structurally_and_is_idempotent() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+        let conv = create_conversation(&conn).expect("conv");
+
+        // ── 播种 parts_json ──
+        // 含一个 type=="widget" 的 part，其 code/title 里**故意写入** "widget" 与 "show_widget"
+        // 字面文本（用户内容），用以验证盲替会损坏而结构化迁移不会。另含一个 type=="text" part
+        // （非 widget，不应被动）。
+        let widget_code = "<div>show_widget demo: a widget that says widget</div>";
+        let parts = serde_json::json!([
+            { "type": "text", "text": "intro mentions widget here" },
+            { "type": "widget", "code": widget_code, "title": "my widget" }
+        ]);
+        save_message(
+            &conn,
+            &conv.id,
+            "assistant",
+            "",
+            None,
+            Some(&parts.to_string()),
+        )
+        .expect("save widget message");
+        // 一个**已经是** artifact 的 part（模拟二次升级 / 新写入），迁移后不应被动（幂等）。
+        let already = serde_json::json!([{ "type": "artifact", "code": "<div>x</div>", "title": "t" }]);
+        save_message(&conn, &conv.id, "assistant", "", None, Some(&already.to_string()))
+            .expect("save already-artifact message");
+
+        // ── 播种 wire_json ──
+        // assistant 消息含 show_widget 工具调用；content 与 arguments 里都**故意含** "show_widget"
+        // 字面文本，验证只改 tool_calls[].function.name、不动 content/arguments。
+        let wire = serde_json::json!([
+            { "role": "user", "content": "please show_widget something" },
+            {
+                "role": "assistant",
+                "content": "I will call show_widget now",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "show_widget",
+                            "arguments": "{\"code\":\"<div>show_widget</div>\"}"
+                        }
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": { "name": "read_file", "arguments": "{}" }
+                    }
+                ]
+            },
+            { "role": "tool", "tool_call_id": "call_1", "content": "{\"ok\":true}" }
+        ]);
+        save_wire_snapshot(&conn, &conv.id, &wire.to_string()).expect("save wire");
+
+        // ── 跑迁移 ──（init_db 已跑过一次，但当时表为空；现显式再跑以测真实数据）
+        migrate_widget_to_artifact_0074(&conn).expect("migrate 0074");
+
+        // ── 断言 parts_json：type 改了，code/title/其它字段原样不动 ──
+        let msgs = get_messages(&conn, &conv.id).expect("get msgs");
+        let widget_msg_parts: serde_json::Value = serde_json::from_str(
+            msgs[0].parts_json.as_deref().expect("parts_json present"),
+        )
+        .expect("parse parts");
+        let arr = widget_msg_parts.as_array().expect("parts array");
+        // text part 完全不动。
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "intro mentions widget here");
+        // widget part：type → artifact，但 code/title 文本里的 "widget"/"show_widget" 一字未动。
+        assert_eq!(arr[1]["type"], "artifact", "type 应改为 artifact");
+        assert_eq!(
+            arr[1]["code"], widget_code,
+            "part.code 必须原样保留（含 widget/show_widget 字面文本）"
+        );
+        assert_eq!(arr[1]["title"], "my widget", "part.title 原样保留");
+        // 已是 artifact 的那条消息保持不变。
+        let already_parts: serde_json::Value =
+            serde_json::from_str(msgs[1].parts_json.as_deref().unwrap()).unwrap();
+        assert_eq!(already_parts[0]["type"], "artifact");
+
+        // ── 断言 wire_json：tool 名改了，content/arguments/其它工具不动 ──
+        let migrated_wire: serde_json::Value = serde_json::from_str(
+            &get_wire_snapshot(&conn, &conv.id).expect("get wire").expect("some"),
+        )
+        .expect("parse wire");
+        let w = migrated_wire.as_array().expect("wire array");
+        // 用户消息正文里的 "show_widget" 文本不动。
+        assert_eq!(w[0]["content"], "please show_widget something");
+        // assistant content 正文不动。
+        assert_eq!(w[1]["content"], "I will call show_widget now");
+        // 工具名改名；arguments（含 show_widget 文本）不动。
+        assert_eq!(
+            w[1]["tool_calls"][0]["function"]["name"], "render_artifact",
+            "工具名应改为 render_artifact"
+        );
+        assert_eq!(
+            w[1]["tool_calls"][0]["function"]["arguments"],
+            "{\"code\":\"<div>show_widget</div>\"}",
+            "tool_calls.arguments 必须原样保留（含 show_widget 字面文本）"
+        );
+        // 旁边的 read_file 工具不受影响。
+        assert_eq!(w[1]["tool_calls"][1]["function"]["name"], "read_file");
+        // tool_result 仅以 tool_call_id 关联、无工具名字段，原样不动。
+        assert_eq!(w[2]["role"], "tool");
+        assert_eq!(w[2]["tool_call_id"], "call_1");
+
+        // ── 幂等：再跑一次，结果完全一致（无新变化）──
+        let parts_after_1 = msgs[0].parts_json.clone();
+        let wire_after_1 = get_wire_snapshot(&conn, &conv.id).unwrap();
+        migrate_widget_to_artifact_0074(&conn).expect("migrate 0074 again");
+        let msgs2 = get_messages(&conn, &conv.id).expect("get msgs 2");
+        assert_eq!(
+            msgs2[0].parts_json, parts_after_1,
+            "幂等：parts_json 再跑无变化"
+        );
+        assert_eq!(
+            get_wire_snapshot(&conn, &conv.id).unwrap(),
+            wire_after_1,
+            "幂等：wire_json 再跑无变化"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }

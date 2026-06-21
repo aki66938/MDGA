@@ -165,8 +165,8 @@ pub(crate) const PARALLEL_READONLY_TOOLS: &[&str] = &[
     "code_overview",
     "repo_map",
     "code_search",
-    // show_widget（0.0.67）：纯渲染、零副作用,可并行。
-    "show_widget",
+    // render_artifact（0.0.67 起；0.0.74 改名）：纯渲染、零副作用,可并行。
+    "render_artifact",
     // repo_wiki（R11）刻意不在此列:其 build 动作会重写 .mdga/wiki 缓存(清旧 .md + 原子写),
     // 并发 build 可能在同一缓存目录上交错,故保持 repo_wiki 串行执行(query 虽纯读,但工具名
     // 粒度无法区分 action,从严按可写处理)。
@@ -438,13 +438,13 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
-                "name": "show_widget",
-                "description": "Render a visual WIDGET inline in the conversation — agent-authored HTML/SVG/JS shown to the user in a sandboxed canvas. Use it to SHOW the user something visual or interactive: UI mockups, diagrams, flowcharts, charts/dashboards, calculators, interactive forms, before/after comparisons. `code` is raw SVG (must start with `<svg`) OR an HTML fragment (NO doctype/html/head/body wrapper — just body content; inline <style> and <script> are allowed). It renders in a STRICT SANDBOX with ZERO network access (no fetch/XHR, and no external scripts, styles, fonts, or images — NOT even from a CDN), no filesystem, and no access to the app or its data. So: do NOT reference any external URL or CDN library (it will be blocked) and do NOT try to fetch user data from inside it — make the widget fully SELF-CONTAINED, writing any needed data and any small helper code directly inline. The widget may call two host bridge functions: `sendPrompt(text)` (propose a message to you — the host shows the user a confirmation dialog first, and only sends if the user approves, so wire it to buttons/inputs but expect a confirm step, never rely on it firing automatically) and `openLink(url)` (open an http(s) link in the user's browser, with the user's confirmation). Use the CSS variables the host injects (e.g. var(--color-text), var(--color-bg), var(--color-text-secondary), var(--brand), var(--border)) so it matches the app's light/dark theme.",
+                "name": "render_artifact",
+                "description": "Render an INTERACTIVE artifact inline in the conversation — agent-authored, fully self-contained HTML/SVG/JS that runs live in a sandboxed canvas the user can click, type into, and play with. Reach for this whenever a LIVE, interactive thing beats a static answer: calculators, interactive forms, clickable/zoomable charts & dashboards, simulations, step-through demos, animated diagrams, games, before/after sliders, mini-tools. PREFER INTERACTION & MOTION over static pictures — a static SVG is the fallback, not the goal; if the topic can react to the user, make it react.\n\nDO:\n- Make it INTERACTIVE: wire up real behavior with addEventListener / onclick / oninput etc. (inline event handlers in your <script>). Respond to clicks, input, hover, drag.\n- Make it ALIVE: animate with native CSS transitions/animations/@keyframes and/or plain requestAnimationFrame — transitions on state change, entrance animations, animated charts, etc.\n- Use the host bridge so the artifact can feed results back into the chat: a button/handler may call `sendPrompt(text)` to propose a message to you (the host shows the user a confirmation dialog first and only sends on approval — wire it to buttons/inputs, but expect that confirm step and never rely on it firing automatically), and `openLink(url)` to open an http(s) link in the user's browser (also user-confirmed).\n- Keep it SELF-CONTAINED: write all data and any helper code directly inline. Use the CSS variables the host injects so it matches the app's light/dark theme (e.g. var(--color-text), var(--color-bg), var(--color-text-secondary), var(--brand), var(--border)).\n\nDON'T (these are blocked by the sandbox and will silently fail — do not even try):\n- NO `eval` or `new Function(...)` (Content-Security-Policy has no unsafe-eval) — write real code, never build it from strings.\n- NO external resources of ANY kind — no CDN, no `<script src>`, no `<link>` stylesheet, no external fonts/images/icons. Inline every script and style; embed images as data: URIs.\n- NO network: no `fetch`, no XMLHttpRequest, no WebSocket, no EventSource (connect-src is none). You cannot load or fetch anything at runtime — inline the data instead.\n- NO storage / ambient identity: no localStorage, sessionStorage, cookies, IndexedDB, or document.domain (the artifact runs from a null origin).\n\nThe artifact runs in a STRICT, isolated sandbox (sandboxed iframe, null origin, zero-network CSP, no filesystem, no access to the app or its data). These limits are a deliberate security boundary and CANNOT be worked around, so design within them: bake every bit of data and logic inline into the single artifact. `code` is raw SVG (must start with `<svg`) OR an HTML fragment (NO doctype/html/head/body wrapper — just body content; inline <style> and <script> are allowed).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "code": { "type": "string", "description": "The widget source: raw SVG (starts with <svg) or an HTML body fragment (no doctype/html/head wrapper). Inline <style>/<script> allowed. Max 512KB." },
-                        "title": { "type": "string", "description": "Optional short caption shown above the widget." }
+                        "code": { "type": "string", "description": "The artifact source: raw SVG (starts with <svg) or an HTML body fragment (no doctype/html/head wrapper). Inline <style>/<script> allowed; prefer adding interactivity (event handlers) and motion (CSS/JS animation). All resources must be inline or data: URIs — no external/CDN references. Max 512KB." },
+                        "title": { "type": "string", "description": "Optional short caption shown above the artifact." }
                     },
                     "required": ["code"],
                     "additionalProperties": false
@@ -1203,7 +1203,7 @@ pub(crate) fn execute_builtin_tool_call(
         "repo_map" => execute_repo_map(workspace_path, arguments),
         "code_search" => execute_code_search(workspace_path, arguments),
         "repo_wiki" => execute_repo_wiki(workspace_path, arguments),
-        "show_widget" => execute_show_widget(arguments),
+        "render_artifact" => execute_render_artifact(arguments),
         "move_path" => {
             let request = serde_json::from_str::<MovePathRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
@@ -1619,7 +1619,7 @@ impl mdga_wiki::SectionSummarizer for DesktopSectionSummarizer {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(60),
                     mdga_deepseek_client::chat_completion(
-                        &base_url, &api_key, messages, &model, None,
+                        &base_url, &api_key, messages, &model, None, None,
                     ),
                 )
                 .await
@@ -1694,26 +1694,26 @@ pub(crate) fn execute_repo_wiki_enriched(
     Ok(value)
 }
 
-/// show_widget 工具（0.0.67）：把 agent 写的 HTML/SVG/JS 作为「画布 widget」内联渲染到对话里。
+/// render_artifact 工具（0.0.67 起；0.0.74 改名）：把 agent 写的 HTML/SVG/JS 作为「互动卡片」内联渲染到对话里。
 ///
 /// 后端**完全惰性**：只校验 code(非空、≤512KB)并判类型(svg/html),不执行、不存储——真正的渲染由
 /// 前端在**沙箱 iframe**(sandbox="allow-scripts"、null origin、严格 CSP、断网、fail-closed 自检)里做。
-/// widget 代码本身随工具调用参数(inputJson)走到前端,故此处不回传 code。
-fn execute_show_widget(arguments: &str) -> Result<serde_json::Value, String> {
+/// 卡片代码本身随工具调用参数(inputJson)走到前端,故此处不回传 code。
+fn execute_render_artifact(arguments: &str) -> Result<serde_json::Value, String> {
     #[derive(serde::Deserialize)]
-    struct ShowWidgetArgs {
+    struct RenderArtifactArgs {
         code: String,
         #[serde(default)]
         title: Option<String>,
     }
-    const MAX_WIDGET_BYTES: usize = 512 * 1024;
-    let args = serde_json::from_str::<ShowWidgetArgs>(arguments.trim())
+    const MAX_ARTIFACT_BYTES: usize = 512 * 1024;
+    let args = serde_json::from_str::<RenderArtifactArgs>(arguments.trim())
         .map_err(|err| format!("工具参数解析失败: {err}"))?;
     if args.code.trim().is_empty() {
-        return Err("show_widget 的 code 不能为空".to_string());
+        return Err("render_artifact 的 code 不能为空".to_string());
     }
-    if args.code.len() > MAX_WIDGET_BYTES {
-        return Err("widget 代码过大（上限 512KB）".to_string());
+    if args.code.len() > MAX_ARTIFACT_BYTES {
+        return Err("互动卡片代码过大（上限 512KB）".to_string());
     }
     let kind = if args.code.trim_start().starts_with("<svg") {
         "svg"

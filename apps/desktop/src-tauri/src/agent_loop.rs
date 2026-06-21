@@ -49,7 +49,8 @@ use mdga_storage::{
     save_token_ledger_entry, PricingContext, ROLE_ACTION, ROLE_MAIN, ROLE_PLAN, ROLE_VISION,
 };
 use mdga_token_accounting::{
-    canonical_model_id, compute_cost_summary_priced, lookup_preset, BillingMode, ModelPricing,
+    build_thinking_profile, canonical_model_id, compute_cost_summary_priced, lookup_preset,
+    BillingMode, ModelPricing, ReasoningEcho, StopEmit, ThinkingDialect,
 };
 use mdga_tool_runtime::RunCommandRequest;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,6 +107,8 @@ pub(crate) async fn send_message(
     plan_mode: Option<bool>,
     execute_plan: Option<bool>,
     images: Option<Vec<InboundImage>>,
+    // 思考深度（E-1）：前端 camelCase `thinkingStop` —— 用户在思考滑块上选的档位下标（None=用 profile 默认档）。
+    thinking_stop: Option<usize>,
 ) -> Result<(), String> {
     let plan_mode = plan_mode.unwrap_or(false);
     // Plan25 C-4：「批准并执行」时为 true，本轮装配阶段注入「严格按上一条计划执行 + 先建 todo」system。
@@ -114,7 +117,7 @@ pub(crate) async fn send_message(
     // R8 角色多模型路由：本轮生效的角色——计划模式用 'plan'，常规工具循环用 'action'。
     // 二者均经 resolve_role_provider 解析：角色未单独配置时回退主模型，行为与从前一致（向后兼容）。
     let active_role = if plan_mode { ROLE_PLAN } else { ROLE_ACTION };
-    let (conversation, permission_rules, base_url, api_key, model_id, context_window, vision_provider, pricing_ctx) = {
+    let (conversation, permission_rules, base_url, api_key, model_id, active_preset, is_main_model, context_window, vision_provider, pricing_ctx) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let conversation = get_conversation(&db, &conversation_id)
             .map_err(|e| e.to_string())?
@@ -126,20 +129,28 @@ pub(crate) async fn send_message(
         // 不再用入参 model（前端控制行写死的 DeepSeek 清单）决定模型，否则配非 DeepSeek 主供应商必失败。
         // Plan27 C2 #2：主模型 context_window 用于推导上下文压缩软上限（始终以主模型为准，与角色无关）。
         // 0.0.59：主模型经 resolve_role_provider 从「连接库 + 角色引用」解析（main 不回退）。
-        let main_context_window = match resolve_role_provider(&db, ROLE_MAIN) {
-            Ok(Some(p)) => p.context_window,
+        // 思考深度：一并取出主模型(ROLE_MAIN)的 model_id/preset，下方与本轮实际模型比对——
+        // 前端思考滑块永远基于主模型构建，故仅当本轮真用主模型时用户档位才适用。
+        let (main_context_window, main_model_id, main_preset) = match resolve_role_provider(&db, ROLE_MAIN) {
+            Ok(Some(p)) => (p.context_window, p.model_id, p.preset),
             _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
         };
         // R8：解析本轮角色对应的 provider（plan/action 未配置时回退 main）。回退保证了
         // 不配任何角色时，base_url/api_key/model_id 与从前取 main 完全一致。
-        let (base_url, api_key, model_id) = match resolve_role_provider(&db, active_role) {
+        let (base_url, api_key, model_id, active_preset) = match resolve_role_provider(&db, active_role) {
             Ok(Some(p)) => {
                 let bu = resolve_base_url(p.base_url.as_deref(), p.preset.as_deref())
                     .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
-                (bu, p.api_key, p.model_id)
+                // 思考深度（E-2）：留存命中连接的 preset（与 model_id 同源），供构建思考档案。
+                (bu, p.api_key, p.model_id, p.preset)
             }
             _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
         };
+        // 思考深度（E-2）：本轮实际模型是否就是前端思考滑块所基于的主模型（同 preset 同 model_id）。
+        // 否则（plan/action 绑了异于主模型的模型）须弃用户档位、用本模型默认档，避免 index 被另一张
+        // 档表重解释（如主模型选「关闭」落到无关闭档的模型上被发成「开启思考」）。
+        let is_main_model = model_id == main_model_id
+            && active_preset.as_deref().unwrap_or("") == main_preset.as_deref().unwrap_or("");
         // 视觉 provider（Plan18）：仅在本轮带图时才需要；未配置则下方走「拒图」降级。
         // 0.0.59：视觉角色**不回退 main**——保留「未单独配置 vision ⇒ 拒图降级」的原行为。
         // 仅当 vision 有一条自身且启用的引用时，才经 resolve 合成出视觉 provider；否则 None。
@@ -158,10 +169,32 @@ pub(crate) async fn send_message(
         // 本轮命中连接的 billing_mode + subscription_json 与命中模型的 pricing_json，供本轮结束结算用。
         // 软处理：解析失败/未配置 → None，结算时落到「无金额」（前端显「—」），不中断本轮。
         let pricing_ctx = resolve_pricing_context(&db, active_role).ok().flatten();
-        (conversation, rules, base_url, api_key, model_id, main_context_window, vision_provider, pricing_ctx)
+        (conversation, rules, base_url, api_key, model_id, active_preset, is_main_model, main_context_window, vision_provider, pricing_ctx)
     };
     // 入参 model 保留以不破坏前端命令签名，但本轮已不再用它决定模型（权威源为 model_id）。
     let _ = &model;
+
+    // 思考深度（E-2）：据本轮命中连接的 (preset, model_id) 构建思考档案。查不到 → None（无思考能力，
+    // 不注入任何思考字段、不回传 reasoning，保持现状）。有档案则：① 据用户选的档位（thinking_stop，
+    // 越界则 clamp、None 用默认档）算出请求体要注入的思考字段 thinking_extra；② 据 echo 策略算出
+    // add_reasoning（是否把每轮 reasoning 嵌回 assistant 历史轮，满足部分模型「多轮工具须回传」契约）。
+    let preset_str = active_preset.as_deref().unwrap_or("");
+    let profile = build_thinking_profile(preset_str, &model_id);
+    let (thinking_extra, add_reasoning): (Option<serde_json::Value>, bool) = match &profile {
+        Some(p) => {
+            // 仅当本轮实际模型==前端滑块所基于的主模型时，才采用用户所选档位；否则用本模型默认档，
+            // 避免跨档表 index 错配（plan/action 绑异于主模型的模型时，「关闭」可能被发成「开启」）。
+            let chosen = if is_main_model {
+                thinking_stop.unwrap_or(p.default_index)
+            } else {
+                p.default_index
+            };
+            let idx = chosen.min(p.stops.len().saturating_sub(1));
+            let extra = thinking_extra_json(p.dialect, &p.stops[idx].emit);
+            (extra, matches!(p.reasoning_echo, ReasoningEcho::Resend))
+        }
+        None => (None, false),
+    };
 
     // Plan21 #4：自动初看的视觉 usage 需并入工具预算累计起点。在记账前 clone 一份留到这里，
     // 后续作为 initial_usage 传入有工作区分支的 chat_with_builtin_tools。
@@ -328,8 +361,9 @@ pub(crate) async fn send_message(
 
     let result = if plan_mode {
         // 计划模式走纯流式（无工具），让模型把计划直接流给用户审阅。
+        // 思考深度（E-6）：计划路径单轮，无需 reasoning 回传，仅注入 thinking_extra。
         tokio::select! {
-            r = chat_stream(&base_url, &api_key, messages, &model_id, |chunk| {
+            r = chat_stream(&base_url, &api_key, messages, &model_id, thinking_extra.as_ref(), |chunk| {
                 // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
                 match chunk {
                     StreamChunk::Content(c) => {
@@ -363,11 +397,15 @@ pub(crate) async fn send_message(
             vision_usage,
             // Plan27 C2 #2：主供应商上下文窗口，用于推导压缩软上限。
             context_window,
+            // 思考深度（E-4/E-5）：方言相关思考字段 + 是否多轮回传 reasoning。
+            thinking_extra.as_ref(),
+            add_reasoning,
         )
         .await
     } else {
+        // 思考深度（E-6）：无工作区路径单轮，仅注入 thinking_extra。
         tokio::select! {
-            r = chat_stream(&base_url, &api_key, messages, &model_id, |chunk| {
+            r = chat_stream(&base_url, &api_key, messages, &model_id, thinking_extra.as_ref(), |chunk| {
                 // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
                 match chunk {
                     StreamChunk::Content(c) => {
@@ -739,6 +777,50 @@ pub(crate) fn finalize_wire(wire: &mut Vec<serde_json::Value>) {
     }
 }
 
+/// 思考深度（E-3）：把 (方言, 单档语义) 序列化为发往请求体的「思考字段」JSON 对象。
+///
+/// 序列化逻辑在此（而非纯数据层 thinking.rs）：这里才有 serde_json + 方言知识。
+/// 返回 None 表示「不发任何思考字段」（跟随服务端默认 / 该方言下该档无字段可发）。
+fn thinking_extra_json(dialect: ThinkingDialect, emit: &StopEmit) -> Option<serde_json::Value> {
+    use serde_json::json;
+    match emit {
+        // 跟随服务端默认：任何方言都不发字段。
+        StopEmit::FollowDefault => None,
+        StopEmit::Off => match dialect {
+            ThinkingDialect::ThinkingObject => Some(json!({ "thinking": { "type": "disabled" } })),
+            ThinkingDialect::EnableThinking => Some(json!({ "enable_thinking": false })),
+            // ReasoningEffortOnly 方言无「关闭」语义（其档位均为 On），此处保守不发。
+            ThinkingDialect::ReasoningEffortOnly => None,
+        },
+        StopEmit::On {
+            reasoning_effort,
+            thinking_budget,
+            keep_all,
+        } => match dialect {
+            ThinkingDialect::ThinkingObject => {
+                let mut t = json!({ "type": "enabled" });
+                if *keep_all {
+                    t["keep"] = json!("all");
+                }
+                let mut o = json!({ "thinking": t });
+                if let Some(e) = reasoning_effort {
+                    o["reasoning_effort"] = json!(e);
+                }
+                Some(o)
+            }
+            ThinkingDialect::EnableThinking => {
+                let mut o = json!({ "enable_thinking": true });
+                if let Some(b) = thinking_budget {
+                    o["thinking_budget"] = json!(b);
+                }
+                Some(o)
+            }
+            ThinkingDialect::ReasoningEffortOnly => reasoning_effort
+                .map(|e| json!({ "reasoning_effort": e })),
+        },
+    }
+}
+
 /// 0.0.69:粗略估算 wire 的 token 体积(序列化字节数 / 3,偏保守高估)。仅用于「续接首轮」是否触发压缩
 /// 护栏的初值——真实 prompt_tokens 在首个响应后即校正。高估顶多多压一次无损;低估才危险(漏压超限快照)。
 pub(crate) fn estimate_wire_tokens(wire: &[serde_json::Value]) -> u64 {
@@ -793,8 +875,22 @@ pub(crate) fn assemble_resume_wire(
     // 唯一 system 既是前导(进 fresh_system)又紧邻 user,会被重复计入。clamp 到前导块之后即只取非前导段。
     let tail_start = tail_start.max(fresh_system.len());
     let trailing_system: Vec<serde_json::Value> = fresh[tail_start..last_idx].to_vec();
-    let snap_history: Vec<serde_json::Value> =
-        snap.into_iter().filter(|m| role(&m) != "system").collect();
+    // 思考深度（D）：从**快照**(跨 send 历史)的 assistant 轮剥掉 reasoning_content。思考态的 reasoning
+    // 只应出现在「本次 send 工具循环内」的 assistant 轮(满足 V4/Kimi 多轮工具须回传);跨 send 的旧轮
+    // reasoning 已完成,残留在历史里回放可能触发 DeepSeek 400,故在续接拼装时一律剥除。新消息侧(fresh)
+    // 不动。本剥除不改变 finalize/续接的配对与压缩护栏语义——只删一个可选字段,角色/tool_calls 全保留。
+    let snap_history: Vec<serde_json::Value> = snap
+        .into_iter()
+        .filter(|m| role(m) != "system")
+        .map(|mut m| {
+            if role(&m) == "assistant" {
+                if let Some(obj) = m.as_object_mut() {
+                    obj.remove("reasoning_content");
+                }
+            }
+            m
+        })
+        .collect();
     // 防重:快照历史末尾已是同一条新 user(如某操作未清快照而 regenerate)则不重复追加,避免连续重复 user。
     let dup = snap_history.last().is_some_and(|m| {
         role(m) == "user" && m.get("content") == new_user.get("content")
@@ -834,6 +930,10 @@ async fn chat_with_builtin_tools(
     initial_usage: Option<mdga_shared::RawUsage>,
     // Plan27 C2 #2：主供应商上下文窗口（tokens，可空）。有值时软上限按其 × 0.8 推导。
     context_window: Option<i64>,
+    // 思考深度（E-5）：方言相关思考字段，透传给每轮 stream_round_with_retry 注入请求体（None=不注入）。
+    thinking_extra: Option<&serde_json::Value>,
+    // 思考深度（E-5）：是否把每轮 reasoning_content 嵌回 assistant 历史轮（echo=Resend 时为 true）。
+    add_reasoning: bool,
 ) -> Result<Option<mdga_shared::RawUsage>, String> {
     let security_context = session_security_context(
         workspace_path.to_string(),
@@ -1027,6 +1127,8 @@ async fn chat_with_builtin_tools(
             request_messages,
             model,
             tool_schemas.clone(),
+            // 思考深度（E-5）：透传方言相关思考字段，注入本轮请求体。
+            thinking_extra,
             app,
             &cancel,
         )
@@ -1234,8 +1336,16 @@ async fn chat_with_builtin_tools(
             return Ok(usage);
         }
 
+        // 思考深度（E-5）：echo=Resend(add_reasoning) 时把本轮 reasoning 嵌回 assistant 历史轮（多轮工具
+        // 须回传以维持思考连续性）；否则传 None 不嵌。先取出避免 completion.assistant_message 移动后无法借用。
+        let round_reasoning = if add_reasoning {
+            completion.reasoning_content.clone()
+        } else {
+            None
+        };
         wire_messages.push(assistant_message_for_tool_calls(
             completion.assistant_message,
+            round_reasoning.as_deref(),
             &tool_calls,
         ));
         // 边执行边落库:assistant 已声明 tool_calls,工具执行前先落——崩溃在工具执行中也能从 DB 重建到此。

@@ -343,6 +343,25 @@ pub struct ChatCompletionResult {
     pub tool_calls: Vec<ToolCall>,
     pub assistant_message: serde_json::Value,
     pub usage: Option<RawUsage>,
+    /// 思考深度（G）：本轮模型返回的 reasoning_content 全文（流式累加 / 非流式直读）。
+    /// None=本轮无思考输出。上层据回传策略决定是否把它嵌回 assistant 轮（见
+    /// `assistant_message_for_tool_calls`），以满足部分模型「多轮工具须回传 reasoning」的契约。
+    pub reasoning_content: Option<String>,
+}
+
+/// 思考深度（A）：把上层算好的「思考字段」对象浅合并进请求体顶层。
+///
+/// extra 为 `Some(对象)` 时，把它的每个键浅覆盖进 body（body 也须是对象）；任一不是对象或
+/// extra 为 None 时不动 body。键如 `thinking` / `enable_thinking` / `thinking_budget` /
+/// `reasoning_effort`，由调用方按方言序列化好（序列化逻辑在 agent_loop，本 crate 只做合并）。
+fn merge_thinking(body: &mut serde_json::Value, extra: Option<&serde_json::Value>) {
+    if let (Some(obj), Some(map)) = (extra, body.as_object_mut()) {
+        if let Some(eo) = obj.as_object() {
+            for (k, v) in eo {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+    }
 }
 
 /// 根据「主 provider 是否已配置且 key 非空」给出 API Key 状态（Plan17 D3：不再读环境变量）。
@@ -388,6 +407,7 @@ pub async fn chat_stream<F>(
     api_key: &str,
     messages: Vec<ChatMessage>,
     model: &str,
+    thinking_extra: Option<&serde_json::Value>,
     mut on_chunk: F,
 ) -> Result<Option<RawUsage>, DeepSeekError>
 where
@@ -399,12 +419,14 @@ where
         .build()
         .map_err(DeepSeekError::Http)?;
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "stream": true,
         "stream_options": { "include_usage": true }
     });
+    // 思考深度（A）：注入方言相关的思考字段（None 时不动 body）。
+    merge_thinking(&mut body, thinking_extra);
 
     let response = client
         .post(chat_completions_url(base_url))
@@ -512,6 +534,7 @@ pub async fn chat_stream_with_tools<F>(
     messages: Vec<serde_json::Value>,
     model: &str,
     tools: Vec<serde_json::Value>,
+    thinking_extra: Option<&serde_json::Value>,
     mut on_content: F,
 ) -> Result<ChatCompletionResult, DeepSeekError>
 where
@@ -532,6 +555,8 @@ where
         body["tools"] = serde_json::Value::Array(tools);
         body["tool_choice"] = serde_json::json!("auto");
     }
+    // 思考深度（A）：注入方言相关的思考字段（None 时不动 body）。
+    merge_thinking(&mut body, thinking_extra);
 
     let response = client
         .post(chat_completions_url(base_url))
@@ -551,6 +576,8 @@ where
     let mut emitted_bytes = 0usize; // 已外显的 content 字节数
     let mut leaked = false;
     let mut usage: Option<RawUsage> = None;
+    // 思考深度（G）：累加 reasoning_content 全文（仍照常 on_content 外显），供上层按回传策略嵌回历史。
+    let mut reasoning_full = String::new();
     // tool_calls 累积：按 index 收集 id / name / arguments 片段
     let mut tool_acc: Vec<(String, String, String)> = Vec::new();
 
@@ -596,12 +623,13 @@ where
                     }
                 }
             }
-            // 推理片段：原样外显，不走防泄漏守卫
+            // 推理片段：原样外显，不走防泄漏守卫；同时累加全文（G）供上层回传。
             if let Some(reasoning) = value
                 .pointer("/choices/0/delta/reasoning_content")
                 .and_then(|v| v.as_str())
             {
                 if !reasoning.is_empty() {
+                    reasoning_full.push_str(reasoning);
                     on_content(StreamChunk::Reasoning(reasoning));
                 }
             }
@@ -660,6 +688,9 @@ where
         tool_calls,
         assistant_message,
         usage,
+        // 思考深度（G）：回传累加的 reasoning_content；是否嵌回 assistant 轮由上层 echo 决定，
+        // 故此处的 assistant_message 不就地塞 reasoning。
+        reasoning_content: if reasoning_full.is_empty() { None } else { Some(reasoning_full) },
     })
 }
 
@@ -673,6 +704,7 @@ pub async fn chat_completion(
     messages: Vec<serde_json::Value>,
     model: &str,
     tools: Option<Vec<serde_json::Value>>,
+    thinking_extra: Option<&serde_json::Value>,
 ) -> Result<ChatCompletionResult, DeepSeekError> {
     // 必须设置总超时：服务端 hang 时若无超时会无限等待，前端表现为「正在思考」永不出 token。
     // 超时映射为可重试的 Http 错误，由上层退避重试。
@@ -691,6 +723,8 @@ pub async fn chat_completion(
         body["tools"] = serde_json::Value::Array(tools);
         body["tool_choice"] = serde_json::json!("auto");
     }
+    // 思考深度（A）：注入方言相关的思考字段（None 时不动 body）。
+    merge_thinking(&mut body, thinking_extra);
 
     let response = client
         .post(chat_completions_url(base_url))
@@ -907,6 +941,12 @@ fn parse_chat_completion_response(
         .get("content")
         .and_then(|content| content.as_str())
         .map(str::to_string);
+    // 思考深度（G）：非流式响应里 reasoning_content 直接挂在 message 上；无则 None。
+    let reasoning_content = assistant_message
+        .get("reasoning_content")
+        .and_then(|rc| rc.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let tool_calls = assistant_message
         .get("tool_calls")
         .cloned()
@@ -924,6 +964,7 @@ fn parse_chat_completion_response(
         tool_calls,
         assistant_message,
         usage,
+        reasoning_content,
     })
 }
 

@@ -141,11 +141,20 @@ export type VisionPart = {
 export type ReasoningPart = { type: "reasoning"; content: string };
 
 /**
- * 部件画布块（0.0.67）：模型通过 show_widget 工具产出 agent 编写的 HTML/SVG/JS，
- * 前端在 sandbox="allow-scripts"（绝不带 allow-same-origin）的 iframe 中内联渲染。
- * code 为不可信内容（agent 生成、可能被 prompt 注入），必须完全隔离；随消息 parts 持久化。
+ * 思考深度（Thinking）档位与档案视图。get_thinking_profile(connectionPreset, modelId) 返回
+ * ThinkingProfileView | null（查不到该模型思考能力即 null，前端整体隐藏控件）。
+ * stops 为可选档位（label 仅展示用）；defaultIndex 为模型默认档；
+ * adjustable=false 表示思考强制开启、不可关闭/调档（此时 stops 通常仅 1 项）。
  */
-export type WidgetPart = { type: "widget"; code: string; title?: string; kind?: "svg" | "html" };
+export type ThinkingStopView = { label: string };
+export type ThinkingProfileView = { stops: ThinkingStopView[]; defaultIndex: number; adjustable: boolean };
+
+/**
+ * 互动卡片块（0.0.67 起；0.0.74 改名 render_artifact）：模型通过 render_artifact 工具产出
+ * agent 编写的 HTML/SVG/JS，前端在 sandbox="allow-scripts"（绝不带 allow-same-origin）的 iframe
+ * 中内联渲染。code 为不可信内容（agent 生成、可能被 prompt 注入），必须完全隔离；随消息 parts 持久化。
+ */
+export type ArtifactPart = { type: "artifact"; code: string; title?: string; kind?: "svg" | "html" };
 
 export type MessagePart =
   | TextPart
@@ -154,7 +163,7 @@ export type MessagePart =
   | ImagePart
   | VisionPart
   | ReasoningPart
-  | WidgetPart;
+  | ArtifactPart;
 
 export type Message = {
   role: "user" | "assistant";
@@ -543,5 +552,5 @@ export type PaletteItem = {
 
 /** 渲染块：单个非工具 part，或一段连续的工具调用（聚合为可折叠组） */
 export type RenderBlock =
-  | { kind: "part"; part: TextPart | NoticePart | ImagePart | VisionPart | ReasoningPart | WidgetPart; index: number }
+  | { kind: "part"; part: TextPart | NoticePart | ImagePart | VisionPart | ReasoningPart | ArtifactPart; index: number }
   | { kind: "tools"; parts: ToolPart[]; index: number };

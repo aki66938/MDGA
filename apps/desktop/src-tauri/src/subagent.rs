@@ -341,6 +341,8 @@ async fn run_subtask_loop(
 
         wire.push(assistant_message_for_tool_calls(
             completion.assistant_message.clone(),
+            // 思考深度（C）：子代理循环不做 reasoning 回传（无 profile/echo 上下文），传 None 保持原行为。
+            None,
             &tool_calls,
         ));
         for call in &tool_calls {

@@ -11,6 +11,12 @@ use serde::{Deserialize, Serialize};
 pub mod presets;
 pub use presets::{canonical_model_id, lookup_preset, PresetEntry};
 
+pub mod thinking;
+pub use thinking::{
+    build_thinking_profile, ReasoningEcho, StopEmit, ThinkingDialect, ThinkingProfile,
+    ThinkingStop,
+};
+
 /// 单次请求的价格快照，版本化保存以支持历史费用回放。
 ///
 /// 价格单位为美元 / 百万 token；每次价格调整新增版本，不覆盖历史记录。

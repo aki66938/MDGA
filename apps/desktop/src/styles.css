@@ -1262,20 +1262,237 @@ h1 {
   overflow: hidden;
 }
 
-/* 部件画布（0.0.67）：沙箱 iframe 的外壳。iframe 自身的边框/圆角在组件内联设定，
-   这里只负责外间距与可选标题。 */
-.widget-card {
+/* 互动卡片（0.0.67 起；0.0.74 改名 + 卡头/折叠）：沙箱 iframe 的外壳。iframe 自身的边框/圆角在
+   组件内联设定，这里负责外间距、固定卡头与折叠态。 */
+.artifact-card {
   margin: 8px 0;
 }
 
-.widget-card__title {
-  font-size: 12px;
-  color: var(--text-2);
-  margin-bottom: 4px;
+/* 固定卡头行：图标 +「互动卡片」固定标签 + 可选副标题 + 右侧操作区（本步只放折叠 chevron）。 */
+.artifact-card__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 4px;
+  cursor: pointer;
+  user-select: none;
+  color: var(--text);
+  font-size: 13px;
 }
 
-.widget-card__frame {
+.artifact-card__head:hover {
+  color: var(--text);
+}
+
+.artifact-card__icon {
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+
+.artifact-card__label {
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.artifact-card__subtitle {
+  color: var(--text-2);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.artifact-card__actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.artifact-card__chevron {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-2);
+}
+
+.artifact-card__head:hover .artifact-card__chevron {
+  color: var(--text);
+}
+
+.artifact-card__frame {
   display: block;
+}
+
+/* 卡头 actions 里的图标按钮（复制 / 下载 / 放大）：朴素方块、hover 提色。 */
+.artifact-card__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px;
+  border: none;
+  background: none;
+  color: var(--text-3);
+  border-radius: 5px;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.artifact-card__btn:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.artifact-card__btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ── 放大画布查看器（0.0.74）──────────────────────────────────────────────────
+   关键：iframe 始终在 __body → __canvas → __stage → iframe 这条 DOM 路径上，
+   放大只切 __body 的 --maximized class（→ position:fixed），节点不动＝不 reload＝状态保。 */
+
+/* 放大态下整个 __body 变全屏定位层（盖住应用，承载画布 + chrome）。 */
+.artifact-card__body--maximized {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  margin: 0;
+  /* display 由内联 style 控制（block）；此处只接管定位与层级。 */
+}
+
+/* 暗背景：__body 的兄弟，铺满视口，点击关闭。 */
+.artifact-viewer__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 999; /* 在 __body--maximized(1000) 之下 */
+  background: rgba(0, 0, 0, 0.62);
+}
+
+/* 画布层：内联态就是普通块（包着 iframe，不影响布局）；放大态铺满、接管滚轮/拖拽、显淡点阵。 */
+.artifact-viewer__canvas {
+  position: relative;
+}
+
+.artifact-viewer__canvas.is-maximized {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  cursor: grab;
+  /* 淡点阵背景，示意可拖拽的无限平面（颜色用主题边框色、低透明）。 */
+  background-color: var(--surface);
+  background-image: radial-gradient(var(--border) 1px, transparent 1px);
+  background-size: 22px 22px;
+  touch-action: none; /* 让指针拖拽不被浏览器手势吞掉 */
+}
+
+.artifact-viewer__canvas.is-maximized:active {
+  cursor: grabbing;
+}
+
+/* 变换层：放大态套 translate+scale；内联态无 transform（保持 FE-1 现状）。 */
+.artifact-viewer__stage {
+  transform-origin: 0 0;
+}
+
+.artifact-viewer__canvas.is-maximized .artifact-viewer__stage {
+  position: absolute;
+  top: 0;
+  left: 0;
+  /* 给产物一个合理初始宽度，居中靠 transform 平移即可（这里靠内容自身宽度撑开）。 */
+  width: min(960px, 88vw);
+  will-change: transform;
+}
+
+/* 放大态时让 iframe 的圆角/边框稍收一下，避免点阵背景下显脏（可选）。
+   关键（0.0.75）：放大态给 iframe 设 pointer-events:none —— 让 wheel/gesture/pointer/touch 穿过
+   跨源沙箱 iframe（否则被它消费、不冒泡）落到 __stage/__canvas → 冒泡到 canvasRef 的捏合/缩放/平移
+   处理器。这**只是事件路由**，不动 sandbox/CSP/探针/srcdoc，不削弱隔离。内联态不加此规则 → iframe
+   仍 pointer-events:auto（产物可交互）。放大态产物不可点（接受：放大是定位细节、以缩放平移为主，
+   且 iframe 不重挂、状态仍保）。空白单击关闭逻辑不受影响：指针穿透后落在 __stage（onBlank=false、不误关）。 */
+.artifact-viewer__canvas.is-maximized .artifact-card__frame {
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+/* 关闭按钮（右上角浮动）。 */
+.artifact-viewer__close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.artifact-viewer__close:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+/* 底部浮动缩放控件（− 百分比 +）。 */
+.artifact-viewer__controls {
+  position: absolute;
+  left: 50%;
+  bottom: 48px;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+
+.artifact-viewer__controls button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: none;
+  color: var(--text-2);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.artifact-viewer__controls button:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.artifact-viewer__pct {
+  min-width: 46px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-2);
+  user-select: none;
+}
+
+/* 底部一行提示。 */
+.artifact-viewer__hint {
+  position: absolute;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  z-index: 2;
+  font-size: 11px;
+  color: var(--text-3);
+  user-select: none;
+  pointer-events: none;
 }
 
 .vision-card__summary {
@@ -1661,7 +1878,8 @@ h1 {
 .composer-footer .control-select--compact,
 .composer-footer .model-pill,
 .composer-footer .control-toggle,
-.composer-footer .ctx-pill {
+.composer-footer .ctx-pill,
+.composer-footer .think-depth__chip {
   font-size: 11.5px;
   background-color: transparent;
   border: 1px dashed var(--border);
@@ -1671,7 +1889,8 @@ h1 {
 .composer-footer .control-select--compact:hover,
 .composer-footer .model-pill:hover,
 .composer-footer .control-toggle:hover,
-.composer-footer .ctx-pill:hover {
+.composer-footer .ctx-pill:hover,
+.composer-footer .think-depth__chip:hover {
   border-color: var(--border-strong);
   color: var(--text-2);
   background-color: var(--surface-3);
@@ -1699,7 +1918,7 @@ h1 {
   color: var(--brand);
 }
 
-/* 上下文指示器胶囊：两行（文字在上、进度条在下，对标 widget 图2），紧凑、不拉长。 */
+/* 上下文指示器胶囊：两行（文字在上、进度条在下，对标设计稿图2），紧凑、不拉长。 */
 .ctx-pill-wrap { position: relative; display: inline-flex; }
 /* 该胶囊是两行，需放开 .composer-footer__left > * 的 30px 强制高度，由 footer 居中对齐。 */
 .composer-footer__left > .ctx-pill-wrap { height: auto; }
@@ -3537,6 +3756,88 @@ h1 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ── 思考深度（Thinking）：底栏 chip → 弹窗（弹层内含渐变滑轨） ── */
+.think-depth { position: relative; display: inline-flex; min-width: 0; }
+/* chip 的边框/底色/字色/hover 全部复用底栏胶囊统一规则（上方 .composer-footer 分组已含 .think-depth__chip），
+   与 model-pill 等整排按钮像素级一致；此处只定布局，不再单独设边框/底色，也不要 --set 变色态（保持统一）。 */
+.think-depth__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  max-width: 180px;
+  padding: 0 11px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all .14s;
+}
+.think-depth__chip--static { cursor: default; }
+/* 强制档静态 chip：中和 hover（与非 hover 同），保持不可交互观感。 */
+.composer-footer .think-depth__chip--static:hover {
+  border-color: var(--border);
+  color: var(--text-3);
+  background-color: transparent;
+}
+.think-depth__chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 弹窗：贴 chip 上方（复用 ctx-popover / workspace-menu 的圆角 + 阴影 + 边框）。 */
+.think-depth__pop {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  z-index: 61;
+  width: 200px;
+  padding: 12px 16px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-pop);
+}
+.think-depth__pop-ends {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10.5px;
+  color: var(--text-3);
+  margin-bottom: 7px;
+}
+/* 渐变滑轨（弹层内，较宽）。 */
+.think-depth__track {
+  position: relative;
+  height: 16px;            /* 命中区放大；视觉轨道用 ::before */
+  display: flex;
+  align-items: center;
+  margin: 0 7px;
+  cursor: pointer;
+  touch-action: none;       /* 触屏拖拽不被滚动吞掉 */
+  outline: none;
+}
+.think-depth__track::before {            /* 渐变底轨：更快(中性) → 更聪明(品牌色) */
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--border-strong), var(--brand));
+}
+.think-depth__thumb {
+  position: absolute;
+  top: 50%;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--brand);
+  transform: translate(-50%, -50%);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .2);
+  transition: left .14s ease, transform .1s, border-width .1s;
+}
+.think-depth__track:hover .think-depth__thumb { transform: translate(-50%, -50%) scale(1.1); }
+.think-depth__track:focus-visible .think-depth__thumb {
+  transform: translate(-50%, -50%) scale(1.18);
+  border-width: 3px;
 }
 
 /* ── 跳到最新浮动按钮（Plan20 🟠4）── */

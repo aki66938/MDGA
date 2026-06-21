@@ -189,7 +189,7 @@ pub(crate) async fn capture_official_pricing(
     // 4) LLM 抽（I/O）：一次性非流式 chat 完成（复用 deepseek-client，OpenAI 兼容）。
     let prompt = build_extraction_prompt(&cleaned, source.currency, source.lang);
     let messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
-    let llm_text = match chat_completion(&main_base, &main_key, messages, &main_model, None).await {
+    let llm_text = match chat_completion(&main_base, &main_key, messages, &main_model, None, None).await {
         Ok(r) => r.content.unwrap_or_default(),
         Err(e) => return Ok(CaptureResult::failed(format!("LLM 抽取失败：{e}"))),
     };

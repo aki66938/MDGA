@@ -27,7 +27,7 @@ pub(crate) async fn chat_completion_with_retry(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match chat_completion(base_url, api_key, messages.clone(), model, tools.clone()).await {
+        match chat_completion(base_url, api_key, messages.clone(), model, tools.clone(), None).await {
             Ok(result) => return Ok(result),
             Err(err) if err.is_retryable() && attempt < MAX_ATTEMPTS => {
                 let delay_ms = 500u64 * 2u64.pow(attempt - 1);
@@ -69,12 +69,15 @@ pub(crate) async fn wait_for_cancel(cancel: &Arc<AtomicBool>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_round_with_retry(
     base_url: &str,
     api_key: &str,
     messages: Vec<serde_json::Value>,
     model: &str,
     tools: Vec<serde_json::Value>,
+    // 思考深度（B-4）：方言相关思考字段，透传给 chat_stream_with_tools 注入请求体（None 时不注入）。
+    thinking_extra: Option<&serde_json::Value>,
     app: &AppHandle,
     cancel: &Arc<AtomicBool>,
 ) -> Result<mdga_deepseek_client::ChatCompletionResult, String> {
@@ -100,6 +103,7 @@ pub(crate) async fn stream_round_with_retry(
                 messages.clone(),
                 &model,
                 tools.clone(),
+                thinking_extra,
                 move |chunk| {
                     // Plan27 C1（#1a）：正文增量走 "chat-chunk"，推理过程增量走 "chat-reasoning"。
                     emitted_cb.store(true, Ordering::SeqCst);
@@ -156,8 +160,25 @@ pub(crate) fn recover_tool_calls_from_content(content: &str) -> Vec<ToolCall> {
 
 pub(crate) fn assistant_message_for_tool_calls(
     assistant_message: serde_json::Value,
+    // 思考深度（C）：本轮 reasoning_content（仅当上层 echo 策略为 Resend 时才传 Some）。
+    // 非空时嵌进返回的 assistant JSON（满足部分模型「多轮工具须回传 reasoning」契约）；
+    // None / 空时不加任何字段，保持原有行为。
+    reasoning_content: Option<&str>,
     tool_calls: &[ToolCall],
 ) -> serde_json::Value {
+    // 思考深度（C）：把非空 reasoning 嵌进给定的 assistant JSON 对象（只附加字段，不动 tool_calls 规整逻辑）。
+    fn with_reasoning(mut msg: serde_json::Value, reasoning: Option<&str>) -> serde_json::Value {
+        if let (Some(rc), Some(map)) = (reasoning, msg.as_object_mut()) {
+            if !rc.is_empty() {
+                map.insert(
+                    "reasoning_content".to_string(),
+                    serde_json::Value::String(rc.to_string()),
+                );
+            }
+        }
+        msg
+    }
+
     // 0.0.69 修正:早返条件须是「存在且**非空**」的 tool_calls。流式客户端恒写 `"tool_calls": []`(即便
     // 为空),旧版 `.is_some()` 对空数组也命中早返,致 DSML/正文兜底恢复出的 tool_calls **没挂回** assistant
     // ——wire 出现无配对 tool_call_id 的 tool 消息(撞 Anthropic/OpenAI 400),还被快照持久化、续接每轮重放
@@ -167,14 +188,17 @@ pub(crate) fn assistant_message_for_tool_calls(
         .and_then(|calls| calls.as_array())
         .is_some_and(|calls| !calls.is_empty())
     {
-        return assistant_message;
+        return with_reasoning(assistant_message, reasoning_content);
     }
 
-    serde_json::json!({
-        "role": "assistant",
-        "content": null,
-        "tool_calls": tool_calls
-    })
+    with_reasoning(
+        serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": tool_calls
+        }),
+        reasoning_content,
+    )
 }
 
 pub(crate) fn chat_messages_to_wire(messages: Vec<ChatMessage>) -> Vec<serde_json::Value> {
@@ -211,7 +235,7 @@ mod tests {
         // calls 丢失,wire 出现无配对 tool_call_id 撞 400。现应把恢复出的 calls 挂回重建的 assistant。
         let native_empty =
             serde_json::json!({"role":"assistant","content":"<ToolCall>...","tool_calls":[]});
-        let out = assistant_message_for_tool_calls(native_empty, &[tc("dsml_call_0")]);
+        let out = assistant_message_for_tool_calls(native_empty, None, &[tc("dsml_call_0")]);
         let calls = out
             .get("tool_calls")
             .and_then(|c| c.as_array())
@@ -225,7 +249,28 @@ mod tests {
         // 模型真给了原生 tool_calls:原样返回,不被恢复值覆盖。
         let native = serde_json::json!({"role":"assistant","content":null,
             "tool_calls":[{"id":"native_0","type":"function","function":{"name":"read_file","arguments":"{}"}}]});
-        let out = assistant_message_for_tool_calls(native, &[tc("should_not_use")]);
+        let out = assistant_message_for_tool_calls(native, None, &[tc("should_not_use")]);
         assert_eq!(out["tool_calls"].as_array().unwrap()[0]["id"], "native_0");
+    }
+
+    #[test]
+    fn reasoning_embedded_when_resend() {
+        // 思考深度（C）：echo=Resend 时传 Some(reasoning)，应嵌进 assistant JSON。
+        let native = serde_json::json!({"role":"assistant","content":null,
+            "tool_calls":[{"id":"n0","type":"function","function":{"name":"read_file","arguments":"{}"}}]});
+        let out = assistant_message_for_tool_calls(native, Some("我的思考过程"), &[tc("x")]);
+        assert_eq!(out["reasoning_content"], "我的思考过程");
+        // tool_calls 规整逻辑不受影响。
+        assert_eq!(out["tool_calls"].as_array().unwrap()[0]["id"], "n0");
+    }
+
+    #[test]
+    fn reasoning_omitted_when_none_or_empty() {
+        // None / 空串都不应加 reasoning_content 字段（保持原行为）。
+        let native = serde_json::json!({"role":"assistant","content":"<ToolCall>...","tool_calls":[]});
+        let out = assistant_message_for_tool_calls(native.clone(), None, &[tc("dsml_call_0")]);
+        assert!(out.get("reasoning_content").is_none());
+        let out2 = assistant_message_for_tool_calls(native, Some(""), &[tc("dsml_call_0")]);
+        assert!(out2.get("reasoning_content").is_none());
     }
 }
