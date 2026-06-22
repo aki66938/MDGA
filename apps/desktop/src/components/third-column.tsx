@@ -1,0 +1,1050 @@
+// 常驻第三栏（停靠式右栏）骨架：折叠/展开两档 + 标签框架（活动 / 变更）。
+//
+// 本期范围（骨架）：布局轨位、折叠交互、标签切换、通知点、变更标签常驻化（复用 ChangesView）。
+// 「活动」标签仅占位——真实活动逻辑（list_bg_activity / 监听 background-task-done 等）由下一个子 agent 接入。
+// 不碰后端、不碰 artifact/思考深度相关代码。
+//
+// 宽度两档：折叠 ~44px 细栏 / 展开 ~340px（见 styles.css 的 .third-col 与 .app-shell 第三轨）。
+// TODO(拖宽)：本期固定两档宽度；后续可加拖拽手柄在展开态自由调宽（CSS 变量 --third-col-w 已预留思路）。
+
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { useEffect, useRef, useState } from "react";
+import {
+  ListChecks, GitCompare, Gauge, ChevronLeft, ChevronRight, Maximize2,
+  Bot, Terminal, Square, Check, CircleDot, ChevronDown, ChevronRight as ChevronRightSm, CheckSquare,
+  FolderTree, Folder, FolderOpen, File as FileIcon, ArrowLeft, LayoutDashboard, X,
+} from "lucide-react";
+import type {
+  FileCheckpoint, FileChange, BgActivityView, TodoItem, UsageSummary, ToolUsageView, ArtifactPart,
+} from "../types";
+import { fmtTokens } from "../utils";
+import { ChangesView } from "./dialogs";
+import { ConversationUsageSummary, DiffBlock } from "./messages";
+import { ArtifactCard } from "./artifact";
+
+export type ThirdColTab = "activity" | "changes" | "usage" | "files" | "artifact";
+
+// 运行时长近似显示：list 不含开始时间，故以「该 id 首次出现」到「now（完成项定格在完成时刻）」计算。
+function fmtDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return `${m}m${rem ? ` ${rem}s` : ""}`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+const ACTIVE_STATUSES = new Set(["done", "killed", "error"]);
+
+// ── 活动标签：顶部 todo/计划进度 + 后台活动列表 ────────────────────────────────
+// 数据源：list_bg_activity(activeConvId) 定时轮询(~2s) + 后台事件即时刷新一次；折叠/非活动标签不渲染（停轮询）。
+// 时长：useRef Map 记每个 id 首次出现时间戳；完成项定格其「最后一次仍 running」附近的时刻（近似）。
+function ActivityPanel({
+  activeConvId,
+  todos,
+}: {
+  activeConvId: string | null;
+  todos: TodoItem[];
+}) {
+  const [items, setItems] = useState<BgActivityView[]>([]);
+  // 展开输出：当前展开的项 key（`${kind}:${id}`）→ 输出文本；null 表示未展开。
+  const [openOutput, setOpenOutput] = useState<Record<string, string | null>>({});
+  // 记每个 id 首次出现时间戳（id→startMs）；完成项定格其完成时刻（id→endMs）。
+  const startRef = useRef<Map<string, number>>(new Map());
+  const endRef = useRef<Map<string, number>>(new Map());
+  // 让运行时长每秒走字：定时 bump 触发重渲染（不依赖轮询）。
+  const [, setTick] = useState(0);
+
+  // 拉一次活动列表，并维护 start/end 时间戳簿。
+  async function refresh() {
+    if (!activeConvId) {
+      setItems([]);
+      return;
+    }
+    const list = await invoke<BgActivityView[]>("list_bg_activity", {
+      conversationId: activeConvId,
+    }).catch(() => [] as BgActivityView[]);
+    const now = Date.now();
+    for (const it of list) {
+      if (!startRef.current.has(it.id)) startRef.current.set(it.id, now);
+      if (ACTIVE_STATUSES.has(it.status)) {
+        // 首次见到完成态时定格完成时刻（后续轮询不再更新）。
+        if (!endRef.current.has(it.id)) endRef.current.set(it.id, now);
+      }
+    }
+    setItems(list);
+  }
+
+  // 切会话即清时间簿与展开态，避免跨会话串味。
+  useEffect(() => {
+    startRef.current.clear();
+    endRef.current.clear();
+    setOpenOutput({});
+    setItems([]);
+    void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConvId]);
+
+  // ~2s 轮询（仅本面板挂载时，即第三栏展开且在活动标签）。
+  useEffect(() => {
+    const id = window.setInterval(() => void refresh(), 2000);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConvId]);
+
+  // 后台事件即时刷新一次（与轮询互补，缩短感知延迟）。
+  useEffect(() => {
+    const names = [
+      "background-task-done",
+      "background-command-done",
+      "command-output",
+      "tool-event",
+    ];
+    const unlistens = names.map((n) => listen(n, () => void refresh()));
+    return () => {
+      for (const u of unlistens) u.then((fn) => fn());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConvId]);
+
+  // 有运行中项时每秒走字（运行时长）。
+  useEffect(() => {
+    if (!items.some((it) => it.status === "running")) return;
+    const id = window.setInterval(() => setTick((t) => t + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [items]);
+
+  async function handleKill(it: BgActivityView) {
+    await invoke("kill_bg_activity", { id: it.id, kind: it.kind }).catch(() => {});
+    void refresh();
+  }
+
+  async function toggleOutput(it: BgActivityView) {
+    const key = `${it.kind}:${it.id}`;
+    if (key in openOutput) {
+      // 已展开 → 收起。
+      setOpenOutput((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      return;
+    }
+    setOpenOutput((prev) => ({ ...prev, [key]: null })); // null = 加载中
+    const out = await invoke<string | null>("get_bg_activity_output", {
+      id: it.id,
+      kind: it.kind,
+    }).catch(() => null);
+    setOpenOutput((prev) => ({ ...prev, [key]: out ?? "" }));
+  }
+
+  function durationFor(it: BgActivityView): string {
+    const start = startRef.current.get(it.id);
+    if (start == null) return "";
+    const end = ACTIVE_STATUSES.has(it.status) ? endRef.current.get(it.id) ?? Date.now() : Date.now();
+    return fmtDuration(end - start);
+  }
+
+  // 运行中置顶、完成项置底（弱化）。
+  const running = items.filter((it) => it.status === "running");
+  const finished = items.filter((it) => it.status !== "running");
+  const ordered = [...running, ...finished];
+
+  const todoDone = todos.filter((t) => t.status === "done").length;
+
+  return (
+    <div className="third-col__activity">
+      {/* 1) todo/计划进度小区块（无 todo 则整块隐藏，不硬造）。 */}
+      {todos.length > 0 && (
+        <div className="activity-todo">
+          <div className="activity-todo__head">任务清单 {todoDone}/{todos.length}</div>
+          <div className="activity-todo__items">
+            {todos.slice(0, 5).map((t, i) => (
+              <div key={i} className={`activity-todo__item activity-todo__item--${t.status}`}>
+                {t.status === "done" ? <CheckSquare size={13} />
+                  : t.status === "in_progress" ? <CircleDot size={13} />
+                  : <Square size={13} />}
+                <span>{t.text}</span>
+              </div>
+            ))}
+            {todos.length > 5 && (
+              <div className="activity-todo__more">还有 {todos.length - 5} 项…</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 2) 后台活动列表。 */}
+      <div className="activity-list">
+        {ordered.length === 0 ? (
+          <div className="activity-empty">暂无后台活动</div>
+        ) : (
+          ordered.map((it) => {
+            const key = `${it.kind}:${it.id}`;
+            const outOpen = key in openOutput;
+            const out = openOutput[key];
+            const KindIcon = it.kind === "subagent" ? Bot : Terminal;
+            return (
+              <div
+                key={key}
+                className={`activity-item activity-item--${it.status}${it.status !== "running" ? " activity-item--finished" : ""}`}
+              >
+                <div className="activity-item__row">
+                  <span className={`activity-item__status activity-item__status--${it.status}`} aria-hidden="true">
+                    {it.status === "running" ? <span className="activity-item__dot" />
+                      : it.status === "done" ? <Check size={13} />
+                      : <span className="activity-item__x">×</span>}
+                  </span>
+                  <KindIcon size={13} className="activity-item__kind" aria-hidden="true" />
+                  <button
+                    className="activity-item__label"
+                    type="button"
+                    onClick={() => void toggleOutput(it)}
+                    title="展开输出"
+                  >
+                    <span className="activity-item__text">{it.label}</span>
+                    <ChevronDown
+                      size={12}
+                      className={`activity-item__caret${outOpen ? " is-open" : ""}`}
+                      aria-hidden="true"
+                    />
+                  </button>
+                  <span className="activity-item__dur">{durationFor(it)}</span>
+                  {it.status === "running" && (
+                    <button
+                      className="icon-btn activity-item__kill"
+                      type="button"
+                      title="停止"
+                      aria-label="停止后台活动"
+                      onClick={() => void handleKill(it)}
+                    >
+                      <Square size={13} />
+                    </button>
+                  )}
+                </div>
+                {outOpen && (
+                  <pre className="activity-item__output">
+                    {out === null ? "加载中…" : out.trim().length > 0 ? out : "（暂无输出）"}
+                  </pre>
+                )}
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── 第三栏·变更标签上半段：本会话文件累计改动 ──────────────────────────────────
+// 数据源：App 从消息流里已有的 diff 卡聚合出的 fileChanges（ToolPart 的 diff/added/removed 按文件路径聚合），
+// 与下半段「检查点时间线」（ChangesView，回退用）分工：上=看改了什么，下=回退到哪。
+// 行内 diff 展开复用 messages.tsx 的 DiffBlock（unified diff 高亮），不复制一份高亮逻辑。
+// 列表为空（本会话无文件改动）则整段不渲染，只留时间线。
+function FileChangesSection({ fileChanges }: { fileChanges: FileChange[] }) {
+  // 当前展开行内 diff 的文件路径（key=path）。
+  const [openPaths, setOpenPaths] = useState<Record<string, boolean>>({});
+  if (fileChanges.length === 0) return null;
+
+  const totalAdded = fileChanges.reduce((s, f) => s + f.added, 0);
+  const totalRemoved = fileChanges.reduce((s, f) => s + f.removed, 0);
+
+  return (
+    <div className="file-changes">
+      <div className="file-changes__summary" aria-label="文件累计改动摘要">
+        <span className="file-changes__count">{fileChanges.length} 个文件</span>
+        <span className="file-changes__stats">
+          <span className="diff-added">+{totalAdded}</span>
+          {" "}
+          <span className="diff-removed">−{totalRemoved}</span>
+        </span>
+      </div>
+      <div className="file-changes__list">
+        {fileChanges.map((f) => {
+          const isOpen = !!openPaths[f.path];
+          const canExpand = f.diffs.length > 0;
+          return (
+            <div
+              key={f.path}
+              className={`file-change-row${f.reverted ? " file-change-row--reverted" : ""}`}
+            >
+              <button
+                className="file-change-row__head"
+                type="button"
+                aria-expanded={isOpen}
+                disabled={!canExpand}
+                title={canExpand ? "展开行内 diff" : f.path}
+                onClick={
+                  canExpand
+                    ? () => setOpenPaths((prev) => ({ ...prev, [f.path]: !prev[f.path] }))
+                    : undefined
+                }
+              >
+                <span className="file-change-row__caret" aria-hidden="true">
+                  {canExpand ? (isOpen ? <ChevronDown size={12} /> : <ChevronRightSm size={12} />) : null}
+                </span>
+                <span className="file-change-row__path" title={f.path}>{f.path}</span>
+                {f.reverted && <span className="file-change-row__reverted">已回退</span>}
+                <span className="file-change-row__stats">
+                  {f.added ? <span className="diff-added">+{f.added}</span> : null}
+                  {f.added && f.removed ? " " : null}
+                  {f.removed ? <span className="diff-removed">−{f.removed}</span> : null}
+                </span>
+              </button>
+              {isOpen && canExpand && (
+                <div className="file-change-row__diffs">
+                  {f.diffs.map((d, i) => (
+                    <DiffBlock key={i} diff={d} />
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── 第三栏·用量标签：上下文环 + 本会话真账单 + 按工具活动量（近似，非账单）──────────
+// 三段数据源全部复用，纯前端、不碰后端账单：
+//   1) 上下文环：复用 App 的 ctxUsage（promptTokens / softLimit）。softLimit 为 null 只显 token、不显百分比。
+//   2) 本会话用量：复用 <ConversationUsageSummary>（aggregateUsage 求和 + aggregateCost 真账单按币种）。
+//   3) 按工具活动：拉 get_tool_usage(activeConvId)，条形列表显「调用次数 / 输出体积」——**上下文贡献近似、非账单**。
+// 刷新：本面板挂载时（即第三栏展开且在用量标签）拉一次 + 监听 tool-event 节流(~800ms)重拉；折叠/非本标签不挂载即不拉。
+function UsagePanel({
+  activeConvId,
+  ctxUsage,
+  conversationUsage,
+  turnUsages,
+}: {
+  activeConvId: string | null;
+  ctxUsage: { promptTokens: number; softLimit: number | null } | null;
+  conversationUsage: UsageSummary | null;
+  turnUsages: UsageSummary[];
+}) {
+  const [toolUsage, setToolUsage] = useState<ToolUsageView[]>([]);
+  // tool-event 节流：避免一连串工具事件高频拉取；尾沿落地一次（工具结束才变值）。
+  const throttleRef = useRef<number | null>(null);
+
+  async function refresh() {
+    if (!activeConvId) {
+      setToolUsage([]);
+      return;
+    }
+    const list = await invoke<ToolUsageView[]>("get_tool_usage", {
+      conversationId: activeConvId,
+    }).catch(() => [] as ToolUsageView[]);
+    setToolUsage(list);
+  }
+
+  // 挂载 / 切会话即拉一次（折叠或非本标签时本组件不挂载，自然不拉）。
+  useEffect(() => {
+    void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConvId]);
+
+  // 监听 tool-event 节流重拉（尾沿 ~800ms）；卸载清定时器与监听。
+  useEffect(() => {
+    const schedule = () => {
+      if (throttleRef.current != null) return;
+      throttleRef.current = window.setTimeout(() => {
+        throttleRef.current = null;
+        void refresh();
+      }, 800);
+    };
+    const un = listen("tool-event", schedule);
+    return () => {
+      if (throttleRef.current != null) {
+        window.clearTimeout(throttleRef.current);
+        throttleRef.current = null;
+      }
+      un.then((fn) => fn());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConvId]);
+
+  // 上下文环：百分比仅在 softLimit 非空时算（别硬造）。
+  const ctxPct =
+    ctxUsage && ctxUsage.softLimit != null && ctxUsage.softLimit > 0
+      ? Math.min(100, Math.round((ctxUsage.promptTokens / ctxUsage.softLimit) * 100))
+      : null;
+
+  // 按工具活动量条形归一：以最大 outputTokens 为满格（全 0 时退而用 calls 归一）。
+  const maxOut = toolUsage.reduce((m, t) => Math.max(m, t.outputTokens), 0);
+  const maxCalls = toolUsage.reduce((m, t) => Math.max(m, t.calls), 0);
+
+  return (
+    <div className="third-col__usage">
+      {/* 1) 上下文环（复用 ctxUsage）。 */}
+      <div className="usage-section">
+        <div className="usage-section__title">上下文</div>
+        {ctxUsage ? (
+          <div className="usage-ring-row">
+            <div
+              className="usage-ring"
+              style={{
+                background:
+                  ctxPct != null
+                    ? `conic-gradient(var(--brand) ${ctxPct * 3.6}deg, var(--border) 0deg)`
+                    : `conic-gradient(var(--brand) 0deg, var(--border) 0deg)`,
+              }}
+              role="img"
+              aria-label={
+                ctxPct != null
+                  ? `上下文占用 ${ctxPct}%`
+                  : `上下文 ${fmtTokens(ctxUsage.promptTokens)} tokens`
+              }
+            >
+              <div className="usage-ring__hole">
+                <span className="usage-ring__main">
+                  {ctxPct != null ? `${ctxPct}%` : fmtTokens(ctxUsage.promptTokens)}
+                </span>
+                <span className="usage-ring__sub">上下文</span>
+              </div>
+            </div>
+            <div className="usage-ring-meta">
+              <div className="usage-ring-meta__nums">
+                {ctxUsage.promptTokens.toLocaleString()}
+                {ctxUsage.softLimit != null && (
+                  <>
+                    {" / "}
+                    {ctxUsage.softLimit.toLocaleString()}
+                  </>
+                )}
+                {" tokens"}
+              </div>
+              <div className="usage-ring-meta__hint">
+                {ctxUsage.softLimit != null
+                  ? "上次请求占主模型上下文窗口的比例"
+                  : "上次请求 prompt token 数（主模型未填上下文窗口，不显百分比）"}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="usage-empty">暂无上下文数据（发送一轮后显示）</div>
+        )}
+      </div>
+
+      {/* 2) 本会话用量（真账单，复用 ConversationUsageSummary）。 */}
+      <div className="usage-section">
+        <div className="usage-section__title">本会话用量</div>
+        {conversationUsage ? (
+          <ConversationUsageSummary aggregated={conversationUsage} usages={turnUsages} />
+        ) : (
+          <div className="usage-empty">本会话暂无用量记录</div>
+        )}
+      </div>
+
+      {/* 3) 按工具活动量（近似、非账单）。 */}
+      <div className="usage-section">
+        <div className="usage-section__title">
+          按工具：调用次数 / 输出体积
+          <span className="usage-section__note">（上下文贡献近似，非账单）</span>
+        </div>
+        {toolUsage.length === 0 ? (
+          <div className="usage-empty">本会话暂无工具调用</div>
+        ) : (
+          <div className="usage-tools">
+            {toolUsage.map((t) => {
+              const isSub = t.toolName.startsWith("sub:");
+              const name = isSub ? t.toolName.slice(4) : t.toolName;
+              const pct =
+                maxOut > 0
+                  ? (t.outputTokens / maxOut) * 100
+                  : maxCalls > 0
+                  ? (t.calls / maxCalls) * 100
+                  : 0;
+              return (
+                <div className="usage-tool" key={t.toolName}>
+                  <div className="usage-tool__head">
+                    <span className="usage-tool__name" title={t.toolName}>
+                      {name}
+                      {isSub && <span className="usage-tool__sub">子代理</span>}
+                    </span>
+                    <span className="usage-tool__nums">
+                      {t.calls} 次 · {fmtTokens(t.outputTokens)}
+                    </span>
+                  </div>
+                  <div className="usage-tool__bar" aria-hidden="true">
+                    <span className="usage-tool__fill" style={{ width: `${pct}%` }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── 第三栏·文件标签：只读工作区文件树 + 单窗格文件查看 ───────────────────────────
+// 数据源（只读、复用已就绪后端命令，不碰后端）：
+//   list_workspace_dir(conv, relPath) -> {name,isDir}[]（""=根；惰性一层；目录在前名称升序；已过滤 .git/node_modules）
+//   read_workspace_file(conv, relPath) -> string（只读、≤512KB，超限/二进制 Err）
+// 状态：树态（默认，可展开/收起文件夹，惰性拉子层并缓存）/ 查看态（单窗格内打开一个文件，返回回树）。
+// agent 改过高亮：fileChanges 里的路径集合，命中的树节点加品牌色点。
+// 加载策略：仅本标签挂载时（第三栏展开且 tab==="files"）才拉；切会话时由 key 重挂载，缓存与查看态自然清。
+type DirEntry = { name: string; isDir: boolean };
+
+function FilesPanel({
+  activeConvId,
+  fileChanges,
+}: {
+  activeConvId: string | null;
+  fileChanges: FileChange[];
+}) {
+  // 已拉取的目录层缓存：relPath（""=根）→ 该层条目；未拉取的键不存在。
+  const [dirCache, setDirCache] = useState<Record<string, DirEntry[]>>({});
+  // 正在加载中的目录 relPath 集合（占位文案 + 防重复并发拉取）。
+  const [loadingDirs, setLoadingDirs] = useState<Record<string, boolean>>({});
+  // 拉取出错的目录 relPath → 错误文案。
+  const [dirErrors, setDirErrors] = useState<Record<string, string>>({});
+  // 已展开的文件夹 relPath 集合。
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  // 查看态：选中文件 relPath（null=树态）+ 内容 + 加载/错误。
+  const [viewPath, setViewPath] = useState<string | null>(null);
+  const [viewContent, setViewContent] = useState<string | null>(null);
+  const [viewLoading, setViewLoading] = useState(false);
+  const [viewError, setViewError] = useState<string | null>(null);
+
+  // agent 改过的文件路径集合（用 fileChanges 的 path，与 list_workspace_dir 返回的工作区相对路径口径一致）。
+  // 统一分隔符为 "/" 以容忍后端可能的反斜杠路径。
+  const changedSet = (() => {
+    const s = new Set<string>();
+    for (const f of fileChanges) {
+      if (f.path && f.path !== "(未知文件)") s.add(f.path.replace(/\\/g, "/"));
+    }
+    return s;
+  })();
+
+  // 拉取某一层目录（已缓存 / 加载中则跳过）。relPath ""=根。
+  async function loadDir(relPath: string) {
+    if (dirCache[relPath] || loadingDirs[relPath]) return;
+    setLoadingDirs((p) => ({ ...p, [relPath]: true }));
+    setDirErrors((p) => { const n = { ...p }; delete n[relPath]; return n; });
+    try {
+      const list = await invoke<DirEntry[]>("list_workspace_dir", {
+        conversationId: activeConvId,
+        relPath,
+      });
+      setDirCache((p) => ({ ...p, [relPath]: Array.isArray(list) ? list : [] }));
+    } catch (err) {
+      setDirErrors((p) => ({ ...p, [relPath]: humanizeFsError(String(err)) }));
+    } finally {
+      setLoadingDirs((p) => { const n = { ...p }; delete n[relPath]; return n; });
+    }
+  }
+
+  // 挂载（即切到本标签 / 切会话重挂载）时拉根层一次。
+  useEffect(() => {
+    void loadDir("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function toggleDir(relPath: string) {
+    const willOpen = !expanded[relPath];
+    setExpanded((p) => ({ ...p, [relPath]: willOpen }));
+    if (willOpen) void loadDir(relPath); // 惰性：首次展开才拉子层
+  }
+
+  async function openFile(relPath: string) {
+    setViewPath(relPath);
+    setViewContent(null);
+    setViewError(null);
+    setViewLoading(true);
+    try {
+      const text = await invoke<string>("read_workspace_file", {
+        conversationId: activeConvId,
+        relPath,
+      });
+      setViewContent(text);
+    } catch {
+      // 后端对过大/二进制/越界统一返回 Err；给友好提示，不暴露原始错误细节。
+      setViewError("无法预览（文件过大、二进制或不可读）");
+    } finally {
+      setViewLoading(false);
+    }
+  }
+
+  function backToTree() {
+    setViewPath(null);
+    setViewContent(null);
+    setViewError(null);
+  }
+
+  // 查看态：单窗格内显示返回按钮 + 路径 + 只读内容。
+  if (viewPath !== null) {
+    return (
+      <div className="files-panel files-panel--view">
+        <div className="files-view__head">
+          <button
+            className="icon-btn files-view__back"
+            type="button"
+            title="返回文件树"
+            aria-label="返回文件树"
+            onClick={backToTree}
+          >
+            <ArrowLeft size={15} />
+          </button>
+          <span className="files-view__path" title={viewPath}>{viewPath}</span>
+        </div>
+        {viewLoading ? (
+          <div className="files-empty">加载中…</div>
+        ) : viewError ? (
+          <div className="files-empty">{viewError}</div>
+        ) : (
+          <pre className="files-view__content">{viewContent ?? ""}</pre>
+        )}
+      </div>
+    );
+  }
+
+  // 树态：递归渲染目录层。根层 relPath="".
+  const rootEntries = dirCache[""];
+  const rootLoading = loadingDirs[""];
+  const rootError = dirErrors[""];
+
+  return (
+    <div className="files-panel">
+      {rootError ? (
+        <div className="files-empty">{rootError}</div>
+      ) : rootLoading && !rootEntries ? (
+        <div className="files-empty">加载中…</div>
+      ) : rootEntries && rootEntries.length === 0 ? (
+        <div className="files-empty">工作区为空</div>
+      ) : rootEntries ? (
+        <div className="files-tree" role="tree">
+          {rootEntries.map((e) => (
+            <FileNode
+              key={e.name}
+              entry={e}
+              relPath={e.name}
+              depth={0}
+              dirCache={dirCache}
+              loadingDirs={loadingDirs}
+              dirErrors={dirErrors}
+              expanded={expanded}
+              changedSet={changedSet}
+              onToggleDir={toggleDir}
+              onOpenFile={openFile}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="files-empty">加载中…</div>
+      )}
+    </div>
+  );
+}
+
+// 单个树节点（目录可展开/收起惰性拉子层；文件可点开查看）。缩进按 depth 表层级。
+function FileNode({
+  entry,
+  relPath,
+  depth,
+  dirCache,
+  loadingDirs,
+  dirErrors,
+  expanded,
+  changedSet,
+  onToggleDir,
+  onOpenFile,
+}: {
+  entry: DirEntry;
+  relPath: string;
+  depth: number;
+  dirCache: Record<string, DirEntry[]>;
+  loadingDirs: Record<string, boolean>;
+  dirErrors: Record<string, string>;
+  expanded: Record<string, boolean>;
+  changedSet: Set<string>;
+  onToggleDir: (relPath: string) => void;
+  onOpenFile: (relPath: string) => void;
+}) {
+  const isOpen = !!expanded[relPath];
+  const changed = changedSet.has(relPath.replace(/\\/g, "/"));
+  const indent = { paddingLeft: `${6 + depth * 14}px` };
+
+  if (!entry.isDir) {
+    return (
+      <button
+        type="button"
+        className={`file-node file-node--file${changed ? " file-node--changed" : ""}`}
+        style={indent}
+        title={relPath}
+        onClick={() => onOpenFile(relPath)}
+      >
+        <span className="file-node__caret" aria-hidden="true" />
+        <FileIcon size={14} className="file-node__icon" aria-hidden="true" />
+        <span className="file-node__name">{entry.name}</span>
+        {changed && <span className="file-node__dot" aria-hidden="true" />}
+      </button>
+    );
+  }
+
+  const children = dirCache[relPath];
+  const loading = loadingDirs[relPath];
+  const err = dirErrors[relPath];
+  return (
+    <>
+      <button
+        type="button"
+        className={`file-node file-node--dir${changed ? " file-node--changed" : ""}`}
+        style={indent}
+        aria-expanded={isOpen}
+        title={relPath}
+        onClick={() => onToggleDir(relPath)}
+      >
+        <span className="file-node__caret" aria-hidden="true">
+          {isOpen ? <ChevronDown size={12} /> : <ChevronRightSm size={12} />}
+        </span>
+        {isOpen ? <FolderOpen size={14} className="file-node__icon" aria-hidden="true" />
+          : <Folder size={14} className="file-node__icon" aria-hidden="true" />}
+        <span className="file-node__name">{entry.name}</span>
+        {changed && <span className="file-node__dot" aria-hidden="true" />}
+      </button>
+      {isOpen && (
+        err ? (
+          <div className="files-empty files-empty--nested" style={{ paddingLeft: `${6 + (depth + 1) * 14}px` }}>{err}</div>
+        ) : loading && !children ? (
+          <div className="files-empty files-empty--nested" style={{ paddingLeft: `${6 + (depth + 1) * 14}px` }}>加载中…</div>
+        ) : children && children.length === 0 ? (
+          <div className="files-empty files-empty--nested" style={{ paddingLeft: `${6 + (depth + 1) * 14}px` }}>空目录</div>
+        ) : children ? (
+          children.map((c) => (
+            <FileNode
+              key={c.name}
+              entry={c}
+              relPath={`${relPath}/${c.name}`}
+              depth={depth + 1}
+              dirCache={dirCache}
+              loadingDirs={loadingDirs}
+              dirErrors={dirErrors}
+              expanded={expanded}
+              changedSet={changedSet}
+              onToggleDir={onToggleDir}
+              onOpenFile={onOpenFile}
+            />
+          ))
+        ) : null
+      )}
+    </>
+  );
+}
+
+// 文件系统错误友好化（目录拉取失败：无工作区 / 越界 / 不存在等统一兜底）。
+function humanizeFsError(_raw: string): string {
+  return "无法读取目录";
+}
+
+export function ThirdColumn({
+  open,
+  tab,
+  width,
+  onResize,
+  onToggleOpen,
+  onSelectTab,
+  // 变更标签数据 + 行为（复用 App 现有 checkpoints / handleRevert / setShowChanges）
+  checkpoints,
+  fileChanges,
+  onRevert,
+  onOpenFullChanges,
+  // 通知点：有后台活动 或 有未回退检查点时，折叠态细栏顶部亮品牌色小圆点。
+  hasActivityDot,
+  hasChangesDot,
+  // 文件标签可见性：当前会话是否绑定工作区（纯聊天会话隐藏文件标签）。
+  hasWorkspace,
+  // 活动标签数据：当前会话 + Agent todo 清单（计划进度小区块复用）。
+  activeConvId,
+  todos,
+  // 用量标签数据（全部复用 App 现有聚合，不碰后端账单）：上下文占用 + 会话累计 + 各轮原始用量。
+  ctxUsage,
+  conversationUsage,
+  turnUsages,
+  // 「产物」坞（0.0.75）：停靠的互动卡片（null＝无停靠产物，「产物」标签隐藏）；解除停靠回调；
+  // 透传给复用的 ArtifactCard 的 sendPrompt/toast（同中栏，安全模型一致）。
+  dockedArtifact,
+  onUndockArtifact,
+  onArtifactSendPrompt,
+  pushToast,
+}: {
+  open: boolean;
+  tab: ThirdColTab;
+  // 展开态宽度（px，已 clamp）+ 拖拽改宽回调（折叠态不用）。
+  width: number;
+  onResize: (next: number) => void;
+  onToggleOpen: (next: boolean) => void;
+  onSelectTab: (tab: ThirdColTab) => void;
+  checkpoints: FileCheckpoint[];
+  fileChanges: FileChange[];
+  onRevert: (id: string) => void;
+  onOpenFullChanges: () => void;
+  hasActivityDot: boolean;
+  hasChangesDot: boolean;
+  hasWorkspace: boolean;
+  activeConvId: string | null;
+  todos: TodoItem[];
+  ctxUsage: { promptTokens: number; softLimit: number | null } | null;
+  conversationUsage: UsageSummary | null;
+  turnUsages: UsageSummary[];
+  dockedArtifact: ArtifactPart | null;
+  onUndockArtifact: () => void;
+  onArtifactSendPrompt?: (text: string) => void;
+  pushToast?: (kind: "error" | "info", text: string) => void;
+}) {
+  // 拖拽改宽：pointerdown 起捕获指针，move 时按「左移变宽」换算（左边缘手柄，向左拖 = 加宽）。
+  // 与思考深度滑轨同款：setPointerCapture + 拖动期间监听本元素 pointermove，抬起释放。手感不依赖全局监听。
+  const resizeStartRef = useRef<{ x: number; w: number } | null>(null);
+  function onResizerDown(e: React.PointerEvent<HTMLDivElement>) {
+    e.preventDefault();
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    resizeStartRef.current = { x: e.clientX, w: width };
+  }
+  function onResizerMove(e: React.PointerEvent<HTMLDivElement>) {
+    const start = resizeStartRef.current;
+    if (!start) return;
+    // 第三栏在右侧，手柄在其左边缘：指针向左移（clientX 变小）应加宽 → delta 取反。
+    onResize(start.w + (start.x - e.clientX));
+  }
+  function onResizerUp(e: React.PointerEvent<HTMLDivElement>) {
+    resizeStartRef.current = null;
+    try { (e.target as HTMLElement).releasePointerCapture(e.pointerId); } catch { /* 已释放则忽略 */ }
+  }
+
+  // 折叠态：竖排图标条。点图标 = 展开并切到该标签。
+  if (!open) {
+    const anyDot = hasActivityDot || hasChangesDot;
+    return (
+      <aside className="third-col third-col--collapsed" aria-label="活动与变更（已折叠）">
+        {/* 顶部通知点：有后台活动或有未回退检查点时亮（折叠态必显）。 */}
+        {anyDot && <span className="third-col__dot third-col__dot--rail" aria-hidden="true" />}
+        <button
+          className="third-col__rail-btn icon-btn"
+          type="button"
+          title="展开"
+          aria-label="展开第三栏"
+          onClick={() => onToggleOpen(true)}
+        >
+          <ChevronLeft size={16} />
+        </button>
+        <button
+          className={`third-col__rail-btn icon-btn${tab === "activity" ? " is-active" : ""}`}
+          type="button"
+          title="活动"
+          aria-label="活动"
+          onClick={() => { onSelectTab("activity"); onToggleOpen(true); }}
+        >
+          <ListChecks size={16} />
+          {hasActivityDot && <span className="third-col__dot third-col__dot--badge" aria-hidden="true" />}
+        </button>
+        <button
+          className={`third-col__rail-btn icon-btn${tab === "changes" ? " is-active" : ""}`}
+          type="button"
+          title="变更"
+          aria-label="变更"
+          onClick={() => { onSelectTab("changes"); onToggleOpen(true); }}
+        >
+          <GitCompare size={16} />
+          {hasChangesDot && <span className="third-col__dot third-col__dot--badge" aria-hidden="true" />}
+        </button>
+        {/* 用量：折叠 rail 直达；用量无通知点（不需要 dot）。 */}
+        <button
+          className={`third-col__rail-btn icon-btn${tab === "usage" ? " is-active" : ""}`}
+          type="button"
+          title="用量"
+          aria-label="用量"
+          onClick={() => { onSelectTab("usage"); onToggleOpen(true); }}
+        >
+          <Gauge size={16} />
+        </button>
+        {/* 文件：仅当前会话绑定工作区时显（纯聊天会话隐藏）。无通知点。 */}
+        {hasWorkspace && (
+          <button
+            className={`third-col__rail-btn icon-btn${tab === "files" ? " is-active" : ""}`}
+            type="button"
+            title="文件"
+            aria-label="文件"
+            onClick={() => { onSelectTab("files"); onToggleOpen(true); }}
+          >
+            <FolderTree size={16} />
+          </button>
+        )}
+        {/* 产物：仅当有停靠的互动卡片时显（0.0.75）。无通知点。 */}
+        {dockedArtifact && (
+          <button
+            className={`third-col__rail-btn icon-btn${tab === "artifact" ? " is-active" : ""}`}
+            type="button"
+            title="产物"
+            aria-label="产物"
+            onClick={() => { onSelectTab("artifact"); onToggleOpen(true); }}
+          >
+            <LayoutDashboard size={16} />
+          </button>
+        )}
+      </aside>
+    );
+  }
+
+  // 展开态：左边缘拖拽手柄 + 顶部标签条 + 内容区。宽度由 --third-col-w 驱动（clamp 在 App/onResize）。
+  return (
+    <aside
+      className="third-col third-col--expanded"
+      aria-label="活动与变更"
+      style={{ ["--third-col-w" as string]: `${width}px` }}
+    >
+      {/* 左边缘拖拽手柄：pointer 捕获改宽，clamp 在 App/onResize（最小 300，最大动态=窗口宽−侧栏−中栏最小）。折叠态不渲染此节点。 */}
+      <div
+        className="third-col__resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="拖拽调整第三栏宽度"
+        title="拖拽调整宽度"
+        onPointerDown={onResizerDown}
+        onPointerMove={onResizerMove}
+        onPointerUp={onResizerUp}
+        onPointerCancel={onResizerUp}
+      />
+      <div className="third-col__tabs" role="tablist" aria-label="第三栏标签">
+        <button
+          className={`third-col__tab${tab === "activity" ? " is-active" : ""}`}
+          type="button"
+          role="tab"
+          aria-selected={tab === "activity"}
+          title="活动"
+          onClick={() => onSelectTab("activity")}
+        >
+          <ListChecks size={14} />
+          <span>活动</span>
+          {hasActivityDot && <span className="third-col__dot third-col__dot--badge" aria-hidden="true" />}
+        </button>
+        <button
+          className={`third-col__tab${tab === "changes" ? " is-active" : ""}`}
+          type="button"
+          role="tab"
+          aria-selected={tab === "changes"}
+          title="变更"
+          onClick={() => onSelectTab("changes")}
+        >
+          <GitCompare size={14} />
+          <span>变更</span>
+          {hasChangesDot && <span className="third-col__dot third-col__dot--badge" aria-hidden="true" />}
+        </button>
+        <button
+          className={`third-col__tab${tab === "usage" ? " is-active" : ""}`}
+          type="button"
+          role="tab"
+          aria-selected={tab === "usage"}
+          title="用量"
+          onClick={() => onSelectTab("usage")}
+        >
+          <Gauge size={14} />
+          <span>用量</span>
+        </button>
+        {/* 文件标签：仅有工作区时显。 */}
+        {hasWorkspace && (
+          <button
+            className={`third-col__tab${tab === "files" ? " is-active" : ""}`}
+            type="button"
+            role="tab"
+            aria-selected={tab === "files"}
+            title="文件"
+            onClick={() => onSelectTab("files")}
+          >
+            <FolderTree size={14} />
+            <span>文件</span>
+          </button>
+        )}
+        {/* 产物标签：仅有停靠的互动卡片时显（0.0.75）。 */}
+        {dockedArtifact && (
+          <button
+            className={`third-col__tab${tab === "artifact" ? " is-active" : ""}`}
+            type="button"
+            role="tab"
+            aria-selected={tab === "artifact"}
+            title="产物"
+            onClick={() => onSelectTab("artifact")}
+          >
+            <LayoutDashboard size={14} />
+            <span>产物</span>
+          </button>
+        )}
+        <button
+          className="third-col__collapse icon-btn"
+          type="button"
+          title="折叠"
+          aria-label="折叠第三栏"
+          onClick={() => onToggleOpen(false)}
+        >
+          <ChevronRight size={16} />
+        </button>
+      </div>
+
+      <div className="third-col__body">
+        {tab === "activity" ? (
+          // 活动面板：todo/计划进度 + 后台活动列表（自带 ~2s 轮询 + 事件即时刷新，仅本标签挂载时运行）。
+          // key=activeConvId：切会话即重挂载，旧会话在途响应/时间簿随实例销毁，杜绝 stale 覆盖。
+          <ActivityPanel key={activeConvId ?? "none"} activeConvId={activeConvId} todos={todos} />
+        ) : tab === "usage" ? (
+          // 用量面板：上下文环（复用 ctxUsage）+ 本会话真账单（复用 ConversationUsageSummary）
+          // + 按工具活动量（get_tool_usage；明确标注近似、非账单）。仅本标签挂载时拉数据。
+          // key=activeConvId：同上，切会话重挂载防 stale 响应覆盖。
+          <UsagePanel
+            key={activeConvId ?? "none"}
+            activeConvId={activeConvId}
+            ctxUsage={ctxUsage}
+            conversationUsage={conversationUsage}
+            turnUsages={turnUsages}
+          />
+        ) : tab === "files" ? (
+          // 文件面板：只读工作区文件树（树态/查看态单窗格）。key=activeConvId：切会话即重挂载，
+          // 缓存与查看态自然清。仅本标签挂载时拉数据（折叠/非本标签不主动拉）。
+          <FilesPanel key={activeConvId ?? "none"} activeConvId={activeConvId} fileChanges={fileChanges} />
+        ) : tab === "artifact" && dockedArtifact ? (
+          // 产物坞（0.0.75）：复用**同一** ArtifactCard 渲染停靠的互动卡片（同安全模型：sandbox/CSP/探针/
+          // nonce 全在 artifact.tsx，未改一字）。顶部一行标题 + 取消停靠；坞内不传 onDock（已在坞里，不再显停靠按钮）。
+          // 放大/复制/下载仍走 ArtifactCard 自带的。
+          <div className="third-col__artifact">
+            <div className="third-col__panel-head">
+              <span className="third-col__panel-title" title={dockedArtifact.title ?? "互动卡片"}>
+                {dockedArtifact.title ?? "互动卡片"}
+              </span>
+              <button
+                className="icon-btn"
+                type="button"
+                title="取消停靠"
+                aria-label="取消停靠"
+                onClick={onUndockArtifact}
+              >
+                <X size={15} />
+              </button>
+            </div>
+            <ArtifactCard part={dockedArtifact} onSendPrompt={onArtifactSendPrompt} pushToast={pushToast} />
+          </div>
+        ) : (
+          <div className="third-col__changes">
+            <div className="third-col__panel-head">
+              <span className="third-col__panel-title">文件变更</span>
+              <button
+                className="icon-btn"
+                type="button"
+                title="全屏审查"
+                aria-label="全屏审查变更"
+                onClick={onOpenFullChanges}
+              >
+                <Maximize2 size={15} />
+              </button>
+            </div>
+            {/* 上半段：本会话文件累计改动（从消息流 diff 卡聚合；空则不渲染）。看「改了什么」。 */}
+            <FileChangesSection fileChanges={fileChanges} />
+            {/* 下半段：检查点时间线（回退用），与 ChangesModal 共用 ChangesView，不复制两份。看「回退到哪」。 */}
+            <ChangesView checkpoints={checkpoints} onRevert={onRevert} />
+          </div>
+        )}
+      </div>
+    </aside>
+  );
+}

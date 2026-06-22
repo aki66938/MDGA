@@ -1412,6 +1412,101 @@ pub(crate) fn list_workspace_files(
     Ok(mdga_tool_runtime::workspace_file_list(&workspace, 500))
 }
 
+// ── 第三栏·文件标签：只读工作区文件树后端（仅后端，不碰既有工具 / 权限） ────────────
+//
+// 这两个命令服务于右侧「文件标签」面板：惰性逐层列目录 + 点击只读预览文件。它们不属于
+// Agent 工具集、不经工具权限门控（纯 UI 读 API，按命令暴露），但**路径守卫完全复用** Agent
+// 工具同一套 resolve_existing_path（拒 `..` / 绝对路径 / canonicalize + starts_with 兜底 symlink
+// 越界）——见 mdga_tool_runtime::{list_workspace_children, read_workspace_text}，绝不自写弱版校验。
+
+/// 文件树面板节点（惰性一层）。serde camelCase → 前端拿到 { name, isDir }。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DirEntryView {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// 面板读文件上限：512 KiB。超出 → 友好 Err，避免把超大文件拉进前端。
+const PANEL_READ_MAX_BYTES: u64 = 512 * 1024;
+
+/// 文件树面板会跳过的噪声目录（构建产物 / 依赖 / 缓存）；`.git` 与隐藏项另行按前缀跳过。
+/// 与 workspace_map 的忽略口径同源（target/node_modules 等），让面板列表干净、适配大仓。
+const PANEL_IGNORE_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "venv",
+    "__pycache__",
+    "coverage",
+];
+
+/// 取会话工作区根；无工作区（纯聊天会话）→ Err，前端据此隐藏文件标签。
+fn conversation_workspace(state: &State<AppState>, conversation_id: &str) -> Result<String, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    get_conversation(&db, conversation_id)
+        .map_err(|e| e.to_string())?
+        .and_then(|c| c.workspace_path)
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| "该会话未绑定工作区".to_string())
+}
+
+/// 只读：列出工作区内 rel_path（""=根）下的直接子项（惰性一层，前端展开时再拉子层）。
+///
+/// 复用 mdga_tool_runtime::list_workspace_children 的路径守卫（拒越界 / symlink 兜底）；尊重忽略
+/// 规则：跳过 `.git`、隐藏项与噪声目录。排序：目录在前、名称升序。无工作区 → Err（前端隐藏标签）。
+#[tauri::command]
+pub(crate) fn list_workspace_dir(
+    state: State<AppState>,
+    conversation_id: String,
+    rel_path: String,
+) -> Result<Vec<DirEntryView>, String> {
+    let workspace = conversation_workspace(&state, &conversation_id)?;
+    let children = mdga_tool_runtime::list_workspace_children(&workspace, &rel_path)
+        .map_err(|e| e.to_string())?;
+    let mut entries: Vec<DirEntryView> = children
+        .into_iter()
+        .filter(|(name, is_dir)| {
+            // 隐藏项（.git/.idea/.env 等以 . 开头）一律跳过；噪声目录按名跳过。
+            if name.starts_with('.') {
+                return false;
+            }
+            !(*is_dir && PANEL_IGNORE_DIRS.contains(&name.as_str()))
+        })
+        .map(|(name, is_dir)| DirEntryView { name, is_dir })
+        .collect();
+    // 目录在前，再按名称（小写）升序，输出稳定。
+    entries.sort_by(|a, b| {
+        (!a.is_dir, a.name.to_lowercase()).cmp(&(!b.is_dir, b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+/// 只读：读取工作区内某文件文本（面板点击查看）。≤512KiB；超限 / 二进制 / 非 UTF-8 → 友好 Err。
+///
+/// 复用 mdga_tool_runtime::read_workspace_text 的路径守卫与字节上限；无工作区 → Err。
+#[tauri::command]
+pub(crate) fn read_workspace_file(
+    state: State<AppState>,
+    conversation_id: String,
+    rel_path: String,
+) -> Result<String, String> {
+    let workspace = conversation_workspace(&state, &conversation_id)?;
+    mdga_tool_runtime::read_workspace_text(&workspace, &rel_path, PANEL_READ_MAX_BYTES).map_err(|e| {
+        match e {
+            mdga_tool_runtime::ToolRuntimeError::FileTooLarge(_) => {
+                "文件过大（超过 512 KiB），无法在面板预览".to_string()
+            }
+            mdga_tool_runtime::ToolRuntimeError::NonUtf8Text => {
+                "该文件不是 UTF-8 文本（可能是二进制文件），无法预览".to_string()
+            }
+            other => other.to_string(),
+        }
+    })
+}
+
 /// 读取命令沙箱开关状态。
 #[tauri::command]
 pub(crate) fn get_command_sandbox(state: State<AppState>) -> bool {
@@ -2051,6 +2146,185 @@ pub(crate) fn open_external_url(app: AppHandle, url: String) -> Result<(), Strin
     app.opener()
         .open_url(u.to_string(), None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+// ── 常驻活动面板：后台子代理 / 命令的拉取与停止（0.0.75）──────────────────────
+//
+// 把已有的后台子代理（bg_tasks）与后台命令（bg_shells）状态/取消暴露给「常驻第三栏·活动面板」。
+// 这里只补「拉取/停止」三命令，复用 AppState 上的 *_snapshot / set_*_cancel 共享原语
+// （与 agent 工具 execute_bg_task_tool / execute_bg_shell_tool 的 list/kill 同底层逻辑，不复制两份）。
+// 不发新事件：面板复用已有 background-task-done / background-command-done / command-output / tool-event。
+
+/// 后台活动（子代理 / 命令）的前端脱敏视图。
+///
+/// 不泄露 cancel 标志、Arc 内部句柄等任何主机侧内部结构，仅给前端展示与轮询所需的最小字段。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BgActivityView {
+    /// taskId（子代理）或 shellId（命令）。
+    pub id: String,
+    /// "subagent" | "command"。
+    pub kind: String,
+    /// 子代理 description / 命令文本。
+    pub label: String,
+    /// 原样透传现有 status 字符串（running / done / killed / error 等）。
+    pub status: String,
+    /// 子代理已结算 usage 的 total_tokens（若有）；命令恒为 None。
+    pub tokens: Option<u64>,
+}
+
+/// 合并列出某会话的后台**子代理**与后台**命令**活动。
+///
+/// 子代理按 conversation_id 过滤（BgTask 自带该字段）；后台命令（BgShell）不绑定会话，
+/// 故全部列出（活动面板需要看到该机器上所有在跑/刚结束的后台命令）。按 id 升序稳定排序。
+#[tauri::command]
+pub(crate) fn list_bg_activity(
+    state: State<AppState>,
+    conversation_id: String,
+) -> Vec<BgActivityView> {
+    let mut out: Vec<BgActivityView> = Vec::new();
+
+    // 后台子代理：仅本会话。tokens 取已结算 usage 的 total（report/status 在锁外读各 Arc）。
+    for (id, task) in state.bg_tasks_snapshot() {
+        if task.conversation_id != conversation_id {
+            continue;
+        }
+        let status = task.status.lock().map(|s| s.clone()).unwrap_or_default();
+        let tokens = task
+            .usage
+            .lock()
+            .ok()
+            .and_then(|u| u.as_ref().map(|usage| usage.total_tokens));
+        out.push(BgActivityView {
+            id,
+            kind: "subagent".to_string(),
+            label: task.description.clone(),
+            status,
+            tokens,
+        });
+    }
+
+    // 后台命令：全部列出（BgShell 不携带会话归属）。
+    for (id, shell) in state.bg_shells_snapshot() {
+        let status = shell.status.lock().map(|s| s.clone()).unwrap_or_default();
+        out.push(BgActivityView {
+            id,
+            kind: "command".to_string(),
+            label: shell.command.clone(),
+            status,
+            tokens: None,
+        });
+    }
+
+    // 稳定排序：先按 kind 再按 id，前端列表不会因 HashMap 迭代顺序抖动。
+    out.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
+/// 按 kind 停止一条后台活动：置对应 cancel 标志（复用 kill_task/kill_shell 的底层置位）。
+/// id 不存在或 kind 未知返回 Err。
+#[tauri::command]
+pub(crate) fn kill_bg_activity(
+    state: State<AppState>,
+    id: String,
+    kind: String,
+) -> Result<(), String> {
+    let found = match kind.as_str() {
+        "subagent" => state.set_task_cancel(&id),
+        "command" => state.set_shell_cancel(&id),
+        other => return Err(format!("未知活动类型: {other}")),
+    };
+    if found {
+        Ok(())
+    } else {
+        Err(format!("活动不存在: {id}"))
+    }
+}
+
+/// 非阻塞读取一条后台活动的当前输出快照（子代理 report / 命令 output）。
+///
+/// 区别于 agent 工具里 get_task_output(block=true) 的阻塞版——这里恒为即取即返，
+/// 前端活动面板自行定时轮询。子代理 report 未就绪（仍在跑、report 为空）时返回阶段性状态文本；
+/// id 不存在或 kind 未知返回 None。
+#[tauri::command]
+pub(crate) fn get_bg_activity_output(
+    state: State<AppState>,
+    id: String,
+    kind: String,
+) -> Option<String> {
+    match kind.as_str() {
+        "subagent" => {
+            let task = state.bg_tasks_snapshot().into_iter().find(|(tid, _)| *tid == id)?;
+            let (_, task) = task;
+            let report = task.report.lock().map(|r| r.clone()).unwrap_or_default();
+            if !report.is_empty() {
+                Some(report)
+            } else {
+                // report 尚未就绪：回阶段性状态文本（如「running」），让面板有东西可显示。
+                let status = task.status.lock().map(|s| s.clone()).unwrap_or_default();
+                if status.is_empty() {
+                    None
+                } else {
+                    Some(format!("[{status}]"))
+                }
+            }
+        }
+        "command" => {
+            let shell = state.bg_shells_snapshot().into_iter().find(|(sid, _)| *sid == id)?;
+            let (_, shell) = shell;
+            Some(shell.output.lock().map(|o| o.clone()).unwrap_or_default())
+        }
+        _ => None,
+    }
+}
+
+// ── 第三栏·用量标签：按工具归因的进程内活动量查询（0.0.75）──────────────────────
+//
+// 读 AppState.tool_usage 进程内累加器（record_tool_event 在工具完成时累加）。**诚实边界**：
+// 这里只回「调用次数 + 输出 token 体积近似」这种**当前会话活动量**，**不是账单成本**——
+// 工具本身不直接产生账单，真账单在 LLM 轮次/角色（token_ledger / messages.usage_json）。
+// 成本换算/展示由前端用已有单价信息另算，本命令不掺和。进程内、会话级、重启清空。
+
+/// 单个工具在某会话内的活动量视图（前端用，serde camelCase）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ToolUsageView {
+    /// 工具名（子代理工具带 `sub:` 前缀，与 record_tool_event 推给前端的口径一致）。
+    pub tool_name: String,
+    /// 该工具在本会话内的完成调用次数。
+    pub calls: u64,
+    /// 该工具输出体积的粗估（字符数 / 4 累加）；非精确分词、非成本。
+    pub output_tokens: u64,
+}
+
+/// 读某会话按工具归因的活动量快照，按 output_tokens 降序（体积大的工具排前）。
+///
+/// 锁失败软处理（返回空 vec，与其余命令一致），绝不 panic。无该会话记录时返回空 vec。
+#[tauri::command]
+pub(crate) fn get_tool_usage(state: State<AppState>, conversation_id: String) -> Vec<ToolUsageView> {
+    let mut out: Vec<ToolUsageView> = match state.tool_usage.lock() {
+        Ok(table) => table
+            .get(&conversation_id)
+            .map(|per_tool| {
+                per_tool
+                    .iter()
+                    .map(|(name, acc)| ToolUsageView {
+                        tool_name: name.clone(),
+                        calls: acc.calls,
+                        output_tokens: acc.output_tokens,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    // output_tokens 降序；并列时按工具名升序保证顺序稳定，前端列表不随 HashMap 迭代抖动。
+    out.sort_by(|a, b| {
+        b.output_tokens
+            .cmp(&a.output_tokens)
+            .then_with(|| a.tool_name.cmp(&b.tool_name))
+    });
+    out
 }
 
 // ── 命令层共享小工具 ───────────────────────────────────────────────────────

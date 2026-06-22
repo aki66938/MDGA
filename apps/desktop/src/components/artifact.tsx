@@ -38,7 +38,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { LayoutGrid, ChevronDown, ChevronUp, Maximize, Copy, Download, X, Plus, Minus } from "lucide-react";
+import { LayoutGrid, ChevronDown, ChevronUp, Maximize, Copy, Download, X, Plus, Minus, PanelRight } from "lucide-react";
 import type { ArtifactPart } from "../types";
 
 /** 展示 iframe 与截图 iframe 共用的严格 CSP（**单一来源**，防两处漂移）。
@@ -416,15 +416,20 @@ function dataUrlToBlob(dataUrl: string): Blob {
  * @param part   ArtifactPart（code + 可选 title/kind）。
  * @param onSendPrompt  卡片内调用 sendPrompt(text) 时回灌到 agent 的发送函数；**仅在用户确认后**调用。
  * @param pushToast  全局 toast（成功/失败提示用）；可选——不传则降级为仅 console.warn。
+ * @param onDock  「停靠到侧栏」回调（0.0.75）：可选——传入时工具栏多一个停靠图标按钮，点了把本产物
+ *               拉到第三栏「产物」坞（复用同一 ArtifactCard 渲染，同安全模型）。不传则不显该按钮
+ *               （停靠态自身复用本组件时即不传，避免坞里再显停靠按钮）。**纯 UI 回调，不碰任何隔离逻辑。**
  */
 export function ArtifactCard({
   part,
   onSendPrompt,
   pushToast,
+  onDock,
 }: {
   part: ArtifactPart;
   onSendPrompt?: (text: string) => void;
   pushToast?: (kind: "error" | "info", text: string) => void;
+  onDock?: (part: ArtifactPart) => void;
 }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(120);
@@ -895,6 +900,22 @@ export function ArtifactCard({
           >
             <Maximize size={14} />
           </button>
+          {/* 停靠到侧栏（0.0.75）：仅在父侧传入 onDock 时显（坞内复用本组件时不传 → 不显）。
+              纯 UI 回调，把本产物拉到第三栏「产物」坞复用渲染，不触任何隔离逻辑。 */}
+          {onDock && (
+            <button
+              type="button"
+              className="artifact-card__btn"
+              title="停靠到侧栏"
+              aria-label="停靠到侧栏"
+              onClick={(e) => {
+                e.stopPropagation();
+                onDock(part);
+              }}
+            >
+              <PanelRight size={14} />
+            </button>
+          )}
           <span className="artifact-card__chevron" aria-hidden="true">
             {expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
           </span>

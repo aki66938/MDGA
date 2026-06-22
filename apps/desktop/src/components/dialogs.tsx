@@ -72,7 +72,66 @@ export function useFocusTrap<T extends HTMLElement>(active: boolean = true) {
   return ref;
 }
 
-// ── ChangesModal ────────────────────────────────────────────────────────────
+// ── ChangesView（共享渲染）────────────────────────────────────────────────────
+
+/**
+ * 「checkpoints → 渲染」的唯一实现，供两处复用：
+ *   - 第三栏「变更」面板（ThirdColumn 包它）
+ *   - 全屏覆盖层 ChangesModal（下方包它）
+ * 不含任何容器/弹层 chrome，只负责「累计摘要 + 每条 checkpoint 行 + 回退按钮」。
+ * 别再复制这段渲染——两侧都进这里。
+ *
+ * 数据约束：后端 FileCheckpoint 仅有 toolName/relPath/revertible/reverted/createdAt，
+ * **不带逐文件 diff/+N/−M**。故摘要只聚合「文件数 + 变更条数」，不展示 +/−；
+ * 行内 diff 展开同样无数据可展，本期不做（留待后端补 diff 字段）。
+ */
+export function ChangesView({
+  checkpoints,
+  onRevert,
+}: {
+  checkpoints: FileCheckpoint[];
+  onRevert: (id: string) => void;
+}) {
+  if (checkpoints.length === 0) {
+    return <p className="changes-view__empty">本会话还没有文件变更。</p>;
+  }
+  // 累计摘要：去重文件数 + 未回退/总条数。无逐行 diff，故不显 +/−（数据所限）。
+  const fileSet = new Set(checkpoints.map((c) => c.relPath));
+  const activeCount = checkpoints.filter((c) => !c.reverted).length;
+  return (
+    <div className="changes-view">
+      <div className="changes-view__summary" aria-label="累计改动">
+        <span className="changes-view__summary-files">
+          {fileSet.size} 个文件 · {activeCount}/{checkpoints.length} 处变更
+        </span>
+      </div>
+      <div className="changes-list">
+        {checkpoints.map((c) => (
+          <div key={c.id} className={`changes-row${c.reverted ? " changes-row--reverted" : ""}`}>
+            <span className="changes-row__tool">{c.toolName}</span>
+            <span className="changes-row__path" title={c.relPath}>{c.relPath}</span>
+            {c.reverted ? (
+              <span className="changes-row__state">已回退</span>
+            ) : c.revertible ? (
+              <button
+                className="changes-row__revert"
+                type="button"
+                title="回退此变更及其后的所有变更"
+                onClick={() => onRevert(c.id)}
+              >
+                回退到此前
+              </button>
+            ) : (
+              <span className="changes-row__state">不可回退</span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── ChangesModal（全屏覆盖层 = 容器 + ChangesView）──────────────────────────────
 
 export function ChangesModal({
   checkpoints,
@@ -94,32 +153,7 @@ export function ChangesModal({
     >
       <div className="approval-card panel-card" ref={trapRef} onClick={(e) => e.stopPropagation()}>
         <p className="approval-card__title">文件变更记录</p>
-        {checkpoints.length === 0 ? (
-          <p className="approval-card__hint">本会话还没有文件变更。</p>
-        ) : (
-          <div className="changes-list">
-            {checkpoints.map((c) => (
-              <div key={c.id} className={`changes-row${c.reverted ? " changes-row--reverted" : ""}`}>
-                <span className="changes-row__tool">{c.toolName}</span>
-                <span className="changes-row__path" title={c.relPath}>{c.relPath}</span>
-                {c.reverted ? (
-                  <span className="changes-row__state">已回退</span>
-                ) : c.revertible ? (
-                  <button
-                    className="changes-row__revert"
-                    type="button"
-                    title="回退此变更及其后的所有变更"
-                    onClick={() => onRevert(c.id)}
-                  >
-                    回退到此前
-                  </button>
-                ) : (
-                  <span className="changes-row__state">不可回退</span>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
+        <ChangesView checkpoints={checkpoints} onRevert={onRevert} />
         <div className="approval-card__actions">
           <button type="button" className="approval-card__btn" onClick={onClose}>
             关闭

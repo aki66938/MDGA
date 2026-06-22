@@ -143,6 +143,8 @@ pub(crate) fn execute_bg_shell_tool(
             let id = parsed.get("shellId").and_then(|v| v.as_str()).ok_or("缺少 shellId")?;
             let sh = shells.get(id).ok_or("shellId 不存在")?;
             if tool_name == "kill_shell" {
+                // 置位逻辑等价于 AppState::set_shell_cancel（前端 kill_bg_activity 走 helper）；
+                // 此处 sh 已在持有 shells 锁的情况下取出，直接 store 以避免对同一 Mutex 重入死锁。
                 sh.cancel.store(true, Ordering::SeqCst);
                 return Ok(serde_json::json!({ "shellId": id, "note": "已请求终止该后台命令" }));
             }

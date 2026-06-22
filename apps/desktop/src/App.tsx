@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Settings2,
   ListChecks, Square, ArrowUp, GitCompare,
@@ -9,6 +9,7 @@ import {
   ChevronDown, FolderOpen, Gauge, AtSign, CornerDownRight,
   Plus, MessageCircle, Cpu,
 } from "lucide-react";
+import { ThirdColumn, type ThirdColTab } from "./components/third-column";
 import {
   DEFAULT_DEEPSEEK_MODEL_ID,
   getApiKeyStatusLabel,
@@ -26,13 +27,16 @@ import {
   type TextPart,
   type TodoItem,
   type FileCheckpoint,
+  type FileChange,
   type AppInfo,
+  type BgActivityView,
   type UserBalance,
   type BalanceState,
   type McpServer,
   type ApprovalRequest,
   type AskUserRequest,
   type ImagePart,
+  type ArtifactPart,
   type RawUsageWire,
   type ReasoningPart,
   type MessagePart,
@@ -75,6 +79,21 @@ import { Sidebar } from "./components/Sidebar";
 import { useTheme, useToasts, useUpdate, useKeyboardShortcuts } from "./hooks";
 
 // 类型与常量已抽至 ./types；本文件仅保留 App 组件与子组件实现。
+
+// ── 第三栏宽度约束 ──────────────────────────────────────────────────────────
+// 第三栏（展开态）最小宽。中栏（第二栏）最小宽 = 第三栏最小宽：第三栏可一直拖大，
+// 直到中栏被压到与第三栏等宽为止（用户要求拖拉范围尽可能大）。
+const THIRD_COL_MIN = 300;
+// .app-shell 第一轨（侧栏）固定宽，与 styles.css `grid-template-columns` 第一轨一致。
+const SIDEBAR_W = 260;
+// 第三栏动态最大宽 = 窗口宽 − 侧栏 − 中栏最小(=第三栏最小)。窗口过窄时兜底到最小宽（min≤max）。
+function thirdColMaxWidth(): number {
+  const avail = (typeof window !== "undefined" ? window.innerWidth : 1280) - SIDEBAR_W - THIRD_COL_MIN;
+  return Math.max(THIRD_COL_MIN, avail);
+}
+function clampThirdColWidth(w: number): number {
+  return Math.max(THIRD_COL_MIN, Math.min(thirdColMaxWidth(), Math.round(w)));
+}
 
 // ── App ───────────────────────────────────────────────────────────────────
 
@@ -139,6 +158,28 @@ export function App() {
   const [mainConfigured, setMainConfigured] = useState<boolean | null>(null);
   const [showChanges, setShowChanges] = useState(false);
   const [checkpoints, setCheckpoints] = useState<FileCheckpoint[]>([]);
+  // 常驻第三栏（停靠式右栏）：默认折叠；标签 活动 / 变更 / 用量 / 文件。
+  const [thirdColOpen, setThirdColOpen] = useState(false);
+  const [thirdColTab, setThirdColTab] = useState<ThirdColTab>("activity");
+  // 展开态期望宽（拖拽手柄驱动；最小 THIRD_COL_MIN，最大动态=窗口宽−侧栏−中栏最小）。
+  // 默认 340；localStorage 记「期望宽」，渲染时按当前窗口 clamp 成有效宽。
+  const [thirdColWidth, setThirdColWidth] = useState<number>(() => {
+    const raw = Number(localStorage.getItem("mdga.thirdColWidth"));
+    return Number.isFinite(raw) && raw >= THIRD_COL_MIN ? raw : 340;
+  });
+  // 窗口宽：驱动第三栏最大宽随窗口变化重算（窗口缩小时中栏不被压破）。
+  const [windowW, setWindowW] = useState<number>(() => (typeof window !== "undefined" ? window.innerWidth : 1280));
+  useEffect(() => {
+    const onResize = () => setWindowW(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  // 停靠到第三栏「产物」坞的互动卡片（0.0.75，纯内存态）：从中栏某条消息「拉出」一个产物到侧栏复用渲染。
+  // null＝无停靠产物（此时「产物」标签不出现）。产物属于当时那条消息，切会话即清（不跨会话保留）。
+  const [dockedArtifact, setDockedArtifact] = useState<ArtifactPart | null>(null);
+  // 活动通知点：该会话是否有「运行中」的后台活动。折叠态也要能亮点，故用 App 层低频(~3.5s)轮询独立维护
+  // （活动标签展开时由 ActivityPanel 自己的 2s 轮询拉明细，二者各取所需，互不依赖）。
+  const [hasActivityRunning, setHasActivityRunning] = useState(false);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [balance, setBalance] = useState<BalanceState>({ status: "idle" });
@@ -1316,14 +1357,67 @@ export function App() {
     onOpenSettings: () => openSettings(),
   });
 
-  async function openChangesPanel() {
-    if (!activeConvId) return;
+  // 拉一次检查点（不开任何弹层/面板）。第三栏展开/切到变更、回退后、打开覆盖层前都先拉。
+  async function refreshCheckpoints() {
+    if (!activeConvId) {
+      setCheckpoints([]);
+      return;
+    }
     const list = await invoke<FileCheckpoint[]>("get_checkpoints", {
       conversationId: activeConvId,
     }).catch(() => [] as FileCheckpoint[]);
     setCheckpoints(list);
+  }
+
+  async function openChangesPanel() {
+    if (!activeConvId) return;
+    await refreshCheckpoints();
     setShowChanges(true);
   }
+
+  // 第三栏展开 或 切到「变更」标签时拉一次检查点（本期展开时拉即可；
+  // TODO：监听 tool-event 做增量刷新留待后续）。
+  useEffect(() => {
+    if (thirdColOpen && thirdColTab === "changes") void refreshCheckpoints();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [thirdColOpen, thirdColTab, activeConvId]);
+
+  // 「文件」标签仅在有工作区时存在；切到纯聊天会话后若仍停在该标签，回退到「活动」（避免空标签态）。
+  // hasWorkspace 在渲染体后段才声明，故此处就地从早声明的 state 重算，规避块级「先用后声明」。
+  useEffect(() => {
+    const hasWs = !!activeConvId && !!conversations.find((c) => c.id === activeConvId)?.workspacePath;
+    if (!hasWs && thirdColTab === "files") setThirdColTab("activity");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConvId, conversations, thirdColTab]);
+
+  // 切会话即清「产物」坞（0.0.75）：停靠的互动卡片属于当时那条消息，跨会话不保留；
+  // 若清空时仍停在「产物」标签则回退到「活动」（避免空标签态）。停靠态的解除（取消停靠）由 ThirdColumn 回调处理。
+  useEffect(() => {
+    setDockedArtifact(null);
+    setThirdColTab((t) => (t === "artifact" ? "activity" : t));
+  }, [activeConvId]);
+
+  // 活动通知点：App 层低频(~3.5s)轮询，只为算「有无运行中后台活动」（折叠态也要能亮点）。
+  // 明细列表由活动标签展开时 ActivityPanel 自己的 2s 轮询负责，此处轻量、独立、不随展开态停。
+  useEffect(() => {
+    if (!activeConvId) {
+      setHasActivityRunning(false);
+      return;
+    }
+    let cancelled = false;
+    async function poll() {
+      const list = await invoke<BgActivityView[]>("list_bg_activity", {
+        conversationId: activeConvId,
+      }).catch(() => [] as BgActivityView[]);
+      if (!cancelled) setHasActivityRunning(list.some((a) => a.status === "running"));
+    }
+    void poll();
+    const id = window.setInterval(() => void poll(), 3500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [activeConvId]);
 
   async function handleRevert(checkpointId: string) {
     if (!activeConvId) return;
@@ -1345,7 +1439,7 @@ export function App() {
           ),
         }))
       );
-      await openChangesPanel(); // 刷新列表状态
+      await refreshCheckpoints(); // 刷新列表状态（覆盖层与第三栏面板共用 checkpoints，不再强开覆盖层）
     } catch (err) {
       pushToast("error", humanizeError(String(err))); // 回退失败属即时操作失败 → toast
     }
@@ -1724,6 +1818,80 @@ export function App() {
   const visibleConversations = filteredConversations.filter((c) => !c.archived);
   const archivedConversations = filteredConversations.filter((c) => c.archived);
 
+  // 第三栏·变更标签上半段「本会话文件累计改动」：从消息流里已有的 diff 卡（ToolPart 的 diff/added/removed）
+  // 按文件路径聚合，而非后端 checkpoints（后者不含 diff/±行数）。同一文件多次写入累加 added/removed、收集各次 diff。
+  // ±行数优先用结构化 added/removed；二者皆缺时从 patch 文本数 +/- 开头行兜底（排除 +++/--- 文件头）。
+  const fileChanges = useMemo<FileChange[]>(() => {
+    const byPath = new Map<string, FileChange>();
+    for (const msg of messages) {
+      for (const part of msg.parts) {
+        if (part.type !== "tool") continue;
+        const hasStats = part.added !== undefined || part.removed !== undefined;
+        const hasDiff = typeof part.diff === "string" && part.diff.trim().length > 0;
+        if (!hasStats && !hasDiff) continue; // 非文件写类工具卡
+        let added = part.added ?? 0;
+        let removed = part.removed ?? 0;
+        // 结构化 ±行数缺失时，从 patch 文本数 +/- 开头行（排除 +++/--- 文件头）。
+        if (!hasStats && hasDiff) {
+          for (const line of part.diff!.split("\n")) {
+            if (line.startsWith("+") && !line.startsWith("+++")) added++;
+            else if (line.startsWith("-") && !line.startsWith("---")) removed++;
+          }
+        }
+        const path = part.target || "(未知文件)";
+        const existing = byPath.get(path);
+        if (existing) {
+          existing.added += added;
+          existing.removed += removed;
+          if (hasDiff) existing.diffs.push(part.diff!);
+          // 该文件涉及的「最后一次写入」是否已回退——后出现的覆盖前者。
+          existing.reverted = part.reverted ?? false;
+        } else {
+          byPath.set(path, {
+            path,
+            added,
+            removed,
+            diffs: hasDiff ? [part.diff!] : [],
+            reverted: part.reverted ?? false,
+          });
+        }
+      }
+    }
+    return [...byPath.values()];
+  }, [messages]);
+
+  // 第三栏通知点（折叠态细栏必显、胶囊/标签可显）：
+  //   变更点 = 存在未回退的检查点；
+  //   活动点 = 该会话有「运行中」的后台活动（由 App 层低频轮询 hasActivityRunning 维护，折叠态也亮）。
+  const hasChangesDot = checkpoints.some((c) => !c.reverted);
+  const hasActivityDot = hasActivityRunning;
+
+  // 第三栏「文件」标签可见性：必须有 activeConvId 且已绑定工作区才显。
+  // 草稿态（无 activeConvId）即使选了目录也不显——list_workspace_dir 需 conversation_id，
+  // 首发前调用必失败；首发绑定后（activeConvId 出现 + workspacePath 落库）标签自然出现。
+  const hasWorkspace = !!activeConvId && !!activeConversation?.workspacePath;
+
+  // 第三栏有效宽 = 期望宽按当前窗口 clamp（中栏最小保 THIRD_COL_MIN、不被压破；窗口缩小自动收）。
+  const effectiveThirdColWidth = Math.max(
+    THIRD_COL_MIN,
+    Math.min(Math.max(THIRD_COL_MIN, windowW - SIDEBAR_W - THIRD_COL_MIN), thirdColWidth),
+  );
+
+  /** 拖拽手柄改宽（clamp 后落地 state + 持久化）。 */
+  function handleThirdColResize(next: number) {
+    const clamped = clampThirdColWidth(next);
+    setThirdColWidth(clamped);
+    localStorage.setItem("mdga.thirdColWidth", String(clamped));
+  }
+
+  // 「拉出/停靠」互动卡片到第三栏「产物」坞（0.0.75，纯前端）：记下产物（内存态）、展开第三栏并切到「产物」标签。
+  // 坞内复用同一 <ArtifactCard>（同安全模型，见 third-column.tsx）。
+  function handleDockArtifact(part: ArtifactPart) {
+    setDockedArtifact(part);
+    setThirdColOpen(true);
+    setThirdColTab("artifact");
+  }
+
   // ── UI ──────────────────────────────────────────────────────────────────
 
   return (
@@ -1765,15 +1933,26 @@ export function App() {
             <h1>MDGA</h1>
           </div>
           <div className="status-strip" aria-label="status">
-            {/* 工作区身份由 composer 底部胶囊承载、上下文用量由底栏指示器承载（Plan26），顶栏仅保留「变更」。 */}
+            {/* 工作区身份由 composer 底部胶囊承载、上下文用量由底栏指示器承载（Plan26）。
+                顶栏的「活动 / 变更」胶囊改为切换常驻第三栏（不再直接开覆盖层）。 */}
+            <button
+              className="topbar-btn"
+              type="button"
+              title="活动面板"
+              onClick={() => { setThirdColOpen(true); setThirdColTab("activity"); }}
+            >
+              <ListChecks size={14} /> 活动
+              {hasActivityDot && <span className="third-col__dot third-col__dot--badge" aria-hidden="true" />}
+            </button>
             {activeConvId && (
               <button
                 className="topbar-btn"
                 type="button"
-                title="文件变更记录（可回退）"
-                onClick={openChangesPanel}
+                title="文件变更（可回退）"
+                onClick={() => { setThirdColOpen(true); setThirdColTab("changes"); }}
               >
                 <GitCompare size={14} /> 变更
+                {hasChangesDot && <span className="third-col__dot third-col__dot--badge" aria-hidden="true" />}
               </button>
             )}
           </div>
@@ -1805,6 +1984,7 @@ export function App() {
                       msg={msg}
                       onSendPrompt={(text) => { void sendText(text); }}
                       pushToast={pushToast}
+                      onDockArtifact={handleDockArtifact}
                     />
                   </div>
                   <MessageActions
@@ -2259,6 +2439,37 @@ export function App() {
           </div>
         </div>
       </section>
+
+      {/* 常驻第三栏（.app-shell 第三个 grid 子节点，在 .workspace 之后）：折叠/展开两档 +
+          活动（占位）/ 变更（常驻化，复用 ChangesView）。覆盖层 ChangesModal 保留作「全屏审查」。 */}
+      <ThirdColumn
+        open={thirdColOpen}
+        tab={thirdColTab}
+        width={effectiveThirdColWidth}
+        onResize={handleThirdColResize}
+        onToggleOpen={setThirdColOpen}
+        onSelectTab={setThirdColTab}
+        checkpoints={checkpoints}
+        fileChanges={fileChanges}
+        onRevert={handleRevert}
+        onOpenFullChanges={openChangesPanel}
+        hasActivityDot={hasActivityDot}
+        hasChangesDot={hasChangesDot}
+        hasWorkspace={hasWorkspace}
+        activeConvId={activeConvId}
+        todos={todos}
+        ctxUsage={ctxUsage}
+        conversationUsage={conversationUsage}
+        turnUsages={turnUsages}
+        dockedArtifact={dockedArtifact}
+        onUndockArtifact={() => {
+          setDockedArtifact(null);
+          // 解除停靠时若仍停在「产物」标签，切回「活动」（该标签随即消失）。
+          setThirdColTab((t) => (t === "artifact" ? "activity" : t));
+        }}
+        onArtifactSendPrompt={(text) => { void sendText(text); }}
+        pushToast={pushToast}
+      />
 
       {approval && (
         <ApprovalModal

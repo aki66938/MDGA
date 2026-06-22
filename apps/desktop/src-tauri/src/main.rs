@@ -18,7 +18,34 @@ pub(crate) const COMPACTED_TOOL_STUB: &str =
     "{\"ok\":true,\"note\":\"[此前的工具结果已省略以节省上下文；如需该文件/目录/命令的最新内容，请重新调用对应工具读取]\"}";
 
 mod state;
-use state::AppState;
+use state::{AppState, ToolUsageAcc};
+
+/// 把一次工具完成累加进进程内按工具归因累加器（0.0.75 第三栏·用量标签）。
+///
+/// 纯逻辑（不持锁、不碰 app）：便于单测「只计完成、次数 +1、token 体积 = 输出长度 / 4 累加」。
+/// `status` 仅 "succeeded" / "failed" 计入（"running" 跳过避免重复、"denied" 无执行无输出）；
+/// `output_json` 为 None（如 running）时按 0 token 处理。返回是否实际记了一笔（供调用方判断）。
+fn accumulate_tool_usage(
+    table: &mut std::collections::HashMap<String, std::collections::HashMap<String, ToolUsageAcc>>,
+    conversation_id: &str,
+    tool_name: &str,
+    status: &str,
+    output_json: Option<&str>,
+) -> bool {
+    if status != "succeeded" && status != "failed" {
+        return false;
+    }
+    // 粗估输出 token 体积：字符数 / 4（与项目其他「体积近似」口径一致，非精确分词、非成本）。
+    let est_tokens = output_json.map(|s| (s.chars().count() / 4) as u64).unwrap_or(0);
+    let entry = table
+        .entry(conversation_id.to_string())
+        .or_default()
+        .entry(tool_name.to_string())
+        .or_default();
+    entry.calls += 1;
+    entry.output_tokens = entry.output_tokens.saturating_add(est_tokens);
+    true
+}
 
 mod commands;
 use commands::{
@@ -28,8 +55,9 @@ use commands::{
     delete_permission_rule, export_conversation, export_token_ledger, get_account_balance,
     get_app_info, get_checkpoints, get_command_sandbox, get_conversation_events, get_conversations,
     get_deepseek_api_key_status, get_mcp_servers, get_permission_rules, get_task_budget,
-    get_workspace, import_file_text, install_update, list_custom_commands, list_workspace_files,
-    open_external_url, probe_command_sandbox, read_image_base64, recent_denied_actions, search_conversations,
+    get_workspace, import_file_text, install_update, list_custom_commands, list_workspace_dir,
+    list_workspace_files, open_external_url, probe_command_sandbox, read_image_base64,
+    read_workspace_file, recent_denied_actions, search_conversations,
     load_messages, load_wire, new_conversation, new_conversation_with_workspace, persist_message,
     pin_conversation, queue_steering, remove_conversation, rename_conversation, respond_approval,
     respond_ask_user, revert_to_checkpoint, rewind_to_message, set_command_sandbox,
@@ -46,6 +74,7 @@ use commands::{
     clear_role_assignment, get_lsp_known_servers, get_lsp_server_config, get_role_assignments,
     save_lsp_server_config, set_role_assignment,
 };
+use commands::{get_bg_activity_output, get_tool_usage, kill_bg_activity, list_bg_activity};
 
 mod pricing_capture;
 use pricing_capture::{apply_pricing_overrides, capture_official_pricing, reset_pricing_overrides};
@@ -99,6 +128,15 @@ pub(crate) fn record_tool_event(
             "errorMessage": error_message,
         }),
     );
+
+    // 0.0.75 第三栏·用量标签：按工具归因的进程内轻量累加（仅工具**完成**时计一笔，避免 running 重复）。
+    // conversation_id 在所有 record_tool_event 调用点都现成可得（本函数签名即带），故直接按会话归因。
+    // 锁失败软跳过（与本函数「写库失败也只忽略」的容错口径一致），绝不 panic、绝不阻塞工具循环。
+    if status == "succeeded" || status == "failed" {
+        if let Ok(mut table) = state.tool_usage.lock() {
+            accumulate_tool_usage(&mut table, conversation_id, tool_name, status, output_json);
+        }
+    }
 }
 
 mod permissions;
@@ -142,6 +180,7 @@ fn main() {
                 command_sandbox: AtomicBool::new(true),
                 task_token_budget: AtomicU64::new(0),
                 loop_guards: Mutex::new(HashMap::new()),
+                tool_usage: Mutex::new(HashMap::new()),
             });
 
             // 启动时后台连接所有已启用的 MCP server，不阻塞窗口加载。
@@ -207,6 +246,8 @@ fn main() {
             revert_to_checkpoint,
             compact_history,
             list_workspace_files,
+            list_workspace_dir,
+            read_workspace_file,
             get_mcp_servers,
             create_mcp_server,
             toggle_mcp_server,
@@ -269,7 +310,53 @@ fn main() {
             get_lsp_known_servers,
             get_lsp_server_config,
             save_lsp_server_config,
+            list_bg_activity,
+            kill_bg_activity,
+            get_bg_activity_output,
+            get_tool_usage,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run MDGA desktop app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// 0.0.75 用量埋点：只计「完成」状态，running/denied 不计；次数 +1、体积 = 输出长度/4 累加。
+    #[test]
+    fn accumulate_only_counts_completed() {
+        let mut table: HashMap<String, HashMap<String, ToolUsageAcc>> = HashMap::new();
+        // running 不计（避免与后续 succeeded 重复计同一次调用）。
+        assert!(!accumulate_tool_usage(&mut table, "c1", "read_file", "running", None));
+        // denied 不计（没真执行、无输出）。
+        assert!(!accumulate_tool_usage(&mut table, "c1", "read_file", "denied", Some("{}")));
+        assert!(table.is_empty(), "未完成事件不应建任何条目");
+
+        // succeeded 计一笔：8 字符 / 4 = 2 token。
+        assert!(accumulate_tool_usage(&mut table, "c1", "read_file", "succeeded", Some("12345678")));
+        // failed 也计一笔（活动量含失败调用）：4 字符 / 4 = 1 token。
+        assert!(accumulate_tool_usage(&mut table, "c1", "read_file", "failed", Some("abcd")));
+        let acc = &table["c1"]["read_file"];
+        assert_eq!(acc.calls, 2);
+        assert_eq!(acc.output_tokens, 3);
+    }
+
+    /// 按 (会话, 工具) 分桶；不同会话、不同工具互不串味；output_json 为 None 计 0 token。
+    #[test]
+    fn accumulate_buckets_by_conversation_and_tool() {
+        let mut table: HashMap<String, HashMap<String, ToolUsageAcc>> = HashMap::new();
+        accumulate_tool_usage(&mut table, "c1", "read_file", "succeeded", Some("aaaa")); // 1 token
+        accumulate_tool_usage(&mut table, "c1", "run_command", "succeeded", None); // 0 token
+        accumulate_tool_usage(&mut table, "c2", "read_file", "succeeded", Some("bbbbbbbb")); // 2 token
+
+        assert_eq!(table["c1"]["read_file"].calls, 1);
+        assert_eq!(table["c1"]["read_file"].output_tokens, 1);
+        assert_eq!(table["c1"]["run_command"].calls, 1);
+        assert_eq!(table["c1"]["run_command"].output_tokens, 0);
+        // 不同会话独立累加，互不影响。
+        assert_eq!(table["c2"]["read_file"].calls, 1);
+        assert_eq!(table["c2"]["read_file"].output_tokens, 2);
+    }
 }

@@ -56,7 +56,43 @@ export type FileCheckpoint = {
   createdAt: number;
 };
 
+/**
+ * 本会话「文件累计改动」聚合项（第三栏·变更标签上半段用）。
+ * 数据来源是消息流里已有的 diff 卡（ToolPart 的 diff/added/removed），按文件路径聚合，
+ * 而非后端 FileCheckpoint（后者不含 diff/±行数）。同一文件多次修改累加 added/removed、收集各次 diff 文本。
+ * reverted：该文件涉及的最后一次写入是否被标记为已回退（弱化展示用，非精确撤销态）。
+ */
+export type FileChange = {
+  path: string;
+  added: number;
+  removed: number;
+  /** 该文件历次写入的 unified diff 文本（按出现顺序），展开时逐段复用 DiffBlock 渲染。 */
+  diffs: string[];
+  reverted: boolean;
+};
+
 export type AppInfo = { version: string; dataDir: string };
+
+/**
+ * 后台活动视图（第三栏「活动」标签）：list_bg_activity(conversationId) 返回的一行。
+ * kind 区分子代理 / 后台命令；status 取 running/done/killed/error；tokens 可选（子代理消耗）。
+ * 注意：list 不含开始时间，运行时长由前端记每个 id 首次出现的时间戳近似计算。
+ */
+export type BgActivityView = {
+  id: string;
+  kind: "subagent" | "command";
+  label: string;
+  status: "running" | "done" | "killed" | "error";
+  tokens?: number;
+};
+
+/**
+ * 单个工具在某会话内的活动量视图（第三栏「用量」标签下半段，get_tool_usage 返回，serde camelCase）。
+ * 诚实边界：这不是账单——真账单是会话级/角色级（见 UsageSummary）。本视图仅有「调用次数 + 输出 token
+ * 体积粗估（字符数/4 累加，非精确分词、非成本）」，作上下文贡献的相对体积近似。
+ * toolName 可能带 `sub:` 前缀＝子代理工具，或为 MCP 工具名。后端已按 outputTokens 降序。
+ */
+export type ToolUsageView = { toolName: string; calls: number; outputTokens: number };
 
 /** 最近被拦动作（Plan27 #9）：recent_denied_actions 返回，用于一键加规则。 */
 export type DeniedAction = { toolName: string; target: string };

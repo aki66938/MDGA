@@ -601,6 +601,44 @@ pub fn read_file(
     })
 }
 
+/// 只读：列举工作区内某目录的**直接子项**（惰性一层），供前端文件树面板按需展开。
+///
+/// 复用与 list_dir / read_file 同一套路径守卫（resolve_existing_path：拒绝 `..` 穿越、绝对路径，
+/// 并经 canonicalize + starts_with 兜底 symlink 越界），故越界读取在此被同样拦下。`rel_path` 为
+/// `""` 或 `.` 表示工作区根。仅返回 (name, is_dir)；不读取文件内容、不递归。排序与过滤由调用方处理。
+pub fn list_workspace_children(
+    workspace_root: impl AsRef<Path>,
+    rel_path: &str,
+) -> Result<Vec<(String, bool)>, ToolRuntimeError> {
+    let key = if rel_path.trim().is_empty() { "." } else { rel_path };
+    let (_workspace, _relative, target) = resolve_existing_path(workspace_root, key)?;
+    if !target.is_dir() {
+        return Err(ToolRuntimeError::NotADirectory);
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&target)? {
+        let entry = entry?;
+        // file_type 不跟随符号链接，便于把 symlink 当成其链接类型展示；目录判定足够文件树用。
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        out.push((entry.file_name().to_string_lossy().to_string(), is_dir));
+    }
+    Ok(out)
+}
+
+/// 只读：读取工作区内某文件的全部 UTF-8 文本（供前端预览面板点击查看），自带字节上限。
+///
+/// 复用与 read_file 同一套路径守卫（resolve_existing_path）。与分页版 read_file 不同：本函数返回
+/// 文件**完整内容**（不按行截断），但施加 `max_bytes` 上限——超限返回 FileTooLarge，二进制 / 非 UTF-8
+/// 返回 NonUtf8Text，由调用方翻成友好提示而非乱码。
+pub fn read_workspace_text(
+    workspace_root: impl AsRef<Path>,
+    rel_path: &str,
+    max_bytes: u64,
+) -> Result<String, ToolRuntimeError> {
+    let (_workspace, _relative, target) = resolve_existing_path(workspace_root, rel_path)?;
+    read_utf8_file(&target, max_bytes)
+}
+
 /// 写入工作区内 UTF-8 文本文件。
 ///
 /// 输入工作区根目录和相对文件路径；输出写入结果。允许覆盖已有文件，但禁止目录和越界路径。

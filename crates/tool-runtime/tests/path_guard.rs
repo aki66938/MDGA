@@ -396,6 +396,77 @@ fn stat_path_rejects_traversal() {
 
 // ── 正常路径冒烟：确认守卫不误伤合法操作（端到端写读一致） ────────────────
 
+// ── 只读文件树面板后端：list_workspace_children / read_workspace_text 守卫 ──
+
+/// list_workspace_children 越界（`..` 穿越）被拒（复用 resolve_existing_path 守卫）。
+#[test]
+fn list_workspace_children_rejects_traversal() {
+    let ws = TempWorkspace::new();
+    let err = list_workspace_children(ws.root(), "..").expect_err("越界应被拒");
+    assert!(matches!(err, ToolRuntimeError::PathOutsideWorkspace));
+}
+
+/// list_workspace_children 绝对路径被拒。
+#[test]
+fn list_workspace_children_rejects_absolute() {
+    let ws = TempWorkspace::new();
+    let abs = ws.root().join("sub").to_string_lossy().to_string();
+    let err = list_workspace_children(ws.root(), &abs).expect_err("绝对路径应被拒");
+    assert!(matches!(err, ToolRuntimeError::PathOutsideWorkspace));
+}
+
+/// list_workspace_children 空串 / "." 都列出工作区根的直接子项（惰性一层）。
+#[test]
+fn list_workspace_children_lists_root() {
+    let ws = TempWorkspace::new();
+    create_file(ws.root(), CreateFileRequest { path: "a.txt".into(), content: "x".into() })
+        .expect("文件");
+    std::fs::create_dir_all(ws.root().join("dir")).expect("目录");
+    // 子目录里的文件不应出现在根列表（仅一层）。
+    create_file(ws.root(), CreateFileRequest { path: "dir/nested.txt".into(), content: "y".into() })
+        .expect("嵌套文件");
+
+    for key in ["", "."] {
+        let mut got = list_workspace_children(ws.root(), key).expect("应列出根");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("a.txt".to_string(), false), ("dir".to_string(), true)],
+            "key={key:?} 应只列出根的直接子项"
+        );
+    }
+}
+
+/// read_workspace_text 越界路径被拒。
+#[test]
+fn read_workspace_text_rejects_traversal() {
+    let ws = TempWorkspace::new();
+    let err = read_workspace_text(ws.root(), "../secret.txt", 512 * 1024)
+        .expect_err("越界应被拒");
+    assert!(matches!(err, ToolRuntimeError::PathOutsideWorkspace));
+}
+
+/// read_workspace_text 超过字节上限返回 FileTooLarge。
+#[test]
+fn read_workspace_text_enforces_byte_cap() {
+    let ws = TempWorkspace::new();
+    create_file(ws.root(), CreateFileRequest { path: "big.txt".into(), content: "abcdef".into() })
+        .expect("文件");
+    let err = read_workspace_text(ws.root(), "big.txt", 4).expect_err("超限应被拒");
+    assert!(matches!(err, ToolRuntimeError::FileTooLarge(4)));
+}
+
+/// read_workspace_text 读取合法文件返回完整内容。
+#[test]
+fn read_workspace_text_reads_full_content() {
+    let ws = TempWorkspace::new();
+    let body = "第一行\n第二行\n第三行";
+    create_file(ws.root(), CreateFileRequest { path: "doc.txt".into(), content: body.into() })
+        .expect("文件");
+    let got = read_workspace_text(ws.root(), "doc.txt", 512 * 1024).expect("应读出");
+    assert_eq!(got, body);
+}
+
 /// 合法相对路径 create → read 往返一致，且嵌套父目录被按需创建。
 #[test]
 fn legal_create_then_read_roundtrip() {

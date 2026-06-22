@@ -1119,16 +1119,14 @@ pub(crate) async fn execute_bg_task_tool(
                 return (Err("kill_task 缺少 taskId".to_string()), None);
             };
             let st = app.state::<AppState>();
-            let cancel = st.bg_tasks.lock().ok().and_then(|t| t.get(id).map(|t| t.cancel.clone()));
-            match cancel {
-                Some(cancel) => {
-                    cancel.store(true, Ordering::SeqCst);
-                    (
-                        Ok(serde_json::json!({ "taskId": id, "note": "已请求终止该后台子代理" })),
-                        None,
-                    )
-                }
-                None => (Err(format!("taskId 不存在: {id}")), None),
+            // 复用 AppState::set_task_cancel（与前端 kill_bg_activity 共享同一置位逻辑）。
+            if st.set_task_cancel(id) {
+                (
+                    Ok(serde_json::json!({ "taskId": id, "note": "已请求终止该后台子代理" })),
+                    None,
+                )
+            } else {
+                (Err(format!("taskId 不存在: {id}")), None)
             }
         }
         "get_task_output" => {
