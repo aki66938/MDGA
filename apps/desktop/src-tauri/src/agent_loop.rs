@@ -45,8 +45,9 @@ use mdga_sandbox_runtime::{session_security_context, NetworkMode};
 use mdga_shared::PermissionMode;
 use mdga_storage::{
     bump_usage_counter, current_ym, get_conversation, get_messages, get_pricing_override,
-    get_role_model, list_permission_rules, resolve_pricing_context, resolve_role_provider,
-    save_token_ledger_entry, PricingContext, ROLE_ACTION, ROLE_MAIN, ROLE_PLAN, ROLE_VISION,
+    get_role_model, insert_usage_attribution, list_permission_rules, resolve_pricing_context,
+    resolve_role_provider, save_token_ledger_entry, PricingContext, ROLE_ACTION, ROLE_MAIN,
+    ROLE_PLAN, ROLE_SUBAGENT, ROLE_VISION,
 };
 use mdga_token_accounting::{
     build_thinking_profile, canonical_model_id, compute_cost_summary_priced, lookup_preset,
@@ -254,6 +255,22 @@ pub(crate) async fn send_message(
                             &serde_json::to_string(u).unwrap_or_default(),
                         );
                     }
+                    // 用量归因（附加式只读、独立于上面的 token_ledger）：自动初看的视觉 own usage，
+                    // 用 ROLE_VISION 单价算一条 consumer_type="vision"（model_id=视觉模型）。解析不到
+                    // 单价 → 只记 tokens。软处理：与上面 token_ledger 各写各的、互不影响。
+                    let vctx = state
+                        .db
+                        .lock()
+                        .ok()
+                        .and_then(|db| resolve_pricing_context(&db, ROLE_VISION).ok().flatten());
+                    record_usage_attribution(
+                        &app,
+                        &conversation_id,
+                        "vision",
+                        Some("初看"),
+                        u,
+                        vctx.as_ref(),
+                    );
                 }
                 Some(format!(
                     "[视觉分析] 用户上传了 {} 张图片，针对其需求，视觉模型识别如下：\n{analysis}\n请据此与用户需求继续。",
@@ -400,6 +417,10 @@ pub(crate) async fn send_message(
             // 思考深度（E-4/E-5）：方言相关思考字段 + 是否多轮回传 reasoning。
             thinking_extra.as_ref(),
             add_reasoning,
+            // 用量归因（附加式只读）：本轮主模型计价上下文（借用，settlement 仍按值用 pricing_ctx）
+            // + 角色标签，供主轮记账点算 cost。
+            pricing_ctx.as_ref(),
+            active_role,
         )
         .await
     } else {
@@ -440,6 +461,12 @@ pub(crate) async fn send_message(
     let raw_usage = result?;
 
     if let Some(raw) = raw_usage {
+        // 用量归因(附加式):计划模式 / 无工作区路径走 chat_stream(不经 chat_with_builtin_tools 的逐轮记账),
+        // 在此把本轮主模型 usage 记一条 consumer="main"(label=active_role)。工作区(工具循环)路径已在循环内
+        // 逐轮记账,故此处用 plan_mode||无工作区 门控跳过,避免与之双计。
+        if plan_mode || conversation.workspace_path.is_none() {
+            record_usage_attribution(&app, &conversation_id, "main", Some(active_role), &raw, pricing_ctx.as_ref());
+        }
         // 0.0.72 计价：据本轮命中的连接 billing_mode + 模型 pricing_json 结算（pricing_ctx 已沿
         // active_role 的解析+回退链取出）。未解析到上下文时按「无计费信息」处理（api 模式无单价）。
         // 0.0.73 第二层：pricing_json 为空且 mode=api 时的回退价改走「有效价」——先查采集覆盖层
@@ -909,6 +936,68 @@ pub(crate) fn assemble_resume_wire(
     wire
 }
 
+/// 用量归因记账（附加式只读追踪，绝不影响对话/计价主流程）。
+///
+/// 在各 merge 点旁调用：记的是「该消费者 **own** usage」(completion.usage / vision_usage /
+/// sub_usage / task_usage)，**不是**合并后的 usage——保证不双计（各 own usage 之和 == 合并后
+/// 的 usage，即 messages.usage_json 的来源）。
+///
+/// pricing：传入「该消费者自己的」`PricingContext`（主轮=active_role、视觉=ROLE_VISION、
+/// 子代理=ROLE_SUBAGENT，各自解析+回退）。用与主轮计价**同一**函数 `compute_cost_summary_priced`
+/// 算 cost，各用各的单价（模型不同则归因 cost 更准——这是本功能的点）。
+///
+/// 软处理：锁失败 / 序列化失败 / 解析不到单价 → 只记 tokens、cost_json 留空，绝不 panic、
+/// 绝不中断主流程。写入失败亦只吞掉错误。**不进 token_ledger、不改 messages、不参与会话总额。**
+fn record_usage_attribution(
+    app: &AppHandle,
+    conversation_id: &str,
+    consumer_type: &str,
+    consumer_label: Option<&str>,
+    raw: &mdga_shared::RawUsage,
+    pricing: Option<&PricingContext>,
+) {
+    let usage_json = match serde_json::to_string(raw) {
+        Ok(s) => s,
+        Err(_) => return, // 连 own usage 都序列化不了：放弃记账（不影响主流程）。
+    };
+    let model_id = pricing.map(|c| c.model_id.clone());
+
+    // 在短作用域 db 锁内：① 预解析回退价（与主轮计价 :448-462 同口径，override 优先、编译兜底）；
+    // ② 据该消费者 pricing 算 CostSummary；③ 写入归因表。任一步失败 → 软降级（cost 留空 / 不写）。
+    let (cost_json, currency): (Option<String>, Option<String>) = if let Some(ctx) = pricing {
+        // 回退价：pricing_json 为空且 mode=api 时用「采集覆盖层 override 优先、编译快照兜底」。
+        let preset = ctx.preset.as_deref().unwrap_or_default();
+        let key = canonical_model_id(preset, &ctx.model_id);
+        let over = app
+            .state::<AppState>()
+            .db
+            .lock()
+            .ok()
+            .and_then(|db| get_pricing_override(&db, preset, &key, "CNY").ok().flatten());
+        let fallback = effective_fallback_pricing(over, lookup_preset(preset, &ctx.model_id, "CNY"));
+        let (mode, pricing_model) = resolve_billing(Some(ctx), fallback);
+        let summary = compute_cost_summary_priced(raw, mode, pricing_model.as_ref());
+        let cj = serde_json::to_string(&summary).ok();
+        (cj, summary.currency)
+    } else {
+        // 解析不到该消费者的计价上下文：只记 tokens（cost 留空）。
+        (None, None)
+    };
+
+    if let Ok(db) = app.state::<AppState>().db.lock() {
+        let _ = insert_usage_attribution(
+            &db,
+            conversation_id,
+            consumer_type,
+            consumer_label,
+            model_id.as_deref(),
+            &usage_json,
+            cost_json.as_deref(),
+            currency.as_deref(),
+        );
+    }
+}
+
 /// Agent 工具循环：每轮带工具问模型、执行返回的工具、把结果回灌，直到模型不再调用工具
 /// （自然终止）或用户中断。不设轮数上限——上下文自动压缩兜底体积，取消按钮兜底失控；
 /// 所有工具执行前都经 SessionSecurityContext 裁决。
@@ -934,6 +1023,11 @@ async fn chat_with_builtin_tools(
     thinking_extra: Option<&serde_json::Value>,
     // 思考深度（E-5）：是否把每轮 reasoning_content 嵌回 assistant 历史轮（echo=Resend 时为 true）。
     add_reasoning: bool,
+    // 用量归因（附加式只读追踪）：本轮主模型(active_role)的计价上下文 + 角色标签，供主轮记账点
+    // 用主轮单价给「本轮主模型 own usage(completion.usage)」算 cost 归一条 main 记录。
+    // 纯增量：不参与既有计价/merge/messages 路径。None=未解析到（只记 tokens）。
+    main_pricing_ctx: Option<&PricingContext>,
+    active_role: &str,
 ) -> Result<Option<mdga_shared::RawUsage>, String> {
     let security_context = session_security_context(
         workspace_path.to_string(),
@@ -963,6 +1057,15 @@ async fn chat_with_builtin_tools(
             (base_url.to_string(), api_key.to_string(), model.to_string())
         })
     };
+    // 用量归因（附加式）：在循环外解析一次子代理(ROLE_SUBAGENT)的计价上下文，供下方三个子代理
+    // 记账点（前台 run_subtask / 并行 / 后台）复用。回退语义与 resolve_subagent_provider 同链
+    // （subagent→action→main），与子代理实际所用模型/单价一致。解析失败 → None（子代理记账只记 tokens）。
+    let sub_pricing_ctx: Option<PricingContext> = app
+        .state::<AppState>()
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| resolve_pricing_context(&db, ROLE_SUBAGENT).ok().flatten());
 
     // 工具 schema：Built-in + 已连接 MCP server 的外部工具。
     let tool_schemas: Vec<serde_json::Value> = all_builtin_tool_schemas()
@@ -1083,6 +1186,11 @@ async fn chat_with_builtin_tools(
                     )
                     .await?;
                     wire_messages = new_wire;
+                    // 用量归因(附加式):压缩(有损摘要)走主模型,记一条 consumer="main" label="压缩"
+                    // ——否则压缩 token 进了合并总额却没归因、归因和会少这部分。记在 merge 前(merge 会 move)。
+                    if let Some(own) = summary_usage.as_ref() {
+                        record_usage_attribution(app, conversation_id, "main", Some("压缩"), own, main_pricing_ctx);
+                    }
                     usage = merge_usage(usage, summary_usage);
                     // 重置体积信号，待下一次响应的真实 usage 刷新，避免连续重复触发。
                     last_prompt_tokens = 0;
@@ -1142,6 +1250,19 @@ async fn chat_with_builtin_tools(
             Err(e) => return Err(e),
         };
         usage = merge_usage(usage, completion.usage.clone());
+        // 用量归因（附加式只读）：记本轮主模型 **own** usage(completion.usage，不含子代理/视觉)，
+        // 用主轮单价算一条 consumer_type="main"（label=active_role 如 action/plan）。在实时产生 usage
+        // 的此处记账（非快照回放路径），故续接/重放不会重复记。失败软处理，不影响 merge/主流程。
+        if let Some(own) = completion.usage.as_ref() {
+            record_usage_attribution(
+                app,
+                conversation_id,
+                "main",
+                Some(active_role),
+                own,
+                main_pricing_ctx,
+            );
+        }
         // 成本预算：累计 total_tokens 超过预算则暂停（防失控烧 token）。
         let budget = app.state::<AppState>().task_token_budget.load(Ordering::SeqCst);
         if budget > 0 {
@@ -1569,6 +1690,24 @@ async fn chat_with_builtin_tools(
                     // Plan27 C3（#1c）：对本会话已上传图片做针对性追问/精读。
                     let (vision_result, vision_usage) =
                         execute_ask_vision(app, conversation_id, &arguments).await;
+                    // 用量归因（附加式只读）：ask_vision 走视觉模型，记一条 consumer_type="vision"，
+                    // 用 ROLE_VISION 的单价算 cost。记的是该次 own vision_usage（非合并后）。软处理。
+                    if let Some(own) = vision_usage.as_ref() {
+                        let vctx = app
+                            .state::<AppState>()
+                            .db
+                            .lock()
+                            .ok()
+                            .and_then(|db| resolve_pricing_context(&db, ROLE_VISION).ok().flatten());
+                        record_usage_attribution(
+                            app,
+                            conversation_id,
+                            "vision",
+                            Some("追问"),
+                            own,
+                            vctx.as_ref(),
+                        );
+                    }
                     usage = merge_usage(usage, vision_usage);
                     vision_result
                 }
@@ -1603,6 +1742,18 @@ async fn chat_with_builtin_tools(
                         &cancel,
                     )
                     .await;
+                    // 用量归因（附加式只读）：前台子代理，记一条 consumer_type="subagent"（label="前台"），
+                    // 用 ROLE_SUBAGENT 单价算 cost。记的是该次 own sub_usage（非合并后）。软处理。
+                    if let Some(own) = sub_usage.as_ref() {
+                        record_usage_attribution(
+                            app,
+                            conversation_id,
+                            "subagent",
+                            Some("前台"),
+                            own,
+                            sub_pricing_ctx.as_ref(),
+                        );
+                    }
                     usage = merge_usage(usage, sub_usage);
                     sub_result
                 }
@@ -1626,6 +1777,18 @@ async fn chat_with_builtin_tools(
                         &cancel,
                     )
                     .await;
+                    // 用量归因（附加式只读）：并行子代理（聚合 usage），记一条 consumer_type="subagent"
+                    // （label="并行"），用 ROLE_SUBAGENT 单价算 cost。记的是该次 own sub_usage。软处理。
+                    if let Some(own) = sub_usage.as_ref() {
+                        record_usage_attribution(
+                            app,
+                            conversation_id,
+                            "subagent",
+                            Some("并行"),
+                            own,
+                            sub_pricing_ctx.as_ref(),
+                        );
+                    }
                     usage = merge_usage(usage, sub_usage);
                     sub_result
                 }
@@ -1635,6 +1798,18 @@ async fn chat_with_builtin_tools(
                 "get_task_output" | "kill_task" | "list_tasks" => {
                     let (task_result, task_usage) =
                         execute_bg_task_tool(app, &tool_name, &arguments).await;
+                    // 用量归因（附加式只读）：后台子代理收割 usage，记一条 consumer_type="subagent"
+                    // （label="后台"），用 ROLE_SUBAGENT 单价算 cost。记的是该次 own task_usage。软处理。
+                    if let Some(own) = task_usage.as_ref() {
+                        record_usage_attribution(
+                            app,
+                            conversation_id,
+                            "subagent",
+                            Some("后台"),
+                            own,
+                            sub_pricing_ctx.as_ref(),
+                        );
+                    }
                     usage = merge_usage(usage, task_usage);
                     task_result
                 }

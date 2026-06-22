@@ -94,6 +94,27 @@ export type BgActivityView = {
  */
 export type ToolUsageView = { toolName: string; calls: number; outputTokens: number };
 
+/**
+ * 按消费者（角色/子代理）聚合的**真账单**归因视图（第三栏「用量」标签，
+ * get_usage_attribution(conversationId) 返回，serde camelCase；已按 totalTokens 降序）。
+ * 诚实边界：与 ToolUsageView（按工具活动量·近似非账单）不同——这是真账单：
+ * 每个消费者按它**自己模型**的单价结算，故各消费者成本之和可能与「本会话总」（按主模型单价估）略有出入。
+ * consumerType 区分：'main'＝主模型循环｜'vision'＝视觉分析｜'subagent'＝子代理；
+ * consumerLabel 为细分小字（如 main 的 action/plan、vision 的 初看/追问、subagent 的 前台/并行/后台）。
+ * estimatedCost/currency 可空（该消费者模型未填单价/无金额时只显 tokens）。
+ */
+export type UsageAttributionView = {
+  consumerType: "main" | "vision" | "subagent";
+  consumerLabel?: string;
+  modelId?: string;
+  totalTokens: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  estimatedCost?: number | null;
+  currency?: PricingCurrency | null;
+};
+
 /** 最近被拦动作（Plan27 #9）：recent_denied_actions 返回，用于一键加规则。 */
 export type DeniedAction = { toolName: string; target: string };
 

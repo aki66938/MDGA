@@ -18,7 +18,7 @@ use mdga_storage::{
     create_conversation_with_workspace, delete_conversation, delete_messages, get_active_workspace,
     get_activity_events, get_conversation, get_messages,
     get_token_ledger_entries, list_conversations,
-    list_file_checkpoints,
+    list_file_checkpoints, list_usage_attribution,
     list_mcp_servers, list_permission_rules, mark_checkpoint_reverted, remove_mcp_server,
     remove_permission_rule, save_active_workspace, save_message, set_conversation_archived,
     set_conversation_pinned, set_mcp_server_enabled, update_conversation_workspace, update_title,
@@ -566,6 +566,107 @@ pub(crate) fn get_connection_monthly_usage(
 ) -> Result<MonthlyUsage, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     get_monthly_usage(&db, &connectionId, &current_ym()).map_err(|e| e.to_string())
+}
+
+/// 一条「按消费者聚合」的用量归因视图（附加式只读追踪，serde camelCase）。
+///
+/// 由 [`get_usage_attribution`] 把 token_usage_attribution 表里同一会话的多条记录
+/// 按 (consumer_type, consumer_label) 聚合而成。**不泄露 api_key / pricing_json 原文**——
+/// 只回聚合后的 tokens 与 cost。
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UsageAttributionView {
+    /// 消费者类别：'main' | 'vision' | 'subagent'。
+    pub consumer_type: String,
+    /// 消费者标签（可空）：如角色名 action/plan、「初看」「追问」「前台」「并行」「后台」。
+    pub consumer_label: Option<String>,
+    /// 该消费者用的模型 id（可空，取组内首条非空）。
+    pub model_id: Option<String>,
+    pub total_tokens: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// 缓存命中 token（取 RawUsage.prompt_cache_hit_tokens）。
+    pub cached_tokens: u64,
+    /// 估算费用（按各条 cost_json 的 estimatedCost 累加；无 cost_json 的计 0 但 tokens 照加）。
+    pub estimated_cost: f64,
+    /// 币种（可空，取组内首条非空）。
+    pub currency: Option<String>,
+}
+
+/// 读某会话的用量归因（附加式只读追踪），按 (consumer_type, consumer_label) 聚合后返回。
+///
+/// 这是「用量按角色/子代理真账单归因」的查询入口：与会话总额（前端从 message.usageJson 聚合）
+/// 是两套独立的数——归因表每条记的是某消费者(主轮/视觉/子代理)的 **own** usage，各 own usage 之和
+/// == 合并后总额，故 sum(归因 tokens) ≈ 会话总额 tokens、不双计；模型不同则归因 cost 更准。
+///
+/// 聚合：tokens 各项相加；estimated_cost 按各条 cost_json 的 estimatedCost 累加（无 cost_json 计 0、
+/// tokens 仍计）；model_id / currency 取组内首条非空。结果按 total_tokens 降序。
+#[allow(non_snake_case)]
+#[tauri::command]
+pub(crate) fn get_usage_attribution(
+    state: State<AppState>,
+    conversationId: String,
+) -> Result<Vec<UsageAttributionView>, String> {
+    let entries = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        list_usage_attribution(&db, &conversationId).map_err(|e| e.to_string())?
+    };
+    Ok(aggregate_usage_attribution(entries))
+}
+
+/// 把归因记录按 (consumer_type, consumer_label) 聚合成视图列表（纯函数，便于单测）。
+///
+/// tokens 各项相加（解析失败的条目 tokens 计 0、绝不 panic）；estimated_cost 按各条 cost_json 的
+/// estimatedCost 累加（无 cost_json / 无金额计 0、tokens 仍计）；model_id / currency 取组内首条非空；
+/// 结果按 total_tokens 降序（相同 total 保持首次出现顺序）。
+fn aggregate_usage_attribution(
+    entries: Vec<mdga_storage::UsageAttributionEntry>,
+) -> Vec<UsageAttributionView> {
+    let mut order: Vec<(String, Option<String>)> = Vec::new();
+    let mut groups: std::collections::HashMap<(String, Option<String>), UsageAttributionView> =
+        std::collections::HashMap::new();
+
+    for e in entries {
+        let key = (e.consumer_type.clone(), e.consumer_label.clone());
+        let view = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            UsageAttributionView {
+                consumer_type: e.consumer_type.clone(),
+                consumer_label: e.consumer_label.clone(),
+                ..Default::default()
+            }
+        });
+        // tokens：解析 own RawUsage（snake_case）；解析失败则该条 tokens 当 0（绝不 panic）。
+        if let Ok(raw) = serde_json::from_str::<mdga_shared::RawUsage>(&e.usage_json) {
+            view.total_tokens = view.total_tokens.saturating_add(raw.total_tokens);
+            view.prompt_tokens = view.prompt_tokens.saturating_add(raw.prompt_tokens);
+            view.completion_tokens =
+                view.completion_tokens.saturating_add(raw.completion_tokens);
+            view.cached_tokens =
+                view.cached_tokens.saturating_add(raw.prompt_cache_hit_tokens);
+        }
+        // cost：解析 CostSummary（camelCase）取 estimatedCost；无 cost_json / 无金额则计 0。
+        if let Some(cj) = e.cost_json.as_deref() {
+            if let Ok(cs) = serde_json::from_str::<mdga_token_accounting::CostSummary>(cj) {
+                if let Some(c) = cs.estimated_cost {
+                    view.estimated_cost += c;
+                }
+            }
+        }
+        // model_id / currency：取组内首条非空。
+        if view.model_id.is_none() {
+            view.model_id = e.model_id.clone();
+        }
+        if view.currency.is_none() {
+            view.currency = e.currency.clone();
+        }
+    }
+
+    let mut out: Vec<UsageAttributionView> =
+        order.into_iter().filter_map(|k| groups.remove(&k)).collect();
+    // 按 total_tokens 降序。
+    out.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    out
 }
 
 /// 拉取某连接端点真实可用的模型 id 列表（0.0.60）：GET {base}/models（连接的 key 作 Bearer）。
@@ -2408,5 +2509,72 @@ mod tests {
         assert!(pick_effective_pricing(None, None).is_none());
         // override 解析失败且无编译 → None。
         assert!(pick_effective_pricing(Some(override_with("{bad")), None).is_none());
+    }
+
+    // ── 用量归因聚合（aggregate_usage_attribution）─────────────────────────
+
+    fn attribution_entry(
+        consumer_type: &str,
+        consumer_label: Option<&str>,
+        model_id: Option<&str>,
+        usage_json: &str,
+        cost_json: Option<&str>,
+        currency: Option<&str>,
+    ) -> mdga_storage::UsageAttributionEntry {
+        mdga_storage::UsageAttributionEntry {
+            id: "x".to_string(),
+            conversation_id: "c".to_string(),
+            consumer_type: consumer_type.to_string(),
+            consumer_label: consumer_label.map(String::from),
+            model_id: model_id.map(String::from),
+            usage_json: usage_json.to_string(),
+            cost_json: cost_json.map(String::from),
+            currency: currency.map(String::from),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn aggregate_groups_sums_and_sorts_desc() {
+        // own usage（snake_case，与 RawUsage 序列化一致）。
+        let main_u = r#"{"prompt_tokens":80,"completion_tokens":20,"total_tokens":100,"prompt_cache_hit_tokens":10,"prompt_cache_miss_tokens":70,"reasoning_tokens":0,"raw_json":"{}"}"#;
+        let sub_u = r#"{"prompt_tokens":30,"completion_tokens":10,"total_tokens":40,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":30,"reasoning_tokens":0,"raw_json":"{}"}"#;
+        // cost（camelCase，与 CostSummary 序列化一致）：仅取 estimatedCost。
+        let main_c = r#"{"promptTokens":80,"completionTokens":20,"totalTokens":100,"cacheHitTokens":10,"cacheMissTokens":70,"reasoningTokens":0,"estimatedCostUsd":0.5,"estimatedCost":0.5,"currency":"CNY","billingMode":"api","usageSource":"deepseek_usage","pricingVersion":""}"#;
+
+        let entries = vec![
+            // 两条 main/action 应聚合成一组，tokens / cost 相加。
+            attribution_entry("main", Some("action"), Some("deepseek-v4-pro"), main_u, Some(main_c), Some("CNY")),
+            attribution_entry("main", Some("action"), Some("deepseek-v4-pro"), main_u, Some(main_c), Some("CNY")),
+            // 子代理一条，无 cost_json（tokens 照计、cost 计 0）。
+            attribution_entry("subagent", Some("并行"), Some("flash"), sub_u, None, None),
+        ];
+
+        let out = aggregate_usage_attribution(entries);
+        assert_eq!(out.len(), 2, "两组：main/action 与 subagent/并行");
+        // 降序：main 组 total=200 在前，subagent 组 total=40 在后。
+        assert_eq!(out[0].consumer_type, "main");
+        assert_eq!(out[0].consumer_label.as_deref(), Some("action"));
+        assert_eq!(out[0].total_tokens, 200);
+        assert_eq!(out[0].prompt_tokens, 160);
+        assert_eq!(out[0].completion_tokens, 40);
+        assert_eq!(out[0].cached_tokens, 20);
+        assert!((out[0].estimated_cost - 1.0).abs() < 1e-9, "0.5 + 0.5");
+        assert_eq!(out[0].currency.as_deref(), Some("CNY"));
+        assert_eq!(out[0].model_id.as_deref(), Some("deepseek-v4-pro"));
+
+        assert_eq!(out[1].consumer_type, "subagent");
+        assert_eq!(out[1].total_tokens, 40);
+        assert_eq!(out[1].estimated_cost, 0.0, "无 cost_json → cost 计 0");
+        assert_eq!(out[1].currency, None);
+    }
+
+    #[test]
+    fn aggregate_bad_usage_json_counts_zero_no_panic() {
+        let entries = vec![attribution_entry("main", None, None, "{not json", None, None)];
+        let out = aggregate_usage_attribution(entries);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].total_tokens, 0);
+        assert_eq!(out[0].estimated_cost, 0.0);
     }
 }

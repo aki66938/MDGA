@@ -234,6 +234,43 @@ textarea {
   letter-spacing: .2px;
 }
 
+/* 极简 header：去横线、去品牌；仅左上角小字对话标题（可点重命名，与第一栏联动）。 */
+.topbar--bare {
+  border-bottom: none;
+  gap: 8px;
+  padding-top: 2px;
+  padding-bottom: 4px;
+}
+.topbar__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 70%;
+  margin-left: -4px;
+  padding: 2px 5px;
+  border: none;
+  background: none;
+  border-radius: 6px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.topbar__title:hover { background: var(--surface-3); color: var(--text-2); }
+.topbar__title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.topbar__title-edit { flex-shrink: 0; opacity: 0; transition: opacity .12s; }
+.topbar__title:hover .topbar__title-edit { opacity: .55; }
+.topbar__title-input {
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--brand);
+  border-radius: 6px;
+  padding: 3px 7px;
+  width: min(360px, 70%);
+  outline: none;
+}
+
 h1,
 h2,
 h3,
@@ -361,7 +398,16 @@ h1 {
   align-self: stretch;
   align-items: center;
   margin: 0 calc(-1 * var(--col-gutter));
-  padding: 24px var(--col-gutter);
+  /* 0.0.76：底部 padding 收小（原 24，与顶部对称），配合下方 composer 收紧的上边距，
+     消除「会话累计删除后内容下沉仍残留的死空隙」。顶部仍 24（内容底对齐时顶部空间无所谓）。 */
+  padding: 24px var(--col-gutter) 6px;
+}
+
+/* 短对话（内容未填满中栏）时让消息内容底部对齐、贴近输入框，空白移到顶部（聊天惯例）。
+   0.0.76：此处原放「会话累计」、删除后下方留白；下沉内容以消除留白。首条消息 margin-top:auto——
+   内容溢出时自动塌缩为 0 → 正常从顶滚动、不裁顶（规避 justify-content:flex-end 的溢出裁切 bug）。 */
+.message-list > .message-row:first-child {
+  margin-top: auto;
 }
 
 /* 每条消息的行容器，user 右对齐，assistant 左对齐。
@@ -1786,7 +1832,7 @@ h1 {
   width: min(var(--thread-width), 100%);
   align-self: center;
   flex-shrink: 0;
-  margin-top: 12px;
+  margin-top: 6px;
 }
 
 .composer-area .composer {

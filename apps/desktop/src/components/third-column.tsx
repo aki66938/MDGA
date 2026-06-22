@@ -16,9 +16,10 @@ import {
   FolderTree, Folder, FolderOpen, File as FileIcon, ArrowLeft, LayoutDashboard, X,
 } from "lucide-react";
 import type {
-  FileCheckpoint, FileChange, BgActivityView, TodoItem, UsageSummary, ToolUsageView, ArtifactPart,
+  FileCheckpoint, FileChange, BgActivityView, TodoItem, UsageSummary, ToolUsageView,
+  UsageAttributionView, ArtifactPart,
 } from "../types";
-import { fmtTokens } from "../utils";
+import { fmtTokens, formatMoney } from "../utils";
 import { ChangesView } from "./dialogs";
 import { ConversationUsageSummary, DiffBlock } from "./messages";
 import { ArtifactCard } from "./artifact";
@@ -308,12 +309,22 @@ function FileChangesSection({ fileChanges }: { fileChanges: FileChange[] }) {
   );
 }
 
-// ── 第三栏·用量标签：上下文环 + 本会话真账单 + 按工具活动量（近似，非账单）──────────
-// 三段数据源全部复用，纯前端、不碰后端账单：
+// consumerType → 友好名（小字 consumerLabel 由调用处单独渲染）。
+const CONSUMER_TYPE_LABEL: Record<UsageAttributionView["consumerType"], string> = {
+  main: "主模型",
+  vision: "视觉",
+  subagent: "子代理",
+};
+
+// ── 第三栏·用量标签：上下文环 + 本会话真账单 + 按角色/子代理真账单 + 按工具活动量（近似）──────
+// 四段数据源全部复用或走只读命令，纯前端、不碰后端账单：
 //   1) 上下文环：复用 App 的 ctxUsage（promptTokens / softLimit）。softLimit 为 null 只显 token、不显百分比。
 //   2) 本会话用量：复用 <ConversationUsageSummary>（aggregateUsage 求和 + aggregateCost 真账单按币种）。
-//   3) 按工具活动：拉 get_tool_usage(activeConvId)，条形列表显「调用次数 / 输出体积」——**上下文贡献近似、非账单**。
-// 刷新：本面板挂载时（即第三栏展开且在用量标签）拉一次 + 监听 tool-event 节流(~800ms)重拉；折叠/非本标签不挂载即不拉。
+//   3) 按角色/子代理（真账单）：拉 get_usage_attribution(activeConvId)，每个消费者按它**自己模型**单价结算；
+//      与第 2 段「本会话总」（按主模型单价估）口径不同，子代理/视觉用了别的单价模型时两者略有出入属正常。
+//   4) 按工具活动：拉 get_tool_usage(activeConvId)，条形列表显「调用次数 / 输出体积」——**上下文贡献近似、非账单**。
+// 刷新：本面板挂载时（即第三栏展开且在用量标签）拉一次；监听 tool-event 节流(~800ms)重拉工具段，
+//   监听 chat-usage / chat-done（新 usage 才变）重拉归因段；折叠/非本标签不挂载即不拉。卸载清定时器与监听。
 function UsagePanel({
   activeConvId,
   ctxUsage,
@@ -326,10 +337,12 @@ function UsagePanel({
   turnUsages: UsageSummary[];
 }) {
   const [toolUsage, setToolUsage] = useState<ToolUsageView[]>([]);
+  // 按角色/子代理真账单归因（get_usage_attribution；新 usage 产生才变）。
+  const [attribution, setAttribution] = useState<UsageAttributionView[]>([]);
   // tool-event 节流：避免一连串工具事件高频拉取；尾沿落地一次（工具结束才变值）。
   const throttleRef = useRef<number | null>(null);
 
-  async function refresh() {
+  async function refreshTools() {
     if (!activeConvId) {
       setToolUsage([]);
       return;
@@ -340,19 +353,32 @@ function UsagePanel({
     setToolUsage(list);
   }
 
-  // 挂载 / 切会话即拉一次（折叠或非本标签时本组件不挂载，自然不拉）。
+  // 真账单归因：后端已按 totalTokens 降序聚合，前端只展示，不再排序/估算。
+  async function refreshAttribution() {
+    if (!activeConvId) {
+      setAttribution([]);
+      return;
+    }
+    const list = await invoke<UsageAttributionView[]>("get_usage_attribution", {
+      conversationId: activeConvId,
+    }).catch(() => [] as UsageAttributionView[]);
+    setAttribution(list);
+  }
+
+  // 挂载 / 切会话即各拉一次（折叠或非本标签时本组件不挂载，自然不拉）。
   useEffect(() => {
-    void refresh();
+    void refreshTools();
+    void refreshAttribution();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeConvId]);
 
-  // 监听 tool-event 节流重拉（尾沿 ~800ms）；卸载清定时器与监听。
+  // 监听 tool-event 节流重拉工具段（尾沿 ~800ms）；卸载清定时器与监听。
   useEffect(() => {
     const schedule = () => {
       if (throttleRef.current != null) return;
       throttleRef.current = window.setTimeout(() => {
         throttleRef.current = null;
-        void refresh();
+        void refreshTools();
       }, 800);
     };
     const un = listen("tool-event", schedule);
@@ -366,6 +392,16 @@ function UsagePanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeConvId]);
 
+  // 新 usage 产生（chat-usage / chat-done）才重拉归因段——账单只随真实计费轮变化，无需节流高频拉。
+  useEffect(() => {
+    const names = ["chat-usage", "chat-done"];
+    const unlistens = names.map((n) => listen(n, () => void refreshAttribution()));
+    return () => {
+      for (const u of unlistens) u.then((fn) => fn());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConvId]);
+
   // 上下文环：百分比仅在 softLimit 非空时算（别硬造）。
   const ctxPct =
     ctxUsage && ctxUsage.softLimit != null && ctxUsage.softLimit > 0
@@ -375,6 +411,9 @@ function UsagePanel({
   // 按工具活动量条形归一：以最大 outputTokens 为满格（全 0 时退而用 calls 归一）。
   const maxOut = toolUsage.reduce((m, t) => Math.max(m, t.outputTokens), 0);
   const maxCalls = toolUsage.reduce((m, t) => Math.max(m, t.calls), 0);
+
+  // 归因段条形归一：以最大 totalTokens 为满格（后端已降序，故首行即满格）。
+  const maxAttrTokens = attribution.reduce((m, a) => Math.max(m, a.totalTokens), 0);
 
   return (
     <div className="third-col__usage">
@@ -438,7 +477,45 @@ function UsagePanel({
         )}
       </div>
 
-      {/* 3) 按工具活动量（近似、非账单）。 */}
+      {/* 3) 按角色/子代理（真账单）：每个消费者按它自己模型单价结算。空列表整段隐藏。 */}
+      {attribution.length > 0 && (
+        <div className="usage-section">
+          <div className="usage-section__title">
+            按角色 / 子代理（真账单）
+            <span className="usage-section__note">（各按自身模型单价）</span>
+          </div>
+          <div className="usage-tools">
+            {attribution.map((a, i) => {
+              const typeLabel = CONSUMER_TYPE_LABEL[a.consumerType] ?? a.consumerType;
+              const pct = maxAttrTokens > 0 ? (a.totalTokens / maxAttrTokens) * 100 : 0;
+              // 成本：有金额（estimatedCost>0 且 currency 非空）才显金额，否则显「—」。
+              const hasCost = a.estimatedCost != null && a.estimatedCost > 0 && a.currency != null;
+              return (
+                <div className="usage-tool" key={`${a.consumerType}:${a.consumerLabel ?? ""}:${i}`}>
+                  <div className="usage-tool__head">
+                    <span className="usage-tool__name" title={a.modelId ?? typeLabel}>
+                      {typeLabel}
+                      {a.consumerLabel && <span className="usage-tool__sub">{a.consumerLabel}</span>}
+                    </span>
+                    <span className="usage-tool__nums">
+                      {fmtTokens(a.totalTokens)} ·{" "}
+                      {hasCost ? formatMoney(a.estimatedCost as number, a.currency ?? undefined) : "—"}
+                    </span>
+                  </div>
+                  <div className="usage-tool__bar" aria-hidden="true">
+                    <span className="usage-tool__fill" style={{ width: `${pct}%` }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="usage-section__note">
+            真账单按各消费者自身模型单价结算，与上方「本会话用量」（按主模型单价估）可能略有出入。
+          </div>
+        </div>
+      )}
+
+      {/* 4) 按工具活动量（近似、非账单）。 */}
       <div className="usage-section">
         <div className="usage-section__title">
           按工具：调用次数 / 输出体积

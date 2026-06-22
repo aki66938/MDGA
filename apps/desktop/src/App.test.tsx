@@ -38,13 +38,13 @@ describe("desktop MVP shell", () => {
   });
 
   it("renders the app shell without crashing", () => {
-    // 稳健冒烟:应用能挂载且顶部 MDGA 标识渲染。不再断言早期 MVP 的具体业务文案(DeepSeek 连接 / 写死的
-    // V4 Flash/Pro 模型下拉等——多模型配置重构后已移除/迁入设置页),避免测试随 UI 演进持续失效(0.0.70)。
+    // 稳健冒烟:应用能挂载、composer 输入框渲染。0.0.76 header 简化(去 MDGA 品牌标语、仅进入对话后
+    // 左上角显可重命名的对话名)后不再有 MDGA 标题,故改断言始终在场的输入框,避免随 UI 演进失效。
     render(<App />);
-    expect(screen.getByRole("heading", { name: "MDGA" })).toBeTruthy();
+    expect(screen.getByLabelText("Message")).toBeTruthy();
   });
 
-  it("aggregates persisted usage for the active conversation", async () => {
+  it("shows the per-turn usage badge on a loaded assistant message", async () => {
     const usage = {
       promptTokens: 120,
       completionTokens: 80,
@@ -90,12 +90,11 @@ describe("desktop MVP shell", () => {
 
     fireEvent.click(await screen.findByText("账本测试"));
 
+    // 0.0.76：会话累计用量已从中栏移到第三栏「用量」标签；中栏保留「单轮逐条」的默认隐藏统计。
+    // 故验证：选中会话后，带 usage 的 assistant 消息渲染逐条用量徽标（aria-label="Token usage"）。
     await waitFor(() => {
-      const summary = screen.getByLabelText("Conversation token summary");
-      expect(within(summary).getByText("会话累计")).toBeTruthy();
-      expect(within(summary).getByText("200 tokens")).toBeTruthy();
-      // 0.0.72：成本改为按币种分小计、显「合计 …」；无 billingMode 的旧用量回退按 USD（formatMoney→＄）累加。
-      expect(within(summary).getByText(/合计\s*＄0\.00012/)).toBeTruthy();
+      const badge = screen.getByLabelText("Token usage");
+      expect(within(badge).getByText("200 tokens")).toBeTruthy();
     });
   });
 

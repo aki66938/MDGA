@@ -65,7 +65,8 @@ use commands::{
 };
 use commands::{
     add_model, delete_connection, delete_model, fetch_available_models, get_app_setting,
-    get_connection_monthly_usage, get_thinking_profile, list_connections, list_models,
+    get_connection_monthly_usage, get_thinking_profile, get_usage_attribution, list_connections,
+    list_models,
     list_models_for_connection, lookup_effective_pricing, lookup_model_preset, save_connection,
     set_app_setting, set_connection_billing, set_model_pricing, smoke_test_tool_call,
     smoke_test_tool_call_for_connection, test_connection, update_model,
@@ -299,6 +300,7 @@ fn main() {
             apply_pricing_overrides,
             reset_pricing_overrides,
             get_connection_monthly_usage,
+            get_usage_attribution,
             fetch_available_models,
             smoke_test_tool_call,
             smoke_test_tool_call_for_connection,

@@ -4,7 +4,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Settings2,
-  ListChecks, Square, ArrowUp, GitCompare,
+  ListChecks, Square, ArrowUp, Pencil,
   Check, X, Ban, Info,
   ChevronDown, FolderOpen, Gauge, AtSign, CornerDownRight,
   Plus, MessageCircle, Cpu,
@@ -65,7 +65,6 @@ import {
   TodoPanel,
   MessageContent,
   MessageActions,
-  ConversationUsageSummary,
 } from "./components/messages";
 import {
   ChangesModal,
@@ -126,6 +125,9 @@ export function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [editingConvId, setEditingConvId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
+  // header 标题就地重命名（独立于第一栏行内重命名态，提交到共享 conversations → 与第一栏双向联动）。
+  const [editingHeaderTitle, setEditingHeaderTitle] = useState(false);
+  const [headerTitleDraft, setHeaderTitleDraft] = useState("");
   const [showArchived, setShowArchived] = useState(false);
   // Agent 实时状态：思考中 / 执行工具 / 压缩上下文 / 输出中，发送期间常驻显示
   const [agentStatus, setAgentStatus] = useState<string | null>(null);
@@ -647,6 +649,16 @@ export function App() {
     setConversations((prev) =>
       prev.map((c) => (c.id === id ? { ...c, title } : c))
     );
+  }
+
+  /** header 标题就地重命名：提交 rename_conversation + 更新共享 conversations（第一栏会话名即时联动）。 */
+  async function commitHeaderRename() {
+    const id = activeConvId;
+    const title = headerTitleDraft.trim();
+    setEditingHeaderTitle(false);
+    if (!id || !title) return;
+    await invoke("rename_conversation", { conversationId: id, title }).catch(() => {});
+    setConversations((prev) => prev.map((c) => (c.id === id ? { ...c, title } : c)));
   }
 
   async function handleSelectWorkspace() {
@@ -1927,36 +1939,38 @@ export function App() {
 
       {/* 工作区 */}
       <section className="workspace" aria-label="MDGA workspace">
-        <header className="topbar topbar--slim">
-          <div className="topbar__brand">
-            <p className="eyebrow">Make DeepSeek Great Again</p>
-            <h1>MDGA</h1>
-          </div>
-          <div className="status-strip" aria-label="status">
-            {/* 工作区身份由 composer 底部胶囊承载、上下文用量由底栏指示器承载（Plan26）。
-                顶栏的「活动 / 变更」胶囊改为切换常驻第三栏（不再直接开覆盖层）。 */}
-            <button
-              className="topbar-btn"
-              type="button"
-              title="活动面板"
-              onClick={() => { setThirdColOpen(true); setThirdColTab("activity"); }}
-            >
-              <ListChecks size={14} /> 活动
-              {hasActivityDot && <span className="third-col__dot third-col__dot--badge" aria-hidden="true" />}
-            </button>
-            {activeConvId && (
+        {/* 极简 header：无横线、无品牌标语；仅进入对话后在左上角小字显对话全名（可点重命名，
+            与第一栏会话名同源双向联动）。未进入对话（欢迎页/草稿）则整条 header 不渲染、不占位。
+            活动 / 变更入口由右侧常驻第三栏承载，顶栏不再重复。 */}
+        {activeConversation && (
+          <header className="topbar topbar--bare">
+            {editingHeaderTitle ? (
+              <input
+                className="topbar__title-input"
+                value={headerTitleDraft}
+                autoFocus
+                maxLength={120}
+                aria-label="重命名对话"
+                onChange={(e) => setHeaderTitleDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") { e.preventDefault(); void commitHeaderRename(); }
+                  else if (e.key === "Escape") { e.preventDefault(); setEditingHeaderTitle(false); }
+                }}
+                onBlur={() => void commitHeaderRename()}
+              />
+            ) : (
               <button
-                className="topbar-btn"
                 type="button"
-                title="文件变更（可回退）"
-                onClick={() => { setThirdColOpen(true); setThirdColTab("changes"); }}
+                className="topbar__title"
+                title="点击重命名对话"
+                onClick={() => { setHeaderTitleDraft(activeConversation.title); setEditingHeaderTitle(true); }}
               >
-                <GitCompare size={14} /> 变更
-                {hasChangesDot && <span className="third-col__dot third-col__dot--badge" aria-hidden="true" />}
+                <span className="topbar__title-text">{activeConversation.title}</span>
+                <Pencil size={11} className="topbar__title-edit" aria-hidden="true" />
               </button>
             )}
-          </div>
-        </header>
+          </header>
+        )}
 
         {hasMessages ? (
           <section
@@ -2052,9 +2066,6 @@ export function App() {
           </section>
         )}
 
-        {conversationUsage && (
-          <ConversationUsageSummary aggregated={conversationUsage} usages={turnUsages} />
-        )}
 
         {todos.length > 0 && <TodoPanel items={todos} />}
 

@@ -319,6 +319,28 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             fetched_at        INTEGER,
             PRIMARY KEY (connection_preset, model_id, currency)
         );
+
+        -- 用量按角色/子代理真账单归因（附加式只读追踪表）：每个「消费者」(主轮/视觉/子代理) 在
+        -- 一次对话里产生的 own usage 各记一条,各用各自的单价算出 cost。与既有计价路径完全隔离——
+        -- 不进 token_ledger(避免 CSV 双计)、不改 messages.usage_json、不参与会话总额计算。
+        -- 字段:consumer_type='main'|'vision'|'subagent';consumer_label 可空(如角色名 action/plan、
+        -- 「并行」「后台」或子代理描述);model_id 可空;usage_json=该消费者 own RawUsage JSON;
+        -- cost_json 可空(该消费者自己单价算出的 CostSummary JSON,解析不到单价时留空只记 tokens);
+        -- currency 可空。
+        CREATE TABLE IF NOT EXISTS token_usage_attribution (
+            id              TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            consumer_type   TEXT NOT NULL,
+            consumer_label  TEXT,
+            model_id        TEXT,
+            usage_json      TEXT NOT NULL,
+            cost_json       TEXT,
+            currency        TEXT,
+            created_at      INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_usage_attribution_conv
+            ON token_usage_attribution (conversation_id, created_at);
         ",
     )?;
     add_column_if_missing(&conn, "conversations", "workspace_path", "TEXT")?;
@@ -850,6 +872,96 @@ pub fn get_token_ledger_entries(
             kind: row.get(2)?,
             usage_json: row.get(3)?,
             created_at: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+// ── 用量归因账本（token_usage_attribution，附加式只读追踪）──────────────────────
+
+/// 归因账本中一条「消费者」用量记录。
+///
+/// 附加式：每个消费者（主轮 / 视觉 / 子代理）在一次对话里产生的 **own usage** 各记一条，
+/// 各用各自的单价算出 cost。与 token_ledger / messages.usage_json / 会话总额计算完全隔离。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAttributionEntry {
+    pub id: String,
+    pub conversation_id: String,
+    /// 消费者类别：'main' | 'vision' | 'subagent'（并行/后台也归 subagent，用 label 区分）。
+    pub consumer_type: String,
+    /// 消费者标签（可空）：如角色名 action/plan、「并行」「后台」或子代理描述。
+    pub consumer_label: Option<String>,
+    /// 该消费者用的模型 id（可空）。
+    pub model_id: Option<String>,
+    /// 该消费者 own usage 的序列化 RawUsage JSON 串。
+    pub usage_json: String,
+    /// 该消费者自己单价算出的 CostSummary JSON 串（可空：解析不到单价时只记 tokens）。
+    pub cost_json: Option<String>,
+    /// 币种（可空）。
+    pub currency: Option<String>,
+    pub created_at: i64,
+}
+
+/// 向归因账本写入一条消费者用量记录（附加式，不挂在任何 messages 行上，不进 token_ledger）。
+///
+/// 失败由调用方软处理：归因记账绝不能影响对话/计价主流程。
+#[allow(clippy::too_many_arguments)]
+pub fn insert_usage_attribution(
+    conn: &Connection,
+    conv_id: &str,
+    consumer_type: &str,
+    consumer_label: Option<&str>,
+    model_id: Option<&str>,
+    usage_json: &str,
+    cost_json: Option<&str>,
+    currency: Option<&str>,
+) -> SqlResult<()> {
+    let id = Uuid::new_v4().to_string();
+    let now = now_ts();
+    conn.execute(
+        "INSERT INTO token_usage_attribution
+             (id, conversation_id, consumer_type, consumer_label, model_id,
+              usage_json, cost_json, currency, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id,
+            conv_id,
+            consumer_type,
+            consumer_label,
+            model_id,
+            usage_json,
+            cost_json,
+            currency,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+/// 查询某会话的全部归因记录，按时间正序。
+pub fn list_usage_attribution(
+    conn: &Connection,
+    conv_id: &str,
+) -> SqlResult<Vec<UsageAttributionEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, conversation_id, consumer_type, consumer_label, model_id,
+                usage_json, cost_json, currency, created_at
+         FROM token_usage_attribution
+         WHERE conversation_id = ?1
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([conv_id], |row| {
+        Ok(UsageAttributionEntry {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            consumer_type: row.get(2)?,
+            consumer_label: row.get(3)?,
+            model_id: row.get(4)?,
+            usage_json: row.get(5)?,
+            cost_json: row.get(6)?,
+            currency: row.get(7)?,
+            created_at: row.get(8)?,
         })
     })?;
     rows.collect()
@@ -2765,6 +2877,80 @@ mod tests {
             .is_some());
         // 删不存在的条目静默 no-op（不报错）。
         delete_pricing_override(&conn, "deepseek", "m1", "CNY").expect("delete absent no-op");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // ── 用量归因账本（token_usage_attribution）──────────────────────────────
+
+    #[test]
+    fn usage_attribution_insert_list_roundtrip_and_isolation() {
+        let db_path = std::env::temp_dir().join(format!("mdga-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        // 同一会话三条不同消费者；另一会话一条作隔离验证。
+        insert_usage_attribution(
+            &conn,
+            "conv-a",
+            "main",
+            Some("action"),
+            Some("deepseek-v4-pro"),
+            "{\"prompt_tokens\":100}",
+            Some("{\"estimatedCost\":0.5}"),
+            Some("CNY"),
+        )
+        .expect("main");
+        insert_usage_attribution(
+            &conn,
+            "conv-a",
+            "vision",
+            None,
+            Some("glm-4v"),
+            "{\"prompt_tokens\":20}",
+            None, // 解析不到单价：只记 tokens、cost 留空。
+            None,
+        )
+        .expect("vision");
+        insert_usage_attribution(
+            &conn,
+            "conv-a",
+            "subagent",
+            Some("并行"),
+            Some("deepseek-v4-flash"),
+            "{\"prompt_tokens\":30}",
+            Some("{\"estimatedCost\":0.1}"),
+            Some("CNY"),
+        )
+        .expect("subagent");
+        insert_usage_attribution(
+            &conn,
+            "conv-b",
+            "main",
+            None,
+            None,
+            "{\"prompt_tokens\":5}",
+            None,
+            None,
+        )
+        .expect("other conv");
+
+        let rows = list_usage_attribution(&conn, "conv-a").expect("list");
+        assert_eq!(rows.len(), 3, "会话隔离：只回 conv-a 的三条");
+        assert!(rows.iter().all(|r| r.conversation_id == "conv-a"));
+        // 字段往返一致（含可空字段）。
+        let main = rows.iter().find(|r| r.consumer_type == "main").expect("main row");
+        assert_eq!(main.consumer_label.as_deref(), Some("action"));
+        assert_eq!(main.model_id.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(main.cost_json.as_deref(), Some("{\"estimatedCost\":0.5}"));
+        assert_eq!(main.currency.as_deref(), Some("CNY"));
+        let vision = rows.iter().find(|r| r.consumer_type == "vision").expect("vision row");
+        assert_eq!(vision.consumer_label, None);
+        assert_eq!(vision.cost_json, None);
+        assert_eq!(vision.currency, None);
+
+        // 另一会话独立。
+        assert_eq!(list_usage_attribution(&conn, "conv-b").expect("list b").len(), 1);
+        assert_eq!(list_usage_attribution(&conn, "nope").expect("list none").len(), 0);
 
         let _ = std::fs::remove_file(db_path);
     }
