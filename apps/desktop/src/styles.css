@@ -3464,14 +3464,29 @@ h1 {
   position: relative;
 }
 
-/* 展开态：标签条。 */
+/* 展开态：标签条。6 个标签可能超宽——标签区横向滚动，折叠按钮始终固定在右侧不参与滚动。 */
 .third-col__tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  flex-shrink: 0;
+  padding: 8px 4px 0 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* 标签滚动容器：横向溢出时滚动；细滚动条不抢视觉。 */
+.third-col__tabs-scroll {
   display: flex;
   align-items: center;
   gap: 2px;
-  flex-shrink: 0;
-  padding: 8px 8px 0;
-  border-bottom: 1px solid var(--border);
+  min-width: 0;
+  flex: 1;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.third-col__tabs-scroll::-webkit-scrollbar {
+  height: 4px;
 }
 
 .third-col__tab {
@@ -3479,6 +3494,7 @@ h1 {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  flex-shrink: 0;
   min-width: 0;
   padding: 8px 8px;
   border: none;
@@ -3503,9 +3519,11 @@ h1 {
   border-bottom-color: var(--brand);
 }
 
-/* 折叠 chevron 推到标签条最右。 */
+/* 折叠 chevron 固定在标签条最右（不参与标签横向滚动）。 */
 .third-col__collapse {
-  margin-left: auto;
+  flex-shrink: 0;
+  align-self: center;
+  margin-left: 2px;
 }
 
 /* 内容区：唯一滚动容器。 */
@@ -4170,6 +4188,259 @@ h1 {
   line-height: 1.55;
   white-space: pre;
   overflow: auto;
+}
+
+/* ── 第三栏·知识标签（OKF 浏览）：沿用文件树样式 + 极简模式头/chip/正文 ── */
+
+.okf-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* 模式头：私有/共享 pill + 右侧图标按钮（刷新/导出）。 */
+.okf-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.okf-head__spacer {
+  flex: 1;
+}
+
+/* 私有/共享 pill：极简小胶囊，说明走 title。 */
+.okf-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  cursor: default;
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  background: var(--surface-3);
+}
+
+.okf-pill svg {
+  flex-shrink: 0;
+}
+
+.okf-pill--shared {
+  color: var(--brand);
+  border-color: var(--brand);
+  background: var(--brand-tint);
+}
+
+/* concept 行尾的 type 小标（弱化、可省）。 */
+.okf-type {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--text-3);
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--surface-3);
+}
+
+/* 外部包分组：头部计数小标。 */
+.okf-bundle__count {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+/* 读不到的已登记外部包：错误标记 + 移除（不静默丢弃，避免误显「暂无知识」）。 */
+.okf-bundle__err {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--danger, #e5534b);
+}
+
+.okf-bundle__rm {
+  flex-shrink: 0;
+  margin-left: 2px;
+}
+
+.okf-bundle--err .file-node--dir {
+  cursor: default;
+}
+
+/* 空态：极简（图标 + 一行字），解释走 title。 */
+.okf-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 32px 12px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  cursor: default;
+}
+
+/* 详情态 chip 行：type + tags。 */
+.okf-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.okf-chip {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--text-2);
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+}
+
+.okf-chip--tag {
+  color: var(--text-3);
+}
+
+/* 「已编辑」标记：被用户覆盖式编辑过的 concept（轻强调，不喧宾夺主）。 */
+.okf-chip--edited {
+  color: var(--accent, #4f8cff);
+  border-color: color-mix(in srgb, var(--accent, #4f8cff) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent, #4f8cff) 12%, var(--surface-3));
+}
+
+/* 覆盖式编辑器（详情态）：撑满可用高度的纯文本正文编辑 + 操作行 + 提示。 */
+.okf-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.okf-edit__area {
+  flex: 1 1 auto;
+  min-height: 180px;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 8px 10px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.okf-edit__area:focus {
+  outline: none;
+  border-color: var(--accent, #4f8cff);
+}
+
+.okf-edit__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.okf-edit__err {
+  font-size: 12px;
+  color: var(--danger, #e5534b);
+  flex-shrink: 0;
+}
+
+.okf-edit__hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+
+/* 详情态正文：复用消息 Markdown 渲染，给舒适的字号/行距。 */
+.okf-body {
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.okf-body > *:first-child {
+  margin-top: 4px;
+}
+
+/* ── 设置 → 知识库 / OKF（2b）：极简控制台，解释一律走 ⓘ title ── */
+
+/* ⓘ 提示图标：弱化、可聚焦（键盘可读 title），不占行。 */
+.okf-info {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-3);
+  cursor: help;
+  flex-shrink: 0;
+  vertical-align: -2px;
+}
+
+.okf-info:hover,
+.okf-info:focus-visible {
+  color: var(--text-2);
+  outline: none;
+}
+
+/* 共享子选项容器：左侧细线收拢，视觉上从属于「共享」。 */
+.okf-settings__sub {
+  margin-top: 10px;
+  padding-left: 10px;
+  border-left: 2px solid var(--surface-3);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* 一行字段：标签在左、控件在右。 */
+.okf-settings__field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  font-size: 13px;
+}
+
+.okf-settings__field-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+
+.okf-settings__field-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 当前共享位置回显：等宽、截断、悬停看全路径。 */
+.okf-settings__path {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text-3);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 底部角标：「严守 OKF v0.1 · Apache-2.0」，弱化。 */
+.okf-settings__footnote {
+  margin-top: 16px;
+  font-size: 11px;
+  color: var(--text-3);
+  cursor: default;
 }
 
 /* ── 审批动作内容预览（Plan19 C-C）：等宽、可滚动 ── */

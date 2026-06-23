@@ -15,6 +15,22 @@ import type {
 import { formatMoney, aggregateCost, formatCostByCurrency } from "../utils";
 import { ArtifactCard } from "./artifact";
 
+/**
+ * 助手正文 Markdown 渲染（统一出口）：GFM + 代码高亮 + 带复制按钮的代码块壳。
+ * 消息正文、视觉分析、第三栏「知识」概念正文复用同一套渲染，避免各处重复 ReactMarkdown 配置。
+ */
+export function Markdown({ children }: { children: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeHighlight]}
+      components={{ pre: CodeBlock }}
+    >
+      {children}
+    </ReactMarkdown>
+  );
+}
+
 export function TodoPanel({ items }: { items: TodoItem[] }) {
   // Agent 自维护任务清单：常驻输入框上方，实时反映多步任务进度。
   const done = items.filter((t) => t.status === "done").length;
@@ -86,14 +102,7 @@ export function MessageContent({
           return msg.role === "user" ? (
             <p key={index}>{part.content}</p>
           ) : (
-            <ReactMarkdown
-              key={index}
-              remarkPlugins={[remarkGfm]}
-              rehypePlugins={[rehypeHighlight]}
-              components={{ pre: CodeBlock }}
-            >
-              {part.content}
-            </ReactMarkdown>
+            <Markdown key={index}>{part.content}</Markdown>
           );
         }
         if (part.type === "image") {
@@ -298,9 +307,7 @@ export function VisionCard({ part }: { part: VisionPart }) {
       </button>
       {expanded && (
         <div className="vision-card__body">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={{ pre: CodeBlock }}>
-            {part.analysis}
-          </ReactMarkdown>
+          <Markdown>{part.analysis}</Markdown>
         </div>
       )}
     </div>

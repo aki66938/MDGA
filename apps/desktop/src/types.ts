@@ -118,6 +118,55 @@ export type UsageAttributionView = {
 /** 最近被拦动作（Plan27 #9）：recent_denied_actions 返回，用于一键加规则。 */
 export type DeniedAction = { toolName: string; target: string };
 
+// ── OKF 知识（第三栏「知识」标签）──────────────────────────────────────────────
+// 显化 agent 整理的 OKF（开放知识格式）内容：本项目 concept 树 + 导入的外部包，只读浏览。
+// 命令（invoke，camelCase）：get_okf_settings / okf_browse / okf_read_concept / okf_export。
+
+/**
+ * OKF 设置视图（get_okf_settings 返回，serde camelCase）。
+ * visibility：'private'＝仅 .mdga（其他 agent 拿不到）｜'shared'＝已发布到可见 OKF 目录（其他 agent 可读）。
+ * sharedLocation：共享态下的可见目录路径（私有态可空）。
+ * externalBundles：已导入的外部包绝对路径列表（okf_browse 以其为 source 浏览）。
+ */
+export type OkfSettingsView = {
+  visibility: "private" | "shared";
+  sharedLocation?: string | null;
+  autoPublish: boolean;
+  externalBundles: string[];
+};
+
+/**
+ * OKF concept 摘要（okf_browse 返回的一项；不含正文 body，正文由 okf_read_concept 按需拉）。
+ * title/description 对应 Rust `Option<String>`，序列化可为 null（外部 bundle 的 concept 可缺这两项），
+ * 故为 `string | null`——所有显示/排序处必须兜底（`?? relPath`/`?? ""`），不得直接解引用。
+ */
+export type OkfConceptView = {
+  relPath: string;
+  type: string;
+  title: string | null;
+  description: string | null;
+  tags: string[];
+  /** 是否被用户覆盖式编辑过（own 源才可能 true；外部恒 false）。 */
+  overridden: boolean;
+};
+
+/** okf_get_concept_source 返回：供编辑器预填的正文（不含 frontmatter）+ 是否已被覆盖。 */
+export type OkfConceptSourceView = {
+  body: string;
+  overridden: boolean;
+};
+
+/**
+ * OKF 浏览结果（okf_browse(conversationId, source) 返回，serde camelCase）。
+ * source＝"own"（本项目）或外部 bundle 绝对路径；hasContent＝是否有可浏览的 concept；note＝可选提示文案。
+ */
+export type OkfBrowseView = {
+  source: string;
+  concepts: OkfConceptView[];
+  hasContent: boolean;
+  note?: string | null;
+};
+
 /** DeepSeek 账户余额（官方 /user/balance，唯一账户信息来源） */
 export type BalanceInfo = {
   currency: string;
@@ -559,6 +608,7 @@ export type SettingsSection =
   | "permission"
   | "mcp"
   | "data"
+  | "knowledge"
   | "about";
 
 // ── LSP 服务器注册表（R-uicfg / 0.0.57）──────────────────────────────────────

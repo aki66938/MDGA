@@ -2,7 +2,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock, Trash2, Pencil, Wrench, Plus, Download, Check, X, RefreshCw } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye, EyeOff, Plug, Lock, Globe, Info, FolderOpen, Upload, Trash2, Pencil, Wrench, Plus, Download, Check, X, RefreshCw } from "lucide-react";
+import { open as openDirDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { getPermissionModeLabel, type PermissionMode } from "@mdga/ui";
 import {
   PERMISSION_MODES,
@@ -31,6 +32,8 @@ import {
   type PricingDiff,
   type SubscriptionInfo,
   type ConnectionMonthlyUsage,
+  type OkfSettingsView,
+  type OkfBrowseView,
 } from "../types";
 import {
   humanizeError,
@@ -2271,6 +2274,329 @@ function AssignmentRow({
   );
 }
 
+// ── 知识库 / OKF（2b）────────────────────────────────────────────────────────
+// 纯前端控制台：私有/共享可见性 + 共享位置/发布 + 导出 OKF 包 + 消费外部包。
+// 全用已就绪命令（camelCase）：get_okf_settings / set_okf_settings / okf_external_add|remove
+// / okf_export / okf_publish。极简：解释一律走 ⓘ title hover，不堆说明文案。
+
+/** 小 ⓘ 图标，说明走原生 title 悬停（极简，不占行）。 */
+function InfoHint({ text }: { text: string }) {
+  return (
+    <span className="okf-info" title={text} tabIndex={0} role="img" aria-label={text}>
+      <Info size={13} />
+    </span>
+  );
+}
+
+function KnowledgeSettings({ activeConvId }: { activeConvId: string | null }) {
+  const [okf, setOkf] = useState<OkfSettingsView | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  function refresh() {
+    invoke<OkfSettingsView>("get_okf_settings")
+      .then((v) => setOkf(v))
+      .catch((e) => setError(humanizeError(String(e))));
+  }
+
+  // 通知第三栏知识标签 OKF 设置已变（导入/登记/移除/可见性/发布）→ 它据此重新拉取并展示。
+  function notifyOkfChanged() {
+    window.dispatchEvent(new CustomEvent("okf-changed"));
+  }
+
+  // 登记一个外部包后，浏览它给出**精确**反馈：有内容 / 空包 / 读取失败——避免「登记成功但实际没东西」的困惑。
+  async function reportBundleStatus(path: string | undefined) {
+    if (!path) {
+      setNote("已登记，可在「知识」标签查看。");
+      return;
+    }
+    try {
+      const b = await invoke<OkfBrowseView>("okf_browse", { conversationId: activeConvId ?? "", source: path });
+      const n = b.concepts?.length ?? 0;
+      setNote(n === 0
+        ? "已登记，但未发现可浏览的知识（可能是空包或不符合 OKF 结构）。"
+        : `已导入：${n} 条知识，见「知识」标签。`);
+    } catch {
+      setNote("已登记，但读取失败（目录可能不存在或不可读）。");
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  /** 一次性落 visibility / sharedLocation / autoPublish 后刷新本地状态。 */
+  async function save(next: { visibility?: "private" | "shared"; sharedLocation?: string; autoPublish?: boolean }) {
+    if (!okf) return;
+    const visibility = next.visibility ?? okf.visibility;
+    const sharedLocation = next.sharedLocation ?? okf.sharedLocation ?? "./knowledge";
+    const autoPublish = next.autoPublish ?? okf.autoPublish;
+    setBusy(true);
+    setError(null);
+    setNote(null);
+    try {
+      await invoke("set_okf_settings", { visibility, sharedLocation, autoPublish });
+      refresh();
+      notifyOkfChanged();
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function pickSharedLocation() {
+    try {
+      const dir = await openDirDialog({ directory: true, multiple: false });
+      if (typeof dir !== "string") return;
+      await save({ sharedLocation: dir });
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    }
+  }
+
+  async function publishNow() {
+    if (!activeConvId || busy) return;
+    setBusy(true);
+    setError(null);
+    setNote(null);
+    try {
+      const target = await invoke<string>("okf_publish", { conversationId: activeConvId });
+      setNote(`已发布到：${target}`);
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exportBundle() {
+    if (!activeConvId || busy) return;
+    setError(null);
+    setNote(null);
+    try {
+      const target = await saveFileDialog({
+        defaultPath: "knowledge-okf.zip",
+        filters: [{ name: "OKF 包", extensions: ["zip"] }],
+      });
+      if (typeof target !== "string") return;
+      setBusy(true);
+      const out = await invoke<string>("okf_export", { conversationId: activeConvId, targetZip: target });
+      setNote(`已导出到：${out}`);
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** 导入 .zip 包：后端自动解包成同级真实目录并登记。 */
+  async function importZip() {
+    setError(null);
+    setNote(null);
+    try {
+      const zip = await openDirDialog({
+        directory: false,
+        multiple: false,
+        filters: [{ name: "OKF 包", extensions: ["zip"] }],
+      });
+      if (typeof zip !== "string") return;
+      setBusy(true);
+      const prev = okf?.externalBundles ?? [];
+      const list = await invoke<string[]>("okf_external_add", { path: zip });
+      setOkf((prevState) => (prevState ? { ...prevState, externalBundles: list } : prevState));
+      notifyOkfChanged();
+      await reportBundleStatus(list.find((p) => !prev.includes(p)));
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** 登记一个已存在的 OKF 目录（无需打包，适合本机已解包/共享盘上的包）。 */
+  async function addExternalDir() {
+    setError(null);
+    setNote(null);
+    try {
+      const dir = await openDirDialog({ directory: true, multiple: false });
+      if (typeof dir !== "string") return;
+      setBusy(true);
+      const prev = okf?.externalBundles ?? [];
+      const list = await invoke<string[]>("okf_external_add", { path: dir });
+      setOkf((prevState) => (prevState ? { ...prevState, externalBundles: list } : prevState));
+      notifyOkfChanged();
+      await reportBundleStatus(list.find((p) => !prev.includes(p)));
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeExternal(path: string) {
+    setError(null);
+    setNote(null);
+    try {
+      const list = await invoke<string[]>("okf_external_remove", { path });
+      setOkf((prev) => (prev ? { ...prev, externalBundles: list } : prev));
+      notifyOkfChanged();
+    } catch (e) {
+      setError(humanizeError(String(e)));
+    }
+  }
+
+  const shared = okf?.visibility === "shared";
+
+  return (
+    <div className="okf-settings">
+      <div className="settings-content__h" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span>知识库</span>
+        <InfoHint text="仓库知识以 Google OKF（开放知识格式）厂商中立·Apache-2.0·纯 markdown 存储，可保持私有或共享给其他 agent。" />
+      </div>
+
+      {!okf ? (
+        <p className="settings-desc">{error ?? "加载中…"}</p>
+      ) : (
+        <>
+          {/* 私有 | 共享 分段开关 */}
+          <div className="provider-billing__head" style={{ marginTop: 12 }}>
+            <span className="provider-billing__title">可见性</span>
+            <span className="provider-billing__seg" role="group" aria-label="知识可见性">
+              <button
+                type="button"
+                className={`provider-billing__segbtn${!shared ? " provider-billing__segbtn--on" : ""}`}
+                disabled={busy}
+                aria-pressed={!shared}
+                title="私有：知识仅留在本项目 .mdga，其他 agent 拿不到。"
+                onClick={() => void save({ visibility: "private" })}
+              >
+                <Lock size={12} style={{ verticalAlign: "-2px", marginRight: 4 }} />私有
+              </button>
+              <button
+                type="button"
+                className={`provider-billing__segbtn${shared ? " provider-billing__segbtn--on" : ""}`}
+                disabled={busy}
+                aria-pressed={shared}
+                title="共享：发布为可见的 OKF 包，其他 agent 可读、开放协作。"
+                onClick={() => void save({ visibility: "shared" })}
+              >
+                <Globe size={12} style={{ verticalAlign: "-2px", marginRight: 4 }} />共享
+              </button>
+            </span>
+          </div>
+
+          {/* 共享子选项（仅共享态显） */}
+          {shared && (
+            <div className="okf-settings__sub">
+              <div className="okf-settings__field">
+                <span className="okf-settings__field-label">
+                  位置
+                  <InfoHint text="项目内目录（如 ./knowledge）随仓库版本化；也可选外部目录，嫁接为全局知识库。" />
+                </span>
+                <span className="okf-settings__field-control">
+                  <span className="okf-settings__path" title={okf.sharedLocation ?? "./knowledge"}>
+                    {okf.sharedLocation ?? "./knowledge"}
+                  </span>
+                  <button className="changes-row__revert" type="button" disabled={busy} onClick={() => void pickSharedLocation()}>
+                    <FolderOpen size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />选目录
+                  </button>
+                </span>
+              </div>
+
+              <div className="okf-settings__field">
+                <span className="okf-settings__field-label">发布</span>
+                <span className="okf-settings__field-control">
+                  <button
+                    className="changes-row__revert"
+                    type="button"
+                    disabled={busy || !activeConvId}
+                    title={activeConvId ? "把本项目知识立即写入共享目录。" : "打开一个对话后可发布。"}
+                    onClick={() => void publishNow()}
+                  >
+                    <Upload size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />立即发布
+                  </button>
+                  <label className="toggle" title="知识更新时自动写入共享目录，可能触发 git / 文件监视。">
+                    <input
+                      type="checkbox"
+                      checked={okf.autoPublish}
+                      disabled={busy}
+                      onChange={(e) => void save({ autoPublish: e.target.checked })}
+                    />
+                    <span>自动</span>
+                  </label>
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* 底部一行：导出 OKF 包 */}
+          <div className="settings-section__head" style={{ marginTop: 18 }}>
+            <span>导出与外部包</span>
+          </div>
+          <div className="okf-settings__field">
+            <span className="okf-settings__field-label">
+              导出 OKF 包
+              <InfoHint text="把本项目知识打包为单个 .zip 导出（与可见性无关，随时可导出）。便于跨 agent/项目流转。" />
+            </span>
+            <button
+              className="changes-row__revert"
+              type="button"
+              disabled={busy || !activeConvId}
+              title={activeConvId ? "导出为单个 .zip 包。" : "打开一个对话后可导出。"}
+              onClick={() => void exportBundle()}
+            >
+              <Download size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />导出 .zip
+            </button>
+          </div>
+
+          {/* 消费外部包：导入 .zip（自动解包）或登记已有目录 */}
+          <div className="okf-settings__field" style={{ alignItems: "flex-start" }}>
+            <span className="okf-settings__field-label">
+              消费外部包
+              <InfoHint text="导入其他 agent 导出的 .zip（自动解包到应用数据区、与工作区无关；移除时一并清理），或登记一个已存在的 OKF 目录（用户自管、移除不删），供 agent 浏览引用其知识。" />
+            </span>
+            <span className="okf-settings__field-control">
+              <button className="changes-row__revert" type="button" disabled={busy} title="导入 .zip 包，自动解包后登记。" onClick={() => void importZip()}>
+                <Download size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />导入 .zip
+              </button>
+              <button className="changes-row__revert" type="button" disabled={busy} title="登记一个已存在的 OKF 目录。" onClick={() => void addExternalDir()}>
+                <Plus size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />目录
+              </button>
+            </span>
+          </div>
+          {okf.externalBundles.length === 0 ? (
+            <p className="settings-desc">暂无外部包。</p>
+          ) : (
+            okf.externalBundles.map((p) => (
+              <div key={p} className="changes-row">
+                <span className="changes-row__path" title={p} style={{ fontFamily: "monospace" }}>{p}</span>
+                <button
+                  className="changes-row__revert"
+                  type="button"
+                  title="移除该外部包"
+                  aria-label="移除该外部包"
+                  onClick={() => void removeExternal(p)}
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            ))
+          )}
+
+          {error && <p className="settings-desc" style={{ color: "var(--danger)" }}>{error}</p>}
+          {note && <p className="settings-desc" style={{ color: "var(--success)" }}>{note}</p>}
+
+          <p className="settings-desc okf-settings__footnote" title="严守 OKF v0.1 开放知识格式 · Apache-2.0 许可。">
+            严守 OKF v0.1 · Apache-2.0
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── SettingsModal ───────────────────────────────────────────────────────────
 
 export function SettingsModal({
@@ -2288,6 +2614,7 @@ export function SettingsModal({
   taskBudget,
   onSetBudget,
   hasActiveConv,
+  activeConvId,
   onExportConversation,
   onExportLedger,
   onClearData,
@@ -2315,6 +2642,8 @@ export function SettingsModal({
   taskBudget: number;
   onSetBudget: (budget: number) => void;
   hasActiveConv: boolean;
+  /** 当前活动会话 id（OKF 导出/发布需要 conversationId；无会话则相关按钮禁用）。 */
+  activeConvId: string | null;
   onExportConversation: () => void;
   onExportLedger: () => void;
   onClearData: () => void;
@@ -2420,6 +2749,7 @@ export function SettingsModal({
     { id: "permission", label: "权限" },
     { id: "mcp", label: "MCP 服务器" },
     { id: "data", label: "数据" },
+    { id: "knowledge", label: "知识库 / OKF" },
     { id: "about", label: "关于" },
   ];
 
@@ -2622,6 +2952,8 @@ export function SettingsModal({
               <p className="settings-desc">Token 账本 CSV 可与 DeepSeek 官方账单对照核对消费。</p>
             </>
           )}
+
+          {section === "knowledge" && <KnowledgeSettings activeConvId={activeConvId} />}
 
           {/* 权限规则并入「权限」页（0.0.66）：与权限模式 / 命令沙箱 / 单轮上限同页,接在其下。 */}
           {section === "permission" && (

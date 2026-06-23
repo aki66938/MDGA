@@ -1704,6 +1704,840 @@ pub(crate) fn export_conversation(
     std::fs::write(&path, md).map_err(|e| format!("写入失败: {e}"))
 }
 
+// ── OKF（Open Knowledge Format）发布 / 浏览 / 导出（前端可用命令层）─────────────
+//
+// 这层把已就绪的 OKF 序列化层（mdga_wiki::{sections_to_okf,write_okf_bundle,read_okf_bundle,…}）
+// 接成前端命令 + 全局设置。**不碰 wiki 现有 store/query/fingerprint、不改 OKF 序列化层逻辑**：
+// 本层只做「取 wiki sections → 投影成 OKF → 读/写/校验路径」的编排。
+//
+// 路径安全红线（务必守住）：
+//   · 外部 bundle 读取**仅允许已登记**（okf_external_bundles 列表内）的绝对目录——防越权读任意目录；
+//   · own 的「共享发布」写到**工作区相对**目录时，解析后必须仍在工作区内（防 `../` 逃逸）；
+//   · external concept 读取复用 mdga_tool_runtime::read_workspace_text 的 resolve_existing_path
+//     守卫（以 bundle 根为「工作区」拒 `..`/绝对/越界），绝不自写弱版校验；
+//   · export/外部绝对目录是用户经对话框显式选定的，属用户授权可写，但仍 reject 控制字符等异常输入。
+
+/// OKF 设置在 app_settings 里的键（全局，非会话）。
+const OKF_VISIBILITY_KEY: &str = "okf_visibility";
+const OKF_SHARED_LOCATION_KEY: &str = "okf_shared_location";
+const OKF_AUTO_PUBLISH_KEY: &str = "okf_auto_publish";
+const OKF_EXTERNAL_BUNDLES_KEY: &str = "okf_external_bundles";
+
+/// 共享位置默认值：工作区相对的 ./knowledge 目录。
+const OKF_DEFAULT_SHARED_LOCATION: &str = "./knowledge";
+/// OKF concept 读取上限（与文件面板同口径 512 KiB；纯 OKF .md 通常远小于此）。
+const OKF_CONCEPT_READ_MAX_BYTES: u64 = 512 * 1024;
+/// 单个 concept 用户覆盖正文的上限（512 KiB；防异常大输入塞满 overlay）。
+const OKF_OVERLAY_BODY_MAX_BYTES: usize = 512 * 1024;
+/// 导入 .zip 解压总字节上限（防 zip bomb；OKF 纯 markdown 包通常极小）。
+const OKF_IMPORT_UNZIP_MAX_BYTES: u64 = 200 * 1024 * 1024;
+/// 导入 .zip 条目数上限（防超多小文件 zip bomb）。
+const OKF_IMPORT_UNZIP_MAX_ENTRIES: usize = 20_000;
+
+/// 给前端的 OKF 设置视图（serde camelCase）。`autoPublish` 暴露为 bool（内部存 "0"/"1"）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OkfSettingsView {
+    /// "private"（默认）| "shared"。
+    pub visibility: String,
+    /// 共享位置：工作区相对（默认 "./knowledge"）或用户填的绝对外部目录。
+    pub shared_location: String,
+    /// 是否自动发布（前端 bool；内部 "0"/"1"）。
+    pub auto_publish: bool,
+    /// 已登记的外部 OKF 包绝对路径列表。
+    pub external_bundles: Vec<String>,
+}
+
+/// 单个 OKF concept 的脱敏视图（**不含 body**；body 走 okf_read_concept 惰性取）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OkfConceptView {
+    /// bundle 内相对路径（正斜杠，含 .md），如 "src/api.md"。也是 okf_read_concept 的 relPath。
+    pub rel_path: String,
+    /// frontmatter 必填 type。
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// 可选标题。
+    pub title: Option<String>,
+    /// 可选描述。
+    pub description: Option<String>,
+    /// 标签列表（可空）。
+    pub tags: Vec<String>,
+    /// 该 concept 是否被用户覆盖式编辑过（own 源才可能为 true；外部恒 false）。
+    pub overridden: bool,
+}
+
+/// okf_get_concept_source 返回视图：供编辑器预填的**正文**（不含 frontmatter）+ 是否已被覆盖。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OkfConceptSourceView {
+    /// 当前生效正文：已覆盖→用户版；否则→自动版。编辑器以此预填。
+    pub body: String,
+    /// 是否已被用户覆盖（决定是否显示「还原自动」）。
+    pub overridden: bool,
+}
+
+/// okf_browse 返回视图：concept 清单 + 是否有内容 + source 回显。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OkfBrowseView {
+    /// source 回显（"own" 或外部 bundle 绝对路径）。
+    pub source: String,
+    /// concept 清单（不含 body）。
+    pub concepts: Vec<OkfConceptView>,
+    /// 是否有内容（own：wiki 是否已生成；外部：bundle 是否含 concept）。
+    pub has_content: bool,
+    /// 给前端的口径说明。
+    pub note: String,
+}
+
+/// 生成 ISO-8601 UTC 时间戳（如 `2026-06-22T10:00:00Z`）。
+///
+/// **不引 chrono**：从 `std::time` 的 Unix 秒手写 civil 换算（Howard Hinnant `civil_from_days`，
+/// 与 storage::ym_from_unix_secs 同源，但这里完整算出 年/月/日 + 时/分/秒）。
+fn okf_iso_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    okf_iso_timestamp_from_unix(secs)
+}
+
+/// 把给定 Unix 秒格式化为 ISO-8601 UTC 时间戳（`okf_iso_timestamp` 的纯函数核心，便于复用 mtime）。
+fn okf_iso_timestamp_from_unix(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400); // 当天内秒数 [0, 86399]
+    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+
+    // civil_from_days：把自 1970-01-01 的天数换算成 (year, month, day)。
+    let z = days + 719_468; // 偏移到自 0000-03-01。
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // 以 3 月为 0 的移位月 [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// 读取已登记的外部 bundle 列表（解析 JSON 字符串数组；缺失/损坏 → 空表，软处理）。
+fn okf_read_external_bundles(db: &rusqlite::Connection) -> Vec<String> {
+    match get_setting(db, OKF_EXTERNAL_BUNDLES_KEY) {
+        Ok(Some(raw)) => serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// 取会话工作区根（无工作区 → Err，与文件面板同口径）。
+fn okf_conversation_workspace(
+    state: &State<AppState>,
+    conversation_id: &str,
+) -> Result<String, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    get_conversation(&db, conversation_id)
+        .map_err(|e| e.to_string())?
+        .and_then(|c| c.workspace_path)
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| "该会话未绑定工作区".to_string())
+}
+
+/// 拒绝异常路径输入（空 / 含控制字符）。用户经对话框选的绝对目录虽属授权，仍做轻量异常拦截。
+fn okf_reject_bad_path(path: &str) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("路径不能为空".to_string());
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("路径含非法控制字符".to_string());
+    }
+    Ok(())
+}
+
+/// 取某工作区当前 wiki 的 OKF bundle（own 源）：读 `.mdga/wiki/index.jsonl` 的 sections →
+/// sections_to_okf。wiki 未生成 / 无 section → 返回空 bundle（has_content=false 由调用方据 concepts 判断）。
+fn okf_own_bundle(workspace: &str) -> mdga_wiki::OkfBundle {
+    let sections = okf_load_wiki_sections(workspace);
+    // 时间戳取 wiki 生成物的 mtime（fix ⑤）：同一份未变 wiki 的 browse/read/publish/export
+    // 时间戳稳定、重发布确定，不再每次 now() 漂移。取不到 mtime 时退回 now。
+    let mut bundle = mdga_wiki::sections_to_okf(&sections, &okf_wiki_timestamp(workspace));
+    // 叠加用户覆盖层（可编辑 wiki）：把被覆盖 concept 的正文换成用户版。
+    // overlay 存于 wiki 工作存储**之外**（.mdga/okf-overlay.json），wiki 自动重生成绝不冲掉它。
+    okf_apply_overlay(&mut bundle, &okf_read_overlay(workspace));
+    bundle
+}
+
+/// 自动版**不含**任何用户覆盖（供「还原自动 / 取自动正文」对照）。
+fn okf_auto_bundle(workspace: &str) -> mdga_wiki::OkfBundle {
+    let sections = okf_load_wiki_sections(workspace);
+    mdga_wiki::sections_to_okf(&sections, &okf_wiki_timestamp(workspace))
+}
+
+/// 用户覆盖层文件路径：`<workspace>/.mdga/okf-overlay.json`（**在 .mdga/wiki/ 之外**，
+/// 故 wiki 重新生成/清理绝不会碰它；键 = concept rel_path，值 = 用户编辑的正文）。
+fn okf_overlay_path(workspace: &str) -> std::path::PathBuf {
+    std::path::Path::new(workspace)
+        .join(".mdga")
+        .join("okf-overlay.json")
+}
+
+/// 读用户覆盖层（容错：缺失/坏 JSON → 空映射，绝不 panic）。
+fn okf_read_overlay(workspace: &str) -> std::collections::BTreeMap<String, String> {
+    match std::fs::read_to_string(okf_overlay_path(workspace)) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => std::collections::BTreeMap::new(),
+    }
+}
+
+/// 写用户覆盖层（确保 .mdga 目录存在；序列化失败/写失败 → Err）。
+fn okf_write_overlay(
+    workspace: &str,
+    map: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let path = okf_overlay_path(workspace);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 .mdga 目录失败：{e}"))?;
+    }
+    let json = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("写覆盖层失败：{e}"))
+}
+
+/// 把覆盖层应用到 bundle：被覆盖 concept 的 `body` 换成用户版（frontmatter 仍由自动管理，保持
+/// 合规）。overlay 里指向已不存在 concept 的孤儿键自然不命中、无副作用。
+fn okf_apply_overlay(
+    bundle: &mut mdga_wiki::OkfBundle,
+    overlay: &std::collections::BTreeMap<String, String>,
+) {
+    if overlay.is_empty() {
+        return;
+    }
+    for c in &mut bundle.concepts {
+        if let Some(body) = overlay.get(&c.rel_path) {
+            c.body = body.clone();
+        }
+    }
+}
+
+/// 取 wiki 生成物的 mtime 并格式化为 ISO-8601 UTC 时间戳。
+///
+/// 依次尝试 `.mdga/wiki/.fingerprint`、再 `.mdga/wiki/index.jsonl` 的修改时间（取得到的第一个）；
+/// 都取不到 → 退回 `okf_iso_timestamp()`（now）。**只读 mtime，绝不触碰 wiki 的 store/query/
+/// fingerprint 逻辑**。
+fn okf_wiki_timestamp(workspace: &str) -> String {
+    let wiki_dir = std::path::Path::new(workspace).join(".mdga").join("wiki");
+    for name in [".fingerprint", "index.jsonl"] {
+        if let Ok(meta) = std::fs::metadata(wiki_dir.join(name)) {
+            if let Ok(mtime) = meta.modified() {
+                if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    return okf_iso_timestamp_from_unix(d.as_secs() as i64);
+                }
+            }
+        }
+    }
+    okf_iso_timestamp()
+}
+
+/// 从工作区的 `.mdga/wiki/index.jsonl` 读回 wiki sections（每行一个 WikiSection 的 JSON）。
+///
+/// **不改 wiki crate**：`mdga_wiki::WikiSection` 已公开且派生 `Deserialize`（index.jsonl 即其
+/// 逐行序列化）。这里只**读** wiki 的产物、按公开类型反序列化，绝不触碰 wiki 的 store/query/fingerprint
+/// 逻辑。文件缺失 / 单行损坏 → 软处理（缺失返回空、坏行跳过），与 wiki 自身回读口径一致。
+fn okf_load_wiki_sections(workspace: &str) -> Vec<mdga_wiki::WikiSection> {
+    let index = std::path::Path::new(workspace)
+        .join(".mdga")
+        .join("wiki")
+        .join("index.jsonl");
+    let content = match std::fs::read_to_string(&index) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(), // wiki 未生成 → 空。
+    };
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str::<mdga_wiki::WikiSection>(l).ok())
+        .collect()
+}
+
+/// 把内存 OkfBundle 的 concept 投影成脱敏视图列表（不含 body）。
+/// `overridden` 集合内的 rel_path 标记为「已编辑」（own 源传覆盖层键；外部传空集）。
+fn okf_concepts_view(
+    bundle: &mdga_wiki::OkfBundle,
+    overridden: &std::collections::BTreeMap<String, String>,
+) -> Vec<OkfConceptView> {
+    bundle
+        .concepts
+        .iter()
+        .map(|c| OkfConceptView {
+            rel_path: c.rel_path.clone(),
+            type_: c.type_.clone(),
+            title: c.title.clone(),
+            description: c.description.clone(),
+            tags: c.tags.clone(),
+            overridden: overridden.contains_key(&c.rel_path),
+        })
+        .collect()
+}
+
+/// 读取 OKF 设置（缺省给默认）。
+#[tauri::command]
+pub(crate) fn get_okf_settings(state: State<AppState>) -> Result<OkfSettingsView, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let visibility = get_setting(&db, OKF_VISIBILITY_KEY)
+        .map_err(|e| e.to_string())?
+        .filter(|v| v == "private" || v == "shared")
+        .unwrap_or_else(|| "private".to_string());
+    let shared_location = get_setting(&db, OKF_SHARED_LOCATION_KEY)
+        .map_err(|e| e.to_string())?
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| OKF_DEFAULT_SHARED_LOCATION.to_string());
+    let auto_publish = get_setting(&db, OKF_AUTO_PUBLISH_KEY)
+        .map_err(|e| e.to_string())?
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let external_bundles = okf_read_external_bundles(&db);
+    Ok(OkfSettingsView {
+        visibility,
+        shared_location,
+        auto_publish,
+        external_bundles,
+    })
+}
+
+/// 写入 OKF 设置（一次性落 visibility / sharedLocation / autoPublish；externalBundles 走专用增删命令）。
+///
+/// visibility 仅接受 "private" / "shared"；sharedLocation 空白回落默认；autoPublish bool → "0"/"1"。
+#[tauri::command]
+pub(crate) fn set_okf_settings(
+    state: State<AppState>,
+    visibility: String,
+    shared_location: String,
+    auto_publish: bool,
+) -> Result<(), String> {
+    let visibility = match visibility.trim() {
+        "private" => "private",
+        "shared" => "shared",
+        other => return Err(format!("visibility 仅允许 private/shared，实得：{other}")),
+    };
+    let shared_location = {
+        let t = shared_location.trim();
+        if t.is_empty() {
+            OKF_DEFAULT_SHARED_LOCATION.to_string()
+        } else {
+            okf_reject_bad_path(t)?;
+            t.to_string()
+        }
+    };
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    set_setting(&db, OKF_VISIBILITY_KEY, visibility).map_err(|e| e.to_string())?;
+    set_setting(&db, OKF_SHARED_LOCATION_KEY, &shared_location).map_err(|e| e.to_string())?;
+    set_setting(&db, OKF_AUTO_PUBLISH_KEY, if auto_publish { "1" } else { "0" })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 登记一个外部 OKF 包并返回更新后的清单。`path` 可为：
+///   · 一个 **.zip 文件** → 自动解包到**应用数据区的托管目录** `<app_data>/okf-imports/<名>/`
+///     （防 zip-slip / zip-bomb），登记该目录。落点固定、可预测、与工作区无关、不在用户随手处
+///     （桌面/下载夹）留文件夹；移除该外部包时连带清理（见 [`okf_external_remove`]）。
+///   · 一个**已存在目录** → 直接登记（用户自管，移除时绝不删）。
+#[tauri::command]
+pub(crate) fn okf_external_add(
+    app: AppHandle,
+    state: State<AppState>,
+    path: String,
+) -> Result<Vec<String>, String> {
+    okf_reject_bad_path(&path)?;
+    let path = path.trim().to_string();
+    let p = std::path::Path::new(&path);
+
+    // 决定要登记的真实目录：.zip → 解包到托管导入根；否则须是已存在目录。
+    let registered = if okf_is_zip_file(p) {
+        let root = okf_imports_root(&app)?;
+        let dir = okf_extract_zip_managed(p, &root)?;
+        dir.to_string_lossy().to_string()
+    } else if p.is_dir() {
+        path.clone()
+    } else {
+        return Err("外部 OKF 包须是 .zip 文件或已存在的目录".to_string());
+    };
+
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut list = okf_read_external_bundles(&db);
+    if !list.iter().any(|p| p == &registered) {
+        list.push(registered);
+    }
+    let json = serde_json::to_string(&list).map_err(|e| e.to_string())?;
+    set_setting(&db, OKF_EXTERNAL_BUNDLES_KEY, &json).map_err(|e| e.to_string())?;
+    // 同步 okf_read 工具用的进程级已登记快照（工具执行路径无 DB 句柄）。
+    crate::tools::set_okf_external_bundles(list.clone());
+    Ok(list)
+}
+
+/// 是否是一个扩展名为 .zip（不分大小写）的现存文件。
+fn okf_is_zip_file(p: &std::path::Path) -> bool {
+    p.is_file()
+        && p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("zip"))
+            .unwrap_or(false)
+}
+
+/// 托管导入根目录：`<app_data>/okf-imports`。导入的 .zip 一律解包到其下——落点固定、可预测、
+/// 与工作区无关；并因属应用托管，移除外部包时可连带清理（仅此根内，绝不动用户自管目录）。
+fn okf_imports_root(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法定位应用数据目录：{e}"))?
+        .join("okf-imports");
+    Ok(dir)
+}
+
+/// 把 zip 解包到**托管导入根** `imports_root` 下的真实目录（目录名取 zip 文件名去 `.zip`；已存在
+/// 则加 `-2`/`-3`… 后缀另起新目录，绝不覆盖）。返回解包目录。zip-slip / zip-bomb 防护见
+/// [`okf_extract_zip_into`]。
+fn okf_extract_zip_managed(
+    zip_path: &std::path::Path,
+    imports_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let stem = zip_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .unwrap_or("okf-bundle");
+    std::fs::create_dir_all(imports_root).map_err(|e| format!("创建导入根目录失败：{e}"))?;
+    // 找一个尚不存在的目录名（不覆盖）。
+    let mut target = imports_root.join(stem);
+    let mut n = 2usize;
+    while target.exists() {
+        target = imports_root.join(format!("{stem}-{n}"));
+        n += 1;
+        if n > 9999 {
+            return Err("无法为解包找到可用目录名".to_string());
+        }
+    }
+    okf_extract_zip_into(zip_path, &target)?;
+    Ok(target)
+}
+
+/// 把 zip 安全解包进**全新的** `target` 目录。
+///
+/// 安全：
+///   · **zip-slip**：用 `enclosed_name()`（剔除绝对/`..`，越界条目跳过）+ 解析后须仍在 target 内；
+///   · **zip-bomb**：限制条目数与解包总字节（边读边累计实际写入字节，超限即中止并清理）。
+fn okf_extract_zip_into(
+    zip_path: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), String> {
+    let file = std::fs::File::open(zip_path).map_err(|e| format!("打开 .zip 失败：{e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!(".zip 解析失败：{e}"))?;
+    if archive.len() > OKF_IMPORT_UNZIP_MAX_ENTRIES {
+        return Err("该 .zip 条目过多，已拒绝解包".to_string());
+    }
+    std::fs::create_dir_all(target).map_err(|e| format!("创建解包目录失败：{e}"))?;
+
+    let mut total: u64 = 0;
+    let mut wrote_any = false;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("读 .zip 条目失败：{e}"))?;
+        // zip-slip：拿到一个保证相对、无 `..`、无绝对前缀的安全名；拿不到 → 跳过该条目。
+        let safe = match entry.enclosed_name() {
+            Some(n) => n.to_path_buf(),
+            None => continue,
+        };
+        if safe.as_os_str().is_empty() {
+            continue;
+        }
+        let dest = target.join(&safe);
+        // 纵深防御：解析后必须仍在 target 内（enclosed_name 已保证，这里再确认）。
+        if !dest.starts_with(target) {
+            continue;
+        }
+        if entry.is_dir() {
+            std::fs::create_dir_all(&dest).map_err(|e| format!("解包建目录失败：{e}"))?;
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("解包建目录失败：{e}"))?;
+        }
+        let mut out =
+            std::fs::File::create(&dest).map_err(|e| format!("解包写文件失败：{e}"))?;
+        // 边拷边记实际字节，超总上限即中止（不信任 header 声明的 size）。
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = std::io::Read::read(&mut entry, &mut buf)
+                .map_err(|e| format!("解包读取失败：{e}"))?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > OKF_IMPORT_UNZIP_MAX_BYTES {
+                drop(out);
+                let _ = std::fs::remove_dir_all(target);
+                return Err("该 .zip 解包体积超限，已中止并清理".to_string());
+            }
+            std::io::Write::write_all(&mut out, &buf[..n])
+                .map_err(|e| format!("解包写文件失败：{e}"))?;
+        }
+        wrote_any = true;
+    }
+    if !wrote_any {
+        // 空包/全是越界条目：清掉空目录，给出明确错误。
+        let _ = std::fs::remove_dir_all(target);
+        return Err("该 .zip 内没有可解包的文件".to_string());
+    }
+    Ok(())
+}
+
+/// 注销一个外部 OKF 包（按精确路径移除；不存在则无操作）。若该路径是**应用托管的导入目录**
+/// （位于 `<app_data>/okf-imports/` 内），连带删除其解包目录；用户用「目录」登记的外部路径绝不删。
+#[tauri::command]
+pub(crate) fn okf_external_remove(
+    app: AppHandle,
+    state: State<AppState>,
+    path: String,
+) -> Result<Vec<String>, String> {
+    let path = path.trim().to_string();
+    let list = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let mut list = okf_read_external_bundles(&db);
+        list.retain(|p| p != &path);
+        let json = serde_json::to_string(&list).map_err(|e| e.to_string())?;
+        set_setting(&db, OKF_EXTERNAL_BUNDLES_KEY, &json).map_err(|e| e.to_string())?;
+        list
+    };
+    // 同步 okf_read 工具用的进程级已登记快照（工具执行路径无 DB 句柄）。
+    crate::tools::set_okf_external_bundles(list.clone());
+    // 托管目录清理（仅当确属本应用导入根内，防误删用户自管目录）。
+    okf_cleanup_managed_import(&app, &path);
+    Ok(list)
+}
+
+/// 若 `path` 落在 `<app_data>/okf-imports/` 内，删除其解包目录（best-effort，失败忽略）；
+/// 否则（用户自管目录 / 路径已不存在）一律不动。canonicalize 双侧比较，防 symlink/相对绕过。
+fn okf_cleanup_managed_import(app: &AppHandle, path: &str) {
+    let Ok(root) = okf_imports_root(app) else { return };
+    let Ok(root_canon) = root.canonicalize() else { return }; // 导入根不存在 → 无可清
+    let Ok(p_canon) = std::path::Path::new(path).canonicalize() else { return }; // 已不存在 → 无需清
+    // 必须严格在导入根内、且不是导入根本身。
+    if p_canon != root_canon && p_canon.starts_with(&root_canon) {
+        let _ = std::fs::remove_dir_all(&p_canon);
+    }
+}
+
+/// 列出已登记外部 OKF 包（也并入 get_okf_settings，单列方便前端刷新）。
+#[tauri::command]
+pub(crate) fn okf_external_list(state: State<AppState>) -> Result<Vec<String>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    Ok(okf_read_external_bundles(&db))
+}
+
+/// 浏览 OKF 内容：`source="own"` 浏览本项目 wiki 投影；否则 `source` 为某外部 bundle 绝对路径。
+///
+/// 外部 bundle 必须在 okf_external_bundles 已登记列表内，否则拒（防越权读任意目录）。
+/// 返回 concept 清单（不含 body，body 走 okf_read_concept 惰性取）。
+#[tauri::command]
+pub(crate) fn okf_browse(
+    state: State<AppState>,
+    conversation_id: String,
+    source: String,
+) -> Result<OkfBrowseView, String> {
+    let source = source.trim().to_string();
+    if source == "own" {
+        let workspace = okf_conversation_workspace(&state, &conversation_id)?;
+        let bundle = okf_own_bundle(&workspace);
+        let overlay = okf_read_overlay(&workspace);
+        let concepts = okf_concepts_view(&bundle, &overlay);
+        let has_content = !concepts.is_empty();
+        let note = if has_content {
+            format!("本项目 wiki 已投影为 {} 个 OKF concept；点开 concept 可读全文。", concepts.len())
+        } else {
+            "本项目尚无 wiki（OKF 来源为空）。可先用 wiki 工具 build 后再浏览。".to_string()
+        };
+        return Ok(OkfBrowseView { source, concepts, has_content, note });
+    }
+
+    // 外部 bundle：必须已登记。
+    okf_reject_bad_path(&source)?;
+    let registered = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        okf_read_external_bundles(&db)
+    };
+    if !registered.iter().any(|p| p == &source) {
+        return Err("该外部 OKF 包未登记，请先在设置里添加后再浏览".to_string());
+    }
+    let dir = std::path::Path::new(&source);
+    if !dir.is_dir() {
+        return Err("外部 OKF 包目录不存在".to_string());
+    }
+    let bundle = mdga_wiki::read_okf_bundle(dir);
+    // 外部 bundle 不参与本地覆盖层（你不编辑别人的知识）→ overridden 恒 false。
+    let concepts = okf_concepts_view(&bundle, &std::collections::BTreeMap::new());
+    let has_content = !concepts.is_empty();
+    let note = format!("外部 OKF 包含 {} 个 concept。", concepts.len());
+    Ok(OkfBrowseView { source, concepts, has_content, note })
+}
+
+/// 读取某 concept 的完整 .md。
+///
+/// own：从 wiki → OKF 投影结果里按**精确 relPath** 取，再 render_concept_md。
+/// 外部：先校验 bundle 已登记，再以 bundle 根为「工作区」用 read_workspace_text 守卫（拒 `..`/绝对/越界）读该 .md。
+#[tauri::command]
+pub(crate) fn okf_read_concept(
+    state: State<AppState>,
+    conversation_id: String,
+    source: String,
+    rel_path: String,
+) -> Result<String, String> {
+    let source = source.trim().to_string();
+    let rel_path = rel_path.trim().to_string();
+    if rel_path.is_empty() {
+        return Err("relPath 不能为空".to_string());
+    }
+
+    if source == "own" {
+        let workspace = okf_conversation_workspace(&state, &conversation_id)?;
+        let bundle = okf_own_bundle(&workspace);
+        // own 在内存投影结果里按精确 relPath 匹配即可（无文件系统读，天然无穿越）。
+        let concept = bundle
+            .concepts
+            .iter()
+            .find(|c| c.rel_path == rel_path)
+            .ok_or_else(|| format!("未找到 concept：{rel_path}"))?;
+        return Ok(mdga_wiki::render_concept_md(concept));
+    }
+
+    // 外部：必须已登记，再经 read_workspace_text 守卫读 bundle 内文件。
+    okf_reject_bad_path(&source)?;
+    let registered = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        okf_read_external_bundles(&db)
+    };
+    if !registered.iter().any(|p| p == &source) {
+        return Err("该外部 OKF 包未登记，无法读取".to_string());
+    }
+    // 以 bundle 根作「工作区根」，复用 resolve_existing_path：拒绝 `..`/绝对/越出 bundle 根。
+    mdga_tool_runtime::read_workspace_text(&source, &rel_path, OKF_CONCEPT_READ_MAX_BYTES)
+        .map_err(|e| match e {
+            mdga_tool_runtime::ToolRuntimeError::FileTooLarge(_) => {
+                "concept 文件过大，无法预览".to_string()
+            }
+            mdga_tool_runtime::ToolRuntimeError::NonUtf8Text => {
+                "该 concept 不是 UTF-8 文本".to_string()
+            }
+            other => other.to_string(),
+        })
+}
+
+// ── 可编辑 wiki：覆盖式编辑（own 源专用；编辑器编辑正文、frontmatter 仍自动管理）──────
+//
+// 模型：每个 concept 默认显示自动正文；用户「编辑」即把该 concept 的**正文**存进覆盖层
+// （.mdga/okf-overlay.json，在 wiki 工作存储之外），okf_own_bundle 叠加后生效，并随之进入
+// browse/详情/导出/发布；可「还原自动」清掉该条覆盖。**外部 bundle 只读、不可编辑。**
+
+/// 取某 own concept 当前生效正文（供编辑器预填）+ 是否已被覆盖。
+///
+/// 正文 = 覆盖层有 → 用户版；否则 → 自动版（render_section_body 的产物，不含 frontmatter）。
+/// concept 必须真实存在于自动 bundle（防对不存在条目写覆盖）。
+#[tauri::command]
+pub(crate) fn okf_get_concept_source(
+    state: State<AppState>,
+    conversation_id: String,
+    rel_path: String,
+) -> Result<OkfConceptSourceView, String> {
+    let rel_path = rel_path.trim().to_string();
+    if rel_path.is_empty() {
+        return Err("relPath 不能为空".to_string());
+    }
+    let workspace = okf_conversation_workspace(&state, &conversation_id)?;
+    let auto = okf_auto_bundle(&workspace);
+    let auto_body = auto
+        .concepts
+        .iter()
+        .find(|c| c.rel_path == rel_path)
+        .map(|c| c.body.clone())
+        .ok_or_else(|| format!("未找到 concept：{rel_path}"))?;
+    let overlay = okf_read_overlay(&workspace);
+    match overlay.get(&rel_path) {
+        Some(body) => Ok(OkfConceptSourceView {
+            body: body.clone(),
+            overridden: true,
+        }),
+        None => Ok(OkfConceptSourceView {
+            body: auto_body,
+            overridden: false,
+        }),
+    }
+}
+
+/// 覆盖式编辑：把某 own concept 的正文存进覆盖层（不存在的 concept 拒；过大拒）。
+#[tauri::command]
+pub(crate) fn okf_set_overlay(
+    state: State<AppState>,
+    conversation_id: String,
+    rel_path: String,
+    body: String,
+) -> Result<(), String> {
+    let rel_path = rel_path.trim().to_string();
+    if rel_path.is_empty() {
+        return Err("relPath 不能为空".to_string());
+    }
+    if body.len() > OKF_OVERLAY_BODY_MAX_BYTES {
+        return Err("内容过大，无法保存".to_string());
+    }
+    let workspace = okf_conversation_workspace(&state, &conversation_id)?;
+    // 仅允许覆盖真实存在的自动 concept（防写孤儿/任意键）。
+    let exists = okf_auto_bundle(&workspace)
+        .concepts
+        .iter()
+        .any(|c| c.rel_path == rel_path);
+    if !exists {
+        return Err(format!("未找到 concept：{rel_path}"));
+    }
+    let mut overlay = okf_read_overlay(&workspace);
+    overlay.insert(rel_path, body);
+    okf_write_overlay(&workspace, &overlay)
+}
+
+/// 还原自动：清掉某 own concept 的覆盖（不存在覆盖则无操作）。
+#[tauri::command]
+pub(crate) fn okf_clear_overlay(
+    state: State<AppState>,
+    conversation_id: String,
+    rel_path: String,
+) -> Result<(), String> {
+    let rel_path = rel_path.trim().to_string();
+    if rel_path.is_empty() {
+        return Err("relPath 不能为空".to_string());
+    }
+    let workspace = okf_conversation_workspace(&state, &conversation_id)?;
+    let mut overlay = okf_read_overlay(&workspace);
+    if overlay.remove(&rel_path).is_some() {
+        okf_write_overlay(&workspace, &overlay)?;
+    }
+    Ok(())
+}
+
+/// 按设置发布本项目 wiki 为 OKF bundle 到共享位置，返回写到的绝对路径。
+///
+/// 路径口径：sharedLocation 为**工作区相对**（如 ./knowledge）→ workspace.join 后**必须**校验解析后
+/// 仍在工作区内（防 `../` 逃逸）；为**绝对外部路径**（用户自选）→ 允许写。
+/// visibility=private 时报错（不静默写）。
+#[tauri::command]
+pub(crate) fn okf_publish(
+    state: State<AppState>,
+    conversation_id: String,
+) -> Result<String, String> {
+    let workspace = okf_conversation_workspace(&state, &conversation_id)?;
+    let (visibility, shared_location) = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let v = get_setting(&db, OKF_VISIBILITY_KEY)
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| "private".to_string());
+        let loc = get_setting(&db, OKF_SHARED_LOCATION_KEY)
+            .map_err(|e| e.to_string())?
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| OKF_DEFAULT_SHARED_LOCATION.to_string());
+        (v, loc)
+    };
+    if visibility != "shared" {
+        return Err("当前 OKF 可见性为「私有」，未发布。如需发布请在设置中切换为「共享」。".to_string());
+    }
+
+    let target = okf_resolve_publish_target(&workspace, &shared_location)?;
+    let bundle = okf_own_bundle(&workspace);
+    if bundle.concepts.is_empty() {
+        return Err("本项目尚无 wiki 内容（无可发布的 OKF concept）。请先 build wiki。".to_string());
+    }
+    mdga_wiki::write_okf_bundle(&bundle, &target).map_err(|e| format!("写入 OKF 包失败：{e}"))?;
+    Ok(target.to_string_lossy().to_string())
+}
+
+/// 解析发布目标目录：
+///   · location 绝对 → 直接用（用户自选外部目录，允许；仅拒控制字符）。
+///   · location 相对 → workspace.join(location)，建目录后 canonicalize，并校验解析后仍在工作区内（防逃逸）。
+fn okf_resolve_publish_target(
+    workspace: &str,
+    location: &str,
+) -> Result<std::path::PathBuf, String> {
+    okf_reject_bad_path(location)?;
+    let loc_path = std::path::Path::new(location);
+    if loc_path.is_absolute() {
+        // 绝对外部目录（用户自选）：确保存在/可建后直接用。
+        std::fs::create_dir_all(loc_path).map_err(|e| format!("创建发布目录失败：{e}"))?;
+        return Ok(loc_path.to_path_buf());
+    }
+
+    // 工作区相对：join 后必须校验解析后仍在工作区内（词法 + canonicalize 双保险）。
+    // 1) 词法：location 不得含 `..` 分量（先挡明显逃逸，且让 canonicalize 前的语义清晰）。
+    if loc_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("共享位置（工作区相对）不允许包含 `..`".to_string());
+    }
+    let ws_canon = std::path::Path::new(workspace)
+        .canonicalize()
+        .map_err(|e| format!("工作区路径不可用：{e}"))?;
+    let target = ws_canon.join(loc_path);
+    std::fs::create_dir_all(&target).map_err(|e| format!("创建发布目录失败：{e}"))?;
+    // 2) canonicalize 兜底 symlink：解析后必须仍在工作区内。
+    let target_canon = target
+        .canonicalize()
+        .map_err(|e| format!("发布目录解析失败：{e}"))?;
+    if !target_canon.starts_with(&ws_canon) {
+        return Err("共享位置解析后逃出了工作区，已拒绝写入".to_string());
+    }
+    Ok(target_canon)
+}
+
+/// 导出本项目 wiki 为**单个 .zip**（OKF bundle 打包）到用户经对话框选的 targetZip 文件路径。
+/// 与 visibility 无关——随时可导出。返回写到的绝对 .zip 路径。便于跨 agent/项目流转：
+/// 收方导入该 .zip 时自动解包成真实 OKF 目录（见 [`okf_external_add`]）。
+#[tauri::command]
+pub(crate) fn okf_export(
+    state: State<AppState>,
+    conversation_id: String,
+    target_zip: String,
+) -> Result<String, String> {
+    okf_reject_bad_path(&target_zip)?;
+    let target_zip = target_zip.trim();
+    let workspace = okf_conversation_workspace(&state, &conversation_id)?;
+    let bundle = okf_own_bundle(&workspace);
+    if bundle.concepts.is_empty() {
+        return Err("本项目尚无 wiki 内容（无可导出的 OKF concept）。请先 build wiki。".to_string());
+    }
+    // 用与「写目录」同一布局（okf_bundle_files）逐条写进 zip → 解包后即标准 OKF 目录。
+    let files = mdga_wiki::okf_bundle_files(&bundle);
+    let target = std::path::Path::new(target_zip);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建导出目录失败：{e}"))?;
+    }
+    okf_write_zip(target, &files).map_err(|e| format!("写入 OKF .zip 失败：{e}"))?;
+    Ok(target.to_string_lossy().to_string())
+}
+
+/// 把 `(相对路径, 内容)` 列表写成一个 .zip（Deflated）。相对路径为正斜杠（zip 条目名规范）。
+fn okf_write_zip(target: &std::path::Path, files: &[(String, String)]) -> std::io::Result<()> {
+    let f = std::fs::File::create(target)?;
+    let mut zip = zip::ZipWriter::new(f);
+    let opts: zip::write::SimpleFileOptions =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (rel, content) in files {
+        zip.start_file(rel.as_str(), opts)
+            .map_err(std::io::Error::other)?;
+        std::io::Write::write_all(&mut zip, content.as_bytes())?;
+    }
+    zip.finish().map_err(std::io::Error::other)?;
+    Ok(())
+}
+
 /// 导出全部会话的 token 账本为 CSV（数据治理 + 对账）。
 #[tauri::command]
 pub(crate) fn export_token_ledger(state: State<AppState>, path: String) -> Result<(), String> {
@@ -2576,5 +3410,335 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].total_tokens, 0);
         assert_eq!(out[0].estimated_cost, 0.0);
+    }
+
+    // ── OKF 命令层 ─────────────────────────────────────────────────────────
+
+    fn okf_tmp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let id = N.fetch_add(1, Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!(
+            "mdga-okf-cmd-{}-{}-{}",
+            tag,
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 设置默认值：键缺失时，命令层的回退口径给出 private / ./knowledge / autoPublish=false / 空外部列表。
+    /// 用 in-memory 连接（无任何 okf_* 键）验证 get_setting 缺失 + 命令默认分支逻辑一致。
+    #[test]
+    fn okf_settings_defaults_when_unset() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+
+        // 缺失时各键都应为 None。
+        assert!(get_setting(&conn, OKF_VISIBILITY_KEY).unwrap().is_none());
+        assert!(get_setting(&conn, OKF_SHARED_LOCATION_KEY).unwrap().is_none());
+        assert!(get_setting(&conn, OKF_AUTO_PUBLISH_KEY).unwrap().is_none());
+
+        // 复刻 get_okf_settings 的默认回退逻辑（与命令同源）。
+        let visibility = get_setting(&conn, OKF_VISIBILITY_KEY)
+            .unwrap()
+            .filter(|v| v == "private" || v == "shared")
+            .unwrap_or_else(|| "private".to_string());
+        let shared_location = get_setting(&conn, OKF_SHARED_LOCATION_KEY)
+            .unwrap()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| OKF_DEFAULT_SHARED_LOCATION.to_string());
+        let auto_publish = get_setting(&conn, OKF_AUTO_PUBLISH_KEY)
+            .unwrap()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let external = okf_read_external_bundles(&conn);
+
+        assert_eq!(visibility, "private");
+        assert_eq!(shared_location, "./knowledge");
+        assert!(!auto_publish);
+        assert!(external.is_empty());
+    }
+
+    /// 路径逃逸被拒：工作区相对的共享位置含 `..` 必须被拒（防写出工作区外）。
+    #[test]
+    fn okf_publish_target_rejects_parent_escape() {
+        let ws = okf_tmp_dir("escape");
+        let ws_str = ws.to_str().unwrap();
+        // 含 `..` 的相对位置 → 拒绝。
+        let err = okf_resolve_publish_target(ws_str, "../evil").unwrap_err();
+        assert!(err.contains("..") || err.contains("逃"), "应因 `..` 被拒，实得：{err}");
+        // 多段 `..` 也拒。
+        assert!(okf_resolve_publish_target(ws_str, "a/../../b").is_err());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 合法工作区相对位置（./knowledge）解析后落在工作区内。
+    #[test]
+    fn okf_publish_target_relative_stays_inside() {
+        let ws = okf_tmp_dir("inside");
+        let ws_str = ws.to_str().unwrap();
+        let target = okf_resolve_publish_target(ws_str, "./knowledge").unwrap();
+        let ws_canon = std::path::Path::new(ws_str).canonicalize().unwrap();
+        assert!(target.starts_with(&ws_canon), "解析后应仍在工作区内：{target:?}");
+        assert!(target.is_dir(), "目标目录应已建好");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 异常路径输入（空 / 控制字符）被 okf_reject_bad_path 拒。
+    #[test]
+    fn okf_reject_bad_path_blocks_control_and_empty() {
+        assert!(okf_reject_bad_path("   ").is_err());
+        assert!(okf_reject_bad_path("a\u{0007}b").is_err());
+        assert!(okf_reject_bad_path("./knowledge").is_ok());
+    }
+
+    /// ISO-8601 UTC 时间戳格式正确（不引 chrono，从 std::time 手算）。
+    #[test]
+    fn okf_iso_timestamp_is_well_formed() {
+        let ts = okf_iso_timestamp();
+        // 形如 YYYY-MM-DDTHH:MM:SSZ，长度 20。
+        assert_eq!(ts.len(), 20, "时间戳长度应为 20，实得：{ts}");
+        assert!(ts.ends_with('Z'), "应以 Z 结尾（UTC）：{ts}");
+        let bytes = ts.as_bytes();
+        assert_eq!(bytes[4], b'-');
+        assert_eq!(bytes[7], b'-');
+        assert_eq!(bytes[10], b'T');
+        assert_eq!(bytes[13], b':');
+        assert_eq!(bytes[16], b':');
+        // 年份合理（2020 之后、2100 之前）。
+        let year: i64 = ts[0..4].parse().unwrap();
+        assert!((2020..2100).contains(&year), "年份不合理：{year}");
+        // 月/日/时/分/秒在合法范围内。
+        let month: u32 = ts[5..7].parse().unwrap();
+        let day: u32 = ts[8..10].parse().unwrap();
+        let hh: u32 = ts[11..13].parse().unwrap();
+        let mm: u32 = ts[14..16].parse().unwrap();
+        let ss: u32 = ts[17..19].parse().unwrap();
+        assert!((1..=12).contains(&month));
+        assert!((1..=31).contains(&day));
+        assert!(hh < 24 && mm < 60 && ss < 60);
+    }
+
+    /// own 源 sections 读取：缺 index.jsonl → 空（软处理，不 panic）。
+    #[test]
+    fn okf_load_wiki_sections_missing_is_empty() {
+        let ws = okf_tmp_dir("nowiki");
+        let secs = okf_load_wiki_sections(ws.to_str().unwrap());
+        assert!(secs.is_empty(), "无 wiki 时应为空");
+        // 空 sections → 空 bundle（has_content 由 concepts 判断）。
+        let bundle = okf_own_bundle(ws.to_str().unwrap());
+        assert!(bundle.concepts.is_empty());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// fix ⑤：时间戳取 wiki 生成物 mtime，同一份未变 wiki 多次取一致（不再每次 now 漂移）。
+    #[test]
+    fn okf_wiki_timestamp_is_stable_from_mtime() {
+        let ws = okf_tmp_dir("ts");
+        let wiki_dir = ws.join(".mdga").join("wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        // 写一个 .fingerprint（时间戳源）+ 一行 index.jsonl（让 own bundle 非空）。
+        std::fs::write(wiki_dir.join(".fingerprint"), "deadbeef").unwrap();
+        std::fs::write(
+            wiki_dir.join("index.jsonl"),
+            "{\"directory\":\"src\",\"role\":\"core engine\",\"file_count\":1,\"key_files\":[],\"symbols\":[]}\n",
+        )
+        .unwrap();
+
+        let t1 = okf_wiki_timestamp(ws.to_str().unwrap());
+        let t2 = okf_wiki_timestamp(ws.to_str().unwrap());
+        assert_eq!(t1, t2, "同一份未变 wiki 的时间戳应稳定，实得 {t1} vs {t2}");
+        // 格式仍是合法 ISO-8601 UTC。
+        assert_eq!(t1.len(), 20, "时间戳长度应为 20：{t1}");
+        assert!(t1.ends_with('Z'));
+
+        // own bundle 的 concept timestamp 也应等于该 mtime 时间戳（且两次构建一致）。
+        let b1 = okf_own_bundle(ws.to_str().unwrap());
+        let b2 = okf_own_bundle(ws.to_str().unwrap());
+        assert!(!b1.concepts.is_empty());
+        assert_eq!(
+            b1.concepts[0].timestamp, b2.concepts[0].timestamp,
+            "未变 wiki 两次构建 timestamp 应一致"
+        );
+        assert_eq!(b1.concepts[0].timestamp.as_deref(), Some(t1.as_str()));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// fix ⑤：取不到 wiki 生成物 mtime 时退回 now（仍产出合法时间戳，不崩）。
+    #[test]
+    fn okf_wiki_timestamp_falls_back_to_now() {
+        let ws = okf_tmp_dir("ts-fallback");
+        // 无 .mdga/wiki → 退回 now。
+        let ts = okf_wiki_timestamp(ws.to_str().unwrap());
+        assert_eq!(ts.len(), 20, "退回 now 仍应是合法时间戳：{ts}");
+        assert!(ts.ends_with('Z'));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 建一个含单个 `src` section 的工作区 wiki（.mdga/wiki/index.jsonl）。
+    fn okf_make_wiki_ws(tag: &str) -> std::path::PathBuf {
+        let ws = okf_tmp_dir(tag);
+        let wiki_dir = ws.join(".mdga").join("wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        std::fs::write(wiki_dir.join(".fingerprint"), "deadbeef").unwrap();
+        std::fs::write(
+            wiki_dir.join("index.jsonl"),
+            "{\"directory\":\"src\",\"role\":\"core engine\",\"file_count\":1,\"key_files\":[],\"symbols\":[]}\n",
+        )
+        .unwrap();
+        ws
+    }
+
+    /// 覆盖式编辑：overlay 持久化 + okf_own_bundle 叠加生效 + 自动版不受影响 + 还原清掉。
+    #[test]
+    fn okf_overlay_applies_persists_and_reverts() {
+        let ws = okf_make_wiki_ws("overlay");
+        let wss = ws.to_str().unwrap();
+
+        // 初始无覆盖：own 与 auto 正文一致。
+        assert!(okf_read_overlay(wss).is_empty());
+        let auto0 = okf_auto_bundle(wss);
+        let src_auto = auto0.concepts.iter().find(|c| c.rel_path == "src.md").unwrap();
+        assert!(src_auto.body.contains("**Role:**"), "自动正文应含 Role 段");
+
+        // 写覆盖 → own_bundle 该 concept 正文换成用户版，auto 不变。
+        let mut m = okf_read_overlay(wss);
+        m.insert("src.md".to_string(), "USER EDITED BODY".to_string());
+        okf_write_overlay(wss, &m).unwrap();
+        assert_eq!(okf_read_overlay(wss).get("src.md").map(String::as_str), Some("USER EDITED BODY"));
+
+        let own = okf_own_bundle(wss);
+        let src_own = own.concepts.iter().find(|c| c.rel_path == "src.md").unwrap();
+        assert_eq!(src_own.body, "USER EDITED BODY", "own 应用覆盖正文");
+        let auto1 = okf_auto_bundle(wss);
+        let src_auto1 = auto1.concepts.iter().find(|c| c.rel_path == "src.md").unwrap();
+        assert!(src_auto1.body.contains("**Role:**"), "auto 版不受覆盖影响");
+
+        // overlay 存于 .mdga/okf-overlay.json，在 wiki 目录之外（重生成不会冲掉）。
+        assert!(ws.join(".mdga").join("okf-overlay.json").is_file());
+        assert!(!ws.join(".mdga").join("wiki").join("okf-overlay.json").exists());
+
+        // 还原：清掉覆盖 → own 回到自动正文。
+        let mut m2 = okf_read_overlay(wss);
+        m2.remove("src.md");
+        okf_write_overlay(wss, &m2).unwrap();
+        let own2 = okf_own_bundle(wss);
+        let src_own2 = own2.concepts.iter().find(|c| c.rel_path == "src.md").unwrap();
+        assert!(src_own2.body.contains("**Role:**"), "还原后回到自动正文");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 导出 .zip → 解包 → 读回：concept 集合往返一致（与「写目录」同一布局）。
+    #[test]
+    fn okf_zip_export_extract_roundtrips() {
+        let dir = okf_tmp_dir("zip-rt");
+        let secs = vec![
+            mdga_wiki::WikiSection {
+                directory: "src/api".to_string(),
+                role: "API / request handlers".to_string(),
+                file_count: 1,
+                key_files: vec![],
+                symbols: vec![],
+                summary: None,
+            },
+            mdga_wiki::WikiSection {
+                directory: ".".to_string(),
+                role: "repository root".to_string(),
+                file_count: 1,
+                key_files: vec![],
+                symbols: vec![],
+                summary: None,
+            },
+        ];
+        let bundle = mdga_wiki::sections_to_okf(&secs, "2026-06-23T00:00:00Z");
+        let files = mdga_wiki::okf_bundle_files(&bundle);
+
+        let zip_path = dir.join("out.zip");
+        okf_write_zip(&zip_path, &files).unwrap();
+        assert!(zip_path.is_file(), "应写出单个 .zip 文件");
+
+        let extracted = dir.join("unpacked");
+        okf_extract_zip_into(&zip_path, &extracted).unwrap();
+        // 解包后即标准 OKF 目录：真路径文件 + 根 index.md。
+        assert!(extracted.join("src").join("api.md").is_file(), "应解出 src/api.md");
+        assert!(extracted.join("index.md").is_file(), "应解出根 index.md");
+
+        let read = mdga_wiki::read_okf_bundle(&extracted);
+        assert_eq!(read.concepts.len(), bundle.concepts.len(), "往返 concept 数应一致");
+        assert!(read.index_md.contains("okf_version: \"0.1\""));
+
+        // 读 concept 正文走的就是 okf_read_concept 外部分支的守卫（read_workspace_text）：
+        // 以解包目录为「工作区根」、用 browse 给出的 relPath 读，必须成功（否则前端会显「无法读取」）。
+        let any = read.concepts.iter().find(|c| c.rel_path == "src/api.md").unwrap();
+        let body = mdga_tool_runtime::read_workspace_text(&extracted, &any.rel_path, OKF_CONCEPT_READ_MAX_BYTES)
+            .expect("解包目录内的 concept 应可经 read_workspace_text 读到");
+        assert!(body.starts_with("---\n") && body.contains("**Role:**"), "应读到完整 .md");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 托管解包：落到 imports_root/<stem>，二次同名导入加 `-2` 后缀，互不覆盖。
+    #[test]
+    fn okf_extract_zip_managed_places_under_root_and_suffixes() {
+        let dir = okf_tmp_dir("zip-managed");
+        let root = dir.join("okf-imports");
+        // 造一个最小有效 zip。
+        let zip_path = dir.join("kb.zip");
+        {
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+            zip.start_file("index.md", opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"---\nokf_version: \"0.1\"\n---\n").unwrap();
+            zip.start_file("a.md", opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"---\ntype: module\n---\nbody\n").unwrap();
+            zip.finish().unwrap();
+        }
+        // 第一次：root/kb。
+        let t1 = okf_extract_zip_managed(&zip_path, &root).unwrap();
+        assert_eq!(t1, root.join("kb"), "应落到 imports_root/<stem>");
+        assert!(t1.join("a.md").is_file());
+        // 第二次同名：root/kb-2（不覆盖）。
+        let t2 = okf_extract_zip_managed(&zip_path, &root).unwrap();
+        assert_eq!(t2, root.join("kb-2"), "撞名应加 -2 后缀，不覆盖");
+        assert!(t1.join("a.md").is_file() && t2.join("a.md").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// zip-slip 防护：含 `../` 越界条目的 zip 解包时被跳过，绝不写到 target 之外。
+    #[test]
+    fn okf_extract_zip_blocks_slip() {
+        let dir = okf_tmp_dir("zip-slip");
+        // 手造一个含一个正常条目 + 一个越界条目的 zip。
+        let zip_path = dir.join("evil.zip");
+        {
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+            zip.start_file("ok.md", opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"---\ntype: module\n---\nok\n").unwrap();
+            // 越界条目：试图逃到 target 的父目录。
+            zip.start_file("../escaped.md", opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"pwned").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let target = dir.join("box");
+        okf_extract_zip_into(&zip_path, &target).unwrap();
+        // 正常条目解出；越界条目既不在 target 内、也不在 target 的父目录里。
+        assert!(target.join("ok.md").is_file(), "正常条目应解出");
+        assert!(!target.join("escaped.md").exists());
+        assert!(!dir.join("escaped.md").exists(), "越界条目绝不可写到 target 之外");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -15,6 +15,7 @@
 //! 求真与安全：wiki 是**派生数据**（可随时重建），只写入 .mdga/wiki/ 缓存、绝不碰用户源码；
 //! 所有写入路径分量都经 sanitize、永不逃出工作区；build 无法运行时 query 仍能降级返回。
 
+mod okf;
 mod role;
 mod sanitize;
 mod sections;
@@ -25,6 +26,13 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 pub use sections::{WikiSection, WikiSymbol};
+
+/// OKF（Open Knowledge Format）v0.1 序列化层：把 `WikiSection[]` 投影成严格合规的 OKF bundle，
+/// 并能写入目录、读取外部 bundle。**纯投影/导出导入层**，不触碰 wiki 现有工作存储/查询/指纹逻辑。
+pub use okf::{
+    okf_bundle_files, read_okf_bundle, render_concept_md, sections_to_okf, write_okf_bundle,
+    OkfBundle, OkfConcept,
+};
 
 /// wiki 缓存在工作区内的相对根目录。所有派生产物都落在这里、绝不外溢。
 pub const WIKI_DIR: &str = ".mdga/wiki";

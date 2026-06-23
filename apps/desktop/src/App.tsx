@@ -2527,6 +2527,7 @@ export function App() {
           taskBudget={taskBudget}
           onSetBudget={handleSetBudget}
           hasActiveConv={!!activeConvId}
+          activeConvId={activeConvId}
           onExportConversation={handleExportConversation}
           onExportLedger={handleExportLedger}
           onClearData={handleClearData}

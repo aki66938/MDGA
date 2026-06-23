@@ -76,6 +76,11 @@ use commands::{
     save_lsp_server_config, set_role_assignment,
 };
 use commands::{get_bg_activity_output, get_tool_usage, kill_bg_activity, list_bg_activity};
+use commands::{
+    get_okf_settings, okf_browse, okf_clear_overlay, okf_export, okf_external_add,
+    okf_external_list, okf_external_remove, okf_get_concept_source, okf_publish, okf_read_concept,
+    okf_set_overlay, set_okf_settings,
+};
 
 mod pricing_capture;
 use pricing_capture::{apply_pricing_overrides, capture_official_pricing, reset_pricing_overrides};
@@ -225,6 +230,17 @@ fn main() {
                     .ok()
                     .map(|db| embedding::refresh_embedding_config(&db));
             }
+
+            // okf_read：从 DB 播种「已登记外部 OKF 包」列表到进程级快照，使该只读工具在无 DB 句柄的
+            // 执行路径里仍能强制「只读已登记包」这道安全闸。无登记＝空表（list 回空提示、read 一律拒）。
+            {
+                let state = app.state::<AppState>();
+                let _ = state
+                    .db
+                    .lock()
+                    .ok()
+                    .map(|db| tools::refresh_okf_external_bundles(&db));
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -316,6 +332,18 @@ fn main() {
             kill_bg_activity,
             get_bg_activity_output,
             get_tool_usage,
+            get_okf_settings,
+            set_okf_settings,
+            okf_external_add,
+            okf_external_remove,
+            okf_external_list,
+            okf_browse,
+            okf_read_concept,
+            okf_get_concept_source,
+            okf_set_overlay,
+            okf_clear_overlay,
+            okf_publish,
+            okf_export,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run MDGA desktop app");

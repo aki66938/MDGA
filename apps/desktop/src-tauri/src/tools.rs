@@ -45,6 +45,48 @@ fn lsp_config_snapshot() -> mdga_lsp::LspServerConfig {
         .unwrap_or_default()
 }
 
+// ── okf_read 工具：已登记外部 OKF 包的进程级快照（与 LSP/embedding 快照同款做法）──────
+//
+// okf_read 在 `execute_builtin_tool_call` 里执行，那里**没有 DB 句柄**；而该工具的核心安全闸
+// 「只允许已登记的外部 bundle」需要读 app_settings 的 okf_external_bundles 列表。沿用 LSP/embedding
+// 快照的解耦法：进程级 RwLock 缓存当前已登记的 bundle 绝对路径列表，
+//   - 启动时由 main.rs 从 DB 播种（refresh_okf_external_bundles）；
+//   - 设置页登记/注销外部包后由命令层刷新（refresh_okf_external_bundles）。
+// 工具执行时只读该快照、零 DB 往返。未登记任何包＝空表（list 回空 + 提示；read 一律拒）。
+//
+// 路径安全红线：本工具是 agent 可调的只读工具，read 仅允许「已登记 bundle 列表内的路径」+ concept
+// 经 mdga_tool_runtime::read_workspace_text 的 resolve_existing_path 守卫（以 bundle 根为「工作区」，
+// 拒 `..`/绝对/越界），与命令层 okf_read_concept 同一道闸，绝不读任意磁盘路径。
+
+/// app_settings 里已登记外部 OKF 包列表的键（须与 commands.rs::OKF_EXTERNAL_BUNDLES_KEY 一致）。
+const OKF_EXTERNAL_BUNDLES_KEY: &str = "okf_external_bundles";
+/// okf_read 读取单个 concept 的字节上限（与命令层 okf_read_concept 同口径 512 KiB）。
+const OKF_CONCEPT_READ_MAX_BYTES: u64 = 512 * 1024;
+
+/// 进程级快照：当前已登记的外部 OKF 包绝对路径列表。默认空表。
+static OKF_EXTERNAL_BUNDLES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// 设置当前已登记外部包快照（启动播种 / 登记·注销后刷新调用）。
+pub(crate) fn set_okf_external_bundles(bundles: Vec<String>) {
+    if let Ok(mut guard) = OKF_EXTERNAL_BUNDLES.write() {
+        *guard = bundles;
+    }
+}
+
+/// 从 DB 读 okf_external_bundles 设置并刷新进程级快照。读失败/损坏＝空表（软处理，不报错冒泡）。
+pub(crate) fn refresh_okf_external_bundles(conn: &rusqlite::Connection) {
+    let list = match mdga_storage::get_setting(conn, OKF_EXTERNAL_BUNDLES_KEY) {
+        Ok(Some(raw)) => serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    set_okf_external_bundles(list);
+}
+
+/// 取当前已登记外部包快照（无锁失败＝空表）。
+fn okf_external_bundles_snapshot() -> Vec<String> {
+    OKF_EXTERNAL_BUNDLES.read().ok().map(|g| g.clone()).unwrap_or_default()
+}
+
 /// 扫描工作区 .mdga/skills/*/SKILL.md，返回技能名与描述（首行 frontmatter 或首段）。
 pub(crate) fn load_workspace_skills(workspace: &str) -> Vec<(String, String)> {
     let skills_dir = std::path::Path::new(workspace).join(".mdga").join("skills");
@@ -429,6 +471,26 @@ pub(crate) fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
                         "limit": { "type": "integer", "description": "For action='query': max sections to return (default 5)." },
                         "force": { "type": "boolean", "description": "For action='build': rebuild even if content is unchanged. Defaults to false (incremental)." },
                         "enrich": { "type": "boolean", "description": "For action='build' only: ALSO add a short LLM prose summary per section (one bounded provider call each, cached by section fingerprint; falls back to the deterministic section on failure). Costs paid API calls. Defaults to false (offline, deterministic, no LLM)." }
+                    },
+                    "required": [],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        // okf_read（只读）：消费用户登记的**外部** OKF 知识包（其他 agent/团队的数字大脑）。
+        // 渐进披露：list 只回索引（不含正文）→ read 按需取单个 concept 全文。与 repo_wiki 分工见描述。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "okf_read",
+                "description": "Consume EXTERNAL OKF (Open Knowledge Format) knowledge bundles that the user has REGISTERED in settings — these are OTHER agents' / teams' externalized 'digital brains' published as portable OKF bundles, typically living OUTSIDE this repo's workspace (absolute paths on disk). Use this to look up domain/decisions/conventions captured by others. PROGRESSIVE DISCLOSURE: call action='list' FIRST to get a lightweight index of all registered bundles and their concepts (path + type + title + description, NO bodies), then action='read' to pull the full markdown of ONE specific concept by its relPath. IMPORTANT — this is NOT for THIS repository's own knowledge: to learn about the CURRENT codebase use repo_wiki / repo_map / code_search instead. okf_read ONLY reads bundles the user explicitly registered (Settings → Knowledge); it can never read arbitrary disk paths. Read-only, no side effects, automatically allowed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "read"], "description": "'list' returns the concept index of all registered external bundles (no bodies — progressive disclosure). 'read' returns the full .md text of one concept. Defaults to 'list'." },
+                        "bundle": { "type": "string", "description": "For action='read': the external bundle path. MUST be one of the registered bundle paths returned by action='list' (verbatim). Reading an unregistered path is refused." },
+                        "concept": { "type": "string", "description": "For action='read': the concept's relPath relative to the bundle root (e.g. 'src/api.md'), as shown in the list index. Path-guarded: '..', absolute paths, and any path escaping the bundle root are refused." },
+                        "query": { "type": "string", "description": "For action='list' (optional): free-text keywords to narrow the index to concepts whose title/description/relPath/type match. Omit to list every concept of every registered bundle." }
                     },
                     "required": [],
                     "additionalProperties": false
@@ -1203,6 +1265,7 @@ pub(crate) fn execute_builtin_tool_call(
         "repo_map" => execute_repo_map(workspace_path, arguments),
         "code_search" => execute_code_search(workspace_path, arguments),
         "repo_wiki" => execute_repo_wiki(workspace_path, arguments),
+        "okf_read" => execute_okf_read(arguments),
         "render_artifact" => execute_render_artifact(arguments),
         "move_path" => {
             let request = serde_json::from_str::<MovePathRequest>(arguments)
@@ -1508,6 +1571,148 @@ impl RepoWikiArgs {
     pub(crate) fn wants_enriched_build(&self) -> bool {
         self.enrich && self.action.as_deref() == Some("build")
     }
+}
+
+/// okf_read 工具（只读、自动放行）：消费用户登记的**外部** OKF 知识包，渐进披露。
+///
+/// - `list`：读已登记外部包快照 → 对每个包 `read_okf_bundle` → 回索引（**不含 body**）；
+///   可选 `query` 词法过滤；某包路径失效/读失败 → 该项给 note 跳过，不崩；无登记包回空 + 提示。
+/// - `read`：校验 `bundle` 在已登记列表内（否则 Err，**绝不读任意路径**），再以 bundle 根为「工作区根」
+///   经 `read_workspace_text` 守卫（resolve_existing_path 拒 `..`/绝对/越界）读 `concept`，回全文（≤512 KiB）。
+///
+/// 路径安全两道闸：① 已登记白名单（bundle 必在快照内）；② concept 经工作区守卫不得越出 bundle 根。
+fn execute_okf_read(arguments: &str) -> Result<serde_json::Value, String> {
+    #[derive(serde::Deserialize, Default)]
+    struct OkfReadArgs {
+        #[serde(default)]
+        action: Option<String>,
+        #[serde(default)]
+        bundle: Option<String>,
+        #[serde(default)]
+        concept: Option<String>,
+        #[serde(default)]
+        query: Option<String>,
+    }
+    let trimmed = arguments.trim();
+    let args = if trimmed.is_empty() {
+        OkfReadArgs::default()
+    } else {
+        serde_json::from_str::<OkfReadArgs>(trimmed)
+            .map_err(|err| format!("工具参数解析失败: {err}"))?
+    };
+    // 默认动作为 list（更轻、渐进披露的第一步）。
+    let action = args.action.as_deref().unwrap_or("list").trim();
+    match action {
+        "list" => Ok(okf_read_list(args.query.as_deref())),
+        "read" => {
+            let bundle = args
+                .bundle
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("action='read' 需要 bundle（必须是 list 返回的已登记包路径之一）")?;
+            let concept = args
+                .concept
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("action='read' 需要 concept（相对 bundle 根的 relPath）")?;
+            okf_read_concept(bundle, concept)
+        }
+        other => Err(format!("未知 action: {other}（应为 \"list\" 或 \"read\"）")),
+    }
+}
+
+/// okf_read action='list'：列出所有已登记外部包的概念索引（不含 body）。可选 query 词法过滤。
+fn okf_read_list(query: Option<&str>) -> serde_json::Value {
+    let registered = okf_external_bundles_snapshot();
+    if registered.is_empty() {
+        return serde_json::json!({
+            "bundles": [],
+            "note": "尚未登记任何外部 OKF 知识包。请在「设置 → 知识库」中添加外部 OKF 包后再用 okf_read 浏览。本仓库自身的知识请用 repo_wiki。"
+        });
+    }
+    let needle = query
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase);
+
+    let mut bundles_out: Vec<serde_json::Value> = Vec::with_capacity(registered.len());
+    for path in &registered {
+        let dir = std::path::Path::new(path);
+        if !dir.is_dir() {
+            // 路径已失效：给 note 跳过该项，不崩、不影响其它包。
+            bundles_out.push(serde_json::json!({
+                "path": path,
+                "conceptCount": 0,
+                "concepts": [],
+                "note": "该已登记外部 OKF 包路径不存在或不是目录，已跳过。"
+            }));
+            continue;
+        }
+        // read_okf_bundle 自身对读失败/坏文件软处理（跳过、不 panic），返回 best-effort bundle。
+        let bundle = mdga_wiki::read_okf_bundle(dir);
+        let concepts: Vec<serde_json::Value> = bundle
+            .concepts
+            .iter()
+            .filter(|c| match &needle {
+                None => true,
+                Some(q) => {
+                    c.rel_path.to_lowercase().contains(q)
+                        || c.type_.to_lowercase().contains(q)
+                        || c.title.as_deref().unwrap_or("").to_lowercase().contains(q)
+                        || c.description.as_deref().unwrap_or("").to_lowercase().contains(q)
+                }
+            })
+            // 只索引、不含 body（渐进披露）。
+            .map(|c| {
+                serde_json::json!({
+                    "relPath": c.rel_path,
+                    "type": c.type_,
+                    "title": c.title,
+                    "description": c.description,
+                })
+            })
+            .collect();
+        bundles_out.push(serde_json::json!({
+            "path": path,
+            "conceptCount": concepts.len(),
+            "concepts": concepts,
+        }));
+    }
+    serde_json::json!({ "bundles": bundles_out })
+}
+
+/// okf_read action='read'：读单个 concept 全文。两道安全闸：① bundle 必在已登记快照内；
+/// ② concept 经工作区守卫（以 bundle 根为根，拒 `..`/绝对/越界）。
+fn okf_read_concept(bundle: &str, concept: &str) -> Result<serde_json::Value, String> {
+    // 闸①：bundle 必须在已登记列表内——绝不读任意磁盘路径。
+    let registered = okf_external_bundles_snapshot();
+    if !registered.iter().any(|p| p == bundle) {
+        return Err(
+            "该外部 OKF 包未登记，无法读取。请先 action='list' 取已登记包路径，或在「设置 → 知识库」中添加。"
+                .to_string(),
+        );
+    }
+    if !std::path::Path::new(bundle).is_dir() {
+        return Err("外部 OKF 包目录不存在或已失效".to_string());
+    }
+    // 闸②：以 bundle 根作「工作区根」，复用 resolve_existing_path 守卫读 concept（拒 `..`/绝对/越界）。
+    let text = mdga_tool_runtime::read_workspace_text(bundle, concept, OKF_CONCEPT_READ_MAX_BYTES)
+        .map_err(|e| match e {
+            mdga_tool_runtime::ToolRuntimeError::FileTooLarge(_) => {
+                "concept 文件过大（超过 512 KiB），无法读取".to_string()
+            }
+            mdga_tool_runtime::ToolRuntimeError::NonUtf8Text => {
+                "该 concept 不是 UTF-8 文本".to_string()
+            }
+            other => other.to_string(),
+        })?;
+    Ok(serde_json::json!({
+        "bundle": bundle,
+        "concept": concept,
+        "content": text,
+    }))
 }
 
 /// 把 repo_wiki 结构事实变成一句话散文摘要的桌面层摘要器：用**用户自己的** provider key
@@ -1840,4 +2045,97 @@ fn read_existing_text_for_patch(workspace_path: &str, rel: &str) -> Result<Strin
     }
     let bytes = std::fs::read(&target).map_err(|e| e.to_string())?;
     String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())
+}
+
+#[cfg(test)]
+mod okf_read_tests {
+    use super::{execute_okf_read, set_okf_external_bundles};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    // okf_read 的进程级快照是全局静态；用一把锁串行化这些测试，避免相互覆盖快照。
+    static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
+
+    fn tmp_dir() -> std::path::PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let id = N.fetch_add(1, Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("mdga-okfread-{}-{}", std::process::id(), id));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 闸①：read 一个**未登记**的 bundle 必须被拒，绝不读任意磁盘路径。
+    #[test]
+    fn read_unregistered_bundle_is_rejected() {
+        let _g = SNAPSHOT_LOCK.lock().unwrap();
+        let bundle = tmp_dir();
+        // 即便目录真实存在且含 concept，未登记也必须拒。
+        std::fs::write(bundle.join("a.md"), "---\ntype: module\n---\n\nbody\n").unwrap();
+        // 快照里只登记了**别的**路径，不含本 bundle。
+        set_okf_external_bundles(vec!["C:/some/other/registered/bundle".to_string()]);
+
+        let args = serde_json::json!({
+            "action": "read",
+            "bundle": bundle.to_string_lossy(),
+            "concept": "a.md",
+        })
+        .to_string();
+        let err = execute_okf_read(&args).expect_err("未登记 bundle 必须被拒");
+        assert!(err.contains("未登记"), "拒因应点明未登记，实得：{err}");
+
+        set_okf_external_bundles(Vec::new());
+        let _ = std::fs::remove_dir_all(&bundle);
+    }
+
+    /// 闸②：concept relPath 含 `..` 穿越（即便 bundle 已登记）必须被工作区守卫拒，不读出 bundle 根外文件。
+    #[test]
+    fn read_concept_traversal_is_rejected() {
+        let _g = SNAPSHOT_LOCK.lock().unwrap();
+        let parent = tmp_dir();
+        // bundle 根在 parent/bundle；parent 根放一个「敏感」文件，穿越意在读它。
+        let bundle = parent.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("ok.md"), "---\ntype: module\n---\n\nbody\n").unwrap();
+        std::fs::write(parent.join("secret.txt"), "TOP SECRET").unwrap();
+
+        // 已登记本 bundle——闸①通过，验证闸②仍拦穿越。
+        set_okf_external_bundles(vec![bundle.to_string_lossy().to_string()]);
+
+        let args = serde_json::json!({
+            "action": "read",
+            "bundle": bundle.to_string_lossy(),
+            "concept": "../secret.txt",
+        })
+        .to_string();
+        let err = execute_okf_read(&args).expect_err("`..` 穿越必须被拒");
+        // 守卫应拒（不得回出 secret 内容）。
+        assert!(!err.contains("TOP SECRET"), "绝不应读出 bundle 根外文件");
+
+        // 正常 concept（在 bundle 根内）应能读到。
+        let ok_args = serde_json::json!({
+            "action": "read",
+            "bundle": bundle.to_string_lossy(),
+            "concept": "ok.md",
+        })
+        .to_string();
+        let val = execute_okf_read(&ok_args).expect("登记 bundle 内的 concept 应能读");
+        assert!(
+            val.get("content").and_then(|v| v.as_str()).unwrap_or("").contains("body"),
+            "应回 concept 全文"
+        );
+
+        set_okf_external_bundles(Vec::new());
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// 无登记包时 list 回空 + note 提示（渐进披露第一步的容错口径）。
+    #[test]
+    fn list_with_no_registered_bundles_returns_note() {
+        let _g = SNAPSHOT_LOCK.lock().unwrap();
+        set_okf_external_bundles(Vec::new());
+        let val = execute_okf_read("{\"action\":\"list\"}").expect("list 不应失败");
+        assert_eq!(val.get("bundles").and_then(|v| v.as_array()).map(|a| a.len()), Some(0));
+        assert!(val.get("note").is_some(), "无登记包应给 note 提示");
+    }
 }

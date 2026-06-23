@@ -44,8 +44,10 @@ pub(crate) fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability
         // git_status/git_diff/git_log 为只读 git 工具，与 read_file/search_text 同列自动放行（R4）。
         // lsp_* 为只读 LSP 工具（仅查询语言服务器、不改文件），同列自动放行（R1）。
         // render_artifact（0.0.67 起；0.0.74 改名）：后端惰性、零副作用,仅把代码交前端在沙箱 iframe 渲染,同列自动放行。
+        // okf_read：只读消费**用户已登记的外部 OKF 知识包**（list 仅回索引、read 经已登记白名单+工作区守卫读
+        //   单个 concept，绝不读任意磁盘路径），无副作用、不发网络,与 read_file/repo_wiki 同列自动放行。
         "list_dir" | "read_file" | "stat_path" | "search_text" | "glob_files" | "code_overview"
-        | "repo_map" | "code_search" | "repo_wiki" | "render_artifact" | "todo_write" | "ask_user"
+        | "repo_map" | "code_search" | "repo_wiki" | "okf_read" | "render_artifact" | "todo_write" | "ask_user"
         | "run_subtask"
         // run_parallel_subtasks（P1/0.0.58）与 run_subtask 同档：编排器入口本身只读 git 状态并派发，
         // 每个并行写子代理的写/删/命令仍在其 loop 内逐次门控+检查点，故入口自动放行、不重复审批。

@@ -10,21 +10,24 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState } from "react";
+import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   ListChecks, GitCompare, Gauge, ChevronLeft, ChevronRight, Maximize2,
   Bot, Terminal, Square, Check, CircleDot, ChevronDown, ChevronRight as ChevronRightSm, CheckSquare,
   FolderTree, Folder, FolderOpen, File as FileIcon, ArrowLeft, LayoutDashboard, X,
+  BookOpen, Lock, Globe, FolderOutput, FileText, RefreshCw, Pencil, Undo2,
 } from "lucide-react";
 import type {
   FileCheckpoint, FileChange, BgActivityView, TodoItem, UsageSummary, ToolUsageView,
-  UsageAttributionView, ArtifactPart,
+  UsageAttributionView, ArtifactPart, OkfSettingsView, OkfBrowseView, OkfConceptView,
+  OkfConceptSourceView,
 } from "../types";
 import { fmtTokens, formatMoney } from "../utils";
 import { ChangesView } from "./dialogs";
-import { ConversationUsageSummary, DiffBlock } from "./messages";
+import { ConversationUsageSummary, DiffBlock, Markdown } from "./messages";
 import { ArtifactCard } from "./artifact";
 
-export type ThirdColTab = "activity" | "changes" | "usage" | "files" | "artifact";
+export type ThirdColTab = "activity" | "changes" | "usage" | "files" | "artifact" | "knowledge";
 
 // 运行时长近似显示：list 不含开始时间，故以「该 id 首次出现」到「now（完成项定格在完成时刻）」计算。
 function fmtDuration(ms: number): string {
@@ -818,6 +821,583 @@ function humanizeFsError(_raw: string): string {
   return "无法读取目录";
 }
 
+// ── 第三栏·知识标签：显化 OKF（开放知识格式）内容 ─────────────────────────────────
+// 数据源（只读，复用已就绪后端命令，不碰后端）：
+//   get_okf_settings() -> { visibility, sharedLocation, autoPublish, externalBundles }
+//   okf_browse(conv, source) -> { source, concepts:[{relPath,type,title,description,tags}], hasContent, note }
+//     source="own"＝本项目；或外部 bundle 绝对路径。返回不含正文 body。
+//   okf_read_concept(conv, source, relPath) -> string（完整 .md：frontmatter + 正文）
+//   okf_export(conv, targetDir) -> string（写到所选目录）
+// 模式：浏览态（模式头 + 本项目 concept 树 + 外部包列表）/ 详情态（单窗格看一个 concept，返回回浏览）。
+// key=activeConvId：切会话重挂载，状态自然清。仅本标签挂载时（第三栏展开且 tab==="knowledge"）才拉。
+
+/** concept 树节点：目录（可折叠）或叶子 concept。 */
+type OkfTreeNode =
+  | { kind: "dir"; name: string; path: string; children: OkfTreeNode[] }
+  | { kind: "concept"; name: string; concept: OkfConceptView };
+
+// 把扁平 concept 列表（按 relPath）构造成目录树。relPath 用 "/" 分隔，末段为文件名。
+function buildOkfTree(concepts: OkfConceptView[]): OkfTreeNode[] {
+  type DirAcc = { dirs: Map<string, DirAcc>; files: OkfConceptView[] };
+  const root: DirAcc = { dirs: new Map(), files: [] };
+  for (const c of concepts) {
+    const parts = c.relPath.replace(/\\/g, "/").split("/").filter(Boolean);
+    if (parts.length === 0) continue;
+    let cur = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const seg = parts[i];
+      let next = cur.dirs.get(seg);
+      if (!next) { next = { dirs: new Map(), files: [] }; cur.dirs.set(seg, next); }
+      cur = next;
+    }
+    cur.files.push(c);
+  }
+  const toNodes = (acc: DirAcc, prefix: string): OkfTreeNode[] => {
+    const dirNodes: OkfTreeNode[] = [...acc.dirs.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([name, sub]) => ({
+        kind: "dir" as const,
+        name,
+        path: prefix ? `${prefix}/${name}` : name,
+        children: toNodes(sub, prefix ? `${prefix}/${name}` : name),
+      }));
+    const fileNodes: OkfTreeNode[] = acc.files
+      .slice()
+      .sort((a, b) => (a.title ?? a.relPath).localeCompare(b.title ?? b.relPath))
+      .map((c) => ({
+        kind: "concept" as const,
+        name: c.relPath.replace(/\\/g, "/").split("/").pop() ?? c.relPath,
+        concept: c,
+      }));
+    return [...dirNodes, ...fileNodes];
+  };
+  return toNodes(root, "");
+}
+
+// concept 树渲染（目录可展开/收起；concept 可点开看详情）。纯前端展开态，无懒加载（列表一次拉全）。
+function OkfTree({
+  nodes,
+  depth,
+  expanded,
+  onToggleDir,
+  onOpen,
+}: {
+  nodes: OkfTreeNode[];
+  depth: number;
+  expanded: Record<string, boolean>;
+  onToggleDir: (path: string) => void;
+  onOpen: (c: OkfConceptView) => void;
+}) {
+  return (
+    <>
+      {nodes.map((node) => {
+        const indent = { paddingLeft: `${6 + depth * 14}px` };
+        if (node.kind === "dir") {
+          const isOpen = !!expanded[node.path];
+          return (
+            <div key={`d:${node.path}`}>
+              <button
+                type="button"
+                className="file-node file-node--dir"
+                style={indent}
+                aria-expanded={isOpen}
+                title={node.path}
+                onClick={() => onToggleDir(node.path)}
+              >
+                <span className="file-node__caret" aria-hidden="true">
+                  {isOpen ? <ChevronDown size={12} /> : <ChevronRightSm size={12} />}
+                </span>
+                {isOpen ? <FolderOpen size={14} className="file-node__icon" aria-hidden="true" />
+                  : <Folder size={14} className="file-node__icon" aria-hidden="true" />}
+                <span className="file-node__name">{node.name}</span>
+              </button>
+              {isOpen && (
+                <OkfTree
+                  nodes={node.children}
+                  depth={depth + 1}
+                  expanded={expanded}
+                  onToggleDir={onToggleDir}
+                  onOpen={onOpen}
+                />
+              )}
+            </div>
+          );
+        }
+        const c = node.concept;
+        return (
+          <button
+            key={`c:${c.relPath}`}
+            type="button"
+            className="file-node file-node--file"
+            style={indent}
+            title={c.description || c.title || c.relPath}
+            onClick={() => onOpen(c)}
+          >
+            <span className="file-node__caret" aria-hidden="true" />
+            <FileText size={14} className="file-node__icon" aria-hidden="true" />
+            <span className="file-node__name">{c.title || node.name}</span>
+            {c.type && <span className="okf-type" title={`类型：${c.type}`}>{c.type}</span>}
+          </button>
+        );
+      })}
+    </>
+  );
+}
+
+function KnowledgePanel({
+  activeConvId,
+  pushToast,
+}: {
+  activeConvId: string | null;
+  pushToast?: (kind: "error" | "info", text: string) => void;
+}) {
+  const [settings, setSettings] = useState<OkfSettingsView | null>(null);
+  // 各 source（"own" 或 bundle 路径）的浏览结果缓存。
+  const [browse, setBrowse] = useState<Record<string, OkfBrowseView>>({});
+  // 已登记但读取失败的外部包（path → 错误）。失败的包不静默丢弃，仍以错误行展示。
+  const [browseErrors, setBrowseErrors] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // 目录展开态（key=`${source}::${dirPath}`）。
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  // 详情态：选中的 concept（含其 source）；null=浏览态。
+  const [view, setView] = useState<{ source: string; concept: OkfConceptView } | null>(null);
+  const [viewBody, setViewBody] = useState<string | null>(null);
+  const [viewLoading, setViewLoading] = useState(false);
+  const [viewError, setViewError] = useState<string | null>(null);
+  // 导出进行中（防重复点）。
+  const [exporting, setExporting] = useState(false);
+  // 覆盖式编辑（own 源专用）。
+  const [editing, setEditing] = useState(false);
+  const [editBody, setEditBody] = useState("");
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+
+  async function refresh() {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const s = await invoke<OkfSettingsView>("get_okf_settings");
+      const next: Record<string, OkfBrowseView> = {};
+      const errs: Record<string, string> = {};
+      // 本项目 OKF 需绑定工作区的会话；无会话/无 wiki 则跳过 own（外部包不依赖会话，仍可浏览）。
+      if (activeConvId) {
+        try {
+          next.own = await invoke<OkfBrowseView>("okf_browse", {
+            conversationId: activeConvId,
+            source: "own",
+          });
+        } catch { /* own 不可读（无工作区/无 wiki）→ 跳过，外部包仍展示 */ }
+      }
+      // 外部包逐个拉。失败的**不静默丢弃**——记下错误，渲染时仍以「无法读取」行展示
+      // （否则一个已登记但目录被删/移动的包会让面板假装「暂无知识」）。外部源不依赖会话，
+      // 故无会话时也能浏览（conversationId 传空串，后端外部分支不读它）。
+      for (const path of s.externalBundles ?? []) {
+        try {
+          next[path] = await invoke<OkfBrowseView>("okf_browse", {
+            conversationId: activeConvId ?? "",
+            source: path,
+          });
+        } catch (e) {
+          errs[path] = String(e);
+        }
+      }
+      setSettings(s);
+      setBrowse(next);
+      setBrowseErrors(errs);
+    } catch {
+      setLoadError("无法加载知识");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConvId]);
+
+  // 设置里改 OKF（导入/登记/移除外部包、改可见性/发布）后，第三栏知识标签同步刷新。
+  // 两组件各持独立 OKF 状态，靠窗口级 CustomEvent 解耦联动（无需提升状态/穿 props）。
+  useEffect(() => {
+    const onChanged = () => { void refresh(); };
+    window.addEventListener("okf-changed", onChanged);
+    return () => window.removeEventListener("okf-changed", onChanged);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConvId]);
+
+  function toggleDir(source: string, dirPath: string) {
+    const key = `${source}::${dirPath}`;
+    setExpanded((p) => ({ ...p, [key]: !p[key] }));
+  }
+
+  async function openConcept(source: string, c: OkfConceptView) {
+    setView({ source, concept: c });
+    setViewBody(null);
+    setViewError(null);
+    setEditing(false);
+    setEditError(null);
+    setViewLoading(true);
+    try {
+      const body = await invoke<string>("okf_read_concept", {
+        // 外部包读取不依赖会话；无会话时传空串（不能传 null，命令签名要 String）。
+        // own 概念只在有会话时才出现在树里，故此处 ?? "" 不影响 own。
+        conversationId: activeConvId ?? "",
+        source,
+        relPath: c.relPath,
+      });
+      setViewBody(body);
+    } catch {
+      setViewError("无法读取该知识");
+    } finally {
+      setViewLoading(false);
+    }
+  }
+
+  function backToBrowse() {
+    setView(null);
+    setViewBody(null);
+    setViewError(null);
+    setEditing(false);
+    setEditError(null);
+  }
+
+  // ── 覆盖式编辑（own 源）：进入编辑预填正文 / 保存覆盖 / 还原自动 / 取消 ──
+  async function startEdit() {
+    if (!view || view.source !== "own" || editBusy) return;
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      const src = await invoke<OkfConceptSourceView>("okf_get_concept_source", {
+        conversationId: activeConvId,
+        relPath: view.concept.relPath,
+      });
+      setEditBody(src.body);
+      setEditing(true);
+    } catch {
+      setEditError("无法载入可编辑内容");
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  async function saveEdit() {
+    if (!view || view.source !== "own" || editBusy) return;
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      await invoke("okf_set_overlay", {
+        conversationId: activeConvId,
+        relPath: view.concept.relPath,
+        body: editBody,
+      });
+      setEditing(false);
+      // 重新拉详情正文（已合并覆盖）并标记 overridden；刷新树上的「已编辑」标记。
+      await openConcept(view.source, { ...view.concept, overridden: true });
+      void refresh();
+    } catch {
+      setEditError("保存失败");
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  async function revertEdit() {
+    if (!view || view.source !== "own" || editBusy) return;
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      await invoke("okf_clear_overlay", {
+        conversationId: activeConvId,
+        relPath: view.concept.relPath,
+      });
+      setEditing(false);
+      await openConcept(view.source, { ...view.concept, overridden: false });
+      void refresh();
+    } catch {
+      setEditError("还原失败");
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  function cancelEdit() {
+    setEditing(false);
+    setEditError(null);
+  }
+
+  /** 移除一个已登记的外部包（用于清掉读不到的死链）。移除后广播 okf-changed 并本地刷新。 */
+  async function removeBundle(path: string) {
+    try {
+      await invoke<string[]>("okf_external_remove", { path });
+      window.dispatchEvent(new CustomEvent("okf-changed"));
+      await refresh();
+    } catch {
+      pushToast?.("error", "移除失败");
+    }
+  }
+
+  async function handleExport() {
+    if (!activeConvId || exporting) return;
+    setExporting(true);
+    try {
+      const target = await saveFileDialog({
+        defaultPath: "knowledge-okf.zip",
+        filters: [{ name: "OKF 包", extensions: ["zip"] }],
+      });
+      if (typeof target !== "string") return; // 取消选择
+      const note = await invoke<string>("okf_export", {
+        conversationId: activeConvId,
+        targetZip: target,
+      });
+      pushToast?.("info", note && note.trim().length > 0 ? `已导出 .zip：${note}` : "已导出 .zip");
+    } catch {
+      pushToast?.("error", "导出失败");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  // 详情态：单窗格（返回 + 标题 + type/tags chip + markdown 正文 / 编辑器）。
+  if (view) {
+    const c = view.concept;
+    const isOwn = view.source === "own";
+    return (
+      <div className="files-panel files-panel--view okf-detail">
+        <div className="files-view__head">
+          <button
+            className="icon-btn files-view__back"
+            type="button"
+            title="返回知识列表"
+            aria-label="返回知识列表"
+            onClick={backToBrowse}
+          >
+            <ArrowLeft size={15} />
+          </button>
+          <span className="files-view__path" title={c.relPath}>{c.title || c.relPath}</span>
+          {isOwn && !editing && (
+            <button
+              className="icon-btn"
+              type="button"
+              title="编辑此知识"
+              aria-label="编辑此知识"
+              disabled={editBusy}
+              onClick={() => void startEdit()}
+            >
+              <Pencil size={14} />
+            </button>
+          )}
+        </div>
+        <div className="okf-chips">
+          {c.type && <span className="okf-chip" title="类型">{c.type}</span>}
+          {c.overridden && (
+            <span className="okf-chip okf-chip--edited" title="已被你覆盖式编辑">已编辑</span>
+          )}
+          {c.tags?.map((t) => (
+            <span key={t} className="okf-chip okf-chip--tag" title="标签">{t}</span>
+          ))}
+        </div>
+        {editing ? (
+          <div className="okf-edit">
+            <textarea
+              className="okf-edit__area"
+              value={editBody}
+              spellCheck={false}
+              disabled={editBusy}
+              onChange={(e) => setEditBody(e.target.value)}
+              aria-label="编辑知识正文"
+            />
+            {editError && <div className="okf-edit__err">{editError}</div>}
+            <div className="okf-edit__actions">
+              <button className="changes-row__revert" type="button" disabled={editBusy} onClick={() => void saveEdit()}>
+                <Check size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />保存
+              </button>
+              <button className="changes-row__revert" type="button" disabled={editBusy} onClick={cancelEdit}>
+                <X size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />取消
+              </button>
+              {c.overridden && (
+                <button
+                  className="changes-row__revert"
+                  type="button"
+                  disabled={editBusy}
+                  title="丢弃你的编辑，恢复自动生成的内容"
+                  onClick={() => void revertEdit()}
+                >
+                  <Undo2 size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />还原自动
+                </button>
+              )}
+            </div>
+            <p className="okf-edit__hint">编辑的是正文；类型等元信息仍自动管理。保存后随导出/发布带出，wiki 重新生成不会冲掉。</p>
+          </div>
+        ) : viewLoading ? (
+          <div className="files-empty">加载中…</div>
+        ) : viewError ? (
+          <div className="files-empty">{viewError}</div>
+        ) : (
+          <div className="okf-body">
+            <Markdown>{viewBody ?? ""}</Markdown>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // 浏览态。
+  const own = browse.own;
+  const ownTree = own ? buildOkfTree(own.concepts) : [];
+  // 渲染**全部已登记**外部包（不再按是否读到过滤）——读不到的也要出一行，否则会假装「暂无知识」。
+  const registeredBundles = settings?.externalBundles ?? [];
+  const ownHasContent = !!own?.hasContent && own.concepts.length > 0;
+  const isShared = settings?.visibility === "shared";
+  const sharedPath = settings?.sharedLocation ?? "";
+
+  return (
+    <div className="okf-panel">
+      {/* 模式头：私有/共享 pill（title 悬停说明）+ 刷新 + 导出（共享态另以 title 显共享目录路径）。 */}
+      <div className="okf-head">
+        {settings && (
+          isShared ? (
+            <span
+              className="okf-pill okf-pill--shared"
+              title={`共享：已发布到可见 OKF 目录，其他 agent 可读${sharedPath ? `（${sharedPath}）` : ""}`}
+            >
+              <Globe size={12} /> 共享
+            </span>
+          ) : (
+            <span
+              className="okf-pill okf-pill--private"
+              title="私有：仅 .mdga，其他 agent 拿不到"
+            >
+              <Lock size={12} /> 私有
+            </span>
+          )
+        )}
+        <span className="okf-head__spacer" />
+        <button
+          className="icon-btn"
+          type="button"
+          title="刷新"
+          aria-label="刷新知识"
+          onClick={() => void refresh()}
+        >
+          <RefreshCw size={15} />
+        </button>
+        <button
+          className="icon-btn"
+          type="button"
+          title="导出到目录"
+          aria-label="导出知识到目录"
+          disabled={exporting || !activeConvId}
+          onClick={() => void handleExport()}
+        >
+          <FolderOutput size={15} />
+        </button>
+      </div>
+
+      {loadError ? (
+        <div className="files-empty">{loadError}</div>
+      ) : loading && !own ? (
+        <div className="files-empty">加载中…</div>
+      ) : !ownHasContent && registeredBundles.length === 0 ? (
+        // 空态：仅当本项目无内容**且**没有任何已登记外部包时才显（登记了的包即便读不到也出错误行）。
+        <div className="okf-empty" title="agent 整理 wiki 后在此以 OKF 浏览">
+          <BookOpen size={20} />
+          <span>暂无知识</span>
+        </div>
+      ) : (
+        <>
+          {/* 本项目 concept 树。 */}
+          {ownHasContent && (
+            <div className="files-tree" role="tree">
+              <OkfTree
+                nodes={ownTree}
+                depth={0}
+                expanded={Object.fromEntries(
+                  Object.entries(expanded)
+                    .filter(([k]) => k.startsWith("own::"))
+                    .map(([k, v]) => [k.slice("own::".length), v]),
+                )}
+                onToggleDir={(dirPath) => toggleDir("own", dirPath)}
+                onOpen={(c) => void openConcept("own", c)}
+              />
+            </div>
+          )}
+
+          {/* 导入的外部包：渲染**全部已登记**包。读不到的（目录被删/移动等）出「无法读取」行 + 移除，
+              绝不静默丢弃（否则会误显「暂无知识」）。只读。 */}
+          {registeredBundles.map((path) => {
+            const b = browse[path];
+            const name = path.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? path;
+            // 读取失败：出错误行（含移除死链）。
+            if (!b) {
+              return (
+                <div className="okf-bundle okf-bundle--err" key={path}>
+                  <div className="file-node file-node--dir okf-bundle__head" title={path}>
+                    <span className="file-node__caret" aria-hidden="true" />
+                    <Folder size={14} className="file-node__icon" aria-hidden="true" />
+                    <span className="file-node__name">{name}</span>
+                    <span className="okf-bundle__err" title={browseErrors[path] ?? "读取失败"}>无法读取</span>
+                    <button
+                      className="icon-btn okf-bundle__rm"
+                      type="button"
+                      title="移除该外部包（目录可能已删除或移动）"
+                      aria-label="移除该外部包"
+                      onClick={() => void removeBundle(path)}
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                </div>
+              );
+            }
+            const groupKey = `bundle::${path}`;
+            const groupOpen = !!expanded[groupKey];
+            const tree = buildOkfTree(b.concepts);
+            return (
+              <div className="okf-bundle" key={path}>
+                <button
+                  type="button"
+                  className="file-node file-node--dir okf-bundle__head"
+                  aria-expanded={groupOpen}
+                  title={path}
+                  onClick={() => setExpanded((p) => ({ ...p, [groupKey]: !p[groupKey] }))}
+                >
+                  <span className="file-node__caret" aria-hidden="true">
+                    {groupOpen ? <ChevronDown size={12} /> : <ChevronRightSm size={12} />}
+                  </span>
+                  <Folder size={14} className="file-node__icon" aria-hidden="true" />
+                  <span className="file-node__name">{name}</span>
+                  <span className="okf-bundle__count" title="知识条数">{b.concepts.length}</span>
+                </button>
+                {groupOpen && (
+                  b.concepts.length === 0 ? (
+                    <div className="files-empty files-empty--nested">（空）</div>
+                  ) : (
+                    <div className="files-tree" role="tree">
+                      <OkfTree
+                        nodes={tree}
+                        depth={1}
+                        expanded={Object.fromEntries(
+                          Object.entries(expanded)
+                            .filter(([k]) => k.startsWith(`${path}::`))
+                            .map(([k, v]) => [k.slice(`${path}::`.length), v]),
+                        )}
+                        onToggleDir={(dirPath) => toggleDir(path, dirPath)}
+                        onOpen={(c) => void openConcept(path, c)}
+                      />
+                    </div>
+                  )
+                )}
+              </div>
+            );
+          })}
+        </>
+      )}
+    </div>
+  );
+}
+
+
 export function ThirdColumn({
   open,
   tab,
@@ -950,6 +1530,16 @@ export function ThirdColumn({
             <FolderTree size={16} />
           </button>
         )}
+        {/* 知识：显化 OKF 内容（私有/共享）。无通知点。 */}
+        <button
+          className={`third-col__rail-btn icon-btn${tab === "knowledge" ? " is-active" : ""}`}
+          type="button"
+          title="知识"
+          aria-label="知识"
+          onClick={() => { onSelectTab("knowledge"); onToggleOpen(true); }}
+        >
+          <BookOpen size={16} />
+        </button>
         {/* 产物：仅当有停靠的互动卡片时显（0.0.75）。无通知点。 */}
         {dockedArtifact && (
           <button
@@ -985,7 +1575,8 @@ export function ThirdColumn({
         onPointerUp={onResizerUp}
         onPointerCancel={onResizerUp}
       />
-      <div className="third-col__tabs" role="tablist" aria-label="第三栏标签">
+      <div className="third-col__tabs">
+        <div className="third-col__tabs-scroll" role="tablist" aria-label="第三栏标签">
         <button
           className={`third-col__tab${tab === "activity" ? " is-active" : ""}`}
           type="button"
@@ -1035,6 +1626,18 @@ export function ThirdColumn({
             <span>文件</span>
           </button>
         )}
+        {/* 知识标签：显化 OKF 内容（私有/共享）。 */}
+        <button
+          className={`third-col__tab${tab === "knowledge" ? " is-active" : ""}`}
+          type="button"
+          role="tab"
+          aria-selected={tab === "knowledge"}
+          title="知识"
+          onClick={() => onSelectTab("knowledge")}
+        >
+          <BookOpen size={14} />
+          <span>知识</span>
+        </button>
         {/* 产物标签：仅有停靠的互动卡片时显（0.0.75）。 */}
         {dockedArtifact && (
           <button
@@ -1049,6 +1652,7 @@ export function ThirdColumn({
             <span>产物</span>
           </button>
         )}
+        </div>
         <button
           className="third-col__collapse icon-btn"
           type="button"
@@ -1080,6 +1684,10 @@ export function ThirdColumn({
           // 文件面板：只读工作区文件树（树态/查看态单窗格）。key=activeConvId：切会话即重挂载，
           // 缓存与查看态自然清。仅本标签挂载时拉数据（折叠/非本标签不主动拉）。
           <FilesPanel key={activeConvId ?? "none"} activeConvId={activeConvId} fileChanges={fileChanges} />
+        ) : tab === "knowledge" ? (
+          // 知识面板：显化 OKF（私有/共享）——本项目 concept 树 + 外部包 + 详情（markdown 复用 messages 的 Markdown）。
+          // key=activeConvId：切会话即重挂载，缓存/详情/展开态自然清。仅本标签挂载时拉数据。
+          <KnowledgePanel key={activeConvId ?? "none"} activeConvId={activeConvId} pushToast={pushToast} />
         ) : tab === "artifact" && dockedArtifact ? (
           // 产物坞（0.0.75）：复用**同一** ArtifactCard 渲染停靠的互动卡片（同安全模型：sandbox/CSP/探针/
           // nonce 全在 artifact.tsx，未改一字）。顶部一行标题 + 取消停靠；坞内不传 onDock（已在坞里，不再显停靠按钮）。
