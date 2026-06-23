@@ -1078,6 +1078,26 @@ pub fn git_pr(
     })
 }
 
+/// git_pr 的轻量前置检查：在调用 `git_pr` 之前确认 gh CLI 已安装且已登录。
+///
+/// 复用 `run_gh`（与 git_pr 同一套命令执行/防 cwd 抢占/无交互语义），跑 `gh auth status`：
+///   · gh 不在 PATH → `run_gh` 直接回传安装提示（CommandFailed）；
+///   · gh 在但未登录 → `gh auth status` 退出非零，回传清晰的「请先 gh auth login」错误；
+///   · 已登录（退出码 0）→ Ok(())，调用方据此 fall through 到真正的 git_pr。
+/// 纯只读探测，不产生任何副作用。
+pub fn gh_preflight(workspace_root: impl AsRef<Path>) -> Result<(), ToolRuntimeError> {
+    let ws = crate::canonical_workspace(workspace_root)?;
+    // gh 缺失：run_gh 内的 resolve_gh_path 失败即回传带安装指引的 CommandFailed。
+    let out = run_gh(&ws, &["auth", "status"])?;
+    if out.code != Some(0) {
+        // 非零退出多为未登录；None（取不到退出码，罕见的进程/OS 层失败）也归此类，文案兼顾两者。
+        return Err(ToolRuntimeError::CommandFailed(
+            "gh 未登录或登录状态不可读：请先 `gh auth login` 后重试".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // ── 单元测试（纯解析逻辑，不依赖系统 git） ────────────────────────────────────
 
 #[cfg(test)]

@@ -201,6 +201,8 @@ export function App() {
   const [mentionActive, setMentionActive] = useState(0);
   // 工作区胶囊菜单容器（Plan27 #7）：打开时聚焦首项 + 方向键漫游 + Esc 关。
   const workspaceMenuRef = useRef<HTMLDivElement>(null);
+  // 菜单打开前的焦点元素（多为工作区胶囊触发钮）：关闭时回退焦点（a11y）。
+  const workspaceMenuPrevFocus = useRef<HTMLElement | null>(null);
   // 思考深度滑轨：测 clientX → 最近档位。
   const thinkingTrackRef = useRef<HTMLDivElement>(null);
   // 思考深度弹窗容器（chip + 弹层，点外 mousedown / Esc 关用）。
@@ -288,10 +290,15 @@ export function App() {
   useEffect(() => { setSlashActive(0); }, [input]);
   useEffect(() => { setMentionActive(0); }, [fileMention]);
 
-  // 工作区菜单打开时聚焦首个菜单项（Plan27 #7）。
+  // 工作区菜单打开时聚焦首个菜单项；关闭时把焦点回退给打开前的触发元素（Plan27 #7 + a11y）。
   useEffect(() => {
     if (workspaceMenuOpen) {
+      workspaceMenuPrevFocus.current = document.activeElement as HTMLElement | null;
       workspaceMenuRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    } else {
+      const prev = workspaceMenuPrevFocus.current;
+      if (prev && document.contains(prev)) prev.focus();
+      workspaceMenuPrevFocus.current = null;
     }
   }, [workspaceMenuOpen]);
 
@@ -1511,7 +1518,7 @@ export function App() {
   }
 
   async function handleClearData() {
-    if (!window.confirm("确定清除所有会话与消息？此操作不可撤销。")) return;
+    if (!window.confirm(`确定清除全部 ${conversations.length} 个会话与所有消息？此操作永久删除、不可恢复。`)) return;
     await invoke("clear_all_conversations").catch(() => {});
     setConversations([]);
     setActiveConvId(null);
@@ -2156,7 +2163,7 @@ export function App() {
             <textarea
               className="composer__input"
               aria-label="Message"
-              placeholder={sending ? "Agent 运行中：输入并回车可插话，下一轮生效（不打断当前任务）" : planMode ? "计划模式：先出计划，确认后再执行（Enter 发送）" : "随心输入（Enter 发送，Shift+Enter 换行，/ 命令，@ 引用文件）"}
+              placeholder={sending ? (hasWorkspace ? "Agent 运行中：输入并回车可插话，下一轮生效（不打断当前任务）" : "回复生成中…可继续输入，回车在下一轮发送") : planMode ? "计划模式：先出计划，确认后再执行（Enter 发送）" : "随心输入（Enter 发送，Shift+Enter 换行，/ 命令，@ 引用文件）"}
               value={input}
               onChange={(e) => {
                 setInput(e.target.value);
@@ -2419,6 +2426,16 @@ export function App() {
                           >
                             <div className="think-depth__thumb" style={{ left: `${pct}%` }} />
                           </div>
+                          {thinkingStop !== null && (
+                            <button
+                              type="button"
+                              className="think-depth__chip"
+                              title="恢复为该模型默认档"
+                              onClick={() => { setThinkingStop(null); setThinkingPopoverOpen(false); }}
+                            >
+                              <span className="think-depth__chip-label">恢复默认</span>
+                            </button>
+                          )}
                         </div>
                       )}
                     </div>

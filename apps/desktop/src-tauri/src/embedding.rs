@@ -108,9 +108,15 @@ pub(crate) fn refresh_embedding_config(conn: &rusqlite::Connection) {
         .flatten();
     // 0.0.59：embedding 端点/凭据从 ROLE_EMBED 解析（未配置 embed ⇒ 回退 main，与从前逐字节一致）。
     // 仅 provider 的 base_url/preset/api_key 取自该解析结果；embedding 模型名仍取上面的设置项。
-    let provider = mdga_storage::resolve_role_provider(conn, mdga_storage::ROLE_EMBED)
-        .ok()
-        .flatten();
+    // 控制流不变（解析失败仍当作「无 provider」→ 关闭功能）；仅把真正的解析失败暴露到日志，
+    // 否则 embedding 重排静默关闭、难以诊断。
+    let provider = match mdga_storage::resolve_role_provider(conn, mdga_storage::ROLE_EMBED) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[mdga] embedding 配置刷新失败（provider 解析）: {e}");
+            None
+        }
+    };
     let config = match provider {
         Some(p) => resolve_embedding_config(
             enabled.as_deref(),

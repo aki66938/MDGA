@@ -40,6 +40,7 @@ body {
   --diff-del-fg: #A3393B;
 
   --shadow-pop: 0 8px 28px rgba(20, 30, 60, 0.12);
+  --overlay: rgba(31, 35, 40, 0.32);
   --sidebar-grad: var(--surface-2);
 
   --radius-container: 12px;
@@ -94,6 +95,7 @@ body {
   --diff-del-fg: #FF7B72;
 
   --shadow-pop: 0 10px 32px rgba(1, 4, 9, 0.5);
+  --overlay: rgba(1, 4, 9, 0.65);
   --scrollbar-thumb: rgba(209, 215, 224, 0.14);
   --scrollbar-thumb-hover: rgba(209, 215, 224, 0.28);
 }
@@ -2081,7 +2083,7 @@ h1 {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(31, 35, 40, 0.12);
+  box-shadow: var(--shadow-pop);
   overflow: hidden;
   z-index: 50;
 }
@@ -4006,7 +4008,7 @@ h1 {
 .approval-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(31, 35, 40, 0.32);
+  background: var(--overlay);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4019,7 +4021,7 @@ h1 {
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 20px;
-  box-shadow: 0 12px 32px rgba(31, 35, 40, 0.18);
+  box-shadow: var(--shadow-pop);
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -4195,8 +4197,15 @@ h1 {
 .okf-panel {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 6px;
   min-width: 0;
+}
+
+/* 详情态面板：复用 .files-panel--view 的余下布局，仅确保撑满并纵向 flex。 */
+.okf-detail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 /* 模式头：私有/共享 pill + 右侧图标按钮（刷新/导出）。 */
@@ -4244,6 +4253,12 @@ h1 {
   padding: 0 4px;
   border-radius: 4px;
   background: var(--surface-3);
+}
+
+/* 外部包分组容器：内部为 file-node 行，纵向排列。 */
+.okf-bundle {
+  display: flex;
+  flex-direction: column;
 }
 
 /* 外部包分组：头部计数小标。 */
@@ -4337,6 +4352,12 @@ h1 {
 .okf-edit__area:focus {
   outline: none;
   border-color: var(--brand);
+}
+
+/* 键盘聚焦：保留可见焦点环（鼠标聚焦仍走上面的无环 border-color 态）。 */
+.okf-edit__area:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: -1px;
 }
 
 .okf-edit__actions {
@@ -4487,6 +4508,11 @@ h1 {
 .approval-card__btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+.approval-card__btn:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
 }
 
 /* ── AskUserModal：Agent 结构化澄清提问 ── */
@@ -4667,6 +4693,24 @@ h1 {
 }
 
 /* ── 响应式 ── */
+
+/* 窄视口（如第三栏展开压缩中栏）：底栏胶囊再收一档字号、工作区/模型胶囊收窄 max-width，避免截断挤压。 */
+@media (max-width: 1024px) {
+  .composer-footer .workspace-pill,
+  .composer-footer .control-select--compact,
+  .composer-footer .model-pill,
+  .composer-footer .control-toggle,
+  .composer-footer .ctx-pill,
+  .composer-footer .think-depth__chip {
+    font-size: 10.5px;
+  }
+  .composer-footer .workspace-pill {
+    max-width: 120px;
+  }
+  .composer-footer .model-pill {
+    max-width: 120px;
+  }
+}
 
 @media (max-width: 760px) {
   .app-shell {

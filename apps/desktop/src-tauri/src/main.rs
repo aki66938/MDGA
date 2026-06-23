@@ -214,8 +214,10 @@ fn main() {
                     .ok()
                     .and_then(|db| mdga_storage::get_lsp_server_config_json(&db).ok().flatten());
                 if let Some(json) = lsp_json {
-                    if let Ok(cfg) = serde_json::from_str::<mdga_lsp::LspServerConfig>(&json) {
-                        tools::set_lsp_server_config(cfg);
+                    match serde_json::from_str::<mdga_lsp::LspServerConfig>(&json) {
+                        Ok(cfg) => tools::set_lsp_server_config(cfg),
+                        // 解析失败：保持回退默认（全部启用、走 PATH）的既有行为，仅把失败暴露到日志。
+                        Err(e) => eprintln!("[mdga] LSP 配置解析失败，回退默认: {e}"),
                     }
                 }
             }
@@ -224,11 +226,12 @@ fn main() {
             // 默认关闭(设置项缺失/非 on)——播种后快照为 None,code_search 行为与 0.0.57 一致。
             {
                 let state = app.state::<AppState>();
-                let _ = state
-                    .db
-                    .lock()
-                    .ok()
-                    .map(|db| embedding::refresh_embedding_config(&db));
+                match state.db.lock() {
+                    Ok(db) => embedding::refresh_embedding_config(&db),
+                    // DB 锁不可用（多见于另一持锁线程 panic 致毒化）：保持「快照为 None＝回退本地」的
+                    // 既有行为，仅把失败暴露到日志，便于诊断为何 embedding 重排未生效。
+                    Err(e) => eprintln!("[mdga] embedding 启动播种失败（DB 锁不可用）: {e}"),
+                };
             }
 
             // okf_read：从 DB 播种「已登记外部 OKF 包」列表到进程级快照，使该只读工具在无 DB 句柄的

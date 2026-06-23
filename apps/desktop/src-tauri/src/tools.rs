@@ -1342,6 +1342,9 @@ pub(crate) fn execute_builtin_tool_call(
         "git_pr" => {
             let request = serde_json::from_str::<GitPrRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            // 轻量前置检查：gh 缺失/未登录时给出明确指引，而非任由底层 gh 跑出晦涩错误。
+            // 复用 git_* 同款命令执行助手（gh_preflight 内部走 run_gh）。成功则 fall through。
+            mdga_tool_runtime::gh_preflight(workspace_path).map_err(|err| err.to_string())?;
             serde_json::to_value(git_pr(workspace_path, request).map_err(|err| err.to_string())?)
                 .map_err(|err| err.to_string())
         }
@@ -1893,7 +1896,16 @@ pub(crate) fn execute_repo_wiki_enriched(
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
             "enrich".to_string(),
-            serde_json::json!({ "requested": true, "applied": true }),
+            serde_json::json!({
+                "requested": true,
+                "applied": true,
+                // 预算可见性：enrich 的付费调用数有全库硬上限；超预算的区段自动退回确定性形态。
+                // 各区段「新增/复用缓存」的精确计数见顶层 `note` 字段（由 wiki 构建结果带出）。
+                "callBudget": ENRICH_CALL_BUDGET,
+                "note": format!(
+                    "LLM 摘要按预算上限 {ENRICH_CALL_BUDGET} 次付费调用执行；超出该预算的区段自动退回确定性（无摘要）形态。逐段「新增/复用」计数见顶层 note。"
+                )
+            }),
         );
     }
     Ok(value)
@@ -1925,12 +1937,42 @@ fn execute_render_artifact(arguments: &str) -> Result<serde_json::Value, String>
     } else {
         "html"
     };
-    Ok(serde_json::json!({
+    // 软性 CSP 顾问（纯附加、绝不拦截）：互动卡片在前端的沙箱 iframe 里以零外联的严格 CSP 渲染，
+    // 外部资源加载与动态求值会被静默拦截（no-op）。这里启发式扫一遍常见模式，命中则在结果里附一条
+    // warning，让 agent/用户理解「为何这类卡片看起来坏了」。不改渲染、不改安全模型、不因此报错。
+    let lower = args.code.to_ascii_lowercase();
+    let blocked_markers: &[(&str, &str)] = &[
+        ("<script src=", "外链脚本 <script src=…>"),
+        ("src=\"http", "外链资源 src=\"http…\""),
+        ("src='http", "外链资源 src='http…'"),
+        ("fetch(", "网络请求 fetch(…)"),
+        ("eval(", "动态求值 eval(…)"),
+        ("new function", "动态求值 new Function(…)"),
+    ];
+    let hits: Vec<&str> = blocked_markers
+        .iter()
+        .filter(|(needle, _)| lower.contains(needle))
+        .map(|(_, label)| *label)
+        .collect();
+    let mut result = serde_json::json!({
         "ok": true,
         "kind": kind,
         "title": args.title,
         "bytes": args.code.len(),
-    }))
+    });
+    if !hits.is_empty() {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "warning".to_string(),
+                serde_json::Value::String(format!(
+                    "互动卡片在断网的沙箱（严格 CSP、null origin）里渲染。启发式扫描检测到可能的外部资源/动态求值用法——{}（按子串匹配，若仅出现在文本/注释中可忽略）：\
+                     若用于真正加载外部资源或动态求值，会被静默拦截并 no-op、卡片可能看起来「坏了」。请改用内联资源与不依赖外部网络/动态求值的实现（SVG/内联样式/内联脚本可正常工作）。",
+                    hits.join("、")
+                )),
+            );
+        }
+    }
+    Ok(result)
 }
 
 pub(crate) fn execute_create_file_tool_call(

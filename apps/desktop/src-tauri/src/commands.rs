@@ -1367,6 +1367,25 @@ pub(crate) fn revert_to_checkpoint(
             reverted += 1;
         }
     }
+
+    // 回退后清理该会话的进程内、按 conversation_id 索引的运行时缓存：工作区文件已被改回，
+    // 当前会话遗留的状态会失真甚至误导后续运行，必须丢弃（仅清进程内缓存，绝不动 DB / 持久数据）：
+    //   · loop_guards —— 陈旧读指纹表会指向已被回退的旧内容，且本会话 doom-loop 预算不应被续用；
+    //   · repo_maps   —— 仓库结构快照随回退而过期，清掉以触发下次重建；
+    //   · tool_usage  —— 本会话的工具活动归因随回退失真，清零避免误计。
+    // 故意不清的：cancels（运行中会话的实时停止信号，清掉会破坏「停止」）、steering（用户排队的
+    // 插话消息，属待处理用户输入，丢弃会静默吞掉用户意图）；以及非按 conversation_id 索引的
+    // approvals/ask_questions（action_id/question_id）、mcp（配置 id）、bg_shells/bg_tasks（shell/task id）。
+    if let Ok(mut guards) = state.loop_guards.lock() {
+        guards.remove(&conversation_id);
+    }
+    if let Ok(mut maps) = state.repo_maps.lock() {
+        maps.remove(&conversation_id);
+    }
+    if let Ok(mut usage) = state.tool_usage.lock() {
+        usage.remove(&conversation_id);
+    }
+
     Ok(reverted)
 }
 
@@ -1722,6 +1741,25 @@ const OKF_VISIBILITY_KEY: &str = "okf_visibility";
 const OKF_SHARED_LOCATION_KEY: &str = "okf_shared_location";
 const OKF_AUTO_PUBLISH_KEY: &str = "okf_auto_publish";
 const OKF_EXTERNAL_BUNDLES_KEY: &str = "okf_external_bundles";
+
+/// 已知的 app_settings 键集中登记（文档/集中化用途，非强制网关）。
+///
+/// 这是当前后端读写 `app_settings`（经 mdga_storage::{get,set}_setting）的全部已知键的清单，
+/// 便于一处审视「都有哪些全局设置项」、避免拼写漂移。它**不**改变任何调用点行为——各命令仍直接用
+/// 各自的常量/字面量键；新增设置键时请同步登记于此。注意：模型/连接/角色/单价等结构化数据走的是
+/// 专用表（connections / models / role_models / pricing_override 等），不在此清单内。
+// 文档/集中化用途的清单，运行期不强制引用（各命令仍直接用各自键常量）；test 有一致性校验。
+#[allow(dead_code)]
+pub(crate) const SETTING_KEYS: &[&str] = &[
+    OKF_VISIBILITY_KEY,
+    OKF_SHARED_LOCATION_KEY,
+    OKF_AUTO_PUBLISH_KEY,
+    OKF_EXTERNAL_BUNDLES_KEY,
+    crate::embedding::EMBEDDING_ENABLED_KEY,
+    crate::embedding::EMBEDDING_MODEL_KEY,
+    mdga_storage::LSP_SERVER_CONFIG_KEY,
+    "modality_extended",
+];
 
 /// 共享位置默认值：工作区相对的 ./knowledge 目录。
 const OKF_DEFAULT_SHARED_LOCATION: &str = "./knowledge";
@@ -2231,7 +2269,11 @@ fn okf_cleanup_managed_import(app: &AppHandle, path: &str) {
     }
 }
 
-/// 列出已登记外部 OKF 包（也并入 get_okf_settings，单列方便前端刷新）。
+/// 列出已登记外部 OKF 包（也并入 get_okf_settings，单列方便前端刷新）。纯读、无副作用。
+///
+/// 不在此**自动剪除**已失效（目录被删/移动/盘暂时不可达）的条目：std 无法可靠区分「确实不存在」
+/// 与「瞬态不可达/无权限」，自动剪枝会把暂时不可达的网络盘条目永久误删。失效条目的处理改由 UI
+/// 承接——第三栏「知识」标签对读不到的已登记包显「无法读取」错误行 + 一键移除（0.0.78），由用户掌控。
 #[tauri::command]
 pub(crate) fn okf_external_list(state: State<AppState>) -> Result<Vec<String>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -3497,6 +3539,19 @@ mod tests {
         assert!(okf_reject_bad_path("   ").is_err());
         assert!(okf_reject_bad_path("a\u{0007}b").is_err());
         assert!(okf_reject_bad_path("./knowledge").is_ok());
+    }
+
+    /// app_settings 键集中登记表非空、无重复键（新增设置项时防拼写漂移/重复登记）。
+    #[test]
+    fn setting_keys_registry_is_consistent() {
+        assert!(!SETTING_KEYS.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for k in SETTING_KEYS {
+            assert!(seen.insert(*k), "SETTING_KEYS 含重复键: {k}");
+        }
+        // OKF 四键应在册（典型代表）。
+        assert!(SETTING_KEYS.contains(&OKF_VISIBILITY_KEY));
+        assert!(SETTING_KEYS.contains(&OKF_EXTERNAL_BUNDLES_KEY));
     }
 
     /// ISO-8601 UTC 时间戳格式正确（不引 chrono，从 std::time 手算）。
