@@ -2315,10 +2315,10 @@ function KnowledgeSettings({ activeConvId }: { activeConvId: string | null }) {
       const b = await invoke<OkfBrowseView>("okf_browse", { conversationId: activeConvId ?? "", source: path });
       const n = b.concepts?.length ?? 0;
       setNote(n === 0
-        ? "已登记，但未发现可浏览的知识（可能是空包或不符合 OKF 结构）。"
-        : `已导入：${n} 条知识，见「知识」标签。`);
+        ? `已登记，但未发现可浏览的知识（可能是空包或不符合 OKF 结构）。位置：${path}`
+        : `已导入 ${n} 条知识，见「知识」标签。位置：${path}`);
     } catch {
-      setNote("已登记，但读取失败（目录可能不存在或不可读）。");
+      setNote(`已登记，但读取失败（目录可能不存在或不可读）。位置：${path}`);
     }
   }
 
@@ -2436,6 +2436,8 @@ function KnowledgeSettings({ activeConvId }: { activeConvId: string | null }) {
   }
 
   async function removeExternal(path: string) {
+    const name = path.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? path;
+    if (!window.confirm(`移除外部包「${name}」？若是导入的 .zip 包，其解包目录会一并删除（不可撤销）。`)) return;
     setError(null);
     setNote(null);
     try {
@@ -2517,15 +2519,6 @@ function KnowledgeSettings({ activeConvId }: { activeConvId: string | null }) {
                   >
                     <Upload size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />立即发布
                   </button>
-                  <label className="toggle" title="知识更新时自动写入共享目录，可能触发 git / 文件监视。">
-                    <input
-                      type="checkbox"
-                      checked={okf.autoPublish}
-                      disabled={busy}
-                      onChange={(e) => void save({ autoPublish: e.target.checked })}
-                    />
-                    <span>自动</span>
-                  </label>
                 </span>
               </div>
             </div>

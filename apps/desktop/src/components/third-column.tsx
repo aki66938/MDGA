@@ -9,7 +9,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   ListChecks, GitCompare, Gauge, ChevronLeft, ChevronRight, Maximize2,
@@ -947,9 +947,12 @@ function OkfTree({
 function KnowledgePanel({
   activeConvId,
   pushToast,
+  onEditDirtyChange,
 }: {
   activeConvId: string | null;
   pushToast?: (kind: "error" | "info", text: string) => void;
+  /** 上报「编辑态有未保存改动」给父栏，用于切标签/折叠前确认拦截。 */
+  onEditDirtyChange?: (dirty: boolean) => void;
 }) {
   const [settings, setSettings] = useState<OkfSettingsView | null>(null);
   // 各 source（"own" 或 bundle 路径）的浏览结果缓存。
@@ -967,11 +970,24 @@ function KnowledgePanel({
   const [viewError, setViewError] = useState<string | null>(null);
   // 导出进行中（防重复点）。
   const [exporting, setExporting] = useState(false);
-  // 覆盖式编辑（own 源专用）。
+  // 覆盖式编辑（own 源专用）。editOriginal=进入编辑时的原文,用于脏判定。
   const [editing, setEditing] = useState(false);
   const [editBody, setEditBody] = useState("");
+  const [editOriginal, setEditOriginal] = useState("");
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
+
+  // 是否有未保存改动；变化时上报父栏(用于切标签/折叠前拦截);卸载时清零。
+  const editDirty = editing && editBody !== editOriginal;
+  useEffect(() => {
+    onEditDirtyChange?.(editDirty);
+    return () => onEditDirtyChange?.(false);
+  }, [editDirty, onEditDirtyChange]);
+
+  /** 有未保存改动时确认放弃;返回 true 表示可继续(无改动或用户确认)。 */
+  function confirmDiscardEdit(): boolean {
+    return !editDirty || window.confirm("有未保存的知识编辑，确定放弃吗？");
+  }
 
   async function refresh() {
     setLoading(true);
@@ -1055,6 +1071,7 @@ function KnowledgePanel({
   }
 
   function backToBrowse() {
+    if (!confirmDiscardEdit()) return;
     setView(null);
     setViewBody(null);
     setViewError(null);
@@ -1073,6 +1090,7 @@ function KnowledgePanel({
         relPath: view.concept.relPath,
       });
       setEditBody(src.body);
+      setEditOriginal(src.body);
       setEditing(true);
     } catch {
       setEditError("无法载入可编辑内容");
@@ -1122,12 +1140,15 @@ function KnowledgePanel({
   }
 
   function cancelEdit() {
+    if (!confirmDiscardEdit()) return;
     setEditing(false);
     setEditError(null);
   }
 
   /** 移除一个已登记的外部包（用于清掉读不到的死链）。移除后广播 okf-changed 并本地刷新。 */
   async function removeBundle(path: string) {
+    const name = path.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? path;
+    if (!window.confirm(`移除外部包「${name}」？若是导入的 .zip 包，其解包目录会一并删除（不可撤销）。`)) return;
     try {
       await invoke<string[]>("okf_external_remove", { path });
       window.dispatchEvent(new CustomEvent("okf-changed"));
@@ -1227,7 +1248,7 @@ function KnowledgePanel({
                 </button>
               )}
             </div>
-            <p className="okf-edit__hint">编辑的是正文；类型等元信息仍自动管理。保存后随导出/发布带出，wiki 重新生成不会冲掉。</p>
+            <p className="okf-edit__hint">编辑的是正文；类型等元信息仍自动管理。保存后随导出/发布带出，wiki 重新生成不会冲掉。注意：agent 的 repo_wiki 仍读自动生成版，你的编辑只进「知识」标签与导出/发布。</p>
           </div>
         ) : viewLoading ? (
           <div className="files-empty">加载中…</div>
@@ -1472,6 +1493,19 @@ export function ThirdColumn({
     try { (e.target as HTMLElement).releasePointerCapture(e.pointerId); } catch { /* 已释放则忽略 */ }
   }
 
+  // 知识标签编辑态脏拦截：KnowledgePanel 切标签即卸载会丢未保存编辑,故在父栏切标签/折叠前确认。
+  // 折叠态下 KnowledgePanel 未挂载,卸载时已上报 dirty=false,故折叠态的 rail 按钮天然无需拦截。
+  const editDirtyRef = useRef(false);
+  function guardLeaveEdit(): boolean {
+    return !editDirtyRef.current || window.confirm("知识编辑有未保存内容，离开将丢弃。确定吗？");
+  }
+  function selectTab(t: ThirdColTab) {
+    if (!guardLeaveEdit()) return;
+    onSelectTab(t);
+  }
+  // 稳定身份,避免每次渲染都让 KnowledgePanel 的上报 effect 重跑。
+  const handleEditDirty = useCallback((d: boolean) => { editDirtyRef.current = d; }, []);
+
   // 折叠态：竖排图标条。点图标 = 展开并切到该标签。
   if (!open) {
     const anyDot = hasActivityDot || hasChangesDot;
@@ -1583,7 +1617,7 @@ export function ThirdColumn({
           role="tab"
           aria-selected={tab === "activity"}
           title="活动"
-          onClick={() => onSelectTab("activity")}
+          onClick={() => selectTab("activity")}
         >
           <ListChecks size={14} />
           <span>活动</span>
@@ -1595,7 +1629,7 @@ export function ThirdColumn({
           role="tab"
           aria-selected={tab === "changes"}
           title="变更"
-          onClick={() => onSelectTab("changes")}
+          onClick={() => selectTab("changes")}
         >
           <GitCompare size={14} />
           <span>变更</span>
@@ -1607,7 +1641,7 @@ export function ThirdColumn({
           role="tab"
           aria-selected={tab === "usage"}
           title="用量"
-          onClick={() => onSelectTab("usage")}
+          onClick={() => selectTab("usage")}
         >
           <Gauge size={14} />
           <span>用量</span>
@@ -1620,7 +1654,7 @@ export function ThirdColumn({
             role="tab"
             aria-selected={tab === "files"}
             title="文件"
-            onClick={() => onSelectTab("files")}
+            onClick={() => selectTab("files")}
           >
             <FolderTree size={14} />
             <span>文件</span>
@@ -1633,7 +1667,7 @@ export function ThirdColumn({
           role="tab"
           aria-selected={tab === "knowledge"}
           title="知识"
-          onClick={() => onSelectTab("knowledge")}
+          onClick={() => selectTab("knowledge")}
         >
           <BookOpen size={14} />
           <span>知识</span>
@@ -1646,7 +1680,7 @@ export function ThirdColumn({
             role="tab"
             aria-selected={tab === "artifact"}
             title="产物"
-            onClick={() => onSelectTab("artifact")}
+            onClick={() => selectTab("artifact")}
           >
             <LayoutDashboard size={14} />
             <span>产物</span>
@@ -1658,7 +1692,7 @@ export function ThirdColumn({
           type="button"
           title="折叠"
           aria-label="折叠第三栏"
-          onClick={() => onToggleOpen(false)}
+          onClick={() => { if (!guardLeaveEdit()) return; onToggleOpen(false); }}
         >
           <ChevronRight size={16} />
         </button>
@@ -1687,7 +1721,12 @@ export function ThirdColumn({
         ) : tab === "knowledge" ? (
           // 知识面板：显化 OKF（私有/共享）——本项目 concept 树 + 外部包 + 详情（markdown 复用 messages 的 Markdown）。
           // key=activeConvId：切会话即重挂载，缓存/详情/展开态自然清。仅本标签挂载时拉数据。
-          <KnowledgePanel key={activeConvId ?? "none"} activeConvId={activeConvId} pushToast={pushToast} />
+          <KnowledgePanel
+            key={activeConvId ?? "none"}
+            activeConvId={activeConvId}
+            pushToast={pushToast}
+            onEditDirtyChange={handleEditDirty}
+          />
         ) : tab === "artifact" && dockedArtifact ? (
           // 产物坞（0.0.75）：复用**同一** ArtifactCard 渲染停靠的互动卡片（同安全模型：sandbox/CSP/探针/
           // nonce 全在 artifact.tsx，未改一字）。顶部一行标题 + 取消停靠；坞内不传 onDock（已在坞里，不再显停靠按钮）。

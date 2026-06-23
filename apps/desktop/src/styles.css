@@ -4304,9 +4304,9 @@ h1 {
 
 /* 「已编辑」标记：被用户覆盖式编辑过的 concept（轻强调，不喧宾夺主）。 */
 .okf-chip--edited {
-  color: var(--accent, #4f8cff);
-  border-color: color-mix(in srgb, var(--accent, #4f8cff) 45%, var(--border));
-  background: color-mix(in srgb, var(--accent, #4f8cff) 12%, var(--surface-3));
+  color: var(--brand);
+  border-color: color-mix(in srgb, var(--brand) 45%, var(--border));
+  background: color-mix(in srgb, var(--brand) 12%, var(--surface-3));
 }
 
 /* 覆盖式编辑器（详情态）：撑满可用高度的纯文本正文编辑 + 操作行 + 提示。 */
@@ -4336,7 +4336,7 @@ h1 {
 
 .okf-edit__area:focus {
   outline: none;
-  border-color: var(--accent, #4f8cff);
+  border-color: var(--brand);
 }
 
 .okf-edit__actions {
