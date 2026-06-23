@@ -39,3 +39,7 @@ desktop.ini
 # R12 情景记忆归档 / repo_wiki 派生数据（运行时生成、可重建,非源码）
 .mdga/archive/
 .mdga/wiki/
+
+# ── OKF 共享发布产物 ──
+# shared 模式把 wiki 投影成 OKF 包发布到工作区 ./knowledge（运行时生成、可由 wiki 重建,非源码）
+/knowledge/
