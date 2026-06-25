@@ -43,3 +43,7 @@ desktop.ini
 # ── OKF 共享发布产物 ──
 # shared 模式把 wiki 投影成 OKF 包发布到工作区 ./knowledge（运行时生成、可由 wiki 重建,非源码）
 /knowledge/
+
+# ── 本地私有文档（思考/调研沉淀,不上传 GitHub）──
+# 约定:任何 *.private.md 都不进版本库（如 doc/feature_plan.private.md）。
+*.private.md
