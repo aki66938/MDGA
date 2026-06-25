@@ -27,6 +27,7 @@ import {
   touchMidpoint,
   pinchDistanceFactor,
 } from "./artifact";
+import { ARTIFACT_RUNTIME_JS, isDeclarativeSpec } from "./artifact-runtime";
 
 // 0.0.70 安全 wrapper 冒烟:锁住 buildSrcdoc 的隔离不变量,防有人改回 CDN / 删 CSP / 加 unsafe-eval。
 // (注:jsdom 不真执行 sandbox iframe 脚本,故这里只做结构断言;真渲染冒烟靠本机半自动。)
@@ -71,6 +72,106 @@ describe("artifact buildSrcdoc 安全 wrapper", () => {
     expect(out).toContain("connect-src 'none'");
     expect(out).not.toContain("unsafe-eval");
     expect(out).not.toContain("allow-same-origin");
+  });
+});
+
+// 0.0.80 内联 UI 运行时 + 声明式 spec：锁住「运行时安全（无 eval/网络/存储/外链）」「注入在产物 code 之前」
+// 「CSP/sandbox 红线不被运行时削弱」「spec 经 mountSpec 渲染且 `</` 被转义防脚本越界」。
+describe("artifact 内联 UI 运行时（0.0.80）", () => {
+  it("运行时本身零危险面：无 eval / new Function / 网络 / 存储 / 动态 import / cookie", () => {
+    const r = ARTIFACT_RUNTIME_JS;
+    expect(r).not.toContain("eval(");
+    expect(r).not.toContain("new Function");
+    expect(r).not.toMatch(/\bFunction\s*\(/); // 不经 Function 构造器
+    expect(r).not.toContain("fetch(");
+    expect(r).not.toContain("XMLHttpRequest");
+    expect(r).not.toContain("WebSocket");
+    expect(r).not.toContain("localStorage");
+    expect(r).not.toContain("sessionStorage");
+    expect(r).not.toContain("document.cookie");
+    expect(r).not.toContain("indexedDB");
+    expect(r).not.toMatch(/\bimport\s*\(/); // 无动态 import
+    // 不读父 / 顶层窗口（null 源本就读不到，但运行时也绝不尝试）。
+    expect(r).not.toContain("window.parent");
+    expect(r).not.toContain("window.top");
+    // 不提供 `html` prop（未净化 innerHTML 入口已移除，缩小沙箱内 DOM-XSS 残留面）。
+    expect(r).not.toContain("=== 'html'");
+  });
+
+  it("buildSrcdoc 注入运行时（window.UI），且在产物 code **之前**（与导出 IIFE 同款先注册）", () => {
+    const out = buildSrcdoc("<div id='x'>USERCODE_MARK</div>", { "--color-text": "#000" }, "N");
+    expect(out).toContain("window.UI");
+    expect(out).toContain("window.h");
+    // 运行时注入位置在用户产物 code 之前（产物能用 UI，但运行时也不读 nonce 闭包）。
+    expect(out.indexOf("window.UI")).toBeLessThan(out.indexOf("USERCODE_MARK"));
+  });
+
+  it("注入运行时不削弱安全 wrapper：CSP/探针/sandbox 红线仍逐字在场", () => {
+    const out = buildSrcdoc("<div>x</div>", { "--color-text": "#000" }, "N");
+    expect(out).toContain("default-src 'none'");
+    expect(out).toContain("connect-src 'none'");
+    expect(out).toContain("get_app_info"); // fail-closed 探针仍在
+    expect(out).not.toContain("unsafe-eval");
+    expect(out).not.toContain("allow-same-origin");
+    expect(out).not.toContain("cdnjs.cloudflare.com");
+    expect(out).not.toContain("cdn.jsdelivr.net");
+  });
+
+  it("画布只是画布（0.0.80）：产物没有 sendPrompt / openLink 任何回灌聊天 / 打开外链的出口", () => {
+    // 用无害产物码，使「sendPrompt/openLink」只可能来自桥本身（已彻底移除）。
+    const out = buildSrcdoc("<div>x</div>", { "--color-text": "#000" }, "N");
+    expect(out).not.toContain("sendPrompt");
+    expect(out).not.toContain("openLink");
+    // 保留的 postMessage 通道全为 父/用户驱动或纯只读视图：resize / theme / export / view-gesture(放大缩放) / view-mode。
+    expect(out).toContain("'resize'");
+    expect(out).toContain("'theme'");
+    expect(out).toContain("'export-request'");
+  });
+
+  it("放大态可交互（0.0.80）：产物转发 wheel 给父侧缩放（view-gesture），但 wheel 之外不外溢", () => {
+    const out = buildSrcdoc("<div>x</div>", { "--color-text": "#000" }, "N");
+    // 放大缩放靠产物转发 wheel（因 iframe 不再 pointer-events:none、产物可交互，父侧拿不到落在产物上的 wheel）。
+    expect(out).toContain("'view-gesture'");
+    expect(out).toContain("'wheel'");
+    expect(out).toContain("'view-mode'"); // 父→产物：告知是否放大态
+    // 该视图通道只转发 wheel：不得借机转发 click/pointer 内容或任意文本（防被当成隐蔽外溢面）。
+    expect(out).not.toContain("sendPrompt");
+    expect(out).not.toContain("openLink");
+  });
+
+  it("isDeclarativeSpec：JSON 对象→true；HTML/SVG/数组/坏 JSON→false", () => {
+    expect(isDeclarativeSpec('{"type":"button","label":"Hi"}')).toBe(true);
+    expect(isDeclarativeSpec('  {"a":1}  ')).toBe(true); // 去空白
+    expect(isDeclarativeSpec("<svg width='10'></svg>")).toBe(false);
+    expect(isDeclarativeSpec("<div>hi</div>")).toBe(false);
+    expect(isDeclarativeSpec("[1,2,3]")).toBe(false); // 数组非对象
+    expect(isDeclarativeSpec("{ not json")).toBe(false);
+    expect(isDeclarativeSpec("")).toBe(false);
+  });
+
+  it("spec 模式：buildSrcdoc 经 UI.mountSpec 渲染，且产物里的 `</` 被转义防脚本越界", () => {
+    const spec = '{"type":"text","text":"x</script>y"}';
+    const out = buildSrcdoc(spec, { "--color-text": "#000" }, "N");
+    expect(out).toContain("UI.mountSpec(");
+    // spec 里每个 `<` 必须被转义成 `\x3c`（脚本文本里彻底无 `<` → 不可能闭合脚本标签逃逸）。
+    expect(out).toContain("x\\x3c/script>y");
+    // 反向锁：转义后产物里不得残留可闭合脚本的裸 `</script`（来自 spec）。
+    expect(out).not.toContain("x</script>y");
+    // 非 spec 的普通 HTML 不走 mountSpec（原样插入）。
+    const html = buildSrcdoc("<p>plain</p>", { "--color-text": "#000" }, "N");
+    expect(html).not.toContain("UI.mountSpec(");
+    expect(html).toContain("<p>plain</p>");
+  });
+
+  it("截断/非法 spec（以 `{` 开头但 JSON 解析失败）：干净占位，绝不把原始 JSON 当 HTML 糊一屏", () => {
+    // 模拟真机暴露的「巨型 spec 被截断」：以 `{` 开头但不是合法 JSON。
+    const broken = '{"title":"设置面板","children":[{"type":"tabs","tabs":[{"label":"外观","content"';
+    const out = buildSrcdoc(broken, { "--color-text": "#000" }, "N");
+    expect(out).not.toContain("UI.mountSpec(");
+    // 关键：原始 JSON 的标识串不得作为可见内容被原样塞进文档。
+    expect(out).not.toContain('"children":[{"type":"tabs"');
+    // 取而代之是一条干净的占位提示。
+    expect(out).toContain("未能渲染");
   });
 });
 

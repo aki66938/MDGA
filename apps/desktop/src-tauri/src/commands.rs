@@ -3104,26 +3104,8 @@ pub(crate) async fn install_update(app: AppHandle) -> Result<(), String> {
     app.restart();
 }
 
-/// 在用户的真实浏览器打开一个外链（0.0.67 起：供互动卡片沙箱的 openLink 桥用）。
-///
-/// 仅放行 http(s)——拒绝 file: / javascript: / data: 等任何其它 scheme,避免沙箱互动卡片借此越权。
-/// 前端只在向用户弹确认后才调用本命令；本命令只负责「http(s) 守卫 + 交系统打开」。
-#[tauri::command]
-pub(crate) fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
-    use tauri_plugin_opener::OpenerExt;
-    let u = url.trim();
-    // 拒绝含控制字符（\n / \r / \t / NUL 等）的 URL：防止换行拼接的解析歧义 / 日志注入,
-    // 也让前端确认框展示的就是将要打开的整串(无隐藏行)。
-    if u.is_empty() || u.chars().any(|c| c.is_control()) {
-        return Err("链接为空或含非法控制字符".to_string());
-    }
-    if !(u.starts_with("http://") || u.starts_with("https://")) {
-        return Err("仅允许打开 http(s) 链接".to_string());
-    }
-    app.opener()
-        .open_url(u.to_string(), None::<&str>)
-        .map_err(|e| e.to_string())
-}
+// open_external_url 命令已随 0.0.80「画布只是画布」一并移除：它仅为互动卡片沙箱的 openLink 桥而设，
+// 该桥已彻底删除，故后端不再保留这个「打开任意外链」的 IPC 端点（消除一个无调用方的潜在能力面）。
 
 // ── 常驻活动面板：后台子代理 / 命令的拉取与停止（0.0.75）──────────────────────
 //

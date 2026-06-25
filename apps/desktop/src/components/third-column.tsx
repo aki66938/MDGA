@@ -1444,10 +1444,9 @@ export function ThirdColumn({
   conversationUsage,
   turnUsages,
   // 「产物」坞（0.0.75）：停靠的互动卡片（null＝无停靠产物，「产物」标签隐藏）；解除停靠回调；
-  // 透传给复用的 ArtifactCard 的 sendPrompt/toast（同中栏，安全模型一致）。
+  // 透传给复用的 ArtifactCard 的 toast（同中栏，安全模型一致）。
   dockedArtifact,
   onUndockArtifact,
-  onArtifactSendPrompt,
   pushToast,
 }: {
   open: boolean;
@@ -1471,7 +1470,6 @@ export function ThirdColumn({
   turnUsages: UsageSummary[];
   dockedArtifact: ArtifactPart | null;
   onUndockArtifact: () => void;
-  onArtifactSendPrompt?: (text: string) => void;
   pushToast?: (kind: "error" | "info", text: string) => void;
 }) {
   // 拖拽改宽：pointerdown 起捕获指针，move 时按「左移变宽」换算（左边缘手柄，向左拖 = 加宽）。
@@ -1746,7 +1744,7 @@ export function ThirdColumn({
                 <X size={15} />
               </button>
             </div>
-            <ArtifactCard part={dockedArtifact} onSendPrompt={onArtifactSendPrompt} pushToast={pushToast} />
+            <ArtifactCard part={dockedArtifact} pushToast={pushToast} />
           </div>
         ) : (
           <div className="third-col__changes">

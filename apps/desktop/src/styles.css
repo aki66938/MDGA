@@ -1454,15 +1454,14 @@ h1 {
   will-change: transform;
 }
 
-/* 放大态时让 iframe 的圆角/边框稍收一下，避免点阵背景下显脏（可选）。
-   关键（0.0.75）：放大态给 iframe 设 pointer-events:none —— 让 wheel/gesture/pointer/touch 穿过
-   跨源沙箱 iframe（否则被它消费、不冒泡）落到 __stage/__canvas → 冒泡到 canvasRef 的捏合/缩放/平移
-   处理器。这**只是事件路由**，不动 sandbox/CSP/探针/srcdoc，不削弱隔离。内联态不加此规则 → iframe
-   仍 pointer-events:auto（产物可交互）。放大态产物不可点（接受：放大是定位细节、以缩放平移为主，
-   且 iframe 不重挂、状态仍保）。空白单击关闭逻辑不受影响：指针穿透后落在 __stage（onBlank=false、不误关）。 */
+/* 放大态时给 iframe 一点投影，点阵背景下更立体。
+   0.0.80 修正（用户要求「放大后交互与内联完全一致，只视觉放大」）：**不再** 设 pointer-events:none——
+   旧做法靠让 iframe 不可点把手势漏给父侧做缩放平移,代价是放大态产物完全不能交互,已废弃。现在 iframe
+   放大态仍 pointer-events:auto（左键点击/输入/拖动照常落进产物，交互与内联零差异）。缩放仍可作用于产物
+   之上：iframe 自身把 **wheel** 转发给父侧驱动以光标为中心缩放（纯视图 CSS transform，不涉任何对外能力）；
+   平移走暗区拖拽 + 控件按钮。空白单击关闭逻辑不变（落在 __canvas 才 onBlank）。不动 sandbox/CSP/探针/srcdoc。 */
 .artifact-viewer__canvas.is-maximized .artifact-card__frame {
   box-shadow: 0 8px 40px rgba(0, 0, 0, 0.35);
-  pointer-events: none;
 }
 
 /* 关闭按钮（右上角浮动）。 */

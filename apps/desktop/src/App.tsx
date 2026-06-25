@@ -963,7 +963,7 @@ export function App() {
         if (status !== "succeeded") return; // running/failed：不插入任何卡片
         let code = "";
         let artifactTitle: string | undefined;
-        let kind: "svg" | "html" | undefined;
+        let kind: "svg" | "html" | "spec" | undefined;
         try {
           const inp = JSON.parse(inputJson ?? "{}") as Record<string, unknown>;
           if (typeof inp.code === "string") code = inp.code;
@@ -975,7 +975,7 @@ export function App() {
         if (outputJson) {
           try {
             const out = JSON.parse(outputJson) as Record<string, unknown>;
-            if (out.kind === "svg" || out.kind === "html") kind = out.kind;
+            if (out.kind === "svg" || out.kind === "html" || out.kind === "spec") kind = out.kind;
           } catch {
             // 输出非 JSON 时忽略 kind
           }
@@ -2003,7 +2003,6 @@ export function App() {
                   <div className={`message message--${msg.role}`}>
                     <MessageContent
                       msg={msg}
-                      onSendPrompt={(text) => { void sendText(text); }}
                       pushToast={pushToast}
                       onDockArtifact={handleDockArtifact}
                     />
@@ -2495,7 +2494,6 @@ export function App() {
           // 解除停靠时若仍停在「产物」标签，切回「活动」（该标签随即消失）。
           setThirdColTab((t) => (t === "artifact" ? "activity" : t));
         }}
-        onArtifactSendPrompt={(text) => { void sendText(text); }}
         pushToast={pushToast}
       />
 

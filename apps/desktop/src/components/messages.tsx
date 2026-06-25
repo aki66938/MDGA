@@ -52,13 +52,10 @@ export function TodoPanel({ items }: { items: TodoItem[] }) {
 
 export function MessageContent({
   msg,
-  onSendPrompt,
   pushToast,
   onDockArtifact,
 }: {
   msg: Message;
-  /** 互动卡片内 sendPrompt(text) 回灌到 agent 的发送函数（透传给 ArtifactCard）。 */
-  onSendPrompt?: (text: string) => void;
   /** 全局 toast（互动卡片导出成功/失败提示用，透传给 ArtifactCard）。 */
   pushToast?: (kind: "error" | "info", text: string) => void;
   /** 「停靠到侧栏」回调（0.0.75）：透传给 ArtifactCard 显示停靠按钮，把产物拉到第三栏坞。 */
@@ -124,8 +121,8 @@ export function MessageContent({
         }
         // 0.0.74 改名 artifact；防御兜底：迁移漏网的历史 "widget" part 仍能渲（纯内部兼容，不对外暴露旧名）。
         if (part.type === "artifact" || (part as { type: string }).type === "widget") {
-          const artifactPart = { ...(part as { code: string; title?: string; kind?: "svg" | "html" }), type: "artifact" as const };
-          return <ArtifactCard key={index} part={artifactPart} onSendPrompt={onSendPrompt} pushToast={pushToast} onDock={onDockArtifact} />;
+          const artifactPart = { ...(part as { code: string; title?: string; kind?: "svg" | "html" | "spec" }), type: "artifact" as const };
+          return <ArtifactCard key={index} part={artifactPart} pushToast={pushToast} onDock={onDockArtifact} />;
         }
         return (
           <div key={index} className="notice-inline" aria-label="系统通知">

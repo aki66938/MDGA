@@ -19,7 +19,14 @@
 //   · 唯一**无法**在 CSP/sandbox 文档层阻断的残留通道是脚本「自导航」(location.href=外部URL)：它会
 //     让整个卡片跳走/变白，**可见、一次性、噪声大**，不是静默信道；且能植入恶意卡片的 agent
 //     本就已被 prompt 注入污染、另有渠道。我们接受该残留并如实记录，不假称已 100% 断网。
-// 桥接（sendPrompt/openLink）一律视为不可信来源：见 onMessage 里的用户确认门控。
+// 画布只是画布（0.0.80）：产物**没有任何**回灌聊天 / 打开外链的出口——sendPrompt / openLink 已彻底移除。
+//   理由：卡片是 agent 编写、不可信的；它绝不应能「替用户说话」往会话里塞消息，也不应能驱动浏览器跳转。
+//   产物→父 的 postMessage 只有这几类，全为父侧/用户驱动、**无任何对外副作用**（都进不了会话、开不了链接）：
+//     · resize（自报高度，纯排版）· csp-violation（仅 dev 观测）
+//     · export-image（仅当用户点「导出」、父侧带 per-render nonce 请求后回传图片）
+//     · view-gesture（仅放大态：把落在产物上的 wheel 转发给父侧做「以光标为中心缩放」——**纯只读视图通道**，
+//       只驱动父侧 CSS transform，不涉任何对外能力）。
+//   父→产物 的 postMessage：theme（推主题色值）、view-mode（告知是否放大态）。均为纯展示控制。
 //
 // 0.0.74 第二步新增（同样守红线）：
 //   · 放大画布查看器：纯父侧 CSS（外层 wrapper 切 position:fixed + 变换层 translate/scale），
@@ -36,10 +43,10 @@
 //   · dev CSP 可观测：buildSrcdoc 仅 dev 构建注入 securitypolicyviolation 监听，经
 //     postMessage('csp-violation') 回传父侧 console.warn（帮定位「交互失效=模型引了被 CSP 封的东西」）。
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { LayoutGrid, ChevronDown, ChevronUp, Maximize, Copy, Download, X, Plus, Minus, PanelRight } from "lucide-react";
 import type { ArtifactPart } from "../types";
+import { ARTIFACT_RUNTIME_JS, isDeclarativeSpec } from "./artifact-runtime";
 
 /** 展示 iframe 与截图 iframe 共用的严格 CSP（**单一来源**，防两处漂移）。
  *  default-src 'none' 全封；脚本/样式只放行 inline、**不放行任何外部主机**；子资源只允许 data:/blob:；
@@ -190,17 +197,40 @@ export function buildSrcdoc(code: string, theme: Record<string, string>, nonce: 
     "</style></head><body>\n" +
     // 导出 IIFE：置于用户产物 code **之前**，其闭包局部（含 nonce）对后跑的产物代码不可见（#3 防伪造）。
     "<script>\n" + exportScript + "\n</script>\n" +
-    code +
+    // 内联 UI 运行时（0.0.80）：在导出 IIFE 之后、产物 code 之前注入（同「先注册、不读 nonce」模式）。
+    // 仅挂 window.UI/window.h，纯 DOM、无 eval/网络，CSP/sandbox 一字不动。给模型一套自带交互的组件。
+    "<script>\n" + ARTIFACT_RUNTIME_JS + "\n</script>\n" +
+    // 产物：若是「纯 JSON 声明式 spec」→ 交 UI.mountSpec 渲染（弱模型可控产出可交互稿，语法幻觉≈0）；
+    // 否则当作 HTML/SVG/JS 原样插入（既有行为不变）。spec 经 JSON.stringify 后再把**每个** `<` 转义成
+    // `\x3c`（JS 里 `\x3c` 即 `<`，故 spec 内容不变）：脚本文本里彻底不出现 `<` → 不可能形成 `</script` /
+    // `<!--` / `<script` 等任何 script-data 状态序列,杜绝脚本标签越界(防御纵深,超出 raw-text 已足够的最低要求)。
+    (isDeclarativeSpec(code)
+      ? "<script>try{window.UI&&window.UI.mountSpec(" +
+        JSON.stringify(code).replace(/</g, "\\x3c") +
+        ");}catch(e){try{document.body.textContent='spec error: '+(e&&e.message||e);}catch(_){}}</script>"
+      : code.trim().charCodeAt(0) === 0x7b
+        ? // 看着像声明式 spec（以 `{` 开头）但 JSON 解析失败 → 多半生成时被截断/格式有误。
+          // 干净占位,绝不把整坨原始 JSON 当 HTML 文本糊一屏(正是 0.0.80 真机暴露的问题)。
+          "<div style='padding:14px;color:var(--color-text-secondary);font:13px/1.6 system-ui;'>⚠ 这份设计稿的数据不完整或格式有误，未能渲染（生成时可能被截断）。请让 AI 重新生成，或要求更简洁的版本。</div>"
+        : code) +
     "\n<script>\n" +
     "(function(){\n" +
-    "  window.sendPrompt = function(t){ parent.postMessage({__mdgaArtifact:'sendPrompt', text: String(t).slice(0,4000)}, '*'); };\n" +
-    "  window.openLink = function(u){ parent.postMessage({__mdgaArtifact:'openLink', url: String(u)}, '*'); };\n" +
+    // 画布只是画布：不暴露任何 sendPrompt / openLink 桥。产物只能自报高度、响应主题/导出请求。
     "  function rh(){ var h = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight, document.body.offsetHeight); parent.postMessage({__mdgaArtifact:'resize', height: h}, '*'); }\n" +
     "  window.addEventListener('load', rh);\n" +
     "  try{ new ResizeObserver(rh).observe(document.body); }catch(e){}\n" +
-    // 主题桥（0.0.74）：父侧切主题时不再重建 srcDoc（会 reload 丢放大/交互态），改 postMessage 推新色值，\n
-    // 这里只把它们写进 :root 的 CSS 变量（复用注入变量名）。仅认本类型消息，纯 CSS 变量更新、不触网。\n
-    "  window.addEventListener('message', function(ev){ var d = ev && ev.data; if(!d || d.__mdgaArtifact!=='theme' || !d.vars) return; try{ var r = document.documentElement; for(var k in d.vars){ if(Object.prototype.hasOwnProperty.call(d.vars,k)){ r.style.setProperty(k, String(d.vars[k])); } } }catch(e){} });\n" +
+    // 父→产物消息：theme（主题桥，0.0.74：切主题不再重建 srcDoc，只更新 :root CSS 变量，不触网）
+    // 与 view-mode（放大态开关，0.0.80：仅用于决定是否转发 wheel 给父侧缩放）。仅认这两类。
+    "  var __mx=false;\n" +
+    "  window.addEventListener('message', function(ev){ var d = ev && ev.data; if(!d) return;\n" +
+    "    if(d.__mdgaArtifact==='view-mode'){ __mx = !!d.maximized; return; }\n" +
+    "    if(d.__mdgaArtifact==='theme' && d.vars){ try{ var r = document.documentElement; for(var k in d.vars){ if(Object.prototype.hasOwnProperty.call(d.vars,k)){ r.style.setProperty(k, String(d.vars[k])); } } }catch(e){} }\n" +
+    "  });\n" +
+    // 放大态滚轮转发（0.0.80）：iframe 是事件边界,父侧拿不到落在产物上的 wheel,故由产物把它转发给父侧
+    // 用于「以光标为中心缩放视图」。这是**只读视图通道**——只驱动父侧 CSS transform,与 sendPrompt/openLink
+    // 无任何关系,不能往会话注入/不能开链接。仅放大态(__mx)拦截并 preventDefault；内联态完全不动滚轮(照常滚动)。
+    // 左键点击/输入/拖动等交互一律由产物自身消费,不受影响(放大态交互与内联零差异)。
+    "  window.addEventListener('wheel', function(e){ if(!__mx) return; e.preventDefault(); parent.postMessage({__mdgaArtifact:'view-gesture', kind:'wheel', deltaY: e.deltaY, ctrlKey: !!e.ctrlKey, x: e.clientX, y: e.clientY}, '*'); }, {passive:false});\n" +
     "})();\n" +
     "</script>\n" +
     "</body></html>"
@@ -414,7 +444,6 @@ function dataUrlToBlob(dataUrl: string): Blob {
 /**
  * 沙箱化的互动卡片。
  * @param part   ArtifactPart（code + 可选 title/kind）。
- * @param onSendPrompt  卡片内调用 sendPrompt(text) 时回灌到 agent 的发送函数；**仅在用户确认后**调用。
  * @param pushToast  全局 toast（成功/失败提示用）；可选——不传则降级为仅 console.warn。
  * @param onDock  「停靠到侧栏」回调（0.0.75）：可选——传入时工具栏多一个停靠图标按钮，点了把本产物
  *               拉到第三栏「产物」坞（复用同一 ArtifactCard 渲染，同安全模型）。不传则不显该按钮
@@ -422,12 +451,10 @@ function dataUrlToBlob(dataUrl: string): Blob {
  */
 export function ArtifactCard({
   part,
-  onSendPrompt,
   pushToast,
   onDock,
 }: {
   part: ArtifactPart;
-  onSendPrompt?: (text: string) => void;
   pushToast?: (kind: "error" | "info", text: string) => void;
   onDock?: (part: ArtifactPart) => void;
 }) {
@@ -441,11 +468,6 @@ export function ArtifactCard({
   const [transform, setTransform] = useState<CanvasTransform>(IDENTITY_TRANSFORM);
   // 导出进行中守卫（#防连点）：true 时忽略再次点击；收到回传或超时后解除。
   const [exporting, setExporting] = useState(false);
-  // sendPrompt 确认门控的冷却闸：记录上一次确认框关闭的时刻，冷却窗口内丢弃后续 sendPrompt，
-  // 防恶意卡片循环调用 sendPrompt 弹出连串阻塞确认框（confirm 轰炸 / 骚扰）。
-  const lastPromptAtRef = useRef(0);
-  // openLink 确认门控的冷却闸（与 sendPrompt 同款语义）：防恶意卡片循环调用 openLink 弹串确认框。
-  const lastOpenAtRef = useRef(0);
 
   // 画布拖拽平移：仅在放大态可用（内联卡片态保持 FE-1 现状，不 pan/zoom）。
   // downX/downY 记录按下起点（用于「点击 vs 拖拽」判定）；onBlank 记按下是否落在画布空白暗区
@@ -460,6 +482,8 @@ export function ArtifactCard({
   });
   // 画布层 ref：滚轮以光标为中心缩放时，需要光标相对画布层原点的坐标。
   const canvasRef = useRef<HTMLDivElement>(null);
+  // 变换层（产物所在的 __stage）ref：放大态用它的未变换尺寸（offsetWidth/Height）算居中初始平移。
+  const stageRef = useRef<HTMLDivElement>(null);
   // per-render 导出 nonce：随 srcDoc 一同（仅 code 变时）生成、烤进导出 IIFE 闭包，并存此 ref 供回传校验（#3）。
   const nonceRef = useRef("");
 
@@ -563,6 +587,13 @@ export function ArtifactCard({
     [exporting, part.title, pushToast]
   );
 
+  // 以画布坐标系内某点 (px,py) 为中心缩放。供「暗区原生 wheel」与「产物转发的 view-gesture wheel」共用，
+  // 保证两条路径缩放语义一致。ctrl+wheel = 触控板捏合 → 按 deltaY 幅度平滑；普通滚轮 → 固定 1.1 因子。
+  const applyWheelZoom = useCallback((deltaY: number, ctrlKey: boolean, px: number, py: number) => {
+    const factor = ctrlKey ? pinchWheelFactor(deltaY) : deltaY < 0 ? 1.1 : 1 / 1.1;
+    setTransform((t) => zoomAtPoint(t, factor, px, py));
+  }, []);
+
   useEffect(() => {
     function onMessage(event: MessageEvent) {
       // 只接受来自**本展示 iframe** contentWindow 且带 __mdgaArtifact 标记的消息（防其它 frame / 扩展伪造）。
@@ -572,10 +603,13 @@ export function ArtifactCard({
       const data = event.data as {
         __mdgaArtifact?: string;
         height?: number;
-        text?: string;
-        url?: string;
         directive?: string;
         blocked?: string;
+        kind?: string;
+        deltaY?: number;
+        ctrlKey?: boolean;
+        x?: number;
+        y?: number;
       };
       if (!data || typeof data.__mdgaArtifact !== "string") return;
 
@@ -594,47 +628,25 @@ export function ArtifactCard({
             typeof data.blocked === "string" && data.blocked ? "blocked=" + data.blocked : ""
           );
         }
-      } else if (data.__mdgaArtifact === "sendPrompt") {
-        // sendPrompt 不可信：必须经用户显式确认才发，绝不自动驱动。父侧自行截断 + 冷却节流防 confirm 轰炸。
-        const text = (typeof data.text === "string" ? data.text : "").slice(0, 4000);
-        if (!text.trim() || !onSendPrompt) return;
-        if (Date.now() - lastPromptAtRef.current < 1000) return;
-        const preview = text.length > 300 ? text.slice(0, 300) + "…" : text;
-        const ok = window.confirm(
-          "此卡片想代你向 AI 发送下面这条消息（不是你本人输入的）：\n\n" + preview + "\n\n确定发送吗？"
-        );
-        lastPromptAtRef.current = Date.now();
-        if (ok) onSendPrompt(text);
-      } else if (data.__mdgaArtifact === "openLink") {
-        const url = typeof data.url === "string" ? data.url : "";
-        if (!url) return;
-        // openLink 同样不可信：与 sendPrompt 同款冷却节流，防恶意卡片循环弹串阻塞确认框。
-        if (Date.now() - lastOpenAtRef.current < 1000) return;
-        let host = "(无法解析)";
-        let warn = "";
-        try {
-          const u = new URL(url);
-          host = u.host;
-          if (u.username || u.password) warn += "\n⚠ 链接带「用户名@」前缀，真实站点是上面的主机，请核对。";
-          if (/[^\x00-\x7F]/.test(u.hostname) || /(^|\.)xn--/.test(u.hostname))
-            warn += "\n⚠ 域名含非 ASCII / Punycode 字符，可能是仿冒域名。";
-        } catch {
-          /* 非法 URL：host 保持「无法解析」，后端仍会再校验 http(s) */
-        }
-        const shownUrl = url.replace(/\s+/g, " ").slice(0, 200) + (url.length > 200 ? "…" : "");
-        const ok = window.confirm(
-          "在浏览器打开此链接？\n\n站点主机：" + host + warn + "\n\n完整地址：\n" + shownUrl
-        );
-        // 与 sendPrompt 语义一致：无论确认与否都重置冷却窗口，丢弃窗口内后续 openLink。
-        lastOpenAtRef.current = Date.now();
-        if (ok) {
-          invoke("open_external_url", { url }).catch(() => {});
-        }
+      } else if (data.__mdgaArtifact === "view-gesture" && data.kind === "wheel") {
+        // 0.0.80：放大态产物把落在其上的 wheel 转发来（产物现可交互、父侧拿不到这层 wheel）。**纯只读视图通道**：
+        // 仅驱动父侧 CSS transform 缩放,不涉任何对外能力,与 sendPrompt/openLink 无关(那两者已不存在)。
+        // 把产物坐标(相对其自身视口、未含父侧 scale)映射回画布坐标系：屏幕点 = iframe 屏幕左上 + 产物内坐标×当前 scale。
+        const cv = canvasRef.current;
+        const fr = iframeRef.current;
+        if (!cv || !fr || typeof data.x !== "number" || typeof data.y !== "number") return;
+        const crect = cv.getBoundingClientRect();
+        const frect = fr.getBoundingClientRect();
+        const scale = fr.clientWidth > 0 && frect.width > 0 ? frect.width / fr.clientWidth : 1; // 当前渲染 scale（稳健,不依赖闭包；双守分母与零宽，杜绝 scale=0/NaN）
+        const px = frect.left + data.x * scale - crect.left;
+        const py = frect.top + data.y * scale - crect.top;
+        applyWheelZoom(typeof data.deltaY === "number" ? data.deltaY : 0, !!data.ctrlKey, px, py);
       }
+      // 不再有 sendPrompt / openLink 分支：画布只是画布，产物没有回灌聊天 / 打开外链的出口。
     }
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [onSendPrompt]);
+  }, [applyWheelZoom]);
 
   // 主题桥（0.0.74，修复 #6）：srcDoc 只随 code 构建（见上 useMemo），主题变化不再重建 srcDoc，
   // 改观测宿主 <html data-theme> 的变化，把新 resolve 的色值经 postMessage 推给 iframe 内监听，
@@ -653,6 +665,14 @@ export function ArtifactCard({
     obs.observe(root, { attributes: true, attributeFilter: ["data-theme"] });
     return () => obs.disconnect();
   }, []);
+
+  // 视图模式桥（0.0.80）：把「是否放大态」推给 iframe 内监听，决定它是否转发 wheel 给父侧缩放。
+  // 放大开关变化时推一次；iframe 因 code 变化重挂后由 <iframe onLoad> 再推一次当前态（见下方 onLoad）。
+  useEffect(() => {
+    const win = iframeRef.current?.contentWindow;
+    if (!win) return;
+    win.postMessage({ __mdgaArtifact: "view-mode", maximized }, "*");
+  }, [maximized]);
 
   // 放大态：Esc 退出（还原 wrapper 内联样式 + 复位变换）。绑在 document 上，模态期间生效。
   useEffect(() => {
@@ -676,12 +696,31 @@ export function ArtifactCard({
     setTransform(IDENTITY_TRANSFORM);
   }, []);
 
-  // 滚轮以光标为中心缩放（**仅放大态**）。修复 #5：React 的 onWheel 是被动监听，e.preventDefault()
-  // 会被忽略 → 缩放产物时整页背景跟着滚。改用**原生非被动监听**（passive:false）才能真正 preventDefault。
-  // 退出放大/卸载时移除。光标坐标取相对画布层原点（未变换坐标系容器）。
-  // 跨引擎（0.0.75）：Chromium/WebView2 触控板捏合 = `wheel` 且 `e.ctrlKey===true`，deltaY 连续而小——
-  //   用 pinchWheelFactor 平滑（固定 1.1 太跳）；非 ctrl 的普通鼠标滚轮维持固定 1.1 因子。两者都 preventDefault。
-  //   放大态产物 iframe 已被 CSS 切 pointer-events:none，故指针在产物上方的 wheel 也会落到 canvas → 触发缩放。
+  // 居中复位（0.0.80）：把产物在画布里水平+垂直居中（scale=1）。用未变换尺寸（offsetWidth/Height，不受
+  // transform 影响）算初始平移。内容比视口高/宽时夹到 0（靠左上对齐，保证起点可见、可下拉/右移浏览），
+  // 否则两轴居中。坐标系仍以 __stage 的 top:0/left:0 原点为基准，故缩放/平移数学一字不改。
+  const recenter = useCallback(() => {
+    const cv = canvasRef.current;
+    const st = stageRef.current;
+    if (!cv || !st) return;
+    const cw = cv.clientWidth;
+    const ch = cv.clientHeight;
+    const sw = st.offsetWidth;
+    const sh = st.offsetHeight;
+    if (!cw || !sw) return;
+    setTransform({ tx: Math.max(0, (cw - sw) / 2), ty: Math.max(0, (ch - sh) / 2), scale: 1 });
+  }, []);
+
+  // 进入放大态后立刻居中（useLayoutEffect：在浏览器绘制前测量+置位，避免先闪一下左上角）。
+  useLayoutEffect(() => {
+    if (maximized) recenter();
+  }, [maximized, recenter]);
+
+  // 滚轮以光标为中心缩放（**仅放大态**，作用于画布**暗区**）。修复 #5：React 的 onWheel 是被动监听，
+  // e.preventDefault() 会被忽略 → 缩放时整页背景跟着滚。改用**原生非被动监听**（passive:false）才能真正
+  // preventDefault。退出放大/卸载时移除。光标坐标取相对画布层原点。
+  // 0.0.80：产物 iframe 放大态不再 pointer-events:none（产物可交互），故落在**产物之上**的 wheel 由产物
+  // 自身转发（见 onMessage 的 view-gesture 分支）；此原生监听只覆盖落在暗区的 wheel。两路共用 applyWheelZoom。
   useEffect(() => {
     if (!maximized) return;
     const el = canvasRef.current;
@@ -689,15 +728,11 @@ export function ArtifactCard({
     const handler = (e: WheelEvent) => {
       e.preventDefault(); // 非被动监听里此调用真正阻止默认的整页滚动 / 浏览器捏合缩放
       const rect = el.getBoundingClientRect();
-      const px = e.clientX - rect.left;
-      const py = e.clientY - rect.top;
-      // ctrl+wheel = 触控板捏合 / ctrl+鼠标滚轮 → 按 deltaY 幅度平滑；普通滚轮 → 固定因子。
-      const factor = e.ctrlKey ? pinchWheelFactor(e.deltaY) : e.deltaY < 0 ? 1.1 : 1 / 1.1;
-      setTransform((t) => zoomAtPoint(t, factor, px, py));
+      applyWheelZoom(e.deltaY, e.ctrlKey, e.clientX - rect.left, e.clientY - rect.top);
     };
     el.addEventListener("wheel", handler, { passive: false });
     return () => el.removeEventListener("wheel", handler);
-  }, [maximized]);
+  }, [maximized, applyWheelZoom]);
 
   // gesture 事件（macOS WKWebView 捏合，0.0.75）：WebKit 捏合发 gesturestart/change/end（带 e.scale），
   // **不发 ctrl+wheel**，故须单独处理。这些事件仅 WebKit 触发（Chromium/WebView2 不发，挂了无害）。
@@ -789,9 +824,9 @@ export function ArtifactCard({
   }, [maximized]);
 
   // 拖拽平移整个画布（**仅放大态**）。指针按下记录起点，移动累加 delta。
-  // 0.0.75 起放大态 iframe 设了 pointer-events:none → 指针穿过产物落到 __stage（其父）并冒泡到此处，
-  // 故在产物上方拖拽也能平移（放大态产物不可点，可接受）。onBlank 只在 target===__canvas（真空白暗区）
-  // 才为 true，落在 __stage（产物区）则 false，故空白单击关闭逻辑不被破坏（产物上单击不误关）。
+  // 0.0.80：产物 iframe 不再 pointer-events:none（产物放大态仍可交互）→ 落在**产物上**的指针事件被产物消费、
+  // 不再冒泡到此处，故此平移只作用于画布**暗区**（产物之外）；在产物上拖拽 = 与产物交互（如拖滑块），符合预期。
+  // onBlank 只在 target===__canvas（真暗区）才 true；产物上点击根本不触发本处理器，故空白单击关闭不被误触。
   const onPointerDown = useCallback(
     (e: React.PointerEvent) => {
       if (!maximized) return;
@@ -944,10 +979,11 @@ export function ArtifactCard({
           onPointerMove={onPointerMove}
           onPointerUp={endPan}
           onPointerLeave={endPan}
-          onDoubleClick={maximized ? () => setTransform(IDENTITY_TRANSFORM) : undefined}
+          onDoubleClick={maximized ? recenter : undefined}
         >
           <div
             className="artifact-viewer__stage"
+            ref={stageRef}
             style={
               maximized
                 ? { transform: `translate(${transform.tx}px, ${transform.ty}px) scale(${transform.scale})` }
@@ -963,6 +999,13 @@ export function ArtifactCard({
               sandbox={ARTIFACT_SANDBOX}
               srcDoc={srcdoc}
               scrolling="no"
+              onLoad={() => {
+                // 重挂后（code 变化）补推当前主题 + 视图模式：避免新 iframe 丢主题、或不知自己正处于放大态。
+                const win = iframeRef.current?.contentWindow;
+                if (!win) return;
+                win.postMessage({ __mdgaArtifact: "theme", vars: readHostTheme() }, "*");
+                win.postMessage({ __mdgaArtifact: "view-mode", maximized }, "*");
+              }}
               style={{
                 width: "100%",
                 height,
@@ -995,7 +1038,7 @@ export function ArtifactCard({
                 <Plus size={15} />
               </button>
             </div>
-            <div className="artifact-viewer__hint">滚轮 / 捏合缩放 · 拖拽平移 · 双击复位</div>
+            <div className="artifact-viewer__hint">滚轮缩放（指向处放大）· 暗区拖拽平移 · 双击复位 · 内容可直接交互</div>
           </>
         )}
       </div>
